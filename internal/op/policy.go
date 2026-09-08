@@ -18,7 +18,7 @@ package op
 
 import (
 	"github.com/PizenLabs/izen/internal/ir"
-	"github.com/PizenLabs/izen/internal/knowledge/v3"
+	"github.com/PizenLabs/izen/internal/knowledge"
 )
 
 // OperationSemantics is a strongly-typed, mutually-exclusive description of

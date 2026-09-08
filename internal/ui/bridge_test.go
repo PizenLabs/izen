@@ -6,8 +6,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/PizenLabs/izen/internal/engine/v3/ir"
-	"github.com/PizenLabs/izen/internal/engine/v3/telemetry"
+	"github.com/PizenLabs/izen/internal/engine/ir"
+	"github.com/PizenLabs/izen/internal/engine/telemetry"
 )
 
 // drainFact forwards the next tea.Msg on ch, failing the test on timeout.

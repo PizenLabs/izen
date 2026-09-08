@@ -19,9 +19,9 @@ import (
 	"github.com/PizenLabs/izen/internal/core/classifier"
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
-	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
+	"github.com/PizenLabs/izen/internal/engine/pipeline"
 	"github.com/PizenLabs/izen/internal/events"
-	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/v3/orchestrator"
+	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 )
 
 // Phase is a logical execution phase within the workflow.

@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/core/workflow"
-	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
+	"github.com/PizenLabs/izen/internal/engine/pipeline"
 )
 
 // TestWithPipelineWiresLayeredEngine verifies the layered Pipeline Engine is

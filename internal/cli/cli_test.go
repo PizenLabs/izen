@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/presentation/diff"
-	"github.com/PizenLabs/izen/internal/runtime/v3/authorization"
-	"github.com/PizenLabs/izen/internal/runtime/v3/orchestrator"
-	"github.com/PizenLabs/izen/internal/runtime/v3/preflight"
-	"github.com/PizenLabs/izen/internal/runtime/v3/target"
+	"github.com/PizenLabs/izen/internal/runtime/authorization"
+	"github.com/PizenLabs/izen/internal/runtime/orchestrator"
+	"github.com/PizenLabs/izen/internal/runtime/preflight"
+	"github.com/PizenLabs/izen/internal/runtime/target"
 )
 
 // stubLLM is a scriptable LLMProvider.

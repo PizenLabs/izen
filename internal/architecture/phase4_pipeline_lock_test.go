@@ -56,12 +56,22 @@ func TestPhase4PipelineLock(t *testing.T) {
 	}
 
 	// ── 2. Executor must NOT directly import os/exec or os.WriteFile ──
+	// The write prohibition targets the authority-tier executor (executor.go,
+	// the 6-clause RuntimeExecutor over Substrate). file_executor.go is the
+	// dedicated transactional file-mutation tier (PrepareSnapshot/Commit/
+	// Rollback over an atomic temp+rename write); it is the merged canonical
+	// home of the former v3 transactional executor tier and owns the low-level
+	// write primitives by contract (covered by file_executor_test.go). All
+	// other files under this directory must stay free of direct writes.
 	execDir := filepath.Join(root, "internal", "runtime", "executor")
 	execFiles := goFilesUnder(execDir)
 	if len(execFiles) == 0 {
 		t.Fatal("architecture: no Go files under internal/runtime/executor")
 	}
 	for _, rel := range execFiles {
+		if rel == "file_executor.go" {
+			continue
+		}
 		f, fset := parseFile(t, filepath.Join(execDir, rel))
 		for p := range imports(f) {
 			if p == "os/exec" {

@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/ir"
-	"github.com/PizenLabs/izen/internal/knowledge/v3"
+	"github.com/PizenLabs/izen/internal/knowledge"
 )
 
 func TestContextPolicyValues(t *testing.T) {

@@ -3,8 +3,8 @@ package ui
 import (
 	"testing"
 
-	"github.com/PizenLabs/izen/internal/engine/v3/ir"
-	"github.com/PizenLabs/izen/internal/engine/v3/telemetry"
+	"github.com/PizenLabs/izen/internal/engine/ir"
+	"github.com/PizenLabs/izen/internal/engine/telemetry"
 )
 
 // TestHandleControlFactIterationProjection verifies a control.iteration fact is

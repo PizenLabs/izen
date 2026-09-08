@@ -246,6 +246,98 @@ func TestSlowConsumerDoesNotBlockOtherSubscribers(t *testing.T) {
 	close(release)
 }
 
+// TestPriorityControlEventsNeverDroppedUnderTelemetrySaturation is the
+// guaranteed-delivery contract: with the telemetry channel saturated past
+// DefaultBufferSize (drops counted), every control-class event published in
+// the same window is STILL delivered. task lifecycle terminals and
+// clarification/checkpoint events never ride the select/default drop path.
+func TestPriorityControlEventsNeverDroppedUnderTelemetrySaturation(t *testing.T) {
+	b := NewBus(DefaultBufferSize)
+	defer b.Close()
+
+	release := make(chan struct{})
+	blocked := make(chan struct{})
+	var blockedFirst sync.Once
+	var receivedMu sync.Mutex
+	var received []string
+
+	sub := b.SubscribeAll(func(ev DomainEvent) {
+		// The first dispatched event blocks the dispatch goroutine so the
+		// telemetry channel saturates while we publish through the window.
+		blockedFirst.Do(func() {
+			close(blocked)
+			<-release
+		})
+		receivedMu.Lock()
+		received = append(received, ev.Type())
+		receivedMu.Unlock()
+	})
+	if sub == nil {
+		t.Fatal("SubscribeAll returned nil")
+	}
+
+	// Saturation: one telemetry chunk blocks the handler, then a burst past
+	// the 256-item buffer must be dropped and counted, never stall the
+	// publisher.
+	b.Publish(NewPatchApplied("a.go", 1, 0, time.Millisecond))
+	<-blocked
+	const telemetryBurst = 350
+	for range telemetryBurst {
+		b.Publish(NewActivity("chunk"))
+	}
+
+	// Control events published while the telemetry channel is saturated must
+	// ALL be delivered — the control partition is guaranteed.
+	controlTypes := []string{
+		EventTaskStarted, EventTaskCompleted, EventTaskFailed, EventTaskCanceled,
+		EventClarificationRequired, EventStateCheckpoint,
+	}
+	for _, typ := range controlTypes {
+		switch typ {
+		case EventTaskStarted:
+			b.Publish(NewTaskStarted("t1"))
+		case EventTaskCompleted:
+			b.Publish(NewTaskCompleted("t1", "ok"))
+		case EventTaskFailed:
+			b.Publish(NewTaskFailed("t1", "boom"))
+		case EventTaskCanceled:
+			b.Publish(NewTaskCanceled("t1"))
+		case EventClarificationRequired:
+			b.Publish(NewClarificationRequired("t1", "which?"))
+		case EventStateCheckpoint:
+			b.Publish(NewStateCheckpoint("t1", "gate"))
+		}
+	}
+	close(release)
+
+	if !waitFor(t, func() bool {
+		receivedMu.Lock()
+		n := len(received)
+		receivedMu.Unlock()
+		return n >= len(controlTypes)
+	}) {
+		t.Fatalf("control events not delivered under telemetry saturation: %v", received)
+	}
+
+	receivedMu.Lock()
+	got := append([]string(nil), received...)
+	gotControl := 0
+	for _, typ := range received {
+		if IsControlEventType(typ) {
+			gotControl++
+		}
+	}
+	receivedMu.Unlock()
+	if gotControl != len(controlTypes) {
+		t.Fatalf("delivered %d control events, want %d (received %v)", gotControl, len(controlTypes), got)
+	}
+
+	// The telemetry drop path stayed intact: saturation dropped and counted.
+	if dropped := sub.Dropped(); dropped < 50 {
+		t.Fatalf("telemetry drops = %d, want >= 50 (channel did not saturate)", dropped)
+	}
+}
+
 func TestSubscribeUnsubscribe(t *testing.T) {
 	b := NewBus(16)
 	defer b.Close()

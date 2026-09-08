@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/PizenLabs/izen/internal/capability/v3/policy"
-	"github.com/PizenLabs/izen/internal/capability/v3/validator"
+	"github.com/PizenLabs/izen/internal/capability/policy"
+	"github.com/PizenLabs/izen/internal/capability/validator"
 	"github.com/PizenLabs/izen/internal/ir"
 	"github.com/PizenLabs/izen/internal/retrieval/extractor"
 )

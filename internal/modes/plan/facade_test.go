@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/ai"
-	"github.com/PizenLabs/izen/internal/engine/v3/layer3"
-	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
+	"github.com/PizenLabs/izen/internal/engine/layer3"
+	"github.com/PizenLabs/izen/internal/engine/pipeline"
 )
 
 // fakeFacade is a recording test double for the pipeline.Facade boundary. It
