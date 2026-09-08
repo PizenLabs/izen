@@ -42,6 +42,7 @@ import (
 	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/planner"
+	"github.com/PizenLabs/izen/internal/policy"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -1156,6 +1157,21 @@ type model struct {
 	// option, skips the approval gate for subsequent SHELL_EXEC tasks for the
 	// remainder of the session. Reset on mode transitions or /clear.
 	pendingBuildAllowAlways bool
+
+	// ── Interactive security permission interceptor ─────────────
+	// pendingPermission holds the tool call awaiting explicit human
+	// authorization ([y] Allow Once / [a] Always Allow / [n] Deny /
+	// [e] Edit Command). While non-nil the TUI renders the centered
+	// risk-colored modal overlay and every key routes to
+	// handlePermissionModalKey. permissionRespCh is the agent goroutine's
+	// release: it always receives exactly one PermissionResponse.
+	pendingPermission   *policy.PermissionRequest
+	permissionRespCh    chan policy.PermissionResponse
+	permissionEditing   bool
+	permissionEditValue string
+	// permissionWhitelist records "[a] Always Allow for Session" grants by
+	// request pattern (tool:command-head). Nil until the first grant.
+	permissionWhitelist *policy.SessionWhitelist
 
 	// Hotfix approval gate: $hot MUST NOT apply structural patches to disk
 	// silently. After the model synthesizes the patch, the engine freezes in
@@ -2485,6 +2501,7 @@ func (m *model) unwindBuildFailure() {
 	m.acceptAll = false
 
 	m.clearAutonomyProposal()
+	m.denyPendingPermission("unwound")
 	if m.workflowSM != nil {
 		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
 		// a reset back to StateIdle, from which every forward phase is reachable.
@@ -2591,6 +2608,10 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	if m.toolCallBuffer != nil {
 		m.toolCallBuffer.Reject()
 	}
+	// 4a. Release a blocked permission gate: the agent goroutine waits on
+	// the modal's response channel, so an interrupt must deny-deliver rather
+	// than orphan it (leak-proof authorization).
+	m.denyPendingPermission("interrupted")
 
 	// 4b. Abort any in-flight hotfix: restore the stashed plan and clear the
 	// hotfixActive flag so a subsequent buildResultMsg can NEVER wrongly

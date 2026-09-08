@@ -29,6 +29,7 @@ import (
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/policy"
 	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
@@ -102,6 +103,29 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if !m.selfHealWorkspace() {
 			m.initStage = initNone
 			m.ti.Blur()
+		}
+	}
+
+	// ── SECURITY PERMISSION MODAL INTERCEPT ──────────────────────────
+	// While the permission interceptor holds a tool call, every key routes
+	// to the modal handler: [y] Allow Once / [a] Always Allow / [n] Deny /
+	// [e] Edit Command. It runs before quit-confirm so a pending security
+	// decision can never be bypassed by exiting, and before the emergency
+	// hatch so Ctrl+C denies (releasing the blocked agent goroutine) instead
+	// of orphaning its response channel.
+	if m.pendingPermission != nil {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			return m, m.handlePermissionModalKey(keyMsg)
+		}
+		// Non-key messages (ticks, resizes) must not dismiss the modal; the
+		// blocked executor waits for an explicit human decision.
+		if _, ok := msg.(tea.KeyMsg); !ok {
+			switch msg.(type) {
+			case tea.WindowSizeMsg:
+				// fall through to the main switch so resize still applies
+			default:
+				return m, nil
+			}
 		}
 	}
 
@@ -375,6 +399,35 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// from the decoupled PresentationEvent payload. Runs on the UI
 		// goroutine, so all model mutation here is race-free.
 		m.handlePresentationEvent(msg.ev)
+		return m, nil
+
+	case PermissionPromptMsg:
+		// Interactive security interceptor: stage the modal and freeze the
+		// approval gate. Session "[a]" grants bypass the modal entirely so
+		// repeat tool calls pass without prompting; the response is
+		// delivered on the request's channel either way so the blocked
+		// agent goroutine is always released.
+		if msg.RespCh == nil {
+			return m, nil
+		}
+		if m.isPermissionAllowedBySession(msg.Req) {
+			resp := policy.PermissionResponse{RequestID: msg.Req.ID, Allowed: true}
+			select {
+			case msg.RespCh <- resp:
+			default:
+			}
+			return m, func() tea.Msg { return PermissionResolvedMsg{Resp: resp} }
+		}
+		m.openPermissionModal(msg)
+		return m, nil
+
+	case PermissionResolvedMsg:
+		// Forward the human decision to the blocked executor channel
+		// (non-blocking — the waiter may have timed out) and log the
+		// authorization outcome. The modal state was already cleared by
+		// deliverPermissionResponse; this is the observable terminal event.
+		m.logActivity("[permission] %s allowed=%t remember=%t edited=%t",
+			msg.Resp.RequestID, msg.Resp.Allowed, msg.Resp.Remember, msg.Resp.Edited)
 		return m, nil
 
 	case sessionPickerResumeMsg:

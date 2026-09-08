@@ -203,6 +203,15 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyRunes && IsSGRMouseFragmentRunes(msg.Runes) {
 		return m, nil
 	}
+	// ── SECURITY PERMISSION MODAL (topmost key gate) ───────────────
+	// While the interceptor holds a tool call, every key resolves the
+	// modal: [y]/Enter Allow Once, [a] Always Allow, [n]/Esc Deny,
+	// [e] Edit Command. It outranks the trace overlay, the autonomy
+	// proposal, and all approval gates so a security decision can never
+	// be bypassed or shadowed.
+	if m.pendingPermission != nil {
+		return m, m.handlePermissionModalKey(msg)
+	}
 	// ── TRACE OVERLAY DISMISSAL ──────────────────────────────────────
 	if m.showTraceOverlay {
 		if msg.Type == tea.KeyEscape || msg.String() == "alt+t" {

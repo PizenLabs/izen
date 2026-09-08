@@ -61,6 +61,11 @@ func (m *model) renderContextHeader() string {
 // to project a Workspace onto the terminal.
 func (m *model) View() string {
 	base := renderWorkspace(m.BuildWorkspace())
+	// The security interceptor is the topmost modal: a pending permission
+	// decision can never be bypassed by the quit dialog or any other overlay.
+	if m.pendingPermission != nil {
+		return m.renderPermissionOverlay(base)
+	}
 	if m.pendingQuitConfirm {
 		return m.renderQuitConfirmOverlay(base)
 	}
@@ -226,6 +231,17 @@ func (m *model) renderProposalBlock() string {
 	// proposal is outstanding, independent of the derived workflow state.
 	if m.pendingAutonomyProposal != nil {
 		b.WriteString(m.renderAutonomyProposalBlock(width))
+		return b.String()
+	}
+
+	// ── SECURITY PERMISSION INTERCEPTOR ──────────────────────────
+	// The interactive permission modal renders inline in the proposal dock
+	// (the fullscreen overlay in View() centers the same box). Dock parity
+	// keeps the decision visible in narrow panes and test harnesses that
+	// assert on renderProposalBlock.
+	if m.pendingPermission != nil {
+		b.WriteString(renderPermissionModal(*m.pendingPermission, width, m.permissionEditing, m.permissionEditValue))
+		b.WriteString("\n")
 		return b.String()
 	}
 
