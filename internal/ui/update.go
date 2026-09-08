@@ -2022,6 +2022,33 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
+	case PlanUpdateMsg:
+		m.handlePlanUpdate(msg)
+		return m, nil
+
+	case PlanStepMsg:
+		m.handlePlanStep(msg)
+		return m, nil
+
+	case ToolStartMsg:
+		m.handleToolStart(msg)
+		return m, nil
+
+	case ToolChunkMsg:
+		m.handleToolChunk(msg)
+		return m, nil
+
+	case ToolEndMsg:
+		return m, m.handleToolEnd(msg)
+
+	case toolCollapseMsg:
+		m.handleToolCollapse(msg)
+		return m, nil
+
+	case ToolToggleMsg:
+		m.toggleToolCard(msg.ID)
+		return m, nil
+
 	case FrameTickMsg:
 		// ── DEBOUNCED FRAME TICKER (30ms / ~33 FPS) ─────────────────────
 		// STREAM BUFFER CONTRACT: Option A — Cumulative Overwrite.
@@ -3481,6 +3508,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		if !m.autocompleteActive && !m.streaming && !m.agentRunning {
 			switch msg.Type {
+			case tea.KeyTab:
+				// Toggle the most recent terminal tool card's historical log.
+				if len(m.toolOrder) > 0 {
+					m.toggleToolCard("")
+					return m, nil
+				}
 			case tea.KeyUp:
 				if len(m.history) > 0 {
 					if m.historyIndex == -1 {

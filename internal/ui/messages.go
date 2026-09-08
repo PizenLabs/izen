@@ -2,6 +2,7 @@ package ui
 
 import (
 	"github.com/PizenLabs/izen/internal/policy"
+	"github.com/PizenLabs/izen/internal/ui/plan"
 )
 
 // PermissionPromptMsg triggers the interactive security-permission modal and
@@ -37,4 +38,50 @@ type ShowDiffMsg struct {
 type ToggleDiffCollapseMsg struct {
 	FileIdx int
 	HunkIdx int
+}
+
+// ── Agent Execution Plan & Live Tool Cards ─────────────────────────────
+// PlanUpdateMsg replaces or updates the current execution plan state.
+type PlanUpdateMsg struct {
+	Plan plan.ExecutionPlan
+}
+
+// PlanStepMsg updates a single plan step in place.
+type PlanStepMsg struct {
+	ID      string
+	Status  plan.TaskStatus
+	Elapsed int64 // nanoseconds; <0 leaves elapsed unchanged
+	Error   string
+}
+
+// ToolStartMsg spawns a new active Tool Output Card.
+type ToolStartMsg struct {
+	ID       string
+	ToolName string
+	Command  string
+}
+
+// ToolChunkMsg appends stdout/stderr stream data to a card.
+type ToolChunkMsg struct {
+	ID    string
+	Chunk []byte
+}
+
+// ToolEndMsg marks process completion and schedules auto-collapse.
+type ToolEndMsg struct {
+	ID       string
+	ExitCode int
+	Err      error
+	// ElapsedNs carries the process duration in nanoseconds (0 = auto).
+	ElapsedNs int64
+}
+
+// toolCollapseMsg fires after the auto-collapse delay for completed cards.
+type toolCollapseMsg struct {
+	ID string
+}
+
+// ToolToggleMsg toggles expansion of a historical output log.
+type ToolToggleMsg struct {
+	ID string // empty = most recent card
 }

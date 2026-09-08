@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -47,8 +48,11 @@ func TestPermissionGate_DenyYieldsStructuredError(t *testing.T) {
 	req := policy.PermissionRequest{ID: "r3", ToolName: "shell_exec", Command: "rm -rf tmp/", RiskLevel: policy.RiskHigh}
 	if _, err := g.Request(context.Background(), req); err == nil {
 		t.Fatal("denied request must error")
-	} else if _, ok := err.(*policy.PermissionDeniedError); !ok {
-		t.Fatalf("err type = %T, want *policy.PermissionDeniedError", err)
+	} else {
+		var deniedErr *policy.PermissionDeniedError
+		if !errors.As(err, &deniedErr) {
+			t.Fatalf("err type = %T, want *policy.PermissionDeniedError", err)
+		}
 	}
 }
 

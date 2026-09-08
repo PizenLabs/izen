@@ -53,7 +53,9 @@ import (
 	"github.com/PizenLabs/izen/internal/session/compaction"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/ui/diff"
+	uiplan "github.com/PizenLabs/izen/internal/ui/plan"
 	"github.com/PizenLabs/izen/internal/ui/status"
+	uitool "github.com/PizenLabs/izen/internal/ui/tool"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
 	"github.com/PizenLabs/izen/pkg/engine/ir"
 	"github.com/PizenLabs/izen/pkg/engine/pipeline"
@@ -1417,6 +1419,16 @@ type model struct {
 
 	// Activity tree — structured tool call logging
 	activityTree *ActivityTree
+
+	// ── Agent Execution Plan card (docked below the prompt header) ──
+	// execPlan is the current multi-step resolution strategy; nil = hidden.
+	execPlan *uiplan.ExecutionPlan
+
+	// ── Live Tool Output cards (inline in the chat stream thread) ───
+	// toolCards maps card ID → card; toolOrder preserves spawn order for
+	// deterministic rendering and Tab-toggle targeting.
+	toolCards map[string]*uitool.ToolCard
+	toolOrder []string
 
 	// Authoritative execution-stage record — the single source of truth for
 	// "what is the runtime doing right now". Every progress indicator derives
@@ -4494,6 +4506,20 @@ func (m *model) resetStreamingRenderer() {
 // the scrollable document so live status stays reachable.
 func (m *model) renderTailPanelLines() []string {
 	var b strings.Builder
+
+	// ── Agent Execution Plan card (docked top of viewport tail) ──
+	// Rendered first so it sits immediately below the conversation content
+	// during multi-step execution and stays pinned via tail auto-scroll.
+	if dock := m.renderPlanDock(m.width); dock != "" {
+		b.WriteString(dock)
+		b.WriteString("\n")
+	}
+
+	// ── Live Tool Output cards (inline in the chat stream thread) ──
+	if dock := m.renderToolDock(m.width); dock != "" {
+		b.WriteString(dock)
+		b.WriteString("\n")
+	}
 
 	// ── Foldable execution log entries ─────────────────────────────
 	if m.logStore != nil {
