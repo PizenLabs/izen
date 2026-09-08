@@ -3,7 +3,7 @@ package parser
 import (
 	"unicode/utf8"
 
-	"github.com/PizenLabs/izen/pkg/domain/command"
+	"github.com/PizenLabs/izen/internal/domain/command"
 )
 
 // Tokenize performs a single left-to-right pass over input and produces the

@@ -30,6 +30,9 @@ import (
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
+	"github.com/PizenLabs/izen/internal/engine/v3/ir"
+	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
+	"github.com/PizenLabs/izen/internal/engine/v3/telemetry"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
@@ -52,16 +55,13 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/session/compaction"
 	"github.com/PizenLabs/izen/internal/state"
+	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
+	"github.com/PizenLabs/izen/internal/tui/tips"
 	"github.com/PizenLabs/izen/internal/ui/diff"
 	uiplan "github.com/PizenLabs/izen/internal/ui/plan"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	uitool "github.com/PizenLabs/izen/internal/ui/tool"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
-	"github.com/PizenLabs/izen/pkg/engine/ir"
-	"github.com/PizenLabs/izen/pkg/engine/pipeline"
-	"github.com/PizenLabs/izen/pkg/engine/telemetry"
-	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
-	"github.com/PizenLabs/izen/pkg/tui/tips"
 )
 
 // ── Init stage types ──────────────────────────────────────────────────────────

@@ -5,10 +5,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/PizenLabs/izen/pkg/capability/policy"
-	"github.com/PizenLabs/izen/pkg/capability/validator"
-	"github.com/PizenLabs/izen/pkg/extractor"
-	"github.com/PizenLabs/izen/pkg/ir"
+	"github.com/PizenLabs/izen/internal/capability/v3/policy"
+	"github.com/PizenLabs/izen/internal/capability/v3/validator"
+	"github.com/PizenLabs/izen/internal/ir"
+	"github.com/PizenLabs/izen/internal/retrieval/extractor"
 )
 
 // extValidatorTags maps file extensions to the canonical validator language

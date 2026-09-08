@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/PizenLabs/izen/pkg/engine/ir"
+	"github.com/PizenLabs/izen/internal/engine/v3/ir"
 )
 
 // ── Dynamic IR Projection ────────────────────────────────────────────────────

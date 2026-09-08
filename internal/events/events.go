@@ -1254,3 +1254,104 @@ func NewAutonomousAborted(runID, contractID, target, workspace, reason string) D
 		RunID: runID, ContractID: contractID, Target: target, Workspace: workspace, Reason: reason,
 	})
 }
+
+// ── Task lifecycle (unified V3 runtime events) ───────────────────────────
+// These are the canonical task.started / task.completed / task.failed /
+// task.canceled / budget.exceeded / state.checkpoint / clarification.required
+// events previously carried on the V3 MemoryEventBus. They are plain
+// DomainEvents now, so kernel and pipeline execution publish on the same bus
+// as every other engine — one bus, one subscription contract, one audit
+// trail. The string discriminators are unchanged.
+const (
+	EventTaskStarted           = "task.started"
+	EventTaskCompleted         = "task.completed"
+	EventTaskFailed            = "task.failed"
+	EventTaskCanceled          = "task.canceled"
+	EventBudgetExceeded        = "budget.exceeded"
+	EventStateCheckpoint       = "state.checkpoint"
+	EventClarificationRequired = "clarification.required"
+)
+
+// TaskStartedPayload carries a task execution start. TaskID links the event
+// to its originating task.
+type TaskStartedPayload struct {
+	TaskID string
+}
+
+// TaskCompletedPayload carries a task's terminal success. Result is the
+// task's terminal result (e.g. kernel.TaskResult); it stays interface{} here
+// because the concrete type lives in the publisher's package.
+type TaskCompletedPayload struct {
+	TaskID string
+	Result interface{}
+}
+
+// TaskFailedPayload carries a task's terminal failure. Result is the task's
+// terminal result (e.g. kernel.TaskResult with its Error).
+type TaskFailedPayload struct {
+	TaskID string
+	Result interface{}
+}
+
+// TaskCanceledPayload carries a task's terminal cancellation.
+type TaskCanceledPayload struct {
+	TaskID string
+}
+
+// BudgetExceededPayload carries a budget-exceeded signal for a task. Detail
+// is an optional human-readable explanation.
+type BudgetExceededPayload struct {
+	TaskID string
+	Detail interface{}
+}
+
+// StateCheckpointPayload carries a pipeline stage checkpoint. Checkpoint is
+// the stage marker (e.g. the pipeline's StageEvent).
+type StateCheckpointPayload struct {
+	TaskID     string
+	Checkpoint interface{}
+}
+
+// ClarificationRequiredPayload carries a clarification request. Questions is
+// the pending question set (e.g. []ir.ClarificationQuestion); it stays
+// interface{} because the concrete type lives in the publisher's package.
+type ClarificationRequiredPayload struct {
+	TaskID    string
+	Questions interface{}
+}
+
+// NewTaskStarted publishes that a task execution began.
+func NewTaskStarted(taskID string) DomainEvent {
+	return newEvent(EventTaskStarted, TaskStartedPayload{TaskID: taskID})
+}
+
+// NewTaskCompleted publishes a task's terminal success with its result.
+func NewTaskCompleted(taskID string, result interface{}) DomainEvent {
+	return newEvent(EventTaskCompleted, TaskCompletedPayload{TaskID: taskID, Result: result})
+}
+
+// NewTaskFailed publishes a task's terminal failure with its result.
+func NewTaskFailed(taskID string, result interface{}) DomainEvent {
+	return newEvent(EventTaskFailed, TaskFailedPayload{TaskID: taskID, Result: result})
+}
+
+// NewTaskCanceled publishes a task's terminal cancellation.
+func NewTaskCanceled(taskID string) DomainEvent {
+	return newEvent(EventTaskCanceled, TaskCanceledPayload{TaskID: taskID})
+}
+
+// NewBudgetExceeded publishes a budget-exceeded signal for a task.
+func NewBudgetExceeded(taskID string, detail interface{}) DomainEvent {
+	return newEvent(EventBudgetExceeded, BudgetExceededPayload{TaskID: taskID, Detail: detail})
+}
+
+// NewStateCheckpoint publishes a pipeline stage checkpoint.
+func NewStateCheckpoint(taskID string, checkpoint interface{}) DomainEvent {
+	return newEvent(EventStateCheckpoint, StateCheckpointPayload{TaskID: taskID, Checkpoint: checkpoint})
+}
+
+// NewClarificationRequired publishes a clarification request with the pending
+// questions.
+func NewClarificationRequired(taskID string, questions interface{}) DomainEvent {
+	return newEvent(EventClarificationRequired, ClarificationRequiredPayload{TaskID: taskID, Questions: questions})
+}

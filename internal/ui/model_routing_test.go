@@ -4,8 +4,8 @@ import (
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
 	"github.com/PizenLabs/izen/internal/modes"
-	"github.com/PizenLabs/izen/pkg/engine/pipeline"
 )
 
 func testRouterModel(t *testing.T, mode string) string {

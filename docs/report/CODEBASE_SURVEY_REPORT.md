@@ -48,10 +48,10 @@ evidence **and** named executable tests; neither may be manufactured.
 | # | Audit Boundary | Physical Packages / Files | Status | Basis |
 |---|----------------|---------------------------|--------|-------|
 | 1 | Intent & Dynamic Surface Selection | `internal/execution/intent.go` (IntentGateway :50-111); `internal/parser` (IntentAST pipeline); `internal/ui/intent_dispatch.go`; `internal/ui/gateway.go:42`; `internal/execution/strategy` | **PARTIAL** | Deterministic directive resolution VERIFIED (no model call: `SelectStrategy` → `strategy.Select`, intent.go:62-65). But no Reduced/Full surface-profile object exists; all 7 capabilities granted at boot regardless of intent (compose.go:520-528); mandatory tests absent. |
-| 2 | Context Compiler & Graceful Degradation | `internal/planner` (orchestrator.go, sources.go, adapters.go); `pkg/app/compiler`; `internal/execution/executor.go:1038` (compileContext); `internal/retrieval` | **PARTIAL** | Probes are SEQUENTIAL (orchestrator.go:152-183). Token-budget degradation implemented (fitBudget :190-215). Probe-failure degradation semantics unproven; quality ranking implicit in priority order, not a ranked-bundle contract. |
-| 3 | Autonomy & Capability Grant | `internal/autonomy` (engine.go, controller.go, grant.go, intent.go); `internal/runtime/compose/compose.go:572-610`; `internal/ui/autonomy_route.go`; `internal/core/capability`; `pkg/capability/policy` | **PARTIAL** | Cutover converged on RuntimeExecutor (see §3). Grant ledger exists (`grant.go`, one grant per capability/scope pair). Residual legacy mutation paths (§3.3) keep this open. Structural guards: `TestRuntimeExecutorSingleCompositionBinding`, `TestUICannotCallProviderOnExecutionPath`. |
+| 2 | Context Compiler & Graceful Degradation | `internal/planner` (orchestrator.go, sources.go, adapters.go); `internal/app/v3/compiler`; `internal/execution/executor.go:1038` (compileContext); `internal/retrieval` | **PARTIAL** | Probes are SEQUENTIAL (orchestrator.go:152-183). Token-budget degradation implemented (fitBudget :190-215). Probe-failure degradation semantics unproven; quality ranking implicit in priority order, not a ranked-bundle contract. |
+| 3 | Autonomy & Capability Grant | `internal/autonomy` (engine.go, controller.go, grant.go, intent.go); `internal/runtime/compose/compose.go:572-610`; `internal/ui/autonomy_route.go`; `internal/core/capability`; `internal/capability/v3/policy` | **PARTIAL** | Cutover converged on RuntimeExecutor (see §3). Grant ledger exists (`grant.go`, one grant per capability/scope pair). Residual legacy mutation paths (§3.3) keep this open. Structural guards: `TestRuntimeExecutorSingleCompositionBinding`, `TestUICannotCallProviderOnExecutionPath`. |
 | 4 | Invocation Retry vs Contract Recovery | `internal/execution/executor.go` (RecoveryStrategy/RecoveryAttempt :108-116, bounded_patch_contract_test.go); `internal/controlplane/failure` | **PARTIAL** | Bounded-patch repair cycles with window rotation exist (executor request fields + 7 tests). No first-class ExecutionContract identity (ID) object, so "retry preserves Contract ID / recovery changes canonical parameter" is UNPROVABLE as specified. |
-| 5 | Mutation Domain, OCC & Snapshot Lifecycle | `internal/execution/executor.go:746-935` (Approve/Rollback/evidence); `mutationset.go`; `patch.go` (PatchManager :95, shadow backup :299-420); `pkg/fs/txfs.go`; `internal/workspace/snapshot`; `internal/workspace/checkpoint`; `internal/core/authorization/impl.go:10-17` (noop verifier) | **PARTIAL** | Staging + atomic two-phase commit + whole-transaction rollback + post-rollback evidence reconciliation VERIFIED in code and tests. OCC fingerprinting STUBBED (noop); no WorkspaceStateConflict; SnapshotCache is a diagnostics view, not an OCC baseline. |
+| 5 | Mutation Domain, OCC & Snapshot Lifecycle | `internal/execution/executor.go:746-935` (Approve/Rollback/evidence); `mutationset.go`; `patch.go` (PatchManager :95, shadow backup :299-420); `internal/fs/txfs.go`; `internal/workspace/snapshot`; `internal/workspace/checkpoint`; `internal/core/authorization/impl.go:10-17` (noop verifier) | **PARTIAL** | Staging + atomic two-phase commit + whole-transaction rollback + post-rollback evidence reconciliation VERIFIED in code and tests. OCC fingerprinting STUBBED (noop); no WorkspaceStateConflict; SnapshotCache is a diagnostics view, not an OCC baseline. |
 | 6 | Runtime Evidence & UI Projection | `internal/events` (bus.go, events.go); `internal/execution/graph/graph.go` (sole lifecycle emitter); `internal/presentation/execution_projection.go`; `internal/ui/model.go` (handleDomainEvent); `internal/events/audit` | **PARTIAL** | "Lifecycle events generated only from graph transitions" is AST-enforced (`TestLifecycleEventsGeneratedOnlyFromGraph`). Provider usage authoritative (`ModelInvocation.Known`, executor.go:124-130; usage_forensics_test.go). No named test proves UI never renders success before MutationEvidence, though execution_truth_matrix_test.go (15 tests) approximates. |
 | 7 | Mutation Domain Isolation | `internal/ui/runtime_cutover.go:177-236` (FILE_MUTATE→executor / SHELL_EXEC split); `internal/ui/commands.go:2614-2641` (shell gate); `runBuildShellExec` | **PARTIAL** | Dispatch-level decomposition EXISTS (runtime does not own OS commands). But a plan mixing SHELL_EXEC with FILE_MUTATE falls back ENTIRELY to the legacy per-task path (runtime_cutover.go:195-200) — mixed-domain operations execute as one sequential UI-driven batch with no independent per-domain evidence contract. |
 | 8 | Context Probe Budget Enforcement | `internal/planner/orchestrator.go:190-215` (token caps); `compose.go:530-539` (Budget + MicroBudget) | **PARTIAL** | Aggregate token budget + per-source share VERIFIED. NO wall-clock, CPU-worker, or memory ceilings per probe; no fan-out overrun guard beyond token math. |
@@ -264,7 +264,7 @@ authoritative evidence.
 | Apply timeout (per approval) | 90 s | executor.go:801 |
 | Operation timeout (TUI submission) | 5 min | runtime_cutover.go:52; gateway.go:90 |
 | Shell timeout | 30 s | main.go:172 |
-| ALLOWED_FILE_TREE scope guard | plan targets ⊆ allowed set (+go.mod/go.sum implicit) | pkg/control/scope_guard.go:28-58 |
+| ALLOWED_FILE_TREE scope guard | plan targets ⊆ allowed set (+go.mod/go.sum implicit) | internal/boundary/scopeguard/scope_guard.go:28-58 |
 | High-risk targets require human approval | secrets/lockfiles/VCS-internals regex set | domain/policy/engine.go:71-73 |
 
 **PolicyEngine precedence** (domain/policy/engine.go:33-80): mode boundary → physical
@@ -310,8 +310,8 @@ persists every envelope to `.izen/audit/events.ndjson` (compose.go:401-416).
 
 | Mechanism | Location | Semantics |
 |-----------|----------|-----------|
-| TxFS (transactional FS) | pkg/fs/txfs.go | In-memory staged map; two-phase commit (fsynced temp files → rename); Rollback restores captured origins incl. created-dir pruning (:1-15, 74-92) |
-| TxResource adapter | pkg/fs/txresource.go | Delegates validation/snapshotting while transaction active |
+| TxFS (transactional FS) | internal/fs/txfs.go | In-memory staged map; two-phase commit (fsynced temp files → rename); Rollback restores captured origins incl. created-dir pruning (:1-15, 74-92) |
+| TxResource adapter | internal/fs/txresource.go | Delegates validation/snapshotting while transaction active |
 | PatchManager shadow backups | internal/execution/patch.go:95, 299-301, 382-420 | Copies current file to `.izen/checkpoints/cp-<ctx>-backup/` before apply; QuickSave/QuickLoad bulk restore |
 | MutationSet | internal/execution/mutationset.go:93-237 | State machine (Recording→Committed/RolledBack…), per-file MutationEvidence, OutcomeFor(path) |
 | Verifier-as-apply-gate | executor.go:785-793 | Verification runs INSIDE Apply; failure restores shadow backup and fails the apply |
@@ -402,8 +402,8 @@ Legend: ✅ exists · 🟨 partial equivalent exists · ❌ missing entirely.
 
 **Aggregate: 0/30 mandatory items exist by name; 9 partial equivalents identified;
 ~350 adjacent tests in `internal/execution` (≈200), `internal/core/authorization` (28),
-`pkg/fs` (25), `internal/workspace/*` (34), `pkg/control` (11), `internal/ui` (large
-suites incl. autonomy_*, domain_events), `pkg/app/compiler` (35).**
+`internal/fs` (25), `internal/workspace/*` (34), `internal/boundary/scopeguard` (11), `internal/ui` (large
+suites incl. autonomy_*, domain_events), `internal/app/v3/compiler` (35).**
 
 ---
 

@@ -6,9 +6,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	cmdreg "github.com/PizenLabs/izen/internal/domain/command"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/parser"
-	cmdreg "github.com/PizenLabs/izen/pkg/domain/command"
 )
 
 // intentFromInput parses the raw input line against the active workspace. It

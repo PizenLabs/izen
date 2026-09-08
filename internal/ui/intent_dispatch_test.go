@@ -9,10 +9,10 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/authorization"
+	cmdreg "github.com/PizenLabs/izen/internal/domain/command"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/parser"
-	cmdreg "github.com/PizenLabs/izen/pkg/domain/command"
 )
 
 // gatedDispatchModel wires a model to the unified IntentGateway + RuntimeExecutor

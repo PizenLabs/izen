@@ -176,7 +176,7 @@ driver.go:494         decideDefault → LoopAbort               ← NO RETRY
 
 ### §4.3 The failure policy WOULD have retried
 
-`pkg/capability/policy/standard.go:53-59`:
+`internal/capability/v3/policy/standard.go:53-59`:
 ```go
 func (p *StandardFailurePolicy) Handle(err error) PolicyDecision {
     switch classify(err) {
@@ -188,7 +188,7 @@ func (p *StandardFailurePolicy) Handle(err error) PolicyDecision {
 }
 ```
 
-`pkg/capability/policy/standard.go:100-111`:
+`internal/capability/v3/policy/standard.go:100-111`:
 ```go
 func isSyntaxError(err error) bool {
     msg := err.Error()
@@ -583,8 +583,8 @@ $ git status --short
 | `TestHTMLApprovalConvergesExactlyOnce` | `internal/runtime/autonomy/forensics_phase7_test.go:476` | 476-609 |
 | `artifactGate` (policy bypass) | `internal/execution/executor.go:1124-1130` | — |
 | `ValidateContent` (policy computation) | `internal/execution/artifact.go:105-136` | — |
-| `StandardFailurePolicy.Handle` | `pkg/capability/policy/standard.go:53-59` | — |
-| `isSyntaxError` | `pkg/capability/policy/standard.go:100-111` | — |
+| `StandardFailurePolicy.Handle` | `internal/capability/v3/policy/standard.go:53-59` | — |
+| `isSyntaxError` | `internal/capability/v3/policy/standard.go:100-111` | — |
 | `ClassifyOutcome` | `internal/autonomy/runtime_loop.go:120-135` | — |
 | `decideDefault` | `internal/runtime/autonomy/driver.go:481-508` | — |
 | OpenRouter `buildRequest` | `internal/providers/openrouter.go:391-414` | — |

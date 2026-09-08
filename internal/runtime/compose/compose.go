@@ -34,6 +34,10 @@ import (
 	"github.com/PizenLabs/izen/internal/domain/policy"
 	"github.com/PizenLabs/izen/internal/domain/ports"
 	"github.com/PizenLabs/izen/internal/domain/workflow"
+	"github.com/PizenLabs/izen/internal/engine/v3/layer1"
+	"github.com/PizenLabs/izen/internal/engine/v3/layer3"
+	"github.com/PizenLabs/izen/internal/engine/v3/pipeline"
+	"github.com/PizenLabs/izen/internal/engine/v3/telemetry"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/events/audit"
 	"github.com/PizenLabs/izen/internal/execution"
@@ -57,10 +61,6 @@ import (
 	izentelemetry "github.com/PizenLabs/izen/internal/telemetry"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	wssnapshot "github.com/PizenLabs/izen/internal/workspace/snapshot"
-	"github.com/PizenLabs/izen/pkg/engine/layer1"
-	"github.com/PizenLabs/izen/pkg/engine/layer3"
-	"github.com/PizenLabs/izen/pkg/engine/pipeline"
-	"github.com/PizenLabs/izen/pkg/engine/telemetry"
 )
 
 // Capabilities bundles the Infrastructure adapters as Domain ports. The

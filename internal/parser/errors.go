@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/PizenLabs/izen/pkg/domain/command"
+	"github.com/PizenLabs/izen/internal/domain/command"
 )
 
 // ErrorKind classifies a deterministic parse failure.

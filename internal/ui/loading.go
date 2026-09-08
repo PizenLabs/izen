@@ -10,8 +10,8 @@ import (
 
 	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/internal/presentation"
-	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
-	"github.com/PizenLabs/izen/pkg/tui/tips"
+	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
+	"github.com/PizenLabs/izen/internal/tui/tips"
 )
 
 // shimmerFrameMsg is the shimmer component's animation tick. It is aliased so

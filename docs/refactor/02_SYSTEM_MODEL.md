@@ -807,7 +807,7 @@ type OrthogonalityCheck interface {
                                     │         IntentGateway            │
                                     │  internal/core/domain/gateway  │  ← ARCH:5.1 step 1
                                     │  Parse → Classify → Validate   │     parser.ParseInWorkspace
-                                    │  Scope extraction + permission │     pkg/domain/command.Registry
+                                    │  Scope extraction + permission │     internal/domain/command.Registry
                                     │  Objective construction        │
                                     └──────────────┬──────────────────┘
                                                    │ Objective (immutable)
@@ -1164,7 +1164,7 @@ IntentAST {
     Directives:  ["$prompt"],
     Scopes:      [ScopeSelector{Kind: file, Pattern: "internal/auth/token.go"}],
     RawIntent:   "explain — also check helpers",
-    Permissions: registry.Contains("$prompt"), // pkg/domain/command.Registry
+    Permissions: registry.Contains("$prompt"), // internal/domain/command.Registry
 }
   ↓  IntentGateway.Gate → Objective
   ↓  ContextCompiler.Compile → []UntrustedContextWrapper + WireFormat

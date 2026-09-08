@@ -3,7 +3,7 @@
 Phase 1 — Read-only evidence-based audit of execution ownership.
 
 Date: 2026-08-15
-Scope: entire repository (cmd/, internal/, pkg/), 883 Go files, ~94k LOC.
+Scope: entire repository (cmd/, internal/, pkg/), 883 Go files, ~94k LOC. (Historical snapshot: `pkg/` has since been migrated into `internal/`.)
 Method: follow actual call paths; documentation and package names were not trusted.
 
 ---
@@ -25,7 +25,7 @@ telemetry-only command facade:
    commands, all of which are **telemetry/state-only**: they never invoke a
    provider, a plan engine, or a mutation. Approval handlers fabricate a
    mutation record via `InMemoryApprover`.
-4. **The V3 engine tree** (`pkg/app`, `pkg/kernel`, `pkg/engine/*`) — only
+4. **The V3 engine tree** (`internal/app/v3`, `internal/kernel`, `internal/engine/v3/*`) — only
    reached by the headless `izen run` CLI, not by the TUI.
 
 Every execution path is owned by the UI. The runtime command layer is a
@@ -52,7 +52,7 @@ who owns mutation, who owns approval, who creates evidence, who renders.
 | `/plan` | UI | mode engine (signal/intent compiler) | **UI** `commands.go:1276-1278` via plan engine provider funcs | none (plan store) | UI plan gate | plan engine `PlanStore` | UI |
 | `/build` | UI | UI | **UI** `commands.go:4509,4735,5062` + `2733` | UI | **UI keys.go:659-704** | UI | UI |
 | `/review` | UI `agents.go:426` | mode engine (deterministic) | none | none (sandbox tests) | none | mode engine `ReviewLedger` | UI |
-| `izen run` CLI | `cmd/izen/runtime.go` | V3 pipeline | `cmd/izen` adapters | `pkg/kernel` | none | pipeline result | CLI |
+| `izen run` CLI | `cmd/izen/runtime.go` | V3 pipeline | `cmd/izen` adapters | `internal/kernel` | none | pipeline result | CLI |
 
 **Deterministic answer to the 7 audit questions:**
 

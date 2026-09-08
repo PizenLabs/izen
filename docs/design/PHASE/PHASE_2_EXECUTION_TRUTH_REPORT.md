@@ -309,5 +309,5 @@ result projection (no-change/rejected/usage-known/usage-unknown).
   `internal/events/audit` (guardrail currently parses the log).
 - A generic prose-vs-content filter for unregistered-language new files
   (mandate: no generic filter layer; needs a strategy-owned contract).
-- Retiring `pkg/event` (7-type `izen run` product bus) or documenting it as a
+- Retiring `internal/events` (7-type `izen run` product bus) or documenting it as a
   separate product stack.

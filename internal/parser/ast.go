@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/PizenLabs/izen/pkg/domain/command"
+	"github.com/PizenLabs/izen/internal/domain/command"
 )
 
 // SemanticScopeType classifies the referent of an @ scope marker.

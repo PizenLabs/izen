@@ -25,8 +25,8 @@ import (
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	compose "github.com/PizenLabs/izen/internal/runtime/compose"
 	"github.com/PizenLabs/izen/internal/state"
-	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
-	"github.com/PizenLabs/izen/pkg/tui/tips"
+	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
+	"github.com/PizenLabs/izen/internal/tui/tips"
 )
 
 // NewProgramWithApp initializes the model bound to the externally wired

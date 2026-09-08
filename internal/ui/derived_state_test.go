@@ -11,7 +11,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/presentation"
-	"github.com/PizenLabs/izen/pkg/tui/components/shimmer"
+	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
 )
 
 // TestEnterApprovalStateDerivesFromWorkflowGate asserts the approval

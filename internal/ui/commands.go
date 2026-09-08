@@ -21,11 +21,13 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	control "github.com/PizenLabs/izen/internal/boundary/scopeguard"
 	"github.com/PizenLabs/izen/internal/command"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	cmdreg "github.com/PizenLabs/izen/internal/domain/command"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/internal/hotfix"
@@ -39,8 +41,6 @@ import (
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 	verification "github.com/PizenLabs/izen/internal/verification"
-	"github.com/PizenLabs/izen/pkg/control"
-	cmdreg "github.com/PizenLabs/izen/pkg/domain/command"
 )
 
 // isSlashInput reports whether the trimmed input is a Slash Command — a

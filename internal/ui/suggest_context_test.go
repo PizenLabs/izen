@@ -7,9 +7,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
+	"github.com/PizenLabs/izen/internal/domain/command"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/parser"
-	"github.com/PizenLabs/izen/pkg/domain/command"
 )
 
 // ── CursorContext analyzer ───────────────────────────────────────────────

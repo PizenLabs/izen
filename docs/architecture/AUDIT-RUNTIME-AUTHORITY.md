@@ -13,8 +13,8 @@ Izen is in a **transitional state where three parallel execution stacks coexist,
 
 There are **three fully separate execution stacks** in the repository:
 
-1. **V3 pipeline (`pkg/app` + `pkg/kernel` + `pkg/planner` + `pkg/fs`)** — reachable **only** through `izen run` (`cmd/izen/runtime.go:156`). Not part of the TUI at all.
-2. **LEA layered engine (`pkg/engine/pipeline`, layers 0–5)** — wired into the TUI by `compose.Wire` (`internal/runtime/compose/compose.go:508`) but **dormant as an executor**: its `Run`/`RunAdaptive`/`ExecutePlan` have no live callers. Only its model router, Layer-1 stack detection, and Layer-4 validation (via `/review`) are exercised.
+1. **V3 pipeline (`internal/app/v3` + `internal/kernel` + `internal/planner/v3` + `internal/fs`)** — reachable **only** through `izen run` (`cmd/izen/runtime.go:156`). Not part of the TUI at all.
+2. **LEA layered engine (`internal/engine/v3/pipeline`, layers 0–5)** — wired into the TUI by `compose.Wire` (`internal/runtime/compose/compose.go:508`) but **dormant as an executor**: its `Run`/`RunAdaptive`/`ExecutePlan` have no live callers. Only its model router, Layer-1 stack detection, and Layer-4 validation (via `/review`) are exercised.
 3. **The TUI runtime stack (`compose.Wire`)** — this is what actually runs. Inside it, **two mutation authorities compete**:
    - **Legacy UI path (the REAL runtime authority)**: autonomy engine → mode engines → **direct provider calls** (`m.provider.Execute`/`ExecuteStream`) → proposals → `m.execEng.Patches.ApplyContext` → `os.WriteFile`. **No canonical lifecycle events, no verification.**
    - **RuntimeExecutor path (the DECLARED authority, DORMANT in the TUI)**: `IntentGateway` → `RuntimeExecutor.Execute` → canonical `events.*` stream → `Approve` → `MutationSet` → `Verifier.RunAll`. **Reachable only when the autonomy engine is nil** (headless/test harnesses).
@@ -77,9 +77,9 @@ buildResultMsg → "success" report; mutation ledger + activity, NO canonical li
 
 ```
 $ izen run "<prompt>"  →  cmd/izen/runtime.go
-  → app.NewPipeline → pkg/app/pipeline.go:226 Run
+  → app.NewPipeline → internal/app/v3/pipeline.go:226 Run
   → compiler.IntentCompiler (LLM semantic) → extractor → planner → kernel → TxFS writes
-  → pkg/event.EventBus → StatusLine (stderr)
+  → internal/events.EventBus → StatusLine (stderr)
 ```
 
 This stack never touches the TUI, the autonomy engine, the mode engines, or `internal/events`.
@@ -103,12 +103,12 @@ runGatedLine  (gateway.go:42)   [only reached when m.autonomy == nil]
 |---|---|---|---|---|
 | Intent classification | autonomy.Engine.Classify (deterministic; semantic fallback never wired) | Same — autonomy is authoritative for $prompt/$hot/free-form | 12 classifiers exist (see §4) | **Yes** — legacy UI re-classifies via `hasMutationIntent`/`investigate.ClassifyIntent` (commands.go:471,511); SubmitPromptHandler.ClassifyIntent re-classifies for the Runtime facade (handlers.go:402) |
 | Target resolution | strategy.Select (`internal/execution/strategy`) | UI resolvers: `resolveAutonomyBuildTarget` (autonomy_target.go:38), `resolveHotfixTarget` (commands.go:3388), `resolveMultiHotfixTargets` (multihotfix.go:50) | 6+ resolvers (§4) | **Yes** — $prompt vs $hot resolve the same mention differently (workspace walk vs regex vs fuzzy) |
-| Workspace selection | autonomy.WorkspaceFor / SelectWorkspace | Same — but the UI bypasses it via `modeForAutonomyWorkspace` re-map (autonomy_route.go:289) and legacy mode-first routing in handleMessageContent | pkg/engine/decision, router.Router, handlers.ClassifyIntent | Partial — autonomy decides, UI re-maps workspace→mode |
-| Capability resolution | autonomy capability vectors (intent.go:105-124) | autonomy + `internal/modes` capability matrix + `core/capability.CapabilitySet` + `pkg/capability` alignment | 4 sets of capability vocabularies | **Yes** — autonomy caps (read/analyze/propose/mutate/verify) ≠ mode caps (CapRead/Write/…) ≠ core CapabilitySet (CapabilityRead/Write/…) ≠ layer1 caps |
+| Workspace selection | autonomy.WorkspaceFor / SelectWorkspace | Same — but the UI bypasses it via `modeForAutonomyWorkspace` re-map (autonomy_route.go:289) and legacy mode-first routing in handleMessageContent | internal/engine/v3/decision, router.Router, handlers.ClassifyIntent | Partial — autonomy decides, UI re-maps workspace→mode |
+| Capability resolution | autonomy capability vectors (intent.go:105-124) | autonomy + `internal/modes` capability matrix + `core/capability.CapabilitySet` + `internal/capability/v3` alignment | 4 sets of capability vocabularies | **Yes** — autonomy caps (read/analyze/propose/mutate/verify) ≠ mode caps (CapRead/Write/…) ≠ core CapabilitySet (CapabilityRead/Write/…) ≠ layer1 caps |
 | Authorization | autonomy proposal (grant internally, no /grant) | autonomy proposal gate; **second** approval = patch proposal dock (Alt+A) | `/grant` deprecated handler; `handlers.PatchApprover` seam; `AuthorizationEngine` (`a.Auth`, compose.go:657) | **Yes** — two sequential human gates on $prompt mutation: autonomy proposal THEN patch approval |
-| Mutation risk | autonomy controller via `Execution.Risk.ClassifyFileOp` | Same (compose.go:631-635) | `pkg/engine/decision`, `guard` in controlplane | None — risk is single-sourced |
+| Mutation risk | autonomy controller via `Execution.Risk.ClassifyFileOp` | Same (compose.go:631-635) | `internal/engine/v3/decision`, `guard` in controlplane | None — risk is single-sourced |
 | Context compilation | RuntimeExecutor.compileContext (strategy-owned policy) | UI paths: `fastTrackFileContext` (alignment.go:103), `buildHotfix*Handoff`, planner context for /ask | autonomy.CompileContext (evidence ledger) | **Yes** — executor context contract is bypassed; UI compiles context itself |
-| File intelligence | autonomy.intelligence.AnalyzeFile | Same (only invoked from `compileAutonomyBuildEvidence`, autonomy_route.go:233) | internal/planner, retrieval polyglot, pkg/engine/inference | Partial — intelligence is advisory; never gates execution |
+| File intelligence | autonomy.intelligence.AnalyzeFile | Same (only invoked from `compileAutonomyBuildEvidence`, autonomy_route.go:233) | internal/planner, retrieval polyglot, internal/engine/v3/inference | Partial — intelligence is advisory; never gates execution |
 | Verification | execution.Verifier.RunAll (executor.Approve) | **None on the legacy UI path** (PatchManager.verifier nil); Verifier only on the dormant executor path | PatchManager micro-fix gate (dormant), layer4 (review only), capability/validator (artifact gate), sandboxed go test (review) | **Yes** — the mutation the user actually triggers is not verified |
 | Token accounting | executor.finalizeResult (provider-reported) | UI: `m.provider` usage + `tokenUsageCmd`; execution.Telemetry (UI-owned); stream usage events | execution.Telemetry, events.StreamUsage, session counters | **Yes** — parallel accounting paths; executor.Completed is dead in TUI |
 | Patch extraction | changeset.NewPipeline | Same (changeset used on both paths) | `execution.Extract*` helpers, `patch.ParseFileCreateBlocks` | None — single pipeline |
@@ -127,11 +127,11 @@ runGatedLine  (gateway.go:42)   [only reached when m.autonomy == nil]
 |---|---|---|---|
 | `autonomy.Classify` (intent.go:337) | deterministic + optional semantic | `autonomy.Decide` (engine.go:180) | **A — authoritative** for autonomy path |
 | `router.Router` + `PromptIntentClassifier` (router/classifier.go, semantic.go) | LLM semantic | `compose.go:590` constructs, **never invoked** | **D — dead-wired** (a.IntentRouter never read) |
-| `pkg/engine/intent.Classify` (classify.go:57) | deterministic keyword | MicrokernelPlanner (microkernel.go:93) | A — microkernel path |
-| `pkg/app/compiler.IntentCompiler` | LLM semantic | `izen run` only (runtime.go:154) | **C — CLI only** |
+| `internal/engine/v3/intent.Classify` (classify.go:57) | deterministic keyword | MicrokernelPlanner (microkernel.go:93) | A — microkernel path |
+| `internal/app/v3/compiler.IntentCompiler` | LLM semantic | `izen run` only (runtime.go:154) | **C — CLI only** |
 | `execution.IntentGateway` → `strategy.Select` | deterministic | gateway.go:58 (dormant in TUI) | **B — dormant fallback** |
 | `investigate.ClassifyIntent` (dispatcher.go:510) + UI `hasMutationIntent`/`isStructuralHotfixIntent`/`isRedundantContentIntent` (commands.go:7618,3543,3605) | keyword/regex | UI build/investigate bypass paths (commands.go:471,511,525) | **E — partially migrated / conflicting** (re-classifies inside autonomy-decided workspace) |
-| `pkg/grounding.Sanitize` (intent.go:29) | fuzzy keyword | plan engine DiscoverAllowedFiles (engine.go:220) | A — grounding only |
+| `internal/retrieval/grounding.Sanitize` (intent.go:29) | fuzzy keyword | plan engine DiscoverAllowedFiles (engine.go:220) | A — grounding only |
 | `internal/parser` IntentAST | structural | UI intentFromInput (intent_dispatch.go:32) | A — parser layer |
 | `internal/planner.ClassifyIntent` | keyword | /ask + investigate context planner | A — context planning |
 | `handlers.ClassifyIntent` (handlers.go:402) | keyword | SubmitPromptHandler (Runtime facade mirror) | **F — conflicting observer** (re-classifies every input in parallel, handlers.go:153) |
@@ -145,19 +145,19 @@ runGatedLine  (gateway.go:42)   [only reached when m.autonomy == nil]
 `project.Detect`→`language.Registry` (authoritative, main.go:157), `layer1.Detect` (stack), `inference.detectLanguage/Framework` (framework), `symbol.ExtractorRegistry.DetectLanguage`, `langFromPath` (presentation), `autonomy.intelligence.detectLanguageID` (intelligence.go:112), `router.detectLanguage` (dead).
 
 ### Event buses (3 structurally identical)
-`internal/events.Bus` (42 types), `pkg/event.MemoryEventBus` (7 types, `izen run`), `pkg/engine/telemetry.EventBus` (8 types). One-way bridge only (telemetry→domain). **No bridge between `izen run` events and the TUI.**
+`internal/events.Bus` (42 types), `internal/events.MemoryEventBus` (7 types, `izen run`), `internal/engine/v3/telemetry.EventBus` (8 types). One-way bridge only (telemetry→domain). **No bridge between `izen run` events and the TUI.**
 
 ### Mutation systems (3)
 `execution.Engine` (m.execEng, PatchManager + MutationSet, UI-authoritative), `RuntimeExecutor` (own PatchManager + MutationSet, dormant), `modes/build.Executor.ApplyMutation` (no production callers — **D**).
 
 ### Verification systems (5, none gating the real path)
-`execution.Verifier` (executor.Approve only), `PatchManager` micro-fix gate (dormant, patch.go:850), `layer4` DAG (review only), `pkg/capability/validator` (artifact gate), `internal/verification` (skip decisions only).
+`execution.Verifier` (executor.Approve only), `PatchManager` micro-fix gate (dormant, patch.go:850), `layer4` DAG (review only), `internal/capability/v3/validator` (artifact gate), `internal/verification` (skip decisions only).
 
 ### Proposal/approval systems (3)
 Autonomy proposal (capability authorization), patch proposal dock (mutation approval), `handlers.PatchApprover` seam (never used in production).
 
 ### Plan engines (7)
-PlanEngine (LLM synthesis), MicrokernelPlanner, IntentCompilerPlanner, `pkg/engine/plan`+`pkg/engine/planner`, `pkg/planner` brownfield/greenfield (CLI only), `internal/planner` (context planning), `pkg/app/plan.go` (CLI only).
+PlanEngine (LLM synthesis), MicrokernelPlanner, IntentCompilerPlanner, `internal/engine/v3/plan`+`internal/engine/v3/planner`, `internal/planner/v3` brownfield/greenfield (CLI only), `internal/planner` (context planning), `internal/app/v3/plan.go` (CLI only).
 
 ### Audit/observability (3 parallel)
 `internal/events/audit` (events.ndjson, write-only), `internal/audit` (legacy JSON logs + patch.go plain-text collisions in same file), audit `ReadMutations` etc. (no callers).
@@ -192,10 +192,10 @@ PlanEngine (LLM synthesis), MicrokernelPlanner, IntentCompilerPlanner, `pkg/engi
 | `internal/gateway/squeezer.go` Squeeze/ClassifyComplexity | zero callers | **D** |
 | `internal/gateway/router.go` routing heuristics (8 fns) | zero callers | **D** |
 | `retrieval.LogDeduplicator` | zero callers, not even tests | **D** |
-| `pkg/capability/registry.NewRegistry` | no production callers | **D** |
+| `internal/capability/v3/registry.NewRegistry` | no production callers | **D** |
 | `internal/core.ClassifyExecutionMode` | no production callers | **D** |
 | `internal/audit` read APIs | no external callers | **D** |
-| `pkg/kernel`, `pkg/dag`, `pkg/graph`, `pkg/planner`, `pkg/fs`, `pkg/resource`, `pkg/op`, `pkg/control` scope_guard | reachable only via `izen run` | **C** |
+| `internal/kernel`, `internal/dag`, `internal/graph`, `internal/planner/v3`, `internal/fs`, `internal/resource`, `internal/op`, `internal/boundary/scopeguard` scope_guard | reachable only via `izen run` | **C** |
 | `internal/agents/context_reducer.go` SanitizeForensicLedger | no callers | **D** |
 | `$grant` / `/grant` handler | explicitly deprecated; not reachable from parser | **B — compatibility seam** |
 | `handleAutonomyGrant` | same | **B** |
@@ -349,7 +349,7 @@ intent → evidence → model → artifact → diff → proposal → mutation �
 11. Three structurally identical bus implementations with disjoint vocabularies and no cross-bridge.
 12. `internal/audit` vs `internal/events/audit` both write `.izen/audit` with colliding formats (patch.go:584 plain-text vs audit.go JSON).
 13. `globalActivityLog`/`globalEventLog` declared in both `internal/execution` and `internal/retrieval`.
-14. `izen run`'s entire `pkg/` stack (`pkg/app`, `pkg/kernel`, `pkg/dag`, `pkg/graph`, `pkg/planner`, `pkg/fs`, `pkg/resource`, `pkg/op`) is a parallel product lineage disconnected from the TUI.
+14. `izen run`'s entire V3 stack (`internal/app/v3`, `internal/kernel`, `internal/dag`, `internal/graph`, `internal/planner/v3`, `internal/fs`, `internal/resource`, `internal/op`) is a parallel product lineage disconnected from the TUI. (Historical note: this stack lived under `pkg/` before the architectural migration.)
 
 ---
 
@@ -364,4 +364,4 @@ The minimal correction sequence — each step is a wiring decision, not a refact
 5. **Unify target resolution** (P1#6): one resolver used by autonomy BUILD, `$hot`, and the executor; remove the divergent UI resolvers.
 6. **Wire the canonical event stream onto the real path** (P1#7): have the legacy apply path publish the lifecycle events the projection already consumes (or route through the executor so it emits them).
 7. **Delete or un-wire the dead projections and dead execution surfaces** (P2#8, #9) so future work is not built against a graph that includes phantom authorities.
-8. **Only after steps 1–7**: reconcile the three bus implementations and the two audit writers (P3), then retire the `izen run` `pkg/` lineage or explicitly document it as a separate product.
+8. **Only after steps 1–7**: reconcile the three bus implementations and the two audit writers (P3), then retire the `izen run` legacy V3 lineage or explicitly document it as a separate product.

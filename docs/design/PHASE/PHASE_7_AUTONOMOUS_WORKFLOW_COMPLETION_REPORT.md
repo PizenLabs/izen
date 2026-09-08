@@ -577,7 +577,7 @@ log, the reasoning-vs-visible split of a specific run is not provable from code 
 | Streaming invocation (authoritative usage) | `executor.go:1252-1368` (`invokeStream`) |
 | `provider.usage_update` emission gate | `executor.go:1291-1306` (Known && !Estimated only) |
 | First-token (TTFT) telemetry | `executor.go:1322` `g.FirstToken(model, time.Since(began))` |
-| Artifact validation gate | `executor.go:1099` `x.artifactGate` → `pkg/capability/validator/html.go:49-82` (`unterminated <script> element`) |
+| Artifact validation gate | `executor.go:1099` `x.artifactGate` → `internal/capability/v3/validator/html.go:49-82` (`unterminated <script> element`) |
 | Invocation evidence dropped on failure (FIXED) | `executor.go:1070-1104` (now `append(invs, inv)` / return `invs`) |
 | `Execute` error branches retaining invocations (FIXED) | `executor.go` error paths: cancel / artifact-rejected / patch-gen-failed |
 | Single token-accounting point | `executor.go` `finalizeResult` (`cc.Latency = time.Since(res.Proof.StartedAt)`) |
@@ -694,7 +694,7 @@ invisible in the rendered content.
 
 ## 9. ARTIFACT REJECTION SEMANTICS
 
-- `pkg/capability/validator/html.go:49-82` rawTextElements check: `<script` without a matching
+- `internal/capability/v3/validator/html.go:49-82` rawTextElements check: `<script` without a matching
   `</script` → `html: unterminated <script> element`. Exact repro match.
 - Rejection is a **PERMANENT** failure: `FailurePermanent`, `OutcomeArtifactRejected`,
   `ErrArtifactRejected`. Never classified recoverable; no repair re-invocation; the file is never

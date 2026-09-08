@@ -6,11 +6,11 @@ import (
 
 	stdctx "context"
 
-	"github.com/PizenLabs/izen/pkg/engine/adapter"
-	"github.com/PizenLabs/izen/pkg/engine/inference"
-	"github.com/PizenLabs/izen/pkg/engine/lowerer"
-	"github.com/PizenLabs/izen/pkg/engine/planner"
-	"github.com/PizenLabs/izen/pkg/engine/strategy"
+	"github.com/PizenLabs/izen/internal/engine/v3/adapter"
+	"github.com/PizenLabs/izen/internal/engine/v3/inference"
+	"github.com/PizenLabs/izen/internal/engine/v3/lowerer"
+	"github.com/PizenLabs/izen/internal/engine/v3/planner"
+	"github.com/PizenLabs/izen/internal/engine/v3/strategy"
 )
 
 // IntentCompilerPlanner runs the IR-driven intent compiler pipeline end to end

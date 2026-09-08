@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
+	control "github.com/PizenLabs/izen/internal/boundary/scopeguard"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/core/classifier"
@@ -35,7 +36,6 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	verification "github.com/PizenLabs/izen/internal/verification"
-	"github.com/PizenLabs/izen/pkg/control"
 )
 
 // stripModePrefix removes a leading mode command (e.g. "/plan", "/build",
