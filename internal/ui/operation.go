@@ -192,6 +192,8 @@ func (m *model) beginOperation(kind OperationKind) *operation {
 	if m.activeOp != nil {
 		m.activeOp.Cancel()
 	}
+	// Execution heartbeat: mark when any foreground operation begins.
+	m.executionStartedAt = time.Now()
 	m.activeOp = op
 	m.cancelGraceDeadline = time.Time{}
 	m.streaming = false

@@ -16,6 +16,73 @@ import (
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
 )
 
+// IsSGRMouseFragment performs a fast, zero-allocation check for orphan SGR
+// 1006 mouse sequences such as "[<65;56;32M" / "[<0;26;37m". It scans the
+// input byte-by-byte: minimum length is 8 chars, the first two must be "[<",
+// the last must be 'M' or 'm', and every byte in between must be a digit or
+// ';'. No regex, no allocations, safe to call on every KeyMsg tick.
+func IsSGRMouseFragment(s string) bool {
+	if len(s) < 8 || s[0] != '[' || s[1] != '<' {
+		return false
+	}
+	last := s[len(s)-1]
+	if last != 'M' && last != 'm' {
+		return false
+	}
+	for i := 2; i < len(s)-1; i++ {
+		b := s[i]
+		if (b < '0' || b > '9') && b != ';' {
+			return false
+		}
+	}
+	return true
+}
+
+// IsSGRMouseFragmentRunes is the byte-equivalent of IsSGRMouseFragment for
+// callers that already hold a []rune (e.g. tea.KeyMsg.Runes). It avoids the
+// string allocation entirely on the hot path. Returns false for rune slices
+// whose first rune is non-ASCII (mouse fragments are pure ASCII), in which
+// case the caller should fall through to a string-based path if needed.
+func IsSGRMouseFragmentRunes(runes []rune) bool {
+	if len(runes) < 8 || runes[0] != '[' || runes[1] != '<' {
+		return false
+	}
+	last := runes[len(runes)-1]
+	if last != 'M' && last != 'm' {
+		return false
+	}
+	for i := 2; i < len(runes)-1; i++ {
+		r := runes[i]
+		if (r < '0' || r > '9') && r != ';' {
+			return false
+		}
+	}
+	return true
+}
+
+// isControlSequence reports whether the runes contain a raw control or
+// SGR mouse escape sequence (e.g. "\x1b[<65;138;23M" or orphaned "[<65;138;23M")
+// that must never reach the textinput buffer. It is the P0 guard against
+// SGR 1006 mouse-tracking leaks. Zero-allocation: walks the rune slice
+// directly without converting to string.
+func isControlSequence(runes []rune) bool {
+	if len(runes) == 0 {
+		return false
+	}
+	if runes[0] == 0x1b {
+		return true
+	}
+	if len(runes) >= 2 && runes[0] == '[' && runes[1] == '<' {
+		return true
+	}
+	for _, r := range runes {
+		if r < 32 && r != '\n' && r != '\t' && r != '\r' {
+			return true
+		}
+	}
+	return false
+}
+
 // isPrintableRunes reports whether a key message is a plain, unmodified
 // printable character (or character run). This is the canonical test for
 // "text the user is typing": Alt-modified keys and control keys are
@@ -43,6 +110,10 @@ func isPrintableRunes(msg tea.KeyMsg) bool {
 func (m *model) forwardToInput(msg tea.KeyMsg) tea.Cmd {
 	var tiCmd tea.Cmd
 	m.ti, tiCmd = m.ti.Update(msg)
+	sanitized := SanitizePromptInput(m.ti.Value())
+	if sanitized != m.ti.Value() {
+		m.ti.SetValue(sanitized)
+	}
 	m.syncInputFromTI()
 	m.updateSuggestions()
 	return tiCmd
@@ -120,6 +191,33 @@ func (m *model) toggleThoughtBlock() bool {
 }
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// P0 SGR 1006 guard: drop control/mouse escape sequences before textinput.
+	// Fast-path: a runes slice that begins with '[' '<' is an orphan mouse
+	// fragment — drop it WITHOUT allocating msg.String() / string(msg.Runes).
+	if msg.Type == tea.KeyRunes && len(msg.Runes) >= 2 && msg.Runes[0] == '[' && msg.Runes[1] == '<' {
+		return m, nil
+	}
+	if msg.Type == tea.KeyRunes && isControlSequence(msg.Runes) {
+		return m, nil
+	}
+	if msg.Type == tea.KeyRunes && IsSGRMouseFragmentRunes(msg.Runes) {
+		return m, nil
+	}
+	// ── TRACE OVERLAY DISMISSAL ──────────────────────────────────────
+	if m.showTraceOverlay {
+		if msg.Type == tea.KeyEscape || msg.String() == "alt+t" {
+			m.showTraceOverlay = false
+			return m, nil
+		}
+		return m, nil
+	}
+
+	// ── GLOBAL: Alt+T toggles telemetry trace overlay drawer ──
+	if msg.String() == "alt+t" {
+		m.showTraceOverlay = !m.showTraceOverlay
+		return m, nil
+	}
+
 	// ── GLOBAL: Alt+O toggles reasoning block visibility ────────────
 	// The unified ThinkingBuffer (event-driven thought block) takes priority;
 	// the legacy ThinkingPanel is only toggled when no event-driven block is
@@ -280,7 +378,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.activateAutonomyProposal()
 		case msg.Type == tea.KeyEscape || msg.String() == "alt+x":
 			return m, m.cancelAutonomyProposal()
-		case msg.String() == "i":
+		case msg.String() == "i" || msg.String() == "I":
 			m.toggleAutonomyProposalInspect()
 			return m, nil
 		default:
@@ -1053,6 +1151,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyRunes:
 		var tiCmd tea.Cmd
 		m.ti, tiCmd = m.ti.Update(msg)
+		sanitized := SanitizePromptInput(m.ti.Value())
+		if sanitized != m.ti.Value() {
+			m.ti.SetValue(sanitized)
+		}
 		m.syncInputFromTI()
 		m.updateSuggestions()
 		return m, tiCmd
@@ -1063,6 +1165,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	default:
 		var tiCmd tea.Cmd
 		m.ti, tiCmd = m.ti.Update(msg)
+		sanitized := SanitizePromptInput(m.ti.Value())
+		if sanitized != m.ti.Value() {
+			m.ti.SetValue(sanitized)
+		}
 		m.syncInputFromTI()
 		m.updateSuggestions()
 		return m, tiCmd
@@ -1076,7 +1182,9 @@ func (m *model) syncInputFromTI() {
 	// operation Bubble Tea parses mouse into tea.MouseMsg before it reaches the
 	// textinput, but this guarantees the buffer stays clean regardless of
 	// terminal raw-mode state during /build shell execution.
-	m.input.WriteString(sanitizeInputBuffer(m.ti.Value()))
+	clean := sanitizeInputBuffer(m.ti.Value())
+	clean = SanitizePromptInput(clean)
+	m.input.WriteString(clean)
 }
 
 // submitEnter executes the canonical Enter submission path: it submits the
@@ -1138,6 +1246,23 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		m.ti.Reset()
 		m.syncInputFromTI()
 
+		// ── STREAM CONTRACT: reset at submit (T=0) ───────────────────
+		// Flush every stream byte buffer to empty synchronously at prompt
+		// submission — BEFORE any async context prep or streamCmd dispatch
+		// — so FrameTick (cumulative overwrite) can never re-emit stale
+		// bytes from the previous turn as duplicates. streamCmd repeats
+		// this reset when the stream actually starts; this covers the prep
+		// window in between.
+		m.streamBuffer = ""
+		m.currentStreamContent = ""
+		if m.utf8StreamBuf != nil {
+			m.utf8StreamBuf.Reset()
+		}
+		if m.streamThrottle != nil {
+			m.streamThrottle.Reset()
+		}
+		m.resetStreamBlocks()
+
 		m.history = append(m.history, userInput)
 		m.historyIndex = len(m.history)
 		m.saveHistory()
@@ -1189,11 +1314,18 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 			cmd = tea.Batch(cmd, m.runtimeSubmitCmd(userInput))
 		}
 		// ── INSTANT ANIMATION AT T=0MS ────────────────────────────
-		// Dispatch the shimmer + smooth ticks alongside the submission so
-		// the loading dock animates immediately, regardless of what the
-		// submitted command does next (async prep, stream, engine run).
-		// Both loops self-terminate when no background producer owns the
-		// flags, so idle submits leak nothing.
+		// Dispatch the shimmer + smooth + frame ticks alongside the submission
+		// so the loading dock AND the TTFT countdown animate immediately,
+		// regardless of what the submitted command does next (async prep,
+		// stream, engine run). The frame loop is what re-renders the live
+		// "Connecting to provider... 4.2s / 15.0s" stopwatch during the
+		// first-byte wait — without it the footer would sit frozen until
+		// the first token arrives. All loops self-terminate when no
+		// background producer owns the flags, so idle submits leak nothing.
+		if !m.frameTickActive {
+			m.frameTickActive = true
+			cmd = tea.Batch(cmd, FrameTickCmd())
+		}
 		cmd = tea.Batch(cmd, m.shimmerTickCmd(), m.smoothStreamTickCmd())
 		m.lockTailToNewPrompt()
 		return m, cmd

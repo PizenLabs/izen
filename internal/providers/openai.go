@@ -25,7 +25,7 @@ func NewOpenAIProvider(apiKey, model string) *OpenAIProvider {
 	return &OpenAIProvider{
 		apiKey: apiKey,
 		model:  model,
-		client: &http.Client{},
+		client: &http.Client{Transport: StrictTransport(CloudResponseHeaderTimeout)},
 	}
 }
 
@@ -52,6 +52,15 @@ type openaiRequest struct {
 	// (low / medium / high / xhigh). It is injected from the dynamically
 	// resolved effort directive; empty omits the field.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// ExtraParams carries arbitrary provider-native JSON fields merged
+	// directly into the HTTP POST body (generic passthrough).
+	ExtraParams map[string]any `json:"-"`
+}
+
+// MarshalJSON merges ExtraParams into the top-level object. Native keys win.
+func (r openaiRequest) MarshalJSON() ([]byte, error) {
+	type alias openaiRequest
+	return marshalWithExtra(alias(r), r.ExtraParams)
 }
 
 type openaiResponse struct {
@@ -124,6 +133,7 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		Stop:            req.Stop,
 		Stream:          false,
 		ReasoningEffort: req.Reasoning.LevelOrDefault(),
+		ExtraParams:     req.ExtraParams,
 	}
 
 	payload, err := json.Marshal(body)
@@ -152,7 +162,7 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("openai: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("openai", resp.StatusCode, respBody)
 	}
 
 	var openaiResp openaiResponse
@@ -214,6 +224,7 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Stream:          true,
 		StreamOptions:   &streamOptions{IncludeUsage: true},
 		ReasoningEffort: req.Reasoning.LevelOrDefault(),
+		ExtraParams:     req.ExtraParams,
 	}
 
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -245,7 +256,7 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("openai: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("openai", resp.StatusCode, respBody)
 	}
 
 	sr := &openaiSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}

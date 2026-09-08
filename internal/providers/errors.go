@@ -3,7 +3,27 @@ package providers
 import (
 	"encoding/json"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/httpx"
 )
+
+// ProviderError is the structured, unadulterated provider error forwarded
+// from the API server. RawMessage carries the exact provider feedback
+// (error.message) with status code preserved. Alias of httpx.ProviderError
+// so both internal/providers and internal/httpx share one contract.
+type ProviderError = httpx.ProviderError
+
+// NewProviderError extracts a structured ProviderError from an HTTP error
+// response body without wrapping it into static string constants.
+func NewProviderError(provider string, statusCode int, body []byte) *ProviderError {
+	return httpx.ParseProviderError(provider, statusCode, body)
+}
+
+// FormatProviderError renders the TUI status banner:
+// ✗ [Provider Error <StatusCode>] <RawMessage>
+func FormatProviderError(provider string, statusCode int, rawMessage string) string {
+	return httpx.FormatProviderError(provider, statusCode, rawMessage)
+}
 
 type apiErrorBody struct {
 	Error *apiErrorDetail `json:"error"`

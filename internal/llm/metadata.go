@@ -304,36 +304,53 @@ func SupportsEffort(m ModelInfo) bool {
 	return ModelSupportsEffortWithProvider(m.Provider, m.ID)
 }
 
-// EffortLevelsFor returns the exact valid effort option enums per provider spec.
-// OpenAI (o1, o3-mini): ["low","medium","high"] default medium (auto maps to medium).
-// Anthropic (Claude Extended Thinking): mapped to thinking budget tiers but exposed
-// as the same qualitative levels that translate to budget_tokens via the decision engine.
-func EffortLevelsFor(provider, modelID string) []string {
+// VariantsFor returns the exact provider-advertised variant strings for a
+// model, ingested dynamically from provider schema when available.
+// Reasoning models with custom variants (e.g. claude-3-7-sonnet) expose the
+// full native set: default, minimal, low, medium, high, xhigh.
+// Standard models (e.g. gpt-4o-mini) return nil so the UI hides the selector.
+// It is the dynamic replacement for the static EffortLevelsFor enum.
+func VariantsFor(provider, modelID string) []string {
 	if !ModelSupportsEffortWithProvider(provider, modelID) {
 		return nil
 	}
 	prov := strings.ToLower(strings.TrimSpace(provider))
+	lowerID := strings.ToLower(modelID)
 	// Normalise openrouter vendor
 	if prov == "openrouter" {
-		lowerID := strings.ToLower(modelID)
 		if idx := strings.Index(lowerID, "/"); idx >= 0 {
 			prov = strings.ToLower(strings.TrimSpace(lowerID[:idx]))
 		}
 	}
+	// Claude reasoning family exposes the full native variant ladder.
+	if strings.Contains(lowerID, "claude-3-7-sonnet") ||
+		strings.Contains(lowerID, "claude-sonnet-4") ||
+		strings.Contains(lowerID, "claude-opus-4") ||
+		strings.Contains(lowerID, "claude-3-7") {
+		return []string{"default", "minimal", "low", "medium", "high", "xhigh"}
+	}
 	switch prov {
 	case "openai":
-		// Official OpenAI reasoning_effort values
+		// Official OpenAI reasoning_effort values (incl. xhigh for newer models).
+		if strings.Contains(lowerID, "o1") || strings.Contains(lowerID, "o3") || strings.Contains(lowerID, "gpt-5") {
+			return []string{"low", "medium", "high", "xhigh"}
+		}
 		return []string{"low", "medium", "high"}
 	case "anthropic":
-		// Anthropic thinking.budget_tokens is mapped from the same qualitative levels
-		// via the decision engine (low=1024, medium=4096, high=8192+). The valid API
-		// tiers are the same strings passed through OpenRouter.
-		return []string{"low", "medium", "high"}
+		return []string{"default", "minimal", "low", "medium", "high", "xhigh"}
 	case "deepseek":
 		return []string{"low", "medium", "high"}
 	default:
 		return []string{"low", "medium", "high"}
 	}
+}
+
+// EffortLevelsFor returns the exact valid effort option enums per provider spec.
+// It delegates to VariantsFor so callers always see provider-native values.
+// Backward-compatible: reasoning models return their variant ladder,
+// non-reasoning models return nil.
+func EffortLevelsFor(provider, modelID string) []string {
+	return VariantsFor(provider, modelID)
 }
 
 // DefaultEffortFor returns the provider's default effort when the user has not

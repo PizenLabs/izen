@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/httpx"
 )
 
 type OpenAIClient struct {
@@ -29,7 +30,7 @@ func NewOpenAIClient(apiKey, model, baseURL string) *OpenAIClient {
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{},
+		client:  &http.Client{Transport: httpx.StrictTransport(httpx.CloudResponseHeaderTimeout)},
 	}
 }
 
@@ -66,6 +67,30 @@ type openAIMessage struct {
 
 type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
+}
+
+// defaultOpenAIMaxTokens is the output limit applied when a request carries
+// no explicit MaxTokens. 4096 keeps long code-generation answers clear of
+// the completion ceiling (finish_reason "length") instead of relying on
+// provider defaults (often ~1500-2048 tokens).
+const defaultOpenAIMaxTokens = 4096
+
+// maxOpenAIMaxTokens is the hard ceiling for an explicit MaxTokens budget:
+// larger requests are clamped, never sent unconstrained.
+const maxOpenAIMaxTokens = 8192
+
+// clampOpenAIMaxTokens enforces the output-limit contract: an unset budget
+// defaults to 4096 (long code-generation answers clear the completion
+// ceiling instead of relying on provider defaults), an explicit budget is
+// preserved verbatim up to the 8192 hard cap.
+func clampOpenAIMaxTokens(n int) int {
+	if n <= 0 {
+		return defaultOpenAIMaxTokens
+	}
+	if n > maxOpenAIMaxTokens {
+		return maxOpenAIMaxTokens
+	}
+	return n
 }
 
 // streamOptions is an alias for backward compatibility.
@@ -162,9 +187,8 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 	}
-	if body.MaxTokens <= 0 {
-		body.MaxTokens = 4096
-	}
+	// Default output limit: never send unconstrained max_tokens (0 or null).
+	body.MaxTokens = clampOpenAIMaxTokens(body.MaxTokens)
 
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -254,6 +278,9 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		llmResp.TotalCostUSD = EnforceFreeModelOverride(modelID, llmResp.TotalCostUSD)
 	}
 
+	if c.bus != nil {
+		c.bus.Publish(events.NewProviderUsageUpdate("", c.resolveModel(req.Model), tokenIn, tokenOut, 0))
+	}
 	return llmResp, nil
 }
 
@@ -266,9 +293,8 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		Temperature:   req.Temperature,
 		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
-	if body.MaxTokens <= 0 {
-		body.MaxTokens = 4096
-	}
+	// Default output limit: never send unconstrained max_tokens (0 or null).
+	body.MaxTokens = clampOpenAIMaxTokens(body.MaxTokens)
 
 	payload, err := json.Marshal(body)
 	if err != nil {

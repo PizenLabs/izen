@@ -28,6 +28,10 @@ type PromptRequest struct {
 	// consumers can publish a reasoning stream without ever mixing it into the
 	// response pipeline. When nil, reasoning content is silently discarded.
 	ReasoningHandler func(chunk string) error
+
+	// ExtraParams carries arbitrary provider-native JSON fields merged
+	// directly into the HTTP POST body (generic passthrough).
+	ExtraParams map[string]any
 }
 
 type Message struct {

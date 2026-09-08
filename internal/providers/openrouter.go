@@ -29,6 +29,17 @@ var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401):
 // carries no model resolvable to OpenRouter's vendor/model schema.
 const DefaultOpenRouterModel = "anthropic/claude-3.5-sonnet"
 
+// defaultOpenRouterMaxTokens is the output limit applied when a request
+// carries no explicit MaxTokens. 4096 keeps long code-generation answers
+// (e.g. /ask technical prompts) clear of the completion ceiling
+// (finish_reason "length") instead of relying on provider defaults
+// (often ~1500-2048 tokens).
+const defaultOpenRouterMaxTokens = 4096
+
+// maxOpenRouterMaxTokens is the hard ceiling for an explicit MaxTokens
+// budget: larger requests are clamped, never sent unconstrained.
+const maxOpenRouterMaxTokens = 8192
+
 // openRouterMaxRateLimitRetries bounds how many times a request answered with
 // HTTP 429 (Too Many Requests / rate limit) is retried before the error is
 // surfaced to the caller. Each retry waits longer (exponential backoff), so the
@@ -99,11 +110,25 @@ func NewOpenRouterProvider(apiKey, model, baseURL string) *OpenRouterProvider {
 	if baseURL == "" {
 		baseURL = "https://openrouter.ai/api/v1"
 	}
+	// Strict TTFT watchdog: the transport carries explicit per-phase socket
+	// timeouts (dial 5s, TLS handshake 5s, response headers 10s) so OS-level
+	// I/O unblocks with a phase-identifiable error instead of hanging, and
+	// the 10s header bound sits strictly inside the 15s request context to
+	// avoid channel-select drift to 27s on blocked http.Body.Read.
 	return &OpenRouterProvider{
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{},
+		client:  &http.Client{Transport: StrictTransport(CloudResponseHeaderTimeout)},
+	}
+}
+
+func (p *OpenRouterProvider) closeIdleConnections() {
+	if p.client == nil || p.client.Transport == nil {
+		return
+	}
+	if t, ok := p.client.Transport.(*http.Transport); ok {
+		t.CloseIdleConnections()
 	}
 }
 
@@ -150,11 +175,12 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%w: server returned 401: %s", ErrOpenRouterAuth, strings.TrimSpace(string(respBody)))
+		pe := NewProviderError("openrouter", resp.StatusCode, respBody)
+		return nil, fmt.Errorf("%w: %s", ErrOpenRouterAuth, pe.Error())
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("openrouter: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("openrouter", resp.StatusCode, respBody)
 	}
 
 	var openaiResp openrouterResponse
@@ -238,17 +264,22 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("%w: server returned 401: %s", ErrOpenRouterAuth, strings.TrimSpace(string(respBody)))
+		pe := NewProviderError("openrouter", resp.StatusCode, respBody)
+		return nil, fmt.Errorf("%w: %s", ErrOpenRouterAuth, pe.Error())
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("openrouter: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("openrouter", resp.StatusCode, respBody)
 	}
 
-	sr := &openrouterSSEReader{body: resp.Body, cancel: cancel}
+	sr := &openrouterSSEReader{
+		body:           resp.Body,
+		cancel:         cancel,
+		closeTransport: p.closeIdleConnections,
+	}
 	sr.usage.markRequestStarted(time.Now())
 	sr.usage.recordTransport(stats.attempts, stats.rateLimitedRetries)
 	return &OpenRouterStreamResult{ReadCloser: sr, sr: sr}, nil
@@ -345,6 +376,15 @@ type openrouterRequest struct {
 	// is injected from the dynamically resolved effort directive; a nil value
 	// omits the field entirely.
 	Reasoning *openrouterReasoning `json:"reasoning,omitempty"`
+	// ExtraParams carries arbitrary provider-native JSON fields merged
+	// directly into the HTTP POST body (generic passthrough).
+	ExtraParams map[string]any `json:"-"`
+}
+
+// MarshalJSON merges ExtraParams into the top-level object. Native keys win.
+func (r openrouterRequest) MarshalJSON() ([]byte, error) {
+	type alias openrouterRequest
+	return marshalWithExtra(alias(r), r.ExtraParams)
 }
 
 // openrouterReasoning is OpenRouter's reasoning control payload: an optional
@@ -356,6 +396,14 @@ type openrouterReasoning struct {
 	MaxTokens int    `json:"max_tokens,omitempty"`
 	Enabled   *bool  `json:"enabled,omitempty"`
 }
+
+// defaultReasoningMaxTokens caps the hidden reasoning channel when reasoning
+// is enabled without an explicit CoT cap or thinking budget. Without a cap a
+// reasoning model can spend the entire shared output budget on hidden
+// chain-of-thought and emit zero visible content (truncating the answer at
+// finish_reason "length"), so the uncapped case defaults here and the maximum
+// token budget goes to the actual response output.
+const defaultReasoningMaxTokens = 1024
 
 // reasoningFor builds the OpenRouter reasoning payload from the resolved
 // effort directive. The qualitative effort maps to reasoning.effort; the CoT
@@ -378,6 +426,12 @@ func reasoningFor(req ai.Request) *openrouterReasoning {
 		r.MaxTokens = req.Reasoning.CoTLimit
 	case req.Reasoning.BudgetTokens > 0:
 		r.MaxTokens = req.Reasoning.BudgetTokens
+	default:
+		// Enabled reasoning without an explicit cap: bound the hidden channel
+		// so it cannot consume the whole output budget.
+		if r.Effort != "" {
+			r.MaxTokens = defaultReasoningMaxTokens
+		}
 	}
 	if r.Effort == "" && r.MaxTokens == 0 {
 		return nil
@@ -412,10 +466,17 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 		Stream:      stream,
 		Reasoning:   reasoningFor(req),
 	}
-	// Default max output tokens for code generation tasks if not explicitly
-	// limited by the provider or user request.
+	// Default output limit — never send unconstrained max_tokens. The default
+	// is 4096 so long code-generation answers complete without hitting the
+	// completion ceiling (finish_reason "length"); explicit larger budgets
+	// are honored up to the 8192 hard cap. Callers with tighter budgets
+	// (bounded-patch mutation, read-only plans) pass their own smaller
+	// MaxTokens, which is preserved verbatim below the cap.
 	if body.MaxTokens == 0 {
-		body.MaxTokens = 4096
+		body.MaxTokens = defaultOpenRouterMaxTokens
+	}
+	if body.MaxTokens > maxOpenRouterMaxTokens {
+		body.MaxTokens = maxOpenRouterMaxTokens
 	}
 	if stream {
 		body.StreamOptions = &streamOptions{IncludeUsage: true}
@@ -479,6 +540,7 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 		}
 		body.Tools = rawTools
 	}
+	body.ExtraParams = req.ExtraParams
 	return body
 }
 
@@ -510,6 +572,11 @@ type chatRequestStats struct {
 // builds recover instead of aborting on the first 429. Every retry is a
 // transport attempt of the SAME logical invocation — recovered 429s never
 // double the invocation count, and their responses carry no billed tokens.
+//
+// Strict TTFT watchdog: each HTTP attempt is wrapped in context.WithTimeout
+// (15s) directly on the Request and the transport enforces a 10s response-
+// header bound, so the OS-level I/O unblocks with a phase-identifiable error
+// instead of drifting to 27s via blocked http.Body.Read select.
 func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body openrouterRequest, stream bool) (*http.Response, chatRequestStats, error) {
 	var stats chatRequestStats
 	attempt := func(b openrouterRequest) (*http.Response, error) {
@@ -831,12 +898,13 @@ func longestPartialSuffix(data []byte, marker string) int {
 }
 
 type openrouterSSEReader struct {
-	cancel     context.CancelFunc
-	body       io.ReadCloser
-	reader     *bufio.Reader
-	closed     bool
-	closeOnce  sync.Once
-	finalUsage *openrouterUsage
+	cancel         context.CancelFunc
+	body           io.ReadCloser
+	reader         *bufio.Reader
+	closed         bool
+	closeOnce      sync.Once
+	finalUsage     *openrouterUsage
+	closeTransport func()
 
 	// think splits inline <think>…</think> blocks out of delta.content into
 	// sentinel-wrapped reasoning runs (see thinkTagSplitter).
@@ -1033,5 +1101,8 @@ func (s *openrouterSSEReader) Close() error {
 		_, _ = io.Copy(io.Discard, s.body)
 		err = s.body.Close()
 	})
+	if s.closeTransport != nil {
+		s.closeTransport()
+	}
 	return err
 }

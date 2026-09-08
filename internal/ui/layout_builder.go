@@ -194,6 +194,9 @@ func SetTraceTurnTokens(in, out int) {}
 // ── Structured Workflow Error Callout ───────────────────────────────────
 
 func isWorkflowErrorText(s string) bool {
+	if isBoundedPatchRecovery(s) {
+		return true
+	}
 	lower := strings.ToLower(s)
 	if strings.Contains(lower, "command switch_mode failed") {
 		return true
@@ -217,6 +220,9 @@ func isWorkflowErrorText(s string) bool {
 }
 
 func formatWorkflowError(s string) string {
+	if isBoundedPatchRecovery(s) {
+		return RenderBoundedPatchRecoveryBadge()
+	}
 	trimmed := strings.TrimSpace(s)
 	trimmed = ansi.Strip(trimmed)
 	// Extract Transition clause if present.
@@ -247,6 +253,9 @@ func formatWorkflowError(s string) string {
 }
 
 func workflowErrorRendered(s string) string {
+	if isBoundedPatchRecovery(s) {
+		return RenderBoundedPatchRecoveryBadge()
+	}
 	formatted := formatWorkflowError(s)
 	// Catppuccin Red #f38ba8 -> 38;2;243;139;168 with bold for callout.
 	return "\x1b[1;38;2;243;139;168m" + formatted + "\x1b[0m"
@@ -841,6 +850,11 @@ func renderCodeBlockToLines(lang string, codeLines []string, wrapWidth int) []Do
 	if len(codeLines) == 0 {
 		return nil
 	}
+	// Patch and diff artifacts: styled with distinct background (Catppuccin Mantle)
+	// and delta header declaring file scope and line delta.
+	if isDiffOrPatch(lang, codeLines) {
+		return renderDiffPatchBlockToLines(lang, codeLines, wrapWidth)
+	}
 	// Shell/command snippets from response text are informational copy — they
 	// render frameless (no ┌─┐ box), indented with a dimmed "$ " prompt and
 	// Catppuccin Yellow command foreground. Actual Tool Execution panels never
@@ -940,6 +954,156 @@ func renderCodeBlockToLines(lang string, codeLines []string, wrapWidth int) []Do
 		Spans:       []RenderSpan{{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false}, {StartCell: outerCells, EndCell: outerCells + boxWidth, SourceStart: 0, SourceEnd: 0, Selectable: false}},
 		RawText:     "",
 		RenderedStr: "\x1b[38;2;88;91;112m" + outerGutter + "\x1b[0m" + "\x1b[38;2;88;91;112m" + bottomBorder + "\x1b[0m",
+	})
+	return out
+}
+
+func isDiffOrPatch(lang string, codeLines []string) bool {
+	l := strings.ToLower(strings.TrimSpace(lang))
+	if l == "diff" || l == "patch" || strings.HasPrefix(l, "diff ") || strings.HasPrefix(l, "patch ") || strings.HasPrefix(l, "diff:") || strings.HasPrefix(l, "patch:") {
+		return true
+	}
+	hasAdd := false
+	hasDel := false
+	for _, cl := range codeLines {
+		if strings.HasPrefix(cl, "--- ") || strings.HasPrefix(cl, "+++ ") || strings.HasPrefix(cl, "diff --git") {
+			return true
+		}
+		if strings.HasPrefix(cl, "+") {
+			hasAdd = true
+		}
+		if strings.HasPrefix(cl, "-") {
+			hasDel = true
+		}
+	}
+	return hasAdd && hasDel
+}
+
+func extractPatchTargetAndDelta(lang string, codeLines []string) (string, int, int) {
+	target := "patch"
+	l := strings.TrimSpace(lang)
+	if strings.HasPrefix(strings.ToLower(l), "patch:") {
+		target = strings.TrimSpace(l[len("patch:"):])
+	} else if strings.HasPrefix(strings.ToLower(l), "diff:") {
+		target = strings.TrimSpace(l[len("diff:"):])
+	}
+	added := 0
+	deleted := 0
+	for _, line := range codeLines {
+		switch {
+		case strings.HasPrefix(line, "+++ b/"):
+			target = strings.TrimPrefix(line, "+++ b/")
+		case strings.HasPrefix(line, "--- a/") && target == "patch":
+			target = strings.TrimPrefix(line, "--- a/")
+		case strings.HasPrefix(line, "diff --git a/"):
+			parts := strings.Split(line, " b/")
+			if len(parts) == 2 {
+				target = parts[1]
+			}
+		case strings.HasPrefix(line, "Patch: "):
+			target = strings.TrimPrefix(line, "Patch: ")
+		case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
+			added++
+		case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
+			deleted++
+		}
+	}
+	return target, added, deleted
+}
+
+func renderDiffPatchBlockToLines(lang string, codeLines []string, wrapWidth int) []DocumentLine {
+	if len(codeLines) == 0 {
+		return nil
+	}
+	outerGutter := "│ "
+	outerCells := runewidth.StringWidth(ansi.Strip(outerGutter))
+	boxWidth := wrapWidth - outerCells
+	if boxWidth < 10 {
+		boxWidth = 10
+	}
+	target, added, deleted := extractPatchTargetAndDelta(lang, codeLines)
+	label := fmt.Sprintf("─ Patch: %s ", target)
+	delta := fmt.Sprintf(" (+%d, -%d) ─", added, deleted)
+	labelCells := runewidth.StringWidth(label)
+	deltaCells := runewidth.StringWidth(delta)
+	remaining := boxWidth - 2 - labelCells - deltaCells
+	if remaining < 0 {
+		remaining = 0
+	}
+	topBorder := "┌" + label + strings.Repeat("─", remaining) + delta + "┐"
+	bottomBorder := "└" + strings.Repeat("─", boxWidth-2) + "┘"
+	innerWidth := boxWidth - 4
+	if innerWidth < 4 {
+		innerWidth = 4
+	}
+
+	const (
+		borderFg    = "\x1b[38;2;88;91;112m" // #585b70
+		borderReset = "\x1b[0m"
+		gutterFg    = "\x1b[38;2;88;91;112m"
+		mantleBg    = "\x1b[48;2;24;24;37m"    // Catppuccin Mantle #181825
+		greenFg     = "\x1b[38;2;166;227;161m" // #a6e3a1
+		redFg       = "\x1b[38;2;243;139;168m" // #f38ba8
+		blueFg      = "\x1b[38;2;137;180;250m" // #89b4fa
+		textFg      = "\x1b[38;2;205;214;244m" // #cdd6f4
+	)
+
+	var out []DocumentLine
+	out = append(out, DocumentLine{
+		Spans:       []RenderSpan{{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false}, {StartCell: outerCells, EndCell: outerCells + boxWidth, SourceStart: 0, SourceEnd: 0, Selectable: false}},
+		RawText:     "",
+		RenderedStr: gutterFg + outerGutter + borderReset + borderFg + topBorder + borderReset,
+	})
+
+	for _, rawLine := range codeLines {
+		if rawLine == "" {
+			emptyContent := strings.Repeat(" ", innerWidth)
+			rendered := gutterFg + outerGutter + borderReset + borderFg + "│ " + borderReset + mantleBg + emptyContent + borderReset + borderFg + " │" + borderReset
+			out = append(out, DocumentLine{
+				Spans:       []RenderSpan{{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false}, {StartCell: outerCells, EndCell: outerCells + 2, SourceStart: 0, SourceEnd: 0, Selectable: false}, {StartCell: outerCells + 2, EndCell: outerCells + 2 + innerWidth, SourceStart: 0, SourceEnd: 0, Selectable: true}},
+				RawText:     "",
+				RenderedStr: rendered,
+			})
+			continue
+		}
+		wrapped := wrapForContentWidth(rawLine, innerWidth)
+		if len(wrapped) == 0 {
+			wrapped = []string{rawLine}
+		}
+		for _, piece := range wrapped {
+			fg := textFg
+			switch {
+			case strings.HasPrefix(piece, "+"):
+				fg = greenFg
+			case strings.HasPrefix(piece, "-"):
+				fg = redFg
+			case strings.HasPrefix(piece, "@@") || strings.HasPrefix(piece, "diff") || strings.HasPrefix(piece, "index"):
+				fg = blueFg
+			}
+			pieceCells := runewidth.StringWidth(piece)
+			padding := ""
+			if pieceCells < innerWidth {
+				padding = strings.Repeat(" ", innerWidth-pieceCells)
+			}
+			styledContent := mantleBg + fg + piece + padding + borderReset
+			rendered := gutterFg + outerGutter + borderReset + borderFg + "│ " + borderReset + styledContent + borderFg + " │" + borderReset
+			contentCells := runewidth.StringWidth(piece)
+			out = append(out, DocumentLine{
+				Spans: []RenderSpan{
+					{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false},
+					{StartCell: outerCells, EndCell: outerCells + 2, SourceStart: 0, SourceEnd: 0, Selectable: false},
+					{StartCell: outerCells + 2, EndCell: outerCells + 2 + contentCells, SourceStart: 0, SourceEnd: len([]rune(piece)), Selectable: true},
+				},
+				RawText:     piece,
+				RenderedStr: rendered,
+			})
+		}
+	}
+
+	out = append(out, DocumentLine{
+		Spans:       []RenderSpan{{StartCell: 0, EndCell: outerCells, SourceStart: 0, SourceEnd: 0, Selectable: false}, {StartCell: outerCells, EndCell: outerCells + boxWidth, SourceStart: 0, SourceEnd: 0, Selectable: false}},
+		RawText:     "",
+		RenderedStr: gutterFg + outerGutter + borderReset + borderFg + bottomBorder + borderReset,
 	})
 	return out
 }

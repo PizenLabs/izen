@@ -119,6 +119,39 @@ func sanitizeInputBuffer(s string) string {
 	return inputANSIRe.ReplaceAllString(s, "")
 }
 
+// stripOrphanSGR removes orphaned SGR mouse fragments ("[<...M" / "[<...m")
+// without using the regex engine. It performs an O(n) single-pass scan with
+// at most one allocation (the returned string only when the input actually
+// contains fragments). Safe to call on every key event.
+func stripOrphanSGR(input string) string {
+	if !strings.Contains(input, "[<") {
+		return input
+	}
+	var sb strings.Builder
+	sb.Grow(len(input))
+	i := 0
+	for i < len(input) {
+		if i+2 < len(input) && input[i] == '[' && input[i+1] == '<' {
+			end := strings.IndexAny(input[i:], "Mm")
+			if end != -1 {
+				i += end + 1
+				continue
+			}
+		}
+		sb.WriteByte(input[i])
+		i++
+	}
+	return sb.String()
+}
+
+// SanitizePromptInput removes any orphaned SGR mouse sequence fragments
+// from the input string, acting as a fail-safe layer for the prompt buffer.
+// Zero-allocation fast path: when no "[<" prefix exists, the input is returned
+// unchanged. On the slow path, a single-pass byte scanner replaces the legacy regex.
+func SanitizePromptInput(input string) string {
+	return stripOrphanSGR(input)
+}
+
 // stashedPlanPath is the deterministic cache file path where the active /build
 // plan is serialized before a $hot hotfix execution. The Go engine restores
 // from this file after the hotfix completes — the LLM never sees the stash,
@@ -2300,6 +2333,12 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	m.responseBuffer.Reset()
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
+	if m.utf8StreamBuf != nil {
+		m.utf8StreamBuf.Reset()
+	}
+	if m.streamThrottle != nil {
+		m.streamThrottle.Reset()
+	}
 	m.resetStreamBlocks()
 	m.lastTestOutput = ""
 	m.lastTestFailed = false
@@ -3499,6 +3538,12 @@ func (m *model) cancelStaleAgentOps() {
 	m.streamTickActive = false
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
+	if m.utf8StreamBuf != nil {
+		m.utf8StreamBuf.Reset()
+	}
+	if m.streamThrottle != nil {
+		m.streamThrottle.Reset()
+	}
 	m.resetStreamBlocks()
 	m.interruptRequested = false
 

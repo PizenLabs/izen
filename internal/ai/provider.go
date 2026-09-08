@@ -47,6 +47,11 @@ type Request struct {
 	// into the response pipeline. When nil, reasoning content is silently
 	// discarded by the SSE readers.
 	ReasoningHandler func(chunk string) error
+	// ExtraParams carries arbitrary provider-native JSON fields that are
+	// merged directly into the HTTP POST body. It is the generic passthrough
+	// for forward-compatibility: callers can send new provider attributes
+	// without code changes. Keys colliding with native fields are ignored.
+	ExtraParams map[string]any `json:"-"`
 }
 
 // ProviderUsage is the AUTHORITATIVE provider-usage contract every invocation

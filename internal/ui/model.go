@@ -26,6 +26,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/runtime"
+	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
@@ -759,6 +760,10 @@ type model struct {
 	traceBuffer strings.Builder
 	// traceExpanded is the Ctrl+O expansion state of the output-trace viewport.
 	traceExpanded bool
+	// showTraceOverlay is the modal/drawer overlay for debugging execution telemetry.
+	showTraceOverlay bool
+	// telemetryDemuxer isolates internal execution loop events into a Trace Buffer.
+	telemetryDemuxer *TelemetryDemuxer
 	// traceVerbose is the model-local verbosity toggle mirrored into the
 	// package-level TraceVerbose flag used by layout/stream renderers.
 	traceVerbose bool
@@ -816,6 +821,8 @@ type model struct {
 	streamParser     *IncrementalStreamParser
 	streamBuffer     string // buffered tokens for smooth tick emission
 	streamTickActive bool   // whether smooth-stream tick is active
+	frameTickActive  bool   // whether FrameTickMsg loop is active (30ms debounced)
+	utf8StreamBuf    *stream.StreamBuffer
 	userName         string // dynamic system username (set at init)
 
 	// Agent state
@@ -1074,13 +1081,33 @@ type model struct {
 	// stream completes to compute this-turn latency for the status line.
 	streamStartTime time.Time
 
+	// streamLiveTokens is the live per-turn streamed-token estimate backing
+	// the footer tok/s meter. It increments on EVERY incoming stream chunk —
+	// content and reasoning/thinking alike — via estimateStreamTokens, and is
+	// floored by the provider's authoritative usage (output + reasoning)
+	// when a streamUsageMsg arrives. It never feeds the authoritative stage
+	// token count (stage.Tokens stays provider-reported only); it exists so
+	// the rate meter stays live (>0) while reasoning tokens stream before
+	// any authoritative usage chunk arrives. Reset per turn in streamCmd.
+	streamLiveTokens int
+
+	// Execution heartbeat: set when any foreground operation begins so the
+	// footer can render live connection-pulse telemetry (elapsed seconds)
+	// even when no provider tokens have arrived yet.
+	executionStartedAt time.Time
+
 	// Thought duration timer: start on prompt submit, frozen on StreamDoneMsg / StateIdle.
 	thoughtStartTime time.Time
 	thoughtEndTime   time.Time
 
 	// AI Interrupt Engine: cancel function for active stream, set by streamCmd.
-	streamCancel       context.CancelFunc
-	interruptRequested bool
+	streamCancel             context.CancelFunc
+	streamInterTokenTimer    *time.Timer
+	streamInterTokenDeadline time.Time
+	interruptRequested       bool
+
+	// Retry state machine (engine.RetryInfo projection for status bar)
+	retryInfo *retryStatusInfo
 
 	// Background context registry: tracks all in-flight background contexts
 	// so they can be cancelled on mode transitions or Ctrl+C.
@@ -1924,9 +1951,28 @@ func (m *model) markUsageKnown() {
 	m.usageKnown = true
 }
 
+// resetTokenMetrics resets all token counters and UI cost to zero.
+// Called by /new to ensure the footer instantly shows ↓0 + ↑0 tok (0%).
+func (m *model) resetTokenMetrics() {
+	m.InputTokens = 0
+	m.OutputTokens = 0
+	m.TotalTokens = 0
+	m.TurnInputTokens = 0
+	m.TurnOutputTokens = 0
+	m.AccumulatedCost = 0
+	m.usageKnown = false
+	m.ContextLimit = 0
+	status.Default.Reset()
+	m.clearRetryState()
+	// Force footer refresh; status bar reads from these fields.
+	if m.Ready {
+		m.refreshViewportContent()
+	}
+}
+
 // tokenUsageCmd returns a command that dispatches the provider-reported token
-// usage of an execution path to the Bubble Tea event loop as a TokenUsageMsg.
-// The TokenUsageMsg handler in update.go accumulates the counts into the
+// usage of an execution path to the Bubble Tea event loop as a UsageUpdateMsg.
+// The UsageUpdateMsg handler in update.go accumulates the counts into the
 // session counters and forces syncUIState so the status bar footer refreshes
 // the token counters immediately — even when the underlying execution failed,
 // was aborted, or was truncated mid-stream. Zero usage produces a nil command
@@ -1947,7 +1993,7 @@ func (m *model) tokenUsageCmdKnown(input, output int, known bool) tea.Cmd {
 		model = m.cfg.ActiveModelName()
 	}
 	return func() tea.Msg {
-		return TokenUsageMsg{
+		return UsageUpdateMsg{
 			PromptTokens:     input,
 			CompletionTokens: output,
 			Model:            model,
@@ -2955,6 +3001,14 @@ func (m *model) push(r role, text string) {
 		return
 	}
 	text = sanitizeIngressANSI(text)
+	if isBoundedPatchRecovery(text) {
+		text = RenderBoundedPatchRecoveryBadge()
+	}
+	if m.telemetryDemuxer == nil {
+		m.telemetryDemuxer = NewTelemetryDemuxer()
+	}
+	m.telemetryDemuxer.Ingest(text)
+
 	rec := record{role: r, text: text, turnID: m.currentTurnID}
 	m.records = append(m.records, rec)
 	m.cacheRecordToHistory(rec)
@@ -3469,6 +3523,13 @@ func (m *model) clearBusyFlags() {
 	m.pipelineRunning = false
 	m.planPending = false
 	m.shellRunning = false
+	// Clean up inter-token timeout timer and deadline so they never leak.
+	if m.streamInterTokenTimer != nil {
+		m.streamInterTokenTimer.Stop()
+		m.streamInterTokenTimer = nil
+	}
+	m.streamInterTokenDeadline = time.Time{}
+	m.executionStartedAt = time.Time{}
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
 }
@@ -4232,7 +4293,9 @@ func (m *model) updateConversationLayout(wrapWidth int, username string) {
 //   - re-renders ONLY the streaming segment through the unified markdown engine
 //     (byte-identical styling to the completed-history path), never the whole
 //     document; and
-//   - appends the Accent-Blue block cursor (▋) to the active trailing line.
+//   - renders streaming content with a muted satin tone (#A6ADC8) for calm
+//     low-glare flow, transitioning to full contrast (#CDD6F4) on completion
+//     (satin-smooth streaming UX — no trailing cursor glyph).
 func (m *model) syncStreamingSegment() {
 	if m.docLayout == nil {
 		m.streamingDocStart = -1
@@ -4300,9 +4363,6 @@ func (m *model) syncStreamingSegment() {
 		newLines[i].GlobalY = base + i
 		newLines[i].RecordIdx = len(m.records)
 	}
-	// Active smooth block cursor on the trailing line.
-	last := &newLines[len(newLines)-1]
-	last.RenderedStr += streamCursorStyle.Render("▋")
 	m.docLayout.Lines = append(m.docLayout.Lines[:m.streamingDocStart], newLines...)
 }
 
@@ -4999,13 +5059,44 @@ func (m *model) renderWorkspaceHeader() string {
 	}
 	modeNameStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(modeAccentStr))
 
-	var b strings.Builder
-	b.WriteString("\n")
-	b.WriteString("  ")
-	b.WriteString(modeNameStyle.Render(Icon.Check + " " + modeName))
-	b.WriteString("  " + dimmedStyle.Render(mode.Description()))
-	b.WriteString("\n\n")
-	return b.String()
+	// Resolve workspace directory
+	cwd, _ := os.Getwd()
+	home := os.Getenv("HOME")
+	if home != "" && strings.HasPrefix(cwd, home) {
+		cwd = "~" + strings.TrimPrefix(cwd, home)
+	}
+
+	// Resolve git branch
+	branch := "main"
+	if m.gitEng != nil {
+		if b, err := m.gitEng.Branch(); err == nil && b != "" {
+			branch = b
+		}
+	}
+
+	version := "0.1.0"
+
+	// Single compact status line anchoring system state:
+	// ─ [izen v0.1.0] ── ~/workspace ── git:(main) ── [BUILD Mode] ─
+	ruleDashes := dimmedStyle.Render("──")
+	appTag := boldAccentStyle.Render(fmt.Sprintf("[izen v%s]", version))
+	wsTag := dimmedStyle.Render(cwd)
+	gitTag := boldMauveStyle.Render(fmt.Sprintf("git:(%s)", branch))
+	modeTag := modeNameStyle.Render(fmt.Sprintf("[%s Mode]", modeName))
+
+	line := fmt.Sprintf("%s %s %s %s %s %s %s %s %s",
+		dimmedStyle.Render("─"),
+		appTag,
+		ruleDashes,
+		wsTag,
+		ruleDashes,
+		gitTag,
+		ruleDashes,
+		modeTag,
+		dimmedStyle.Render("─"),
+	)
+
+	return line + "\n\n"
 }
 
 // ── History persistence ───────────────────────────────────────────────────────

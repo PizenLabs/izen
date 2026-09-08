@@ -12,43 +12,17 @@ type TokenManager struct{}
 // NewTokenManager returns a stateless manager (no config needed).
 func NewTokenManager() *TokenManager { return &TokenManager{} }
 
-// ThinkingBudget computes the thinking budget per effort level per spec:
+// ThinkingBudget computes the thinking budget dynamically from the model's
+// native MaxCompletionTokens bound and the selected variant ratio.
+// No hardcoded token strings: budgets scale with the target model.
 //
-//	auto: 0 (default provider behavior)
-//	low: min(4000, 25% * MaxOutputTokens)
-//	medium: min(16000, 50% * MaxOutputTokens)
-//	high: min(32000, 80% * MaxOutputTokens)
+// Ratios (see VariantBudgetRatio): minimal=10%, low=25%, medium=50%,
+// high=80%, xhigh=95%, default/auto=0.
 func (tm *TokenManager) ThinkingBudget(effort string, maxOutputTokens int) int {
 	if maxOutputTokens <= 0 {
 		maxOutputTokens = 8192 // heuristic fallback
 	}
-	switch strings.ToLower(effort) {
-	case "low":
-		v := int(float64(maxOutputTokens) * 0.25)
-		if v > 4000 {
-			v = 4000
-		}
-		if v < 1 {
-			v = 1
-		}
-		return v
-	case "medium":
-		v := int(float64(maxOutputTokens) * 0.5)
-		if v > 16000 {
-			v = 16000
-		}
-		return v
-	case "high":
-		v := int(float64(maxOutputTokens) * 0.80)
-		if v > 32000 {
-			v = 32000
-		}
-		return v
-	case "auto", "":
-		return 0
-	default:
-		return 0
-	}
+	return VariantBudget(effort, maxOutputTokens)
 }
 
 // MaxOutputForModel returns the model's max output tokens, consulting

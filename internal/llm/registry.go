@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,15 +17,26 @@ import (
 )
 
 // ModelInfo represents a discovered model with dynamic capabilities.
+// Variants holds the exact provider-advertised reasoning/effort variants
+// (e.g. default, minimal, low, medium, high, xhigh). Nil/empty means the
+// model exposes no variant control and the UI must hide the selector.
+// MaxContextTokens/MaxCompletionTokens are the native API bounds; they are
+// kept in sync with the legacy ContextWindow/MaxOutputTokens aliases.
+// RawExtraFields stores unmapped provider attributes verbatim for
+// forward-compatibility with new provider schema fields.
 type ModelInfo struct {
-	ID                  string        `json:"id"`
-	Name                string        `json:"name,omitempty"`
-	Provider            string        `json:"provider"`
-	SupportsReasoning   *bool         `json:"supports_reasoning,omitempty"`
-	ContextWindow       int           `json:"context_window,omitempty"`
-	MaxOutputTokens     int           `json:"max_output_tokens,omitempty"`
-	SupportedParameters []string      `json:"supported_parameters,omitempty"`
-	Architecture        *Architecture `json:"architecture,omitempty"`
+	ID                  string         `json:"id"`
+	Name                string         `json:"name,omitempty"`
+	Provider            string         `json:"provider"`
+	SupportsReasoning   *bool          `json:"supports_reasoning,omitempty"`
+	ContextWindow       int            `json:"context_window,omitempty"`
+	MaxOutputTokens     int            `json:"max_output_tokens,omitempty"`
+	MaxContextTokens    int            `json:"max_context_tokens,omitempty"`
+	MaxCompletionTokens int            `json:"max_completion_tokens,omitempty"`
+	Variants            []string       `json:"variants,omitempty"`
+	SupportedParameters []string       `json:"supported_parameters,omitempty"`
+	Architecture        *Architecture  `json:"architecture,omitempty"`
+	RawExtraFields      map[string]any `json:"raw_extra,omitempty"`
 }
 
 // Architecture mirrors OpenRouter architecture.modality.
@@ -180,6 +192,7 @@ type openRouterResponse struct {
 type openRouterModel struct {
 	ID                  string        `json:"id"`
 	Name                string        `json:"name,omitempty"`
+	Description         string        `json:"description,omitempty"`
 	ContextLength       int           `json:"context_length,omitempty"`
 	SupportedParameters []string      `json:"supported_parameters,omitempty"`
 	Architecture        *Architecture `json:"architecture,omitempty"`
@@ -187,6 +200,33 @@ type openRouterModel struct {
 		ContextLength       int  `json:"context_length,omitempty"`
 		MaxCompletionTokens *int `json:"max_completion_tokens,omitempty"`
 	} `json:"top_provider,omitempty"`
+	PerRequestLimits map[string]any `json:"per_request_limits,omitempty"`
+	// raw captures unmapped provider attributes verbatim.
+	raw map[string]any
+}
+
+// UnmarshalJSON preserves unknown provider attributes into raw so they can
+// be attached to ModelInfo.RawExtraFields without loss.
+func (m *openRouterModel) UnmarshalJSON(data []byte) error {
+	type alias openRouterModel
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*m = openRouterModel(a)
+	var generic map[string]any
+	_ = json.Unmarshal(data, &generic)
+	for _, k := range []string{"id", "name", "description", "context_length", "supported_parameters", "architecture", "top_provider"} {
+		delete(generic, k)
+	}
+	// Preserve per_request_limits natively inside RawExtraFields.
+	if a.PerRequestLimits != nil {
+		generic["per_request_limits"] = a.PerRequestLimits
+	}
+	if len(generic) > 0 {
+		m.raw = generic
+	}
+	return nil
 }
 
 func fetchOpenRouterModels(client *http.Client, apiKey string) ([]ModelInfo, error) {
@@ -268,8 +308,12 @@ func fetchOpenRouterModels(client *http.Client, apiKey string) ([]ModelInfo, err
 			SupportsReasoning:   supports,
 			ContextWindow:       ctxWin,
 			MaxOutputTokens:     maxOut,
+			MaxContextTokens:    ctxWin,
+			MaxCompletionTokens: maxOut,
+			Variants:            VariantsFor("openrouter", m.ID),
 			SupportedParameters: m.SupportedParameters,
 			Architecture:        m.Architecture,
+			RawExtraFields:      m.raw,
 		})
 	}
 
@@ -508,14 +552,20 @@ func applyOverrides(models []ModelInfo, overrides map[string]modelOverride) []Mo
 				maxOut = *ov.MaxOutputTokens
 			}
 			models = append(models, ModelInfo{
-				ID:                id,
-				Name:              id,
-				Provider:          prov,
-				SupportsReasoning: sup,
-				ContextWindow:     ctxWin,
-				MaxOutputTokens:   maxOut,
+				ID:                  id,
+				Name:                id,
+				Provider:            prov,
+				SupportsReasoning:   sup,
+				ContextWindow:       ctxWin,
+				MaxOutputTokens:     maxOut,
+				MaxContextTokens:    ctxWin,
+				MaxCompletionTokens: maxOut,
+				Variants:            VariantsFor(prov, id),
 			})
 		}
+	}
+	for i := range models {
+		models[i].SyncNativeBounds()
 	}
 	return models
 }
@@ -532,6 +582,7 @@ func enrichWithHeuristics(models []ModelInfo) []ModelInfo {
 		if m.MaxOutputTokens == 0 {
 			models[i].MaxOutputTokens = heuristicMaxOutputTokens(m.Provider, m.ID)
 		}
+		models[i].SyncNativeBounds()
 	}
 	return models
 }
@@ -601,14 +652,18 @@ func fetchOllamaModels(client *http.Client) ([]ModelInfo, error) {
 					models := make([]ModelInfo, 0, len(result.Models))
 					for _, m := range result.Models {
 						sup := ModelSupportsEffortWithProvider("ollama", m.Name)
-						models = append(models, ModelInfo{
+						info := ModelInfo{
 							ID:                m.Name,
 							Name:              m.Name,
 							Provider:          "ollama",
 							SupportsReasoning: &sup,
 							ContextWindow:     ContextWindowFor(m.Name),
 							MaxOutputTokens:   heuristicMaxOutputTokens("ollama", m.Name),
-						})
+						}
+						// Dynamically ingest native capabilities via /api/show.
+						enrichOllamaModelFromShow(shortClient, &info)
+						info.SyncNativeBounds()
+						models = append(models, info)
 					}
 					return models, nil
 				}
@@ -617,6 +672,93 @@ func fetchOllamaModels(client *http.Client) ([]ModelInfo, error) {
 	}
 
 	return fetchOllamaModelsCLI()
+}
+
+// ollamaShowResponse mirrors Ollama /api/show native capability metadata.
+type ollamaShowResponse struct {
+	Details *struct {
+		ParameterSize string `json:"parameter_size,omitempty"`
+		Quantization  string `json:"quantization_level,omitempty"`
+		Family        string `json:"family,omitempty"`
+	} `json:"details,omitempty"`
+	ModelInfo    map[string]any `json:"model_info,omitempty"`
+	Capabilities []string       `json:"capabilities,omitempty"`
+	NumCtx       int            `json:"num_ctx,omitempty"`
+}
+
+// enrichOllamaModelFromShow ingests native capability metadata from Ollama
+// /api/show. Failures are silent: heuristic values are preserved.
+func enrichOllamaModelFromShow(client *http.Client, info *ModelInfo) {
+	if info == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]string{"name": info.ID})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://localhost:11434/api/show", bytes.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	var show ollamaShowResponse
+	if err := json.Unmarshal(body, &show); err != nil {
+		return
+	}
+	raw := make(map[string]any)
+	if show.Details != nil {
+		raw["details"] = map[string]any{
+			"parameter_size":     show.Details.ParameterSize,
+			"quantization_level": show.Details.Quantization,
+			"family":             show.Details.Family,
+		}
+	}
+	if len(show.ModelInfo) > 0 {
+		raw["model_info"] = show.ModelInfo
+		// Native context bound: Ollama exposes e.g. llama.context_length.
+		for k, v := range show.ModelInfo {
+			lk := strings.ToLower(k)
+			if strings.Contains(lk, "context_length") {
+				if f, ok := v.(float64); ok && f > 0 {
+					info.MaxContextTokens = int(f)
+					info.ContextWindow = int(f)
+				}
+			}
+		}
+	}
+	if len(show.Capabilities) > 0 {
+		raw["capabilities"] = show.Capabilities
+		for _, c := range show.Capabilities {
+			if strings.EqualFold(c, "thinking") || strings.EqualFold(c, "reasoning") {
+				t := true
+				info.SupportsReasoning = &t
+			}
+		}
+	}
+	if show.NumCtx > 0 {
+		info.MaxContextTokens = show.NumCtx
+		info.ContextWindow = show.NumCtx
+	}
+	if len(raw) > 0 {
+		if info.RawExtraFields == nil {
+			info.RawExtraFields = raw
+		} else {
+			for k, v := range raw {
+				info.RawExtraFields[k] = v
+			}
+		}
+	}
 }
 
 func fetchOllamaModelsCLI() ([]ModelInfo, error) {
@@ -644,6 +786,7 @@ func fetchOllamaModelsCLI() ([]ModelInfo, error) {
 		models[i].SupportsReasoning = &sup
 		models[i].ContextWindow = ContextWindowFor(models[i].ID)
 		models[i].MaxOutputTokens = heuristicMaxOutputTokens(models[i].Provider, models[i].ID)
+		models[i].SyncNativeBounds()
 	}
 	return models, nil
 }
@@ -694,6 +837,7 @@ func ollamaFallbackModels() []ModelInfo {
 		fallback[i].SupportsReasoning = &sup
 		fallback[i].ContextWindow = ContextWindowFor(fallback[i].ID)
 		fallback[i].MaxOutputTokens = heuristicMaxOutputTokens(fallback[i].Provider, fallback[i].ID)
+		fallback[i].SyncNativeBounds()
 	}
 	return fallback
 }
@@ -741,13 +885,18 @@ func fetchAnthropicModels() ([]ModelInfo, error) {
 	models := make([]ModelInfo, len(staticModels))
 	for i, id := range staticModels {
 		sup := ModelSupportsEffortWithProvider("anthropic", id)
+		ctxWin := ContextWindowFor(id)
+		maxOut := heuristicMaxOutputTokens("anthropic", id)
 		models[i] = ModelInfo{
-			ID:                id,
-			Name:              id,
-			Provider:          "anthropic",
-			SupportsReasoning: &sup,
-			ContextWindow:     ContextWindowFor(id),
-			MaxOutputTokens:   heuristicMaxOutputTokens("anthropic", id),
+			ID:                  id,
+			Name:                id,
+			Provider:            "anthropic",
+			SupportsReasoning:   &sup,
+			ContextWindow:       ctxWin,
+			MaxOutputTokens:     maxOut,
+			MaxContextTokens:    ctxWin,
+			MaxCompletionTokens: maxOut,
+			Variants:            VariantsFor("anthropic", id),
 		}
 	}
 	return models, nil
@@ -768,13 +917,18 @@ func fetchOpenAIModels() ([]ModelInfo, error) {
 	models := make([]ModelInfo, len(staticModels))
 	for i, id := range staticModels {
 		sup := ModelSupportsEffortWithProvider("openai", id)
+		ctxWin := ContextWindowFor(id)
+		maxOut := heuristicMaxOutputTokens("openai", id)
 		models[i] = ModelInfo{
-			ID:                id,
-			Name:              id,
-			Provider:          "openai",
-			SupportsReasoning: &sup,
-			ContextWindow:     ContextWindowFor(id),
-			MaxOutputTokens:   heuristicMaxOutputTokens("openai", id),
+			ID:                  id,
+			Name:                id,
+			Provider:            "openai",
+			SupportsReasoning:   &sup,
+			ContextWindow:       ctxWin,
+			MaxOutputTokens:     maxOut,
+			MaxContextTokens:    ctxWin,
+			MaxCompletionTokens: maxOut,
+			Variants:            VariantsFor("openai", id),
 		}
 	}
 	return models, nil

@@ -921,8 +921,10 @@ func (m *model) renderStartupBanner(termWidth int) string {
 		modelLabel = accentStyle.Render("✓") + " " + modelLabel
 	}
 	metaParts = append(metaParts, mutedStyle.Render(modelLabel))
-	if branch, err := m.gitEng.Branch(); err == nil && branch != "" {
-		metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
+	if m.gitEng != nil && m.gitEng.IsRepo() {
+		if branch, err := m.gitEng.Branch(); err == nil && branch != "" {
+			metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
+		}
 	}
 	metaSep := subtleStyle.Render(" · ")
 	meta := strings.Join(metaParts, metaSep)
@@ -985,8 +987,10 @@ func (m *model) renderStartupBannerCompact(termWidth int) string {
 			modelLabel = accentStyle.Render("✓") + " " + modelLabel
 		}
 		metaParts = append(metaParts, mutedStyle.Render(modelLabel))
-		if branch, err := m.gitEng.Branch(); err == nil && branch != "" {
-			metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
+		if m.gitEng != nil && m.gitEng.IsRepo() {
+			if branch, err := m.gitEng.Branch(); err == nil && branch != "" {
+				metaParts = append(metaParts, mutedStyle.Render("git ("+branch+")"))
+			}
 		}
 	}
 	meta := strings.Join(metaParts, subtleStyle.Render(" · "))
@@ -1287,6 +1291,21 @@ func renderWidget(title string, content string, width int, accentHex string) str
 	}
 
 	return b.String()
+}
+
+var (
+	completedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#CDD6F4"))
+	streamingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A6ADC8")).Faint(true)
+)
+
+func (m *model) renderAssistantResponse(content string, isStreaming bool) string {
+	if content == "" {
+		return ""
+	}
+	if isStreaming {
+		return streamingStyle.Render(content)
+	}
+	return completedStyle.Render(content)
 }
 
 func (m *model) renderAIResponseBlocks(content string, width int) string {

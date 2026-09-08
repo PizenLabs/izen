@@ -35,7 +35,7 @@ func NewOpenCodeProvider(apiKey, model, baseURL string) *OpenCodeProvider {
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{},
+		client:  &http.Client{Transport: StrictTransport(CloudResponseHeaderTimeout)},
 	}
 }
 
@@ -85,6 +85,7 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 		Temperature: req.Temperature,
 		Stop:        req.Stop,
 		Stream:      false,
+		ExtraParams: req.ExtraParams,
 	}
 
 	if len(req.Tools) > 0 {
@@ -124,7 +125,7 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("opencode: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("opencode", resp.StatusCode, respBody)
 	}
 
 	var ocResp opencodeResponse
@@ -201,6 +202,7 @@ func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (i
 		Stop:          req.Stop,
 		Stream:        true,
 		StreamOptions: &streamOptions{IncludeUsage: true},
+		ExtraParams:   req.ExtraParams,
 	}
 
 	if len(req.Tools) > 0 {
@@ -243,7 +245,7 @@ func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (i
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("opencode: status %d: %s", resp.StatusCode, string(respBody))
+		return nil, NewProviderError("opencode", resp.StatusCode, respBody)
 	}
 
 	sr := &opencodeSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
@@ -265,6 +267,15 @@ type opencodeRequest struct {
 	Stream        bool              `json:"stream,omitempty"`
 	StreamOptions *streamOptions    `json:"stream_options,omitempty"`
 	Tools         []json.RawMessage `json:"tools,omitempty"`
+	// ExtraParams carries arbitrary provider-native JSON fields merged
+	// directly into the HTTP POST body (generic passthrough).
+	ExtraParams map[string]any `json:"-"`
+}
+
+// MarshalJSON merges ExtraParams into the top-level object. Native keys win.
+func (r opencodeRequest) MarshalJSON() ([]byte, error) {
+	type alias opencodeRequest
+	return marshalWithExtra(alias(r), r.ExtraParams)
 }
 
 type opencodeResponse struct {

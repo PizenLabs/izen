@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -510,6 +511,20 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		hasActiveWork := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning ||
 			m.shellRunning || m.state == StateProcessing || m.state == StateAwaitingApproval ||
 			m.shimmerActive || m.autonomousActive
+		// Inter-token idle check: if the rolling idle deadline (reset on every
+		// chunk in the tokenMsg handler) has passed without a new token, the
+		// stream stalled mid-generation — cancel it and emit a fast-fail
+		// message. The window matches streamInterTokenIdle (30s) so a
+		// slow-but-alive model never trips it.
+		if !m.streamInterTokenDeadline.IsZero() && time.Now().After(m.streamInterTokenDeadline) {
+			if m.streamCancel != nil {
+				m.streamCancel()
+			}
+			m.push(roleError, errorStyle.Render(
+				"✗ provider response stalled: inter-token timeout exceeded (30s exceeded without new token). Try switching models or retrying."))
+			m.streamInterTokenDeadline = time.Time{}
+		}
+
 		if hasActiveWork {
 			// Keep the activity heartbeat fresh while any execution indicator
 			// is live. The idle-gate in the reconcile block above relies on
@@ -534,7 +549,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case spinnerTickMsg:
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
 		m.refreshViewportContent()
-		if m.indexingStatus == "indexing" || m.pendingArchArgs != "" {
+		// Continuously re-arm the spinner tick whenever any execution work
+		// is active — this prevents frozen spinners during model invocation,
+		// long-running tool execution, or any background producer.
+		if m.isExecuting() || m.streaming || m.agentRunning || m.reviewRunning ||
+			m.pipelineRunning || m.shellRunning || m.planPending || m.autonomousActive ||
+			m.indexingStatus == "indexing" || m.pendingArchArgs != "" {
 			return m, m.spinnerTickCmd()
 		}
 		return m, nil
@@ -731,7 +751,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		// ── TOKEN ACCOUNTING ────────────────────────────────────────────
 		// The provider-reported usage of plan synthesis is dispatched as a
-		// TokenUsageMsg (see the final return of this case) so the TokenUsageMsg
+		// UsageUpdateMsg (see the final return of this case) so the UsageUpdateMsg
 		// handler accumulates it into the session counters and refreshes the
 		// footer. The plan engine records usage even when the response was
 		// truncated by the completion ceiling (finish_reason: "length"), so the
@@ -1141,8 +1161,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// renders for the operator's decision.
 		return m, m.handleAutonomousRun(msg)
 
-	case TokenUsageMsg:
-		// TokenUsageMsg is dispatched on EVERY async execution exit path —
+	case UsageUpdateMsg:
+		// UsageUpdateMsg is dispatched on EVERY async execution exit path —
 		// success, parse error, truncation, or abort — so the status bar
 		// footer never reports 0 tokens after a provider has consumed tokens.
 		// Accumulate into the session counters and force an immediate footer
@@ -1154,6 +1174,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// The provider reported usage this turn (even zero): the footer
 			// may now render a real "0 tok" instead of "usage unknown".
 			m.markUsageKnown()
+		}
+		// Calculate live average tok/s based on executionStartedAt.
+		if !m.executionStartedAt.IsZero() {
+			elapsed := time.Since(m.executionStartedAt).Seconds()
+			if elapsed > 0 {
+				total := msg.PromptTokens + msg.CompletionTokens
+				_ = float64(total) / elapsed // live average rate; footer projection uses this implicitly
+			}
 		}
 		m.syncUIState()
 		return m, nil
@@ -1189,6 +1217,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.Chunk == "" {
 			return m, nil
 		}
+		// Sub-task reasoning is real streamed output: advance the live tok/s
+		// estimate (estimate only — the authoritative stage count is
+		// untouched).
+		m.streamLiveTokens += estimateStreamTokens(msg.Chunk)
 		if m.thinkingBuffer == nil {
 			m.thinkingBuffer = NewThinkingBuffer()
 		}
@@ -1234,6 +1266,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.responseBuffer.Reset()
 			m.currentStreamContent = ""
 			m.streamBuffer = ""
+			if m.utf8StreamBuf != nil {
+				m.utf8StreamBuf.Reset()
+			}
+			if m.streamThrottle != nil {
+				m.streamThrottle.Reset()
+			}
 			m.resetStreamBlocks()
 			m.historyIndex = -1
 		}
@@ -1907,6 +1945,71 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		flush := m.flushPendingRecords()
 		return m, flush
 
+	case FrameTickMsg:
+		// ── DEBOUNCED FRAME TICKER (30ms / ~33 FPS) ─────────────────────
+		// STREAM BUFFER CONTRACT: Option A — Cumulative Overwrite.
+		// StreamBuffer.ReadValidString() returns the FULL accumulated string
+		// from the start of the stream (never a drained delta). This handler
+		// MUST NOT do `m.currentStreamContent += fullText` (that duplicates).
+		// It overwrites the view from the full text by emitting ONLY the
+		// unread suffix beyond currentStreamContent. FrameTick is the SOLE
+		// content emitter while utf8StreamBuf is active; the smooth-tick loop
+		// never emits throttle/legacy content on that path (see
+		// smoothStreamTickMsg) so no byte is ever rendered twice.
+		if m.utf8StreamBuf != nil {
+			if content, updated := m.utf8StreamBuf.ReadValidString(); updated && content != "" {
+				// Only animate spinner while streaming; content emission is handled via smooth tick path
+				// For FrameTick path, we emit via the UTF-8 buffer's valid string delta.
+				// Cumulative overwrite: emit only the new suffix beyond
+				// currentStreamContent. HasPrefix guards against slicing
+				// mismatched bytes after a mid-stream reset (content shorter
+				// or diverged) — in that case there is no safe delta, so
+				// emit nothing rather than duplicating.
+				if strings.HasPrefix(content, m.currentStreamContent) {
+					if delta := content[len(m.currentStreamContent):]; delta != "" {
+						m.emitVisibleContent(delta)
+					}
+				} else if m.currentStreamContent == "" {
+					m.emitVisibleContent(content)
+				}
+				if repaint := m.scheduleRepaint(); repaint != nil {
+					return m, tea.Batch(FrameTickCmd(), repaint)
+				}
+			}
+		} else if m.streamThrottle != nil {
+			if content, ok := m.streamThrottle.Flush(); ok && content != "" {
+				m.emitVisibleContent(content)
+				if repaint := m.scheduleRepaint(); repaint != nil {
+					return m, tea.Batch(FrameTickCmd(), repaint)
+				}
+			}
+		}
+		// ── LIVE TTFT COUNTDOWN ──────────────────────────────────────
+		// While the first byte has not arrived, re-render on EVERY frame
+		// tick so the "Connecting to provider... 4.2s / 15.0s" stopwatch
+		// and spinner advance smoothly instead of sitting frozen. The
+		// single-flight repaint gate bounds actual renders to 30FPS.
+		// The countdown stops the instant the first byte lands in
+		// utf8StreamBuf (firstTokenReceived flips true) and the bar
+		// transitions to token metrics.
+		waitingForFirstByte := m.isExecuting() && !m.firstTokenReceived(m.stageSnapshot())
+		if waitingForFirstByte {
+			if repaint := m.scheduleRepaint(); repaint != nil {
+				m.frameTickActive = true
+				return m, tea.Batch(FrameTickCmd(), repaint)
+			}
+		}
+		// Keep the loop alive while a stream is live, the first byte is
+		// still awaited, or the loading shimmer owns the dock (async
+		// context-prep window before streamCmd sets streaming). Every
+		// terminal path clears these flags, so the loop always stops.
+		if m.streaming || waitingForFirstByte || m.shimmerActive {
+			m.frameTickActive = true
+			return m, FrameTickCmd()
+		}
+		m.frameTickActive = false
+		return m, nil
+
 	case repaintTickMsg:
 		// ── SINGLE-FLIGHT 30FPS REPAINT GATE ──────────────────────────
 		// Incoming tokens were appended to docLayout in memory instantly; this
@@ -1972,37 +2075,42 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 
 		// ── FRAME-THROTTLED FLUSH ──────────────────────────────────────
-		// Prefer flushing from the StreamThrottle (16ms frame interval / 60FPS).
-		// Falls back to direct streamBuffer for non-throttle paths. The throttle
-		// retains whatever it does not release this frame, so content is never
-		// dropped — only paced.
+		// LEGACY/FALLBACK PATH ONLY. While utf8StreamBuf is active,
+		// FrameTickMsg is the sole content emitter (Option A cumulative
+		// overwrite) — this loop must NOT also flush throttle/legacy
+		// content or every byte renders twice. Emission here runs only
+		// when there is no utf8 buffer (legacy harnesses / non-stream
+		// producers). The throttle retains whatever it does not release
+		// this frame, so content is never dropped — only paced.
 		emitContent := ""
-		if m.streamThrottle != nil {
-			emitContent, _ = m.streamThrottle.Flush()
-		}
-		if emitContent == "" && len(m.streamBuffer) > 0 {
-			// Legacy fallback: emit directly from streamBuffer, up to the
-			// first word boundary (capped), keeping the remainder buffered for
-			// the next tick.
-			emit := 0
-			minChars := 3
-			for i, c := range m.streamBuffer {
-				if i >= minChars && (c == ' ' || c == '\n') {
-					emit = i + 1
-					break
+		if m.utf8StreamBuf == nil {
+			if m.streamThrottle != nil {
+				emitContent, _ = m.streamThrottle.Flush()
+			}
+			if emitContent == "" && len(m.streamBuffer) > 0 {
+				// Legacy fallback: emit directly from streamBuffer, up to the
+				// first word boundary (capped), keeping the remainder buffered for
+				// the next tick.
+				emit := 0
+				minChars := 3
+				for i, c := range m.streamBuffer {
+					if i >= minChars && (c == ' ' || c == '\n') {
+						emit = i + 1
+						break
+					}
 				}
-			}
-			if emit == 0 {
-				emit = len(m.streamBuffer)
-			}
-			if emit > 80 {
-				emit = 80
-				for emit > 0 && !utf8.RuneStart(m.streamBuffer[emit]) {
-					emit--
+				if emit == 0 {
+					emit = len(m.streamBuffer)
 				}
+				if emit > 80 {
+					emit = 80
+					for emit > 0 && !utf8.RuneStart(m.streamBuffer[emit]) {
+						emit--
+					}
+				}
+				emitContent = m.streamBuffer[:emit]
+				m.streamBuffer = m.streamBuffer[emit:]
 			}
-			emitContent = m.streamBuffer[:emit]
-			m.streamBuffer = m.streamBuffer[emit:]
 		}
 		if emitContent != "" {
 			// Tokens are appended to docLayout in memory INSTANTLY (the
@@ -2132,6 +2240,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// "streaming" (never "thinking"), without exposing the reasoning text.
 		// NO token count is asserted here: only the producer's authoritative
 		// streamUsageMsg (provider-reported usage) may populate the count.
+		// The live tok/s estimate advances on every reasoning chunk so the
+		// footer rate meter stays live while thinking streams.
+		m.streamLiveTokens += estimateStreamTokens(string(msg))
 		m.setStage("model", m.getActiveModelName(), stageStreaming)
 		m.ensureStreamBlocks().Append(KindThinking, string(msg))
 		// Full stream transparency: the reasoning chunk is also retained in the
@@ -2158,6 +2269,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// The smoothStreamTick handler then flushes word-aligned content from
 		// the throttle buffer instead of draining streamBuffer directly. This
 		// eliminates layout snapping caused by dumping raw buffer chunks.
+		// IMPORTANT: markdown AST parsing and table width layout recalculation
+		// MUST NOT be invoked here. Token reception only appends to the
+		// UTF-8 safe StreamBuffer and the throttle; rendering is driven by
+		// FrameTickMsg (30ms) via ReadValidString() with updated==true gate.
 		raw := string(msg)
 		// SMOOTH CLEARING: the first content token replaces the shimmer
 		// loading line with the streaming output. The shimmer tick loop stops
@@ -2171,14 +2286,35 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Only content bytes received from the provider mark the stage as
 		// streaming. The token count is NEVER derived from the response
 		// buffer length — it is populated only by the producer's authoritative
-		// streamUsageMsg (provider-reported usage).
+		// streamUsageMsg (provider-reported usage). The live tok/s estimate
+		// advances on every content chunk (estimate only, never the count).
+		m.streamLiveTokens += estimateStreamTokens(raw)
+		// Inter-token idle deadline: once the first byte arrives, arm a
+		// rolling streamInterTokenIdle (30s) deadline, reset on every chunk.
+		// A continuous generation never trips it; only a stalled socket
+		// does (mirrors the IdleTimeoutReader watchdog on the byte path).
+		if raw != "" && m.streamCancel != nil && m.streamInterTokenDeadline.IsZero() {
+			m.streamInterTokenDeadline = time.Now().Add(streamInterTokenIdle)
+		} else if raw != "" && !m.streamInterTokenDeadline.IsZero() {
+			m.streamInterTokenDeadline = time.Now().Add(streamInterTokenIdle)
+		}
+
 		if raw != "" {
 			m.setStage("model", m.getActiveModelName(), stageStreaming)
 		}
 		m.traceBuffer.WriteString(raw)
-		if m.streamThrottle != nil {
+		// UTF-8 safe byte buffer (Option A cumulative source of truth):
+		// while utf8StreamBuf is active it is the SOLE content emitter
+		// (drained by FrameTickMsg). Raw tokens are appended ONLY here —
+		// never additionally to the throttle/legacy buffers — so no byte
+		// can be emitted twice. The throttle/legacy paths are strictly
+		// fallbacks for harnesses with no utf8 buffer.
+		switch {
+		case m.utf8StreamBuf != nil:
+			m.utf8StreamBuf.Append([]byte(raw))
+		case m.streamThrottle != nil:
 			m.streamThrottle.Write(raw)
-		} else {
+		default:
 			m.streamBuffer += raw
 		}
 		if m.streamParser != nil {
@@ -2198,6 +2334,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamTickActive = true
 			cmds = append(cmds, m.smoothStreamTickCmd())
 		}
+		if !m.frameTickActive {
+			m.frameTickActive = true
+			cmds = append(cmds, FrameTickCmd())
+		}
 		// Keep cursor blink alive during streaming
 		var tiCmd tea.Cmd
 		m.ti, tiCmd = m.ti.Update(msg)
@@ -2211,8 +2351,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// character-count estimate. A zero/unknown usage leaves the count
 		// empty so the renderer shows plain "streaming". The reasoning split
 		// also backs the compact thought summary so its "N tokens" is
-		// provider-reported, not estimated.
+		// provider-reported, not estimated. The live tok/s estimate is
+		// floored by the authoritative total (output + reasoning) so the
+		// rate meter reflects reasoning tokens too.
 		m.setStageMetrics(0, 0, msg.output)
+		if total := msg.output + msg.reasoning; total > m.streamLiveTokens {
+			m.streamLiveTokens = total
+		}
 		if m.thinkingBuffer != nil && msg.reasoning > 0 {
 			m.thinkingBuffer.SetReasoningTokens(msg.reasoning)
 		}
@@ -2252,6 +2397,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamCh = nil
 		m.streaming = false
 		m.streamCancel = nil
+		// Clean up the inter-token timeout timer and deadline.
+		if m.streamInterTokenTimer != nil {
+			m.streamInterTokenTimer.Stop()
+			m.streamInterTokenTimer = nil
+		}
+		m.streamInterTokenDeadline = time.Time{}
 		m.stopShimmer()
 
 		if m.streamParser != nil {
@@ -2259,11 +2410,33 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamParser = nil
 		}
 
-		// Flush any remaining buffered stream content. The frame throttle may
-		// still hold un-emitted tokens — the stream can end before a final tick
-		// drains it — so it is drained unconditionally here. Without this, the
-		// tail of every response is silently dropped.
-		if m.streamThrottle != nil {
+		// Flush any remaining buffered stream content WITHOUT duplicating
+		// what FrameTick already emitted. Under Option A the utf8 buffer
+		// holds the FULL accumulated string while currentStreamContent holds
+		// the already-emitted prefix — so Flush() (full string) must be
+		// reduced to its undrained suffix before emission. Emitting the full
+		// Flush output via += would render every byte a second time.
+		// The legacy throttle path (utf8 == nil) still drains unconditionally
+		// so a stream that ends before a final tick never drops its tail.
+		if m.utf8StreamBuf != nil {
+			// Discard any throttle remainder: tokenMsg no longer feeds the
+			// throttle while utf8 is active, so it must be empty; draining
+			// it into streamBuffer would double-emit.
+			if m.streamThrottle != nil {
+				_ = m.streamThrottle.Drain()
+			}
+			if tail := m.utf8StreamBuf.Flush(); tail != "" {
+				if strings.HasPrefix(tail, m.currentStreamContent) {
+					if delta := tail[len(m.currentStreamContent):]; delta != "" {
+						m.streamBuffer += delta
+					}
+				} else if m.currentStreamContent == "" {
+					m.streamBuffer += tail
+				}
+				// Diverged non-empty currentStreamContent + non-prefix tail:
+				// emit nothing — the content is already on screen.
+			}
+		} else if m.streamThrottle != nil {
 			m.streamBuffer += m.streamThrottle.Drain()
 		}
 		if m.streamTickActive || len(m.streamBuffer) > 0 {
@@ -2271,6 +2444,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.streamBuffer = ""
 			m.streamTickActive = false
 		}
+		m.frameTickActive = false
 		// Final reasoning extraction from any remaining content
 		m.extractReasoningContent()
 
@@ -2729,6 +2903,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streaming = false
 		m.streamParser = nil
 		m.streamCancel = nil
+		if m.streamInterTokenTimer != nil {
+			m.streamInterTokenTimer.Stop()
+			m.streamInterTokenTimer = nil
+		}
+		m.streamInterTokenDeadline = time.Time{}
 		m.planPending = false
 		m.stopShimmer()
 
@@ -2738,8 +2917,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.responseBuffer.Reset()
 			m.currentStreamContent = ""
 			m.streamBuffer = ""
+			if m.utf8StreamBuf != nil {
+				m.utf8StreamBuf.Reset()
+			}
+			if m.streamThrottle != nil {
+				m.streamThrottle.Reset()
+			}
 			m.resetStreamBlocks()
 			m.streamTickActive = false
+			m.frameTickActive = false
 			m.streamCancel = nil
 			m.refreshViewportContent()
 			return m, nil
@@ -2750,19 +2936,60 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
 			_ = m.sess.Save()
 		}
+		// NON-DESTRUCTIVE SNAPSHOT: capture whether the first token was already
+		// rendered BEFORE any error bookkeeping. A mid-stream failure must
+		// preserve every rendered byte; only a pre-first-token failure may
+		// authoritatively set the stream content.
+		hasPartialContent := len(m.currentStreamContent) > 0 ||
+			(m.utf8StreamBuf != nil && m.utf8StreamBuf.Len() > 0) ||
+			m.responseBuffer.Len() > 0
+		sanitizedErr := ""
+		if msg.err != nil {
+			sanitizedErr = providers.SanitizeAPIError(msg.err)
+		}
 		if errors.Is(msg.err, providers.ErrOpenRouterAuth) {
 			m.push(roleError, errorStyle.Render("✗ OpenRouter Authorization Failed"))
 			m.push(roleSystem, infoStyle.Render("Invalid or missing OPENROUTER_API_KEY. Please check your environment variables or run:"))
 			m.push(roleSystem, infoStyle.Render("  export OPENROUTER_API_KEY=<your_key>"))
 		} else {
-			sanitized := providers.SanitizeAPIError(msg.err)
-			m.push(roleError, "stream error: "+sanitized)
+			sanitized := sanitizedErr
+			// TTFT Timeout: no first byte arrived and the failure is a
+			// deadline or a phase-identifiable socket stall (DNS / TCP /
+			// TLS / response headers). Measure actual elapsed via
+			// time.Since and name the stalled phase so the log pinpoints
+			// where the connection died instead of showing a bare deadline.
+			phaseDetail := providers.TTFTPhaseDetail(msg.err)
+			isTTFTFailure := m.noFirstByteReceived() && !hasPartialContent &&
+				(isContextDeadline(msg.err) || errors.Is(msg.err, context.DeadlineExceeded) || phaseDetail != "")
+			if isTTFTFailure {
+				start := m.executionStartedAt
+				if start.IsZero() {
+					start = m.streamStartTime
+				}
+				elapsed := time.Since(start)
+				if elapsed < 15*time.Second {
+					elapsed = 15 * time.Second
+				}
+				if phaseDetail == "" {
+					phaseDetail = "No first byte received within TTFT budget"
+				}
+				m.push(roleError, errorStyle.Render(
+					fmt.Sprintf("✗ provider response stalled: TTFT timeout after %.1fs (%s).", elapsed.Seconds(), phaseDetail)))
+				// Context isolation: prune the uncompleted prompt from SessionHistory so it does not pollute next turn.
+				m.pruneFailedPromptFromHistory()
+			} else {
+				m.push(roleError, "stream error: "+sanitized)
+				// On non-TTFT execution failure in ASK mode, also prune stale single-shot prompt.
+				if m.resolver.Current() == modes.ModeAsk {
+					m.pruneFailedPromptFromHistory()
+				}
+			}
 		}
 
 		// ── TOKEN ACCOUNTING ON FAILURE ────────────────────────────────
 		// Explicit Over Implicit: whatever usage the provider reported (or the
 		// character estimate the stream reader produced) is dispatched as a
-		// TokenUsageMsg — even before the stream died — so tokens consumed on a
+		// UsageUpdateMsg — even before the stream died — so tokens consumed on a
 		// timeout/error are not silently zeroed in the footer. Publish the
 		// typed StreamUsage event so telemetry projections observe the failed
 		// attempt too.
@@ -2776,19 +3003,67 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 
-		// ALWAYS flush partial stream tokens to the TUI so that tokens
-		// already received on the wire are never discarded when a
-		// mid-stream connection error or unexpected termination occurs.
+		// NON-DESTRUCTIVE PARTIAL FLUSH: tokens already rendered to the screen
+		// are never discarded or overwritten on a mid-stream failure.
+		//   - pre-first-token (utf8StreamBuf.Len() == 0, nothing rendered):
+		//     msg.content may authoritatively become the stream content.
+		//   - mid-stream (partial already rendered): retain every rendered
+		//     byte, extend only by the undrained suffix, then dock the
+		//     failure banner directly below the partial response so the 200
+		//     rendered tokens stay intact on screen.
 		if msg.content != "" {
-			if m.streamTickActive {
-				m.currentStreamContent += m.streamBuffer
+			if !hasPartialContent {
+				// Authoritative pre-first-token path: nothing rendered yet,
+				// so the producer's full text may initialize the content.
 				m.streamBuffer = ""
 				m.streamTickActive = false
+				m.currentStreamContent = msg.content
+				m.ensureStreamBlocks().Append(KindContent, msg.content)
+			} else {
+				// Mid-stream: extend by suffix only, never overwrite.
+				switch {
+				case strings.HasPrefix(msg.content, m.currentStreamContent):
+					if delta := msg.content[len(m.currentStreamContent):]; delta != "" {
+						m.currentStreamContent = msg.content
+						m.ensureStreamBlocks().Append(KindContent, delta)
+					}
+				case m.currentStreamContent == "":
+					m.currentStreamContent = msg.content
+					m.ensureStreamBlocks().Append(KindContent, msg.content)
+				default:
+					// Diverged producer tail with rendered content on
+					// screen: keep the rendered bytes verbatim. Overwriting
+					// here would wipe the viewport mid-generation.
+				}
 			}
-			m.streamBuffer = msg.content
-			m.currentStreamContent = msg.content
-			m.ensureStreamBlocks().Append(KindContent, msg.content)
 			m.extractReasoningContent()
+		} else if hasPartialContent {
+			// No producer tail, but the byte buffer may hold an undrained
+			// suffix not yet emitted to currentStreamContent (FrameTick
+			// drains via ReadValidString). Recover it without resetting the
+			// buffer so nothing already received is lost.
+			if m.utf8StreamBuf != nil {
+				if tail := m.utf8StreamBuf.String(); tail != "" {
+					if strings.HasPrefix(tail, m.currentStreamContent) {
+						if delta := tail[len(m.currentStreamContent):]; delta != "" {
+							m.currentStreamContent = tail
+							m.ensureStreamBlocks().Append(KindContent, delta)
+						}
+					} else if m.currentStreamContent == "" {
+						m.currentStreamContent = tail
+						m.ensureStreamBlocks().Append(KindContent, tail)
+					}
+				}
+			}
+		}
+		// Dock the interruption banner directly below the retained partial
+		// response. hasPartialContent gates this: a pre-first-token failure
+		// already pushed its TTFT/stream-error record above and has no
+		// partial to annotate.
+		if hasPartialContent && sanitizedErr != "" {
+			banner := "\n\n[INTERRUPTED] Stream ended prematurely: " + sanitizedErr
+			m.currentStreamContent += banner
+			m.ensureStreamBlocks().Append(KindContent, banner)
 		}
 		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
@@ -2841,7 +3116,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.stopShimmer()
 		// "Explicit Over Implicit": report partial usage on the failed fast-track
 		// attempt so consumed tokens are never silently zeroed (dispatched as a
-		// TokenUsageMsg so the footer refreshes immediately).
+		// UsageUpdateMsg so the footer refreshes immediately).
 		m.push(roleError, "fast-track build failed: "+providers.SanitizeAPIError(msg.Err))
 		// "Human-Centered / Reversible": a failed build stream must never trap
 		// the workflow in the build phase. Unwind the state machine back to
@@ -3016,6 +3291,18 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// P0 SGR 1006 guard: drop control sequences before they reach textinput.
+		// Fast-path: a runes slice beginning with '[' '<' is an orphan mouse
+		// fragment — drop it WITHOUT allocating msg.String() / string(Runes).
+		if msg.Type == tea.KeyRunes && len(msg.Runes) >= 2 && msg.Runes[0] == '[' && msg.Runes[1] == '<' {
+			return m, nil
+		}
+		if msg.Type == tea.KeyRunes && isControlSequence(msg.Runes) {
+			return m, nil
+		}
+		if msg.Type == tea.KeyRunes && IsSGRMouseFragmentRunes(msg.Runes) {
+			return m, nil
+		}
 
 		// ── PRIORITY 1: ACTIVE TEXT INPUT ────────────────────────────
 		// A printable character typed into the focused input is ALWAYS text.

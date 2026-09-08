@@ -137,7 +137,7 @@ type ModelPickerModal struct {
 	height   int
 	registry *llm.ModelRegistry
 
-	effortIdx    int // 0=auto, 1=low, 2=medium, 3=high
+	effortIdx    int // index into DynamicVariants(); 0 when no variants
 	scrollOffset int // row-based offset into visibleRows()
 
 	// Collapsible provider groups: true = collapsed.
@@ -151,18 +151,58 @@ type ModelPickerModal struct {
 }
 
 func (mp *ModelPickerModal) CurrentEffort() EffortLevel {
-	switch mp.effortIdx {
-	case 0:
-		return EffortAuto
-	case 1:
+	// Backward-compatible mapping from the dynamic variant string onto the
+	// legacy EffortLevel enum. New code should prefer CurrentVariant().
+	v := mp.CurrentVariant()
+	switch v {
+	case "low", "minimal":
 		return EffortLow
-	case 2:
+	case "medium":
 		return EffortMedium
-	case 3:
+	case "high", "xhigh":
 		return EffortHigh
 	default:
 		return EffortAuto
 	}
+}
+
+// VariantsForModel returns the exact provider-advertised variant strings for
+// a model, dynamically queried from activeModel.Capabilities.Variants.
+// Nil means the model exposes no variant control and the selector must hide.
+func VariantsForModel(m llm.ModelInfo) []string {
+	return m.Capabilities().Variants
+}
+
+// DynamicVariants returns the variant options for the currently selected
+// model. It detaches the picker from the static (auto/low/medium/high) enum.
+func (mp *ModelPickerModal) DynamicVariants() []string {
+	m := mp.selectedModel()
+	if m == nil {
+		return nil
+	}
+	return VariantsForModel(*m)
+}
+
+// dynamicVariants is the unexported alias for internal use.
+func (mp *ModelPickerModal) dynamicVariants() []string {
+	return mp.DynamicVariants()
+}
+
+// CurrentVariant returns the exact provider variant string at effortIdx,
+// or "auto" when the model exposes no variants.
+func (mp *ModelPickerModal) CurrentVariant() string {
+	variants := mp.dynamicVariants()
+	if len(variants) == 0 {
+		return "auto"
+	}
+	idx := mp.effortIdx
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(variants) {
+		idx = len(variants) - 1
+	}
+	return variants[idx]
 }
 
 type modelPickerLoadedMsg struct {
@@ -226,9 +266,14 @@ func (mp *ModelPickerModal) RefreshModels(providers map[string]string) tea.Cmd {
 }
 
 type modelSelectedMsg struct {
-	model  llm.ModelInfo
-	effort EffortLevel
+	model   llm.ModelInfo
+	effort  EffortLevel
+	variant string
 }
+
+// Variant returns the exact provider variant string selected. Empty means
+// the model exposes no variants (selector hidden).
+func (m modelSelectedMsg) Variant() string { return m.variant }
 
 // ── Helpers for selection / effort / auth ────────────────────────────────────
 
@@ -272,20 +317,13 @@ func (mp *ModelPickerModal) selectedProvider() string {
 }
 
 func (mp *ModelPickerModal) supportsEffortForSelected() bool {
-	// Strict cursor context validation per spec: only RowTypeModel with
-	// SupportsEffort == true qualifies. Provider headers are never effort-capable.
+	// Capability-driven: only models whose Capabilities.Variants is non-empty
+	// qualify. Provider headers never qualify.
 	row := mp.selectedRow()
 	if row == nil || row.kind != mpRowItem {
 		return false
 	}
-	if m := mp.selectedModel(); m != nil {
-		// Prefer dynamic SupportsReasoning from registry discovery (API supported_parameters)
-		if m.SupportsReasoning != nil {
-			return *m.SupportsReasoning
-		}
-		return llm.ModelSupportsEffortWithProvider(m.Provider, m.ID)
-	}
-	return false
+	return len(mp.dynamicVariants()) > 0
 }
 
 // shouldShowEffort reports whether the Effort UI should be allocated at all.
@@ -430,6 +468,7 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 				mp.cursor--
 			}
 			mp.clampScrollOffset()
+			mp.clampEffortIdx()
 			return mp, nil
 
 		case tea.KeyDown:
@@ -438,6 +477,7 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 				mp.cursor++
 			}
 			mp.clampScrollOffset()
+			mp.clampEffortIdx()
 			return mp, nil
 
 		case tea.KeyLeft:
@@ -453,7 +493,7 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 			if !mp.supportsEffortForSelected() {
 				return mp, nil
 			}
-			if mp.effortIdx < 3 {
+			if max := len(mp.dynamicVariants()) - 1; mp.effortIdx < max {
 				mp.effortIdx++
 			}
 			return mp, nil
@@ -472,8 +512,9 @@ func (mp *ModelPickerModal) Update(msg tea.Msg) (*ModelPickerModal, tea.Cmd) {
 				if m := mp.selectedModel(); m != nil {
 					selected := *m
 					effort := mp.CurrentEffort()
+					variant := mp.CurrentVariant()
 					return mp, func() tea.Msg {
-						return modelSelectedMsg{model: selected, effort: effort}
+						return modelSelectedMsg{model: selected, effort: effort, variant: variant}
 					}
 				}
 			}
@@ -593,6 +634,22 @@ func (mp *ModelPickerModal) buildRows() []mpRow {
 		rows = append(rows, mpRow{kind: mpRowItem, itemIndex: i})
 	}
 	return rows
+}
+
+// clampEffortIdx keeps effortIdx inside the dynamic variant range for the
+// current selection. When the model exposes no variants it resets to 0.
+func (mp *ModelPickerModal) clampEffortIdx() {
+	n := len(mp.dynamicVariants())
+	if n == 0 {
+		mp.effortIdx = 0
+		return
+	}
+	if mp.effortIdx < 0 {
+		mp.effortIdx = 0
+	}
+	if mp.effortIdx >= n {
+		mp.effortIdx = n - 1
+	}
 }
 
 func (mp *ModelPickerModal) clampScrollOffset() {
@@ -1083,58 +1140,63 @@ func highlightMatch(text string, tokens []string) string {
 	return b.String()
 }
 
-// renderEffortSlider renders the interactive effort/intent slider.
+// renderEffortSlider renders the capability-driven variant selector.
 // Caller guarantees shouldShowEffort() == true; the component is hidden
 // otherwise with 0-row height so vertical space is reclaimed for the list.
-// It also displays real-time token info per spec: "Effort: medium (Thinking Budget: 16k | Total Max: 20k tokens)"
+// Variants are the exact provider strings (e.g. default/minimal/low/medium/
+// high/xhigh); budgets are calculated dynamically from the model's native
+// MaxCompletionTokens bound and the variant ratio — no hardcoded strings.
 func (mp *ModelPickerModal) renderEffortSlider() string {
-	levels := []struct {
-		label string
-		desc  string
-	}{
-		{"auto", "auto"},
-		{"low", "low"},
-		{"medium", "medium"},
-		{"high", "high"},
+	variants := mp.dynamicVariants()
+	if len(variants) == 0 {
+		return ""
 	}
-
+	if mp.effortIdx < 0 {
+		mp.effortIdx = 0
+	}
+	if mp.effortIdx >= len(variants) {
+		mp.effortIdx = len(variants) - 1
+	}
 	trackLen := 4
 	var b strings.Builder
 
 	effort := mp.CurrentEffort()
+	variant := variants[mp.effortIdx]
 	levelStyle := effort.Style()
-	// Base effort label
-	baseDesc := effort.Description()
-	// Enrich with token info via TokenManager when model is known
+	// Base label is the exact provider variant string.
+	baseDesc := variant
+	// Dynamic budget: thinking = ratio * MaxCompletionTokens, total = native bound.
 	if m := mp.selectedModel(); m != nil {
-		tm := llm.NewTokenManager()
-		info := tm.InfoFor(m.Provider, m.ID, effort.String())
-		thinkingStr := llm.FormatTokenCount(info.ThinkingBudget)
-		totalStr := llm.FormatTokenCount(info.TotalMax)
-		if effort == EffortAuto {
-			// Auto has no thinking budget, show total only
-			if info.TotalMax > 0 {
-				baseDesc = fmt.Sprintf("%s (Total Max: %s tokens)", baseDesc, totalStr)
-			}
-		} else {
-			if info.ThinkingBudget > 0 && info.TotalMax > 0 {
-				baseDesc = fmt.Sprintf("%s (Thinking Budget: %s | Total Max: %s tokens)", baseDesc, thinkingStr, totalStr)
-			} else if info.TotalMax > 0 {
-				baseDesc = fmt.Sprintf("%s (Total Max: %s tokens)", baseDesc, totalStr)
-			}
+		caps := m.Capabilities()
+		maxComp := caps.MaxCompletionTokens
+		if maxComp == 0 {
+			maxComp = m.MaxOutputTokens
+		}
+		if maxComp == 0 {
+			tm := llm.NewTokenManager()
+			info := tm.InfoFor(m.Provider, m.ID, variant)
+			maxComp = info.TotalMax
+		}
+		thinking := llm.VariantBudget(variant, maxComp)
+		thinkingStr := llm.FormatTokenCount(thinking)
+		totalStr := llm.FormatTokenCount(maxComp)
+		if thinking > 0 && maxComp > 0 {
+			baseDesc = fmt.Sprintf("%s (Thinking Budget: %s | Total Max: %s tokens)", variant, thinkingStr, totalStr)
+		} else if maxComp > 0 {
+			baseDesc = fmt.Sprintf("%s (Total Max: %s tokens)", variant, totalStr)
 		}
 	}
 	desc := levelStyle.Render(baseDesc)
-	b.WriteString("  " + mutedStyle.Render("Effort:") + " " + desc + "\n")
+	b.WriteString("  " + mutedStyle.Render("Variant:") + " " + desc + "\n")
 
 	b.WriteString("  ")
-	for i, lvl := range levels {
+	for i, label := range variants {
 		if i == mp.effortIdx {
-			b.WriteString(levelStyle.Bold(true).Render(lvl.label))
+			b.WriteString(levelStyle.Bold(true).Render(label))
 		} else {
-			b.WriteString(dimmedStyle.Render(lvl.label))
+			b.WriteString(dimmedStyle.Render(label))
 		}
-		if i < len(levels)-1 {
+		if i < len(variants)-1 {
 			b.WriteString(" ")
 			for j := 0; j < trackLen; j++ {
 				switch {
