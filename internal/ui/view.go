@@ -69,6 +69,9 @@ func (m *model) View() string {
 	if m.pendingQuitConfirm {
 		return m.renderQuitConfirmOverlay(base)
 	}
+	if m.diffActive() {
+		return m.renderDiffOverlay()
+	}
 	return base
 }
 

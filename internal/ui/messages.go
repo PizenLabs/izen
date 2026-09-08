@@ -23,3 +23,18 @@ type PermissionPromptMsg struct {
 type PermissionResolvedMsg struct {
 	Resp policy.PermissionResponse
 }
+
+// ShowDiffMsg triggers the full-screen unified diff viewer modal. DiffText
+// is a standard unified diff (e.g. `git diff` output); Title labels the view.
+type ShowDiffMsg struct {
+	DiffText string
+	Title    string
+}
+
+// ToggleDiffCollapseMsg toggles context folding for one hunk.
+// FileIdx/HunkIdx < 0 toggles the hunk under the viewport cursor;
+// FileIdx < 0 && HunkIdx < 0 toggles all hunks globally.
+type ToggleDiffCollapseMsg struct {
+	FileIdx int
+	HunkIdx int
+}

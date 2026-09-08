@@ -212,6 +212,17 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.pendingPermission != nil {
 		return m, m.handlePermissionModalKey(msg)
 	}
+	// ── UNIFIED DIFF VIEWER MODAL ────────────────────────────────────
+	// While open it owns j/k + arrows (scroll), c (fold focused hunk),
+	// a (fold all), and Esc/q (close). This guard covers states that
+	// route directly to handleKey (Processing / AwaitingApproval) before
+	// the Update tea.KeyMsg switch runs its own diff intercept.
+	if m.diffActive() {
+		if consumed, cmd := m.handleDiffKey(msg); consumed {
+			return m, cmd
+		}
+		return m, nil
+	}
 	// ── TRACE OVERLAY DISMISSAL ──────────────────────────────────────
 	if m.showTraceOverlay {
 		if msg.Type == tea.KeyEscape || msg.String() == "alt+t" {

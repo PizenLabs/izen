@@ -52,6 +52,7 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/session/compaction"
 	"github.com/PizenLabs/izen/internal/state"
+	"github.com/PizenLabs/izen/internal/ui/diff"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
 	"github.com/PizenLabs/izen/pkg/engine/ir"
@@ -1038,6 +1039,10 @@ type model struct {
 
 	// Proposal widget diff scroll offset
 	proposalDiffOffset int
+
+	// Unified diff viewer modal (nil when closed). Opened via ShowDiffMsg,
+	// dismissed via Esc/q. While non-nil it owns j/k/c/Esc/q keybindings.
+	diffView *diff.Model
 
 	// Project type detection
 	detection project.Detection

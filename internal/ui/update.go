@@ -430,6 +430,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			msg.Resp.RequestID, msg.Resp.Allowed, msg.Resp.Remember, msg.Resp.Edited)
 		return m, nil
 
+	case ShowDiffMsg:
+		// Full-screen unified diff viewer modal.
+		m.openDiffView(msg.DiffText, msg.Title)
+		return m, nil
+
+	case ToggleDiffCollapseMsg:
+		// Programmatic fold toggle: specific hunk, or global when negative.
+		if m.diffView != nil {
+			if msg.FileIdx < 0 && msg.HunkIdx < 0 {
+				m.diffView.ToggleAll()
+			} else {
+				m.diffView.ToggleHunk(msg.FileIdx, msg.HunkIdx)
+			}
+		}
+		return m, nil
+
 	case sessionPickerResumeMsg:
 		return m, m.handleSessionPickerResume(msg.slot)
 	case sessionPickerNewMsg:
@@ -505,6 +521,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.frozenViewportStr = ""
 		m.frozenRecords = nil
 		m.refreshViewportContent()
+		// Keep the diff viewer width-safe: re-truncate to the new width.
+		if m.diffView != nil {
+			vh := msg.Height - 4
+			if vh < 8 {
+				vh = 8
+			}
+			m.diffView.SetSize(msg.Width-2, vh)
+		}
 		return m, nil
 
 	case tickMsg:
@@ -3354,6 +3378,18 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 		if msg.Type == tea.KeyRunes && IsSGRMouseFragmentRunes(msg.Runes) {
+			return m, nil
+		}
+
+		// ── UNIFIED DIFF VIEWER MODAL ────────────────────────────────
+		// While open it owns its keybindings: j/k or ↑/↓ scroll the diff
+		// viewport, c folds the focused hunk, Esc/q closes and returns
+		// focus to chat. All other keys are swallowed so typing never
+		// leaks into the prompt bar behind the modal.
+		if m.diffActive() {
+			if consumed, cmd := m.handleDiffKey(msg); consumed {
+				return m, cmd
+			}
 			return m, nil
 		}
 
