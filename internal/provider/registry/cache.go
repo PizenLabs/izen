@@ -4,218 +4,164 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/provider/detector"
 )
 
-// cacheFileName is the on-disk model catalog under ~/.izen/cache/.
-const cacheFileName = "models.json"
+// Cache status values for per-provider provenance.
+const (
+	CacheStatusOK      = "ok"
+	CacheStatusTimeout = "timeout"
+	CacheStatusError   = "error"
+)
 
-// httpTimeout bounds every /models fetch so background sync can never hang.
-const httpTimeout = 15 * time.Second
+// CacheVersion is the current on-disk schema version for ModelCacheFile.
+const CacheVersion = 1
 
-// FetchFunc fetches model descriptors for one provider. It is a Registry
-// field so tests can stub the network without touching the HTTP layer.
-type FetchFunc func(ctx context.Context, provider detector.ProviderConfig) ([]ModelDescriptor, error)
-
-// Registry is the thread-safe in-memory model catalog. All reads take RLock
-// and never touch disk; writes swap the slice atomically under Lock.
-type Registry struct {
-	mu        sync.RWMutex
-	models    []ModelDescriptor
-	cachePath string
-	fetch     FetchFunc
-	client    *http.Client
+// ProviderCacheEntry is the provenance-aware per-provider cache record.
+type ProviderCacheEntry struct {
+	UpdatedAt time.Time `json:"updated_at"`
+	Status    string    `json:"status"`
+	ErrorMsg  string    `json:"error_msg,omitempty"`
+	Models    []Model   `json:"models"`
 }
 
-// NewRegistry builds a Registry backed by ~/.izen/cache/models.json.
-// A missing or unreadable home directory yields an in-memory-only registry
-// (cache path empty; flush becomes a no-op).
-func NewRegistry() *Registry {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = ""
-	}
-	return NewRegistryWithHome(home)
+// ModelCacheFile is the on-disk shape at ~/.izen/cache/models.json: a
+// versioned map of provider name -> ProviderCacheEntry. Per-provider writes
+// must preserve non-target keys so one provider's failure or timeout never
+// purges another provider's cached models.
+type ModelCacheFile struct {
+	Version   int                           `json:"version"`
+	Providers map[string]ProviderCacheEntry `json:"providers"`
 }
 
-// NewRegistryWithHome is NewRegistry with an injectable home directory.
-func NewRegistryWithHome(home string) *Registry {
-	path := ""
-	if home != "" {
-		path = filepath.Join(home, ".izen", "cache", cacheFileName)
-	}
-	return &Registry{
-		cachePath: path,
-		fetch:     nil, // nil = default HTTP fetch
-		client:    &http.Client{Timeout: httpTimeout},
-	}
-}
-
-// NewRegistryWithCachePath builds a Registry with an explicit cache path
-// (tests). An empty path disables persistence.
-func NewRegistryWithCachePath(path string) *Registry {
-	return &Registry{
-		cachePath: path,
-		client:    &http.Client{Timeout: httpTimeout},
-	}
-}
-
-// SetFetch overrides the fetch function (tests).
-func (r *Registry) SetFetch(fn FetchFunc) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.fetch = fn
-}
-
-// CachePath reports the backing cache file path ("" = memory-only).
-func (r *Registry) CachePath() string {
-	return r.cachePath
-}
-
-// Len returns the number of descriptors in memory.
-func (r *Registry) Len() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.models)
-}
-
-// Snapshot returns a copy of the in-memory slice.
-func (r *Registry) Snapshot() []ModelDescriptor {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make([]ModelDescriptor, len(r.models))
-	copy(out, r.models)
-	return out
-}
-
-// SetSeed replaces the in-memory catalog (tests/benchmarks).
-func (r *Registry) SetSeed(models []ModelDescriptor) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]ModelDescriptor, len(models))
-	copy(out, models)
-	r.models = out
-}
-
-// LoadCache reads the cache file into memory synchronously (startup path).
-// A missing file is not an error (fresh install → empty registry).
-// A malformed file returns an explicit error and leaves memory untouched.
-func (r *Registry) LoadCache() error {
-	if r.cachePath == "" {
-		return nil
-	}
-	data, err := os.ReadFile(r.cachePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read model cache %s: %w", r.cachePath, err)
-	}
-	models, err := decodeCache(data)
-	if err != nil {
-		return fmt.Errorf("parse model cache %s: %w", r.cachePath, err)
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.models = models
-	return nil
-}
-
-// Sync fetches every provider synchronously, atomically swaps the in-memory
-// slice on success, and flushes to disk. A total failure (or an empty
-// aggregate result) never clears the existing valid cache.
-func (r *Registry) Sync(ctx context.Context, providers []detector.ProviderConfig) error {
-	fetch := r.activeFetch()
-	var all []ModelDescriptor
-	var lastErr error
-	for _, p := range providers {
-		if p.APIKey == "" || p.BaseURL == "" {
-			continue
-		}
-		got, err := fetch(ctx, p)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		all = append(all, got...)
-	}
-	if len(all) == 0 {
-		if lastErr != nil {
-			return fmt.Errorf("model sync: all providers failed: %w", lastErr)
-		}
-		return fmt.Errorf("model sync: no models returned, keeping existing cache")
-	}
-	r.mu.Lock()
-	r.models = all
-	r.mu.Unlock()
-	if err := r.flush(all); err != nil {
-		return err
-	}
-	return nil
-}
-
-// SyncBackground runs Sync in a background goroutine and reports its result
-// on the returned channel (buffered, exactly one value, then closed).
-// Callers get non-blocking dispatch:
-//
-//	select {
-//	case err := <-reg.SyncBackground(ctx, providers):
-//	case <-ctx.Done():
-//	}
-//
-// A background failure never clears the existing in-memory cache.
-func (r *Registry) SyncBackground(ctx context.Context, providers []detector.ProviderConfig) <-chan error {
-	done := make(chan error, 1)
-	go func() {
-		done <- r.Sync(ctx, providers)
-		close(done)
-	}()
-	return done
-}
-
-// activeFetch resolves the fetch function under RLock.
-func (r *Registry) activeFetch() FetchFunc {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.fetch != nil {
-		return r.fetch
-	}
-	return r.fetchHTTPModels
-}
-
-// flush persists models to the cache file (mkdir -p + 0644). Memory-only
-// registries (empty path) skip silently. Callers hold no lock.
-func (r *Registry) flush(models []ModelDescriptor) error {
-	if r.cachePath == "" {
-		return nil
-	}
-	dir := filepath.Dir(r.cachePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("mkdir model cache %s: %w", dir, err)
-	}
-	payload := cacheEnvelope{Models: models, Version: 1}
-	data, err := json.MarshalIndent(payload, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal model cache: %w", err)
-	}
-	if err := os.WriteFile(r.cachePath, data, 0644); err != nil {
-		return fmt.Errorf("write model cache %s: %w", r.cachePath, err)
-	}
-	return nil
-}
-
-// cacheEnvelope is the on-disk shape. decodeCache also accepts a bare array.
+// cacheEnvelope is the legacy on-disk shape (flat model list). decodeCache
+// still accepts it plus a bare array for backward compatibility.
 type cacheEnvelope struct {
 	Version int               `json:"version"`
 	Models  []ModelDescriptor `json:"models"`
+}
+
+// LoadCacheFile reads a ModelCacheFile from path. A missing file yields an
+// empty (non-nil map) file and no error. Malformed content returns an error.
+func LoadCacheFile(path string) (ModelCacheFile, error) {
+	out := ModelCacheFile{Version: CacheVersion, Providers: map[string]ProviderCacheEntry{}}
+	if path == "" {
+		return out, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, nil
+		}
+		return out, fmt.Errorf("read model cache %s: %w", path, err)
+	}
+	return DecodeCacheFile(data)
+}
+
+// DecodeCacheFile parses either the current {"providers": {...}} shape, the
+// legacy {"models": [...]} envelope, or a bare [...] array.
+func DecodeCacheFile(data []byte) (ModelCacheFile, error) {
+	out := ModelCacheFile{Version: CacheVersion, Providers: map[string]ProviderCacheEntry{}}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return out, nil
+	}
+	var modern ModelCacheFile
+	if err := json.Unmarshal(trimmed, &modern); err == nil && modern.Providers != nil {
+		if modern.Version == 0 {
+			modern.Version = CacheVersion
+		}
+		return modern, nil
+	}
+	models, err := decodeCache(trimmed)
+	if err != nil {
+		return out, err
+	}
+	// Migrate legacy flat list: group by provider with ok status.
+	now := time.Now()
+	for _, m := range models {
+		e := out.Providers[m.Provider]
+		e.Status = CacheStatusOK
+		e.UpdatedAt = now
+		e.Models = append(e.Models, m)
+		out.Providers[m.Provider] = e
+	}
+	if len(models) > 0 && len(out.Providers) == 0 {
+		out.Providers["default"] = ProviderCacheEntry{
+			UpdatedAt: now,
+			Status:    CacheStatusOK,
+			Models:    models,
+		}
+	}
+	return out, nil
+}
+
+// WriteCacheFile persists file to path (mkdir -p + 0644) atomically.
+func WriteCacheFile(path string, file ModelCacheFile) error {
+	if path == "" {
+		return nil
+	}
+	if file.Providers == nil {
+		file.Providers = map[string]ProviderCacheEntry{}
+	}
+	if file.Version == 0 {
+		file.Version = CacheVersion
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("mkdir model cache %s: %w", dir, err)
+	}
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal model cache: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return fmt.Errorf("write model cache %s: %w", path, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename model cache %s: %w", path, err)
+	}
+	return nil
+}
+
+// UpsertProviderEntry rewrites only the target provider key, preserving every
+// non-target provider entry on disk. It is the lock-free-at-file-level
+// per-provider write helper: failures from one provider never destroy the
+// cached models of the others.
+func UpsertProviderEntry(path string, provider string, entry ProviderCacheEntry) error {
+	if path == "" || provider == "" {
+		return nil
+	}
+	existing, err := LoadCacheFile(path)
+	if err != nil {
+		// Corrupt cache: start fresh rather than failing the sync, but
+		// surface nothing destructive — single-provider write only.
+		existing = ModelCacheFile{Version: CacheVersion, Providers: map[string]ProviderCacheEntry{}}
+	}
+	if existing.Providers == nil {
+		existing.Providers = map[string]ProviderCacheEntry{}
+	}
+	existing.Providers[provider] = entry
+	return WriteCacheFile(path, existing)
+}
+
+// FlattenModels aggregates all provider entries into a single model slice.
+func (f ModelCacheFile) FlattenModels() []Model {
+	var out []Model
+	for _, e := range f.Providers {
+		out = append(out, e.Models...)
+	}
+	return out
 }
 
 // decodeCache parses either {"models": [...]} or a bare [...] array.
@@ -233,6 +179,191 @@ func decodeCache(data []byte) ([]ModelDescriptor, error) {
 		return nil, err
 	}
 	return bare, nil
+}
+
+// LoadCache reads the cache file into memory synchronously (startup path).
+// A missing file is not an error (fresh install → empty registry).
+// A malformed file returns an explicit error and leaves memory untouched.
+// Both the modern per-provider shape and legacy flat shapes are accepted.
+func (r *Registry) LoadCache() error {
+	if r.cachePath == "" {
+		return nil
+	}
+	data, err := os.ReadFile(r.cachePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read model cache %s: %w", r.cachePath, err)
+	}
+	file, err := DecodeCacheFile(data)
+	if err != nil {
+		return fmt.Errorf("parse model cache %s: %w", r.cachePath, err)
+	}
+	for name, entry := range file.Providers {
+		if entry.Status == "" {
+			entry.Status = CacheStatusOK
+		}
+		r.UpdateProvider(name, entry)
+	}
+	// Legacy flat files with zero providers but decodable models are handled
+	// inside DecodeCacheFile (grouped by provider), so nothing else to do.
+	return nil
+}
+
+// Sync fetches every provider synchronously with per-provider provenance:
+// a failure or timeout for one provider updates only that provider's status
+// and never purges cached models from any provider (memory or disk).
+// A total failure (or an empty aggregate result with an empty registry)
+// never clears the existing valid cache.
+func (r *Registry) Sync(ctx context.Context, providers []detector.ProviderConfig) error {
+	fetch := r.activeFetch()
+	var lastErr error
+	succeeded := 0
+	for _, p := range providers {
+		if p.APIKey == "" || p.BaseURL == "" {
+			continue
+		}
+		got, err := fetch(ctx, p)
+		now := time.Now()
+		if err != nil {
+			lastErr = err
+			status := classifyFetchError(err)
+			// Preserve existing models: UpdateProvider keeps old models
+			// for non-ok statuses; persist status without wiping disk.
+			r.UpdateProvider(p.Name, ProviderCacheEntry{
+				UpdatedAt: now,
+				Status:    status,
+				ErrorMsg:  err.Error(),
+			})
+			r.persistProviderEntry(p.Name, ProviderCacheEntry{
+				UpdatedAt: now,
+				Status:    status,
+				ErrorMsg:  err.Error(),
+				Models:    r.modelsForProvider(p.Name),
+			})
+			continue
+		}
+		succeeded++
+		entry := ProviderCacheEntry{
+			UpdatedAt: now,
+			Status:    CacheStatusOK,
+			Models:    got,
+		}
+		r.UpdateProvider(p.Name, entry)
+		r.persistProviderEntry(p.Name, entry)
+	}
+	if succeeded == 0 {
+		if lastErr != nil {
+			return fmt.Errorf("model sync: all providers failed: %w", lastErr)
+		}
+		if r.Len() == 0 {
+			return fmt.Errorf("model sync: no models returned, keeping existing cache")
+		}
+		return fmt.Errorf("model sync: no models returned, keeping existing cache")
+	}
+	return nil
+}
+
+// SyncProviders is an alias for Sync kept for explicit call sites.
+func (r *Registry) SyncProviders(ctx context.Context, providers []detector.ProviderConfig) error {
+	return r.Sync(ctx, providers)
+}
+
+// SyncBackground runs Sync in a background goroutine and reports its result
+// on the returned channel (buffered, exactly one value, then closed).
+// A background failure never clears the existing in-memory cache.
+func (r *Registry) SyncBackground(ctx context.Context, providers []detector.ProviderConfig) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		done <- r.Sync(ctx, providers)
+		close(done)
+	}()
+	return done
+}
+
+// modelsForProvider returns a copy of the current snapshot models for one
+// provider (used to persist failure statuses without wiping disk models).
+func (r *Registry) modelsForProvider(provider string) []Model {
+	var out []Model
+	for _, m := range r.Load().Models {
+		if m.Provider == provider {
+			out = append(out, m)
+		}
+	}
+	if out == nil {
+		out = []Model{}
+	}
+	return out
+}
+
+// persistProviderEntry upserts one provider key on disk, preserving all
+// non-target provider keys. Memory-only registries skip silently.
+func (r *Registry) persistProviderEntry(provider string, entry ProviderCacheEntry) {
+	if r.cachePath == "" || provider == "" {
+		return
+	}
+	r.fileMu.Lock()
+	defer r.fileMu.Unlock()
+	_ = UpsertProviderEntry(r.cachePath, provider, entry)
+}
+
+// activeFetch resolves the fetch function under RLock.
+func (r *Registry) activeFetch() FetchFunc {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.fetch != nil {
+		return r.fetch
+	}
+	return r.fetchHTTPModels
+}
+
+// flush persists models to the cache file (mkdir -p + 0644). Memory-only
+// registries (empty path) skip silently. Callers hold no lock. The modern
+// shape groups models by provider with ok status; per-provider provenance
+// for failures is persisted via UpsertProviderEntry in syncProviders.
+func (r *Registry) flush(models []ModelDescriptor) error {
+	if r.cachePath == "" {
+		return nil
+	}
+	r.fileMu.Lock()
+	defer r.fileMu.Unlock()
+	existing, err := LoadCacheFile(r.cachePath)
+	if err != nil {
+		existing = ModelCacheFile{Version: CacheVersion, Providers: map[string]ProviderCacheEntry{}}
+	}
+	now := time.Now()
+	grouped := map[string][]Model{}
+	for _, m := range models {
+		grouped[m.Provider] = append(grouped[m.Provider], m)
+	}
+	for name, ms := range grouped {
+		existing.Providers[name] = ProviderCacheEntry{
+			UpdatedAt: now,
+			Status:    CacheStatusOK,
+			Models:    ms,
+		}
+	}
+	return WriteCacheFile(r.cachePath, existing)
+}
+
+// classifyFetchError maps a fetch error to a cache status + message.
+func classifyFetchError(err error) string {
+	if err == nil {
+		return CacheStatusOK
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return CacheStatusTimeout
+	}
+	var osTimeout interface{ Timeout() bool }
+	if errors.As(err, &osTimeout) && osTimeout.Timeout() {
+		return CacheStatusTimeout
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline") {
+		return CacheStatusTimeout
+	}
+	return CacheStatusError
 }
 
 // openAIModels is the tolerant OpenAI-compatible /models response shape.

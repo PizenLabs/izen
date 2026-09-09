@@ -13,9 +13,9 @@ import (
 // providerFilter matches all providers. The result is a fresh slice; the
 // registry is never mutated and callers may freely modify the output.
 func (r *Registry) Filter(query, providerFilter string) []ModelDescriptor {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return filterSlice(r.models, query, providerFilter)
+	// Lock-free read via the immutable atomic snapshot: zero disk I/O,
+	// zero mutex contention with background Sync/UpdateProvider writers.
+	return filterSlice(r.Load().Models, query, providerFilter)
 }
 
 // filterSlice is the lock-free core so benchmarks can isolate matching cost.

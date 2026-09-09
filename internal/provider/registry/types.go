@@ -12,6 +12,11 @@ const (
 	CapThinking ModelCapability = "thinking"
 )
 
+// Model is the canonical model descriptor alias used by the Phase 1
+// provenance-aware cache and snapshot layer. It is identical to
+// ModelDescriptor so existing callers keep working unchanged.
+type Model = ModelDescriptor
+
 // ModelDescriptor describes a single provider model.
 type ModelDescriptor struct {
 	ID              string            `json:"id"`

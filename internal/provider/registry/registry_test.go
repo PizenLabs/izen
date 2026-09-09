@@ -127,7 +127,7 @@ func TestSyncFailurePreservesCache(t *testing.T) {
 	}
 }
 
-func TestSyncSuccessSwapsAndFlushes(t *testing.T) {
+func TestSyncSuccessMergesPerProviderAndFlushes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "models.json")
 	r := NewRegistryWithCachePath(path)
 	r.SetSeed(seedModels(3))
@@ -139,11 +139,29 @@ func TestSyncSuccessSwapsAndFlushes(t *testing.T) {
 	if err := r.Sync(context.Background(), provs); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	if r.Len() != 1 || r.Snapshot()[0].ID != "new-model" {
-		t.Errorf("after sync: %v, want swapped new-model", r.Snapshot())
+	// Per-provider provenance: groq models merge; seeded openrouter models persist.
+	if r.Len() != 4 {
+		t.Errorf("after sync: Len = %d, want 4 (3 openrouter + 1 groq)", r.Len())
+	}
+	found := false
+	for _, m := range r.Snapshot() {
+		if m.ID == "new-model" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("after sync: %v, want merged new-model", r.Snapshot())
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("expected cache flush: %v", err)
+	}
+	// Flushed file must carry both providers without destroying either key.
+	file, err := LoadCacheFile(path)
+	if err != nil {
+		t.Fatalf("LoadCacheFile: %v", err)
+	}
+	if _, ok := file.Providers["groq"]; !ok {
+		t.Errorf("flushed cache missing groq key: %v", file.Providers)
 	}
 }
 
@@ -164,8 +182,9 @@ func TestSyncBackgroundAsync(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("background sync timed out")
 	}
-	if r.Len() != 1 {
-		t.Errorf("Len = %d, want 1 after background sync", r.Len())
+	// Per-provider merge: 2 seeded openrouter + 1 background provider model.
+	if r.Len() != 3 {
+		t.Errorf("Len = %d, want 3 after background sync (merge)", r.Len())
 	}
 }
 
