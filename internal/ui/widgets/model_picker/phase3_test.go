@@ -37,8 +37,8 @@ func TestPhase3ContextualRender(t *testing.T) {
 	if !strings.Contains(vStd, "BINDINGS") {
 		t.Errorf("view must contain BINDINGS line:\n%s", vStd)
 	}
-	if !strings.Contains(vStd, "Enter use") {
-		t.Errorf("footer must contain Enter use:\n%s", vStd)
+	if !strings.Contains(vStd, "Enter: activate") {
+		t.Errorf("footer must contain Enter: activate:\n%s", vStd)
 	}
 }
 

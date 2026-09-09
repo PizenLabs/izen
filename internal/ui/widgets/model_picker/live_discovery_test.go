@@ -51,7 +51,7 @@ func TestSelectedRowCursor(t *testing.T) {
 	}
 	// Zero-state keeps the help panel and anchored footer.
 	empty := New(seedSnapshot(nil)).SetSize(100, 30).View()
-	for _, want := range []string{"NO MODELS AVAILABLE", "Ctrl+R", "Enter use"} {
+	for _, want := range []string{"NO MODELS AVAILABLE", "Ctrl+R", "Enter: activate"} {
 		if !strings.Contains(empty, want) {
 			t.Errorf("zero-state missing %q:\n%s", want, empty)
 		}

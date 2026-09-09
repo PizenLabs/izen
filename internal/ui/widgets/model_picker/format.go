@@ -29,27 +29,31 @@ func formatPricing(prompt, completion float64) string {
 	if prompt == 0 && completion == 0 {
 		return "free"
 	}
-	return fmt.Sprintf("$%s/$%s", formatPriceVal(prompt), formatPriceVal(completion))
+	s := fmt.Sprintf("$%s/$%s", formatPriceVal(prompt), formatPriceVal(completion))
+	return strings.ReplaceAll(s, "\n", " ")
 }
 
 // formatContextWindow renders a context window with dynamic units:
 // 1000000+ → "1M"/"2M"/"1.5M", 1000+ → "128k"/"256k", else raw digits.
 // Non-positive windows render "-" (unknown). Zero I/O.
 func formatContextWindow(tokens int) string {
-	if tokens <= 0 {
-		return "-"
-	}
-	if tokens >= 1_000_000 {
+	var s string
+	switch {
+	case tokens <= 0:
+		s = "-"
+	case tokens >= 1_000_000:
 		val := float64(tokens) / 1_000_000.0
 		if val == float64(int(val)) {
-			return fmt.Sprintf("%dM", int(val))
+			s = fmt.Sprintf("%dM", int(val))
+		} else {
+			s = fmt.Sprintf("%.1fM", val)
 		}
-		return fmt.Sprintf("%.1fM", val)
+	case tokens >= 1_000:
+		s = fmt.Sprintf("%dk", tokens/1000)
+	default:
+		s = fmt.Sprintf("%d", tokens)
 	}
-	if tokens >= 1_000 {
-		return fmt.Sprintf("%dk", tokens/1000)
-	}
-	return fmt.Sprintf("%d", tokens)
+	return strings.ReplaceAll(s, "\n", " ")
 }
 
 // truncateWithEllipsis cuts s to at most n visible runes, using "…" as the
@@ -68,25 +72,40 @@ func truncateWithEllipsis(s string, n int) string {
 	return string(runes[:n-1]) + "…"
 }
 
-// padRight pads s with spaces to exactly w visible runes. Over-wide input is
-// truncated with ellipsis first so output width is always <= w.
+// padRight pads s with spaces to exactly w visible cells using lipgloss.Width.
+// Over-wide input is truncated with ellipsis first so output width is always <= w.
 func padRight(s string, w int) string {
 	if w <= 0 {
 		return ""
 	}
+	// Truncate with ellipsis if over width (rune-safe fallback), then pad.
 	runes := []rune(s)
 	if len(runes) > w {
-		return truncateWithEllipsis(s, w)
+		s = truncateWithEllipsis(s, w)
 	}
-	if len(runes) < w {
-		return s + strings.Repeat(" ", w-len(runes))
+	vw := lipgloss.Width(s)
+	if vw >= w {
+		return s
 	}
-	return s
+	return s + strings.Repeat(" ", w-vw)
 }
 
 // fitCell truncates then pads a plain cell to exactly w columns.
 func fitCell(s string, w int) string {
 	return padRight(truncateWithEllipsis(s, w), w)
+}
+
+// padVisible pads a (potentially ANSI-styled) string with trailing spaces so
+// its visible width equals exactly w cells. Uses lipgloss.Width for correct
+// measurement of styled and wide-character content.
+//
+//nolint:unused // retained for spec compatibility and potential external use
+func padVisible(s string, w int) string {
+	vw := lipgloss.Width(s)
+	if vw >= w {
+		return s
+	}
+	return s + strings.Repeat(" ", w-vw)
 }
 
 // truncateStyled cuts an ANSI-styled line to at most w visible cells while

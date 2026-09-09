@@ -26,6 +26,30 @@ import (
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
+// FocusScope distinguishes Search input vs List navigation key routing.
+type FocusScope int
+
+const (
+	FocusSearch FocusScope = iota // 0: Search input active
+	FocusList                     // 1: Navigation & bindings active
+)
+
+// searchInputModel mirrors the task spec's TextInput lock: width is forced
+// to searchInputWidth (16) on every render so typing never expands header.
+type searchInputModel struct {
+	Width   int
+	focused bool
+}
+
+// Focus marks the search input as focused.
+func (s *searchInputModel) Focus() { s.focused = true }
+
+// Blur marks the search input as blurred.
+func (s *searchInputModel) Blur() { s.focused = false }
+
+// Focused reports whether the search input is focused.
+func (s searchInputModel) Focused() bool { return s.focused }
+
 // Role hotkeys.
 const (
 	RoleDefaultKey = "d"
@@ -106,9 +130,11 @@ type Model struct {
 	// only on persistence confirmation — never persisted here.
 	roles map[string]string
 
-	// searchFocused selects key routing: true routes printable runes into
-	// the search query (zero-latency RAM filter); false routes d/p/s/v/a
-	// into role-binding command emission. Tab toggles.
+	// focus selects key routing: FocusSearch routes printable runes into
+	// the search query (zero-latency RAM filter); FocusList routes d/p/s/v/a
+	// into role-binding command emission. Tab toggles. searchFocused is the
+	// legacy bool mirror kept in sync for backward compatibility.
+	focus         FocusScope
 	searchFocused bool
 
 	// reasoningIdx selects within the highlighted model's permitted options
@@ -137,6 +163,18 @@ type Model struct {
 	width  int
 	height int
 	done   bool
+
+	// searchInput mirrors the task spec's TextInput lock: width is forced
+	// to searchInputWidth (16) on every render so typing never expands header.
+	searchInput searchInputModel
+
+	// Box-model geometry: outer modal dimensions and strict inner bounds.
+	// W_inner = modalW - 4 (border 2 + padding 2), H_inner = modalH - 2 (border 2)
+	modalW        int
+	modalH        int
+	innerWidth    int
+	innerHeight   int
+	listRowBudget int
 }
 
 // New builds a pure-view picker from an immutable snapshot. A nil snapshot
@@ -150,7 +188,9 @@ func New(snap *registry.ModelSnapshot) Model {
 		snap:          snap,
 		roles:         make(map[string]string),
 		pending:       make(map[string]PendingBind),
-		searchFocused: true,
+		focus:         FocusList,
+		searchFocused: false,
+		searchInput:   searchInputModel{Width: searchInputWidth, focused: false},
 	}
 	m.refilter()
 	m.resetReasoning()
@@ -261,6 +301,14 @@ func (m Model) ProviderFilter() string { return m.provider }
 // list scrolling budget on the next render (via visibleWindow) so resize and
 // split-pane events never clip text or break borders. Non-positive dimensions
 // are floored to 1; cursor is clamped to the filtered list.
+//
+// Geometry (spec: inner/outer rectification):
+//
+//	W_inner = modalW - 4 (border 2 + padding 1+1)
+//	H_inner = modalH - 2 (border 2, padding 0 vertical)
+//
+// Chrome = 6 lines (Title, Search, Divider, Reasoning, Bindings, Footer)
+// listRowBudget = max(3, innerHeight - 6)
 func (m Model) SetSize(w, h int) Model {
 	if w < 1 {
 		w = 1
@@ -268,28 +316,68 @@ func (m Model) SetSize(w, h int) Model {
 	if h < 1 {
 		h = 1
 	}
-	m.width = w
-	m.height = h
+	m.modalW = w
+	m.modalH = h
+	m.innerWidth = max(20, w-4)
+	m.innerHeight = max(5, h-2)
+	m.listRowBudget = max(3, m.innerHeight-6)
+	// Legacy aliases: width/height now represent inner bounds for all
+	// rendering helpers (clipLine, padFooter, render*).
+	m.width = m.innerWidth
+	m.height = m.innerHeight
 	if m.cursor >= len(m.filtered) {
 		m.cursor = len(m.filtered) - 1
 	}
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
+	m.clampScrollOffset()
 	return m
 }
 
-// Size reports the current picker content bounds (0 = unbounded).
-func (m Model) Size() (w, h int) { return m.width, m.height }
+func (m Model) clampScrollOffset() {
+	// Cursor-following offset is derived dynamically in visibleWindow
+	// from listRowBudget; no persistent offset field to clamp.
+}
+
+// Size reports the outer modal bounds (0 = unbounded). Kept for
+// compatibility with callers that probe dialog size.
+func (m Model) Size() (w, h int) {
+	if m.modalW > 0 || m.modalH > 0 {
+		return m.modalW, m.modalH
+	}
+	return m.width, m.height
+}
+
+// InnerSize reports the strict inner content bounds (modal - border/padding).
+func (m Model) InnerSize() (w, h int) {
+	if m.innerWidth > 0 || m.innerHeight > 0 {
+		return m.innerWidth, m.innerHeight
+	}
+	return m.width, m.height
+}
+
+// Focus returns the current FocusScope.
+func (m Model) Focus() FocusScope { return m.focus }
 
 // FocusSearch routes printable runes into the search box.
-func (m Model) FocusSearch() Model { m.searchFocused = true; return m }
+func (m Model) FocusSearch() Model {
+	m.focus = FocusSearch
+	m.searchFocused = true
+	m.searchInput.Focus()
+	return m
+}
 
 // FocusList routes d/p/s/v/a into role-binding command emission.
-func (m Model) FocusList() Model { m.searchFocused = false; return m }
+func (m Model) FocusList() Model {
+	m.focus = FocusList
+	m.searchFocused = false
+	m.searchInput.Blur()
+	return m
+}
 
 // SearchFocused reports the current focus.
-func (m Model) SearchFocused() bool { return m.searchFocused }
+func (m Model) SearchFocused() bool { return m.focus == FocusSearch }
 
 // IsGlobal reports the binding target scope.
 func (m Model) IsGlobal() bool { return m.isGlobal }
@@ -559,6 +647,14 @@ func (m *Model) refilter() {
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
+}
+
+// applyFilter is the spec-named alias of refilter used by the FocusScope
+// state machine after search input updates. It rebuilds the filtered view and
+// resets reasoning selection.
+func (m *Model) applyFilter() {
+	m.refilter()
+	m.resetReasoning()
 }
 
 // refreshBadges is a no-op anchor: badges derive live from m.roles +

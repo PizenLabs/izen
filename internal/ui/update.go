@@ -341,12 +341,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				if um.Done() {
 					m.showModelPicker = false
 					m.ti.Focus()
-					return m, tea.Batch(cmd, func() tea.Msg {
-						if act, ok := um.BuildActivateCommand(); ok {
-							return act
-						}
-						return nil
-					})
+					// Single dispatch: the picker already emitted ActivateModelCommand
+					// via EmitActivateCommand(). Do NOT batch a second
+					// BuildActivateCommand — that duplicates the system log
+					// (✔ Model set to ...) as two Activations.
+					return m, cmd
 				}
 			}
 			return m, cmd

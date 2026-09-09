@@ -39,7 +39,7 @@ func isQuerySep(r rune) bool {
 
 // matchToken reports whether a single lowercase token matches any field of m:
 // ID, Name, Provider (substring or subsequence-fuzzy fallback), context
-// window (128000 / 128k / 128), price (0.55 / $0.55), or capabilities
+// window (128000 / 128k / 128), price (0.55 / $0.55 / free), or capabilities
 // (thinking / tools / vision).
 func matchToken(m ModelDescriptor, tok string) bool {
 	if tok == "" {
@@ -50,6 +50,26 @@ func matchToken(m ModelDescriptor, tok string) bool {
 	prov := strings.ToLower(m.Provider)
 	if strings.Contains(id, tok) || strings.Contains(name, tok) || strings.Contains(prov, tok) {
 		return true
+	}
+	// Synthetic pricing tag: "free" matches zero-priced models so queries
+	// like "groq free" or "free" surface $0.00 models even when "free"
+	// is absent from the ID/name. Also match the formatted price pair
+	// (e.g. "free" or "$0.04/$0.15") as synthetic search buffer.
+	if tok == "free" {
+		if m.InputCostPerM == 0 && m.OutputCostPerM == 0 {
+			return true
+		}
+		priceTag := strings.ToLower(formatPricePair(m.InputCostPerM, m.OutputCostPerM))
+		return strings.Contains(priceTag, tok)
+	}
+	// Also inject synthetic priceTag for numeric price fragments so
+	// queries like "0.04" match via the "$0.04/$0.15" buffer even when
+	// individual cost formatting differs.
+	if isNumericToken(tok) {
+		priceTag := strings.ToLower(formatPricePair(m.InputCostPerM, m.OutputCostPerM))
+		if strings.Contains(priceTag, tok) {
+			return true
+		}
 	}
 	// Capability tokens.
 	switch tok {
@@ -170,6 +190,25 @@ func formatContextK(ctx int) string {
 // formatPrice renders a $/M cost compactly ("0.55", "2.19", "0").
 func formatPrice(cost float64) string {
 	return strconv.FormatFloat(cost, 'f', -1, 64)
+}
+
+// formatPriceVal formats a single $/M value for the synthetic pair.
+func formatPriceVal(v float64) string {
+	if v == 0 {
+		return "0"
+	}
+	if v < 0.01 {
+		return strconv.FormatFloat(v, 'f', 3, 64)
+	}
+	return strconv.FormatFloat(v, 'f', 2, 64)
+}
+
+// formatPricePair renders "$in/$out" or "free" for synthetic indexing.
+func formatPricePair(in, out float64) string {
+	if in == 0 && out == 0 {
+		return "free"
+	}
+	return "$" + formatPriceVal(in) + "/$" + formatPriceVal(out)
 }
 
 // isNumericToken reports whether tok could match a number field (context,

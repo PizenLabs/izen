@@ -159,9 +159,9 @@ func TestAllRoleHotkeysEmit(t *testing.T) {
 
 // Typing "p" in search focus must filter, never emit a bind command.
 func TestSearchFocusDoesNotBind(t *testing.T) {
-	m := New(seedSnapshot(testModels()))
+	m := New(seedSnapshot(testModels())).FocusSearch()
 	if !m.SearchFocused() {
-		t.Fatal("picker must start search-focused")
+		t.Fatal("picker must be search-focused for this test")
 	}
 	var cmd tea.Cmd
 	m, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})

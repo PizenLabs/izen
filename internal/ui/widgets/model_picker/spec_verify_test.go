@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
@@ -15,7 +16,7 @@ func TestSpaceKeyBuildsMultiTokenQuery(t *testing.T) {
 	models := []registry.ModelDescriptor{
 		{ID: "openrouter/free-hybrid-north", Provider: "openrouter", Name: "Free North Hybrid"},
 		{ID: "openrouter/free-only", Provider: "openrouter", Name: "Free Only"},
-		{ID: "nvidia/north-star", Provider: "nvidia", Name: "North Star"},
+		{ID: "nvidia/north-star", Provider: "nvidia", Name: "North Star", InputCostPerM: 0.5, OutputCostPerM: 1.5},
 	}
 	m := New(seedSnapshot(models))
 
@@ -42,17 +43,17 @@ func TestSpaceKeyBuildsMultiTokenQuery(t *testing.T) {
 	}
 }
 
-// Space in list focus must be a no-op: no query mutation, no bind command,
-// no selection side effect.
+// Space in unified engine: always active search – space appends to query
+// (type to search). Legacy no-op expectation retired; verify unified behavior.
 func TestSpaceKeyNoOpInListFocus(t *testing.T) {
 	m := New(seedSnapshot(testModels())).FocusList()
-	before := m.Query()
 	m, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeySpace})
 	if cmd != nil {
-		t.Error("space in list focus must not emit a command")
+		t.Error("space must not emit a command")
 	}
-	if m.Query() != before {
-		t.Errorf("query = %q, want unchanged %q", m.Query(), before)
+	// Unified engine: space builds multi-token query
+	if m.Query() != " " {
+		t.Errorf("query = %q, want %q (unified search active)", m.Query(), " ")
 	}
 	if m.Done() {
 		t.Error("space must never trigger selection")
@@ -112,5 +113,170 @@ func TestDefaultCycleRoundTrip(t *testing.T) {
 	}
 	if bar := m.RenderReasoningBar(); !strings.Contains(bar, "default") {
 		t.Errorf("bar = %q, want default tier rendered", bar)
+	}
+}
+
+// FocusScope state machine: UNIFIED ENGINE – Tab wall eliminated.
+// Search is ALWAYS active; Tab is no-op, Down moves cursor (global nav),
+// Alt+d/p/s/v/a bind roles, ←/→ cycle reasoning, typing always filters.
+func TestFocusScopeStateMachine(t *testing.T) {
+	m := New(seedSnapshot(testModels()))
+	if m.Focus() != FocusList {
+		t.Fatalf("initial focus = %v, want FocusList", m.Focus())
+	}
+	// Unified: Tab is no-op (search always active) – focus must not toggle.
+	mTab, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if mTab.Focus() != m.Focus() {
+		t.Errorf("Tab must be no-op in unified engine, got %v want %v", mTab.Focus(), m.Focus())
+	}
+	mShift, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if mShift.Focus() != m.Focus() {
+		t.Errorf("Shift+Tab must be no-op in unified engine")
+	}
+
+	// Alt bindings must work regardless of focus.
+	for _, tc := range []struct{ key, role string }{
+		{"alt+d", "default"}, {"alt+p", "plan"}, {"alt+s", "smol"}, {"alt+v", "vision"}, {"alt+a", "adviser"},
+	} {
+		mm := m
+		var cmd tea.Cmd
+		// Send Alt+key as Runes with Alt flag
+		r := tc.key[4:] // after "alt+"
+		mm, cmd = mm.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r), Alt: true})
+		if cmd == nil {
+			t.Fatalf("alt %q must emit binding cmd", tc.key)
+		}
+		if bind := cmd().(modelapp.BindModelToRoleCommand); string(bind.Role) != tc.role {
+			t.Errorf("alt %q role = %q, want %q", tc.key, string(bind.Role), tc.role)
+		}
+	}
+	// Plain d/p/s/v/a must NOT bind in unified engine when focus is Search – they type.
+	mSearch := m.FocusSearch()
+	for _, key := range []string{"d", "p", "s", "v", "a"} {
+		mm, cmd := mSearch.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		if cmd != nil {
+			t.Errorf("plain %q in search focus must not emit bind (unified search), got cmd", key)
+		}
+		_ = mm
+	}
+
+	// ←/→ cycle reasoning without touching the cursor or query.
+	before := m.Cursor()
+	m2, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRight})
+	if cmd != nil {
+		t.Error("→ must emit no command")
+	}
+	if m2.Cursor() != before {
+		t.Errorf("→ changed cursor %d→%d", before, m2.Cursor())
+	}
+	if o, ok := m2.CurrentReasoningOption(); !ok || o != "low" {
+		t.Errorf("after → reasoning option = %q,%v, want low,true", o, ok)
+	}
+
+	// Down moves cursor globally (no focus toggle)
+	mDown, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
+	if mDown.Cursor() != 1 {
+		t.Errorf("down must move cursor in unified engine, got %d want 1", mDown.Cursor())
+	}
+}
+
+// Search-focus exclusivity: printable runes never leak into bindings while
+// focused on the search input, and the query filters RAM synchronously.
+func TestSearchFocusTypingDoesNotBind(t *testing.T) {
+	m := New(seedSnapshot([]registry.ModelDescriptor{
+		{ID: "openrouter/free-hybrid-north", Provider: "openrouter", Name: "Free North Hybrid"},
+	}))
+	m, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("free")})
+	if cmd != nil {
+		t.Fatal("typing in search must not emit commands")
+	}
+	if m.Query() != "free" {
+		t.Fatalf("query = %q, want free", m.Query())
+	}
+	if m.Focus() != FocusSearch {
+		t.Fatalf("focus drifted to %v", m.Focus())
+	}
+}
+
+// Header focus indicator renders the active scope: Focus: [SEARCH] (Tab to
+// List) in search focus and Focus: [LIST] (Tab to Search) in list focus.
+// Default is [LIST] per UX spec.
+func TestHeaderFocusIndicator(t *testing.T) {
+	m := New(seedSnapshot(testModels()))
+	view := m.View()
+	if !strings.Contains(view, "[LIST]") || !strings.Contains(view, "Tab to Search") {
+		t.Errorf("default list-focus header must show Focus: [LIST] (Tab to Search), got:\n%s", view)
+	}
+	m = m.FocusSearch()
+	view2 := m.View()
+	if !strings.Contains(view2, "[SEARCH]") || !strings.Contains(view2, "Tab to List") {
+		t.Errorf("search-focus header must show Focus: [SEARCH] (Tab to List), got:\n%s", view2)
+	}
+	if strings.Contains(view2, "[LIST]") {
+		t.Errorf("search-focus header must not show [LIST]:\n%s", view2)
+	}
+}
+
+// Selected-row single-line contract: the active row renders the word "Tools"
+// on the SAME line as the cursor with zero embedded newlines, zero wrapped
+// fragment below the row, and no frame-breaking blank line. Lipgloss width
+// wrap must never split the long capabilities cell onto line 2.
+func TestSelectedRowSingleLineNoWrap(t *testing.T) {
+	models := []registry.ModelDescriptor{
+		{
+			ID:            "meta/muse-glimmer-30b:batch",
+			Provider:      "meta",
+			Name:          "Muse Glimmer 30B batch",
+			ContextWindow: 1_000_000,
+			InputCostPerM: 0.25, OutputCostPerM: 0.75,
+			Capabilities: []registry.ModelCapability{registry.CapThinking, registry.CapTools, registry.CapVision},
+		},
+		{ID: "openai/gpt-4o-mini", Provider: "openai", Name: "GPT-4o mini", ContextWindow: 128000},
+	}
+	m := New(seedSnapshot(models)).SetSize(100, 30)
+	m = m.MoveCursor(0)
+	view := m.View()
+
+	lines := strings.Split(strings.ReplaceAll(view, "\r", ""), "\n")
+	activeIdx := -1
+	for i, ln := range lines {
+		if strings.Contains(ln, ">") && strings.Contains(ln, "muse") {
+			activeIdx = i
+			break
+		}
+	}
+	if activeIdx < 0 {
+		t.Fatalf("active muse row not found:\n%s", view)
+	}
+	active := lines[activeIdx]
+
+	// The word Tools must stay on the SELECTED row line itself.
+	if !strings.Contains(active, "Tools") {
+		t.Errorf("Tools must remain on the selected row line:\n%q", active)
+	}
+	if strings.Contains(active, "\n") {
+		t.Errorf("selected row must contain zero embedded newlines: %q", active)
+	}
+
+	// Zero wrap fragments: any other line carrying "Tools" must be a real
+	// model row (contains a "/" model ID + provider pill) or chrome, never a
+	// bare continuation of the caps cell spilled onto line 2.
+	for i, ln := range lines {
+		if i == activeIdx || !strings.Contains(ln, "Tools") {
+			continue
+		}
+		trimmed := strings.TrimSpace(ln)
+		if trimmed == "" {
+			continue
+		}
+		isRow := strings.Contains(ln, "/") && strings.Contains(ln, "[")
+		isChrome := strings.HasPrefix(trimmed, "REASONING") ||
+			strings.HasPrefix(trimmed, "BINDINGS") ||
+			strings.HasPrefix(trimmed, "IZEN") ||
+			strings.Contains(trimmed, "Enter") ||
+			strings.Contains(trimmed, "Focus:")
+		if !isRow && !isChrome {
+			t.Errorf("wrap fragment on line %d (selected-rows's caps spilled to line 2): %q\nfull view:\n%s", i+1, ln, view)
+		}
 	}
 }

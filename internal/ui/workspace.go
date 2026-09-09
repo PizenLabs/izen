@@ -177,6 +177,13 @@ func ModelPickerModalSize(w, h int) (int, int) {
 // adaptively: inner content bounds are set via SetSize on every render so
 // terminal resizes and tmux split-panes recalculate list scrolling budgets
 // with zero UI clipping.
+//
+// Box model (rectified):
+//
+//	W_inner = modalW - 4 (border 2 + padding 1+1)
+//	H_inner = modalH - 2 (border 2)
+//
+// Total rendered box is exactly modalW x modalH with continuous borders.
 func (m *model) renderModelPickerModal() string {
 	var normalWS Workspace
 	if m.Ready && m.viewRegistry != nil {
@@ -200,29 +207,29 @@ func (m *model) renderModelPickerModal() string {
 	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
 	modalW, modalH := ModelPickerModalSize(m.width, m.height)
-	// Inner content bounds: border + padding consume 4 columns / 2 rows.
+	// Pass total outer dimensions to picker; picker derives inner bounds
+	// strictly as modal-4 / modal-2 (spec rectification).
+	m.modelPicker = m.modelPicker.SetSize(modalW, modalH)
+	innerContent := m.modelPicker.View()
+
+	// innerContent is guaranteed <= modalW-4 wide and <= modalH-2 high.
+	// Wrap with border+padding using explicit content dimensions so the
+	// Lipgloss box model yields exactly modalW x modalH outer size without
+	// clipping the right/bottom borders.
 	innerW, innerH := modalW-4, modalH-2
-	m.modelPicker = m.modelPicker.SetSize(innerW, innerH)
-	rawContent := m.modelPicker.View()
-
-	// Content hard clip: enforce MaxWidth/MaxHeight on the picker blob so
-	// an oversized list can never stretch the modal border or jitter the
-	// viewport. The picker itself already budgets rows (modalH-7) and
-	// single-line rows; this is belt-and-suspenders.
-	boxContent := lipgloss.NewStyle().
-		MaxWidth(innerW).
-		MaxHeight(innerH).
-		Render(rawContent)
-
+	if innerW < 1 {
+		innerW = 1
+	}
+	if innerH < 1 {
+		innerH = 1
+	}
 	modalBox := lipgloss.NewStyle().
-		Width(modalW).
-		MaxWidth(modalW).
-		Height(modalH).
-		MaxHeight(modalH).
+		Width(innerW).
+		Height(innerH).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(colorMauve)).
 		Padding(0, 1).
-		Render(boxContent)
+		Render(innerContent)
 
 	centered := lipgloss.Place(
 		m.width, m.height,

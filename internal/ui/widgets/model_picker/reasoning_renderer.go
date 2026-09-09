@@ -3,9 +3,28 @@ package model_picker
 import (
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
+
 	"github.com/PizenLabs/izen/internal/provider/adapter"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
+
+// effortStyle returns the Catppuccin Mocha semantic style for a reasoning
+// option. Unknown options fall back to muted.
+func effortStyle(opt string) lipgloss.Style {
+	if s, ok := effortStyles[opt]; ok {
+		return s
+	}
+	return mutedStyle
+}
+
+func renderReasoningItem(level string, selected bool) string {
+	style := effortStyle(level)
+	if selected {
+		return style.Underline(true).Render("[" + level + "]")
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086")).Render(level)
+}
 
 // ReasoningModeFor resolves the provider-native reasoning mode for a model
 // via adapter.CapabilityForProvider. Unknown providers yield ReasoningModeNone.
@@ -128,11 +147,7 @@ func (m Model) RenderReasoningBar() string {
 		sel := clampedReasoningIdx(m.reasoningIdx, options)
 		cells := make([]string, 0, len(options))
 		for i, opt := range options {
-			if i == sel {
-				cells = append(cells, accentStyle.Render(opt))
-			} else {
-				cells = append(cells, mutedStyle.Render(opt))
-			}
+			cells = append(cells, renderReasoningItem(opt, i == sel))
 		}
 		return strings.Join(cells, mutedStyle.Render(" • "))
 	case adapter.ReasoningModeFixed:
