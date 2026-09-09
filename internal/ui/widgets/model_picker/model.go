@@ -26,19 +26,12 @@ import (
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
-// FocusScope distinguishes Search input vs List navigation key routing.
-type FocusScope int
-
-const (
-	FocusSearch FocusScope = iota // 0: Search input active
-	FocusList                     // 1: Navigation & bindings active
-)
-
 // searchInputModel mirrors the task spec's TextInput lock: width is forced
 // to searchInputWidth (16) on every render so typing never expands header.
 type searchInputModel struct {
 	Width   int
 	focused bool
+	value   string
 }
 
 // Focus marks the search input as focused.
@@ -49,6 +42,28 @@ func (s *searchInputModel) Blur() { s.focused = false }
 
 // Focused reports whether the search input is focused.
 func (s searchInputModel) Focused() bool { return s.focused }
+
+// Value returns the current input value.
+func (s searchInputModel) Value() string { return s.value }
+
+// SetValue sets the input value.
+func (s *searchInputModel) SetValue(v string) { s.value = v }
+
+// Update handles a key message for the search input (bubbles compatible shim).
+func (s searchInputModel) Update(msg tea.KeyMsg) (searchInputModel, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyBackspace:
+		if len(s.value) > 0 {
+			r := []rune(s.value)
+			s.value = string(r[:len(r)-1])
+		}
+	case tea.KeyRunes:
+		s.value += string(msg.Runes)
+	case tea.KeySpace:
+		s.value += " "
+	}
+	return s, nil
+}
 
 // Role hotkeys.
 const (
@@ -137,6 +152,18 @@ type Model struct {
 	focus         FocusScope
 	searchFocused bool
 
+	// state is the two-step picker state machine (browsing vs detail).
+	state PickerState
+
+	// activeWorkspace is the contextual workspace target for fast-path assignment.
+	activeWorkspace WorkspaceTarget
+
+	// targetCursor is the assignment drawer cursor in StateDetail.
+	targetCursor int
+
+	// reasoningPolicy is the workspace reasoning policy for assignment.
+	reasoningPolicy string
+
 	// reasoningIdx selects within the highlighted model's permitted options
 	// (adapter.OptionsForMode). Fixed/None modes ignore it.
 	reasoningIdx int
@@ -185,12 +212,16 @@ func New(snap *registry.ModelSnapshot) Model {
 		snap = &registry.ModelSnapshot{}
 	}
 	m := Model{
-		snap:          snap,
-		roles:         make(map[string]string),
-		pending:       make(map[string]PendingBind),
-		focus:         FocusList,
-		searchFocused: false,
-		searchInput:   searchInputModel{Width: searchInputWidth, focused: false},
+		snap:            snap,
+		roles:           make(map[string]string),
+		pending:         make(map[string]PendingBind),
+		focus:           FocusList,
+		searchFocused:   false,
+		searchInput:     searchInputModel{Width: searchInputWidth, focused: false},
+		state:           StateBrowsing,
+		activeWorkspace: TargetAsk,
+		targetCursor:    0,
+		reasoningPolicy: "default",
 	}
 	m.refilter()
 	m.resetReasoning()
@@ -378,6 +409,102 @@ func (m Model) FocusList() Model {
 
 // SearchFocused reports the current focus.
 func (m Model) SearchFocused() bool { return m.focus == FocusSearch }
+
+// State returns the current PickerState.
+func (m Model) State() PickerState { return m.state }
+
+// SetState sets the picker state.
+func (m Model) SetState(s PickerState) Model { m.state = s; return m }
+
+// ActiveWorkspace returns the active workspace context.
+func (m Model) ActiveWorkspace() WorkspaceTarget { return m.activeWorkspace }
+
+// SetActiveWorkspace sets the active workspace context.
+func (m Model) SetActiveWorkspace(t WorkspaceTarget) Model { m.activeWorkspace = t; return m }
+
+// TargetCursor returns the detail view target cursor index.
+func (m Model) TargetCursor() int { return m.targetCursor }
+
+// SetTargetCursor sets the detail view target cursor.
+func (m Model) SetTargetCursor(i int) Model { m.targetCursor = i; return m }
+
+// ReasoningPolicy returns the reasoning policy string.
+func (m Model) ReasoningPolicy() string { return m.reasoningPolicy }
+
+// ReasoningPolicyValue is an alias for ReasoningPolicy.
+func (m Model) ReasoningPolicyValue() string { return m.reasoningPolicy }
+
+// SetReasoningPolicy sets the reasoning policy.
+func (m Model) SetReasoningPolicy(p string) Model { m.reasoningPolicy = p; return m }
+
+// SelectedModel returns the highlighted model or nil (spec alias of Highlighted).
+func (m Model) SelectedModel() *registry.ModelDescriptor { return m.Highlighted() }
+
+// getInitialTargetIndex returns the cursor init position for the assignment drawer.
+func (m Model) getInitialTargetIndex() int {
+	for i, t := range AllWorkspaceTargets {
+		if t == m.activeWorkspace {
+			return i
+		}
+	}
+	return 0
+}
+
+// isModelAssignedToTarget reports whether modelID is bound to target.
+func (m Model) isModelAssignedToTarget(modelID string, target WorkspaceTarget) bool {
+	if modelID == "" {
+		return false
+	}
+	if bound, ok := m.roles[string(target)]; ok && bound != "" {
+		return bound == modelID
+	}
+	return false
+}
+
+// cycleReasoningPolicy rotates through default/off/auto/on.
+func (m *Model) cycleReasoningPolicy() {
+	policies := []string{"default", "off", "auto", "on"}
+	idx := 0
+	for i, p := range policies {
+		if p == m.reasoningPolicy {
+			idx = i
+			break
+		}
+	}
+	m.reasoningPolicy = policies[(idx+1)%len(policies)]
+}
+
+// clearSearch empties the query and reapplies filter.
+func (m *Model) clearSearch() {
+	m.query = ""
+	m.searchInput.SetValue("")
+	m.searchInput.value = ""
+	m.applyFilter()
+}
+
+// moveCursor shifts cursor clamped to filtered list (lowercase alias for MoveCursor).
+func (m *Model) moveCursor(delta int) {
+	*m = m.MoveCursor(delta)
+}
+
+// emitAssignmentCmd builds a ModelAssignmentRequestedMsg command.
+func (m Model) emitAssignmentCmd(model *registry.ModelDescriptor, target WorkspaceTarget) tea.Cmd {
+	if model == nil {
+		return nil
+	}
+	policy := m.reasoningPolicy
+	if policy == "" {
+		policy = "default"
+	}
+	return func() tea.Msg {
+		return ModelAssignmentRequestedMsg{
+			ModelID:  model.ID,
+			Provider: model.Provider,
+			Target:   target,
+			Policy:   InvocationPolicy{Reasoning: policy},
+		}
+	}
+}
 
 // IsGlobal reports the binding target scope.
 func (m Model) IsGlobal() bool { return m.isGlobal }

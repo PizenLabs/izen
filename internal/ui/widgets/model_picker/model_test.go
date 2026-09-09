@@ -94,66 +94,52 @@ func TestSearchInputFiltersRAM(t *testing.T) {
 	}
 }
 
-// Pressing p in list focus must emit a BindModelToRoleCommand (no file I/O,
-// no direct persistence, no badge mutation until confirmation).
+// Pressing a in browsing must emit ModelAssignmentRequestedMsg for the active workspace.
 func TestRoleBindingHotkeyEmitsCommand(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	m = m.FocusList()
+	// Set active workspace to plan for deterministic test
+	m = m.SetActiveWorkspace(TargetPlan)
 
 	var cmd tea.Cmd
-	m, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
 	if cmd == nil {
-		t.Fatal("role hotkey must return a tea.Cmd emitting BindModelToRoleCommand")
+		t.Fatal("quick assign hotkey 'a' must return a tea.Cmd emitting ModelAssignmentRequestedMsg")
 	}
 	msg := cmd()
-	bind, ok := msg.(modelapp.BindModelToRoleCommand)
+	assign, ok := msg.(ModelAssignmentRequestedMsg)
 	if !ok {
-		t.Fatalf("cmd msg = %T, want BindModelToRoleCommand", msg)
+		t.Fatalf("cmd msg = %T, want ModelAssignmentRequestedMsg", msg)
 	}
-	if string(bind.Role) != "plan" {
-		t.Errorf("role = %q, want plan", string(bind.Role))
+	if string(assign.Target) != "plan" {
+		t.Errorf("target = %q, want plan", string(assign.Target))
 	}
-	if bind.ModelID != "openrouter/deepseek/deepseek-r1" {
-		t.Errorf("model = %q, want highlighted deepseek-r1", bind.ModelID)
-	}
-	// Pure view: badges stay empty until the app layer confirms.
-	if _, ok := m.Roles()["plan"]; ok {
-		t.Error("picker must not mutate badges on keypress; wait for BindingSucceededMsg")
-	}
-	if !strings.Contains(m.Status(), "queued bind") {
-		t.Errorf("status = %q, want queued bind", m.Status())
-	}
-
-	// Confirmation path updates badges.
-	m, _ = m.UpdateModel(BindingSucceededMsg{Role: "plan", ModelID: bind.ModelID})
-	if got := m.Roles()["plan"]; got != bind.ModelID {
-		t.Errorf("after confirm, roles[plan] = %q", got)
-	}
-	if view := m.View(); !strings.Contains(view, "[PLAN]") {
-		t.Errorf("view must render [PLAN] badge after confirmation:\n%s", view)
+	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
+		t.Errorf("model = %q, want highlighted deepseek-r1", assign.ModelID)
 	}
 }
 
-// d/s/v/a hotkeys bind their roles via command emission.
+// Detail target hotkeys 1-5 emit assignment for the selected workspace target.
 func TestAllRoleHotkeysEmit(t *testing.T) {
-	cases := map[string]string{"d": "default", "s": "smol", "v": "vision", "a": "adviser"}
-	for key, wantRole := range cases {
-		m := New(seedSnapshot(testModels()))
-		m = m.FocusList().MoveCursor(2) // gpt-4o-mini
-		var cmd tea.Cmd
-		var updated Model
-		updated, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
-		_ = updated
-		if cmd == nil {
-			t.Fatalf("key %q must emit a command", key)
-		}
-		bind := cmd().(modelapp.BindModelToRoleCommand)
-		if string(bind.Role) != wantRole {
-			t.Errorf("key %q role = %q, want %q", key, string(bind.Role), wantRole)
-		}
-		if bind.ModelID != "openai/gpt-4o-mini" {
-			t.Errorf("key %q model = %q", key, bind.ModelID)
-		}
+	m := New(seedSnapshot(testModels()))
+	m = m.FocusList().MoveCursor(2) // gpt-4o-mini
+	// Enter detail
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.State() != StateDetail {
+		t.Fatalf("Enter must open detail, got state %v", m.State())
+	}
+	// Press 3 to assign to plan (index 2)
+	var cmd tea.Cmd
+	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
+	if cmd == nil {
+		t.Fatalf("key 3 must emit assignment command in detail")
+	}
+	assign := cmd().(ModelAssignmentRequestedMsg)
+	if string(assign.Target) != string(TargetPlan) {
+		t.Errorf("target = %q, want %q", string(assign.Target), TargetPlan)
+	}
+	if assign.ModelID != "openai/gpt-4o-mini" {
+		t.Errorf("model = %q, want gpt-4o-mini", assign.ModelID)
 	}
 }
 
@@ -229,8 +215,8 @@ func TestReasoningFidelity(t *testing.T) {
 
 	toggle := registry.ModelDescriptor{ID: "y", Provider: "gemini", Name: "y"}
 	mt := New(seedSnapshot([]registry.ModelDescriptor{toggle}))
-	if bar := mt.View(); !strings.Contains(bar, "off") || !strings.Contains(bar, "auto") {
-		t.Errorf("toggle view = %q, want off/auto/on", bar)
+	if bar := mt.RenderReasoningBar(); !strings.Contains(bar, "off") || !strings.Contains(bar, "auto") {
+		t.Errorf("toggle bar = %q, want off/auto/on", bar)
 	}
 
 	fixed := registry.ModelDescriptor{ID: "deepseek-r1", Provider: "deepseek", Name: "R1"}
@@ -258,22 +244,18 @@ func TestReasoningFidelity(t *testing.T) {
 	}
 }
 
-// Scope toggle flips local/global and flows into the emitted command.
+// Tab toggles focus between Search and List (spec state machine).
 func TestScopeToggleFlowsIntoCommand(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
-	m = m.FocusList()
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
-	if !m.IsGlobal() {
-		t.Fatal("g must toggle scope to global")
+	if m.Focus() != FocusList {
+		t.Fatalf("initial focus = %v, want FocusList", m.Focus())
 	}
-	var cmd tea.Cmd
-	var updated Model
-	updated, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
-	_ = updated
-	if cmd == nil {
-		t.Fatal("bind must emit a command")
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if m.Focus() != FocusSearch {
+		t.Fatalf("after Tab, focus = %v, want FocusSearch", m.Focus())
 	}
-	if bind := cmd().(modelapp.BindModelToRoleCommand); !bind.IsGlobal {
-		t.Error("command must carry IsGlobal=true after toggle")
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if m.Focus() != FocusList {
+		t.Fatalf("after second Tab, focus = %v, want FocusList", m.Focus())
 	}
 }

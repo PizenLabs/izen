@@ -21,7 +21,7 @@ var (
 	visionBadge   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89dceb"))
 	otherBadge    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f5a623"))
 	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))
-	okStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1"))
+	okStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1")) //nolint:unused // retained for legacy badge rendering
 	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa"))
 	syncOkStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
 	syncBusyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))

@@ -51,10 +51,14 @@ func TestSelectedRowCursor(t *testing.T) {
 	}
 	// Zero-state keeps the help panel and anchored footer.
 	empty := New(seedSnapshot(nil)).SetSize(100, 30).View()
-	for _, want := range []string{"NO MODELS AVAILABLE", "Ctrl+R", "Enter: activate"} {
+	for _, want := range []string{"NO MODELS AVAILABLE", "Ctrl+R"} {
 		if !strings.Contains(empty, want) {
 			t.Errorf("zero-state missing %q:\n%s", want, empty)
 		}
+	}
+	// Browsing footer should be clean with new hints
+	if !strings.Contains(view, "quick assign") || !strings.Contains(view, "Enter") {
+		t.Errorf("browsing footer must contain quick assign hint, got:\n%s", view)
 	}
 }
 

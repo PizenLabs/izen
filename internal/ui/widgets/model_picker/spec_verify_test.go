@@ -6,7 +6,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
@@ -116,67 +115,50 @@ func TestDefaultCycleRoundTrip(t *testing.T) {
 	}
 }
 
-// FocusScope state machine: UNIFIED ENGINE – Tab wall eliminated.
-// Search is ALWAYS active; Tab is no-op, Down moves cursor (global nav),
-// Alt+d/p/s/v/a bind roles, ←/→ cycle reasoning, typing always filters.
+// FocusScope state machine: 2-step model – Tab toggles Search/List, Enter inspects, a quick assigns.
 func TestFocusScopeStateMachine(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	if m.Focus() != FocusList {
 		t.Fatalf("initial focus = %v, want FocusList", m.Focus())
 	}
-	// Unified: Tab is no-op (search always active) – focus must not toggle.
+	// Tab toggles to Search
 	mTab, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
-	if mTab.Focus() != m.Focus() {
-		t.Errorf("Tab must be no-op in unified engine, got %v want %v", mTab.Focus(), m.Focus())
+	if mTab.Focus() != FocusSearch {
+		t.Errorf("Tab must toggle to Search, got %v want %v", mTab.Focus(), FocusSearch)
 	}
-	mShift, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyShiftTab})
-	if mShift.Focus() != m.Focus() {
-		t.Errorf("Shift+Tab must be no-op in unified engine")
-	}
-
-	// Alt bindings must work regardless of focus.
-	for _, tc := range []struct{ key, role string }{
-		{"alt+d", "default"}, {"alt+p", "plan"}, {"alt+s", "smol"}, {"alt+v", "vision"}, {"alt+a", "adviser"},
-	} {
-		mm := m
-		var cmd tea.Cmd
-		// Send Alt+key as Runes with Alt flag
-		r := tc.key[4:] // after "alt+"
-		_, cmd = mm.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r), Alt: true})
-		if cmd == nil {
-			t.Fatalf("alt %q must emit binding cmd", tc.key)
-		}
-		if bind := cmd().(modelapp.BindModelToRoleCommand); string(bind.Role) != tc.role {
-			t.Errorf("alt %q role = %q, want %q", tc.key, string(bind.Role), tc.role)
-		}
-	}
-	// Plain d/p/s/v/a must NOT bind in unified engine when focus is Search – they type.
-	mSearch := m.FocusSearch()
-	for _, key := range []string{"d", "p", "s", "v", "a"} {
-		mm, cmd := mSearch.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
-		if cmd != nil {
-			t.Errorf("plain %q in search focus must not emit bind (unified search), got cmd", key)
-		}
-		_ = mm
+	// Second Tab toggles back to List
+	mTab2, _ := mTab.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if mTab2.Focus() != FocusList {
+		t.Errorf("second Tab must toggle back to List, got %v", mTab2.Focus())
 	}
 
-	// ←/→ cycle reasoning without touching the cursor or query.
-	before := m.Cursor()
-	m2, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRight})
+	// Quick assign via 'a' must emit ModelAssignmentRequestedMsg in browsing
+	mAssign, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	if cmd == nil {
+		t.Fatalf("'a' quick assign must emit assignment cmd in browsing")
+	}
+	if _, ok := cmd().(ModelAssignmentRequestedMsg); !ok {
+		t.Fatalf("'a' cmd = %T, want ModelAssignmentRequestedMsg", cmd())
+	}
+	_ = mAssign
+
+	// Enter must open detail, not activate
+	mDetail, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if mDetail.State() != StateDetail {
+		t.Fatalf("Enter must transition to StateDetail, got %v", mDetail.State())
+	}
 	if cmd != nil {
-		t.Error("→ must emit no command")
-	}
-	if m2.Cursor() != before {
-		t.Errorf("→ changed cursor %d→%d", before, m2.Cursor())
-	}
-	if o, ok := m2.CurrentReasoningOption(); !ok || o != "low" {
-		t.Errorf("after → reasoning option = %q,%v, want low,true", o, ok)
+		t.Error("Enter to detail must not emit assignment command")
 	}
 
-	// Down moves cursor globally (no focus toggle)
+	// In detail, up/down navigate targets, Esc returns to browsing
+	mUp, _ := mDetail.UpdateModel(tea.KeyMsg{Type: tea.KeyUp})
+	if mUp.TargetCursor() != 0 {
+		t.Errorf("up at top should stay 0, got %d", mUp.TargetCursor())
+	}
 	mDown, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
 	if mDown.Cursor() != 1 {
-		t.Errorf("down must move cursor in unified engine, got %d want 1", mDown.Cursor())
+		t.Errorf("down must move cursor in browsing, got %d want 1", mDown.Cursor())
 	}
 }
 

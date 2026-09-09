@@ -2,6 +2,7 @@ package model_picker
 
 import (
 	"fmt"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -15,18 +16,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return updated, cmd
 }
 
-// UpdateModel is the typed transition for hosts embedding the picker. Pure
-// view: zero I/O. Search input filters the snapshot RAM slice synchronously;
-// role hotkeys (d/p/s/v/a) stamp a monotonic Seq, record saving... pending
-// state, and emit modelapp.BindModelToRoleCommand via tea.Cmd for the app
-// layer to persist; arrow keys cycle the provider-native reasoning options;
-// "g" toggles local/global scope; Enter dispatches ActivateModelCommand;
-// Ctrl+R emits SyncRequestedMsg. Badges mutate only on persistence-authority
-// confirmation (BindingResultMsg / Succeeded / Failed with matching Seq).
+// UpdateModel is the typed transition for hosts embedding the picker.
 func (m Model) UpdateModel(msg tea.Msg) (Model, tea.Cmd) {
 	if m.done {
-		// Terminal state: still honor persistence confirmations so late
-		// BindingResultMsg updates badges even after ACTIVATE.
 		switch msg := msg.(type) {
 		case modelapp.BindingResultMsg:
 			if msg.Err != nil {
@@ -45,6 +37,8 @@ func (m Model) UpdateModel(msg tea.Msg) (Model, tea.Cmd) {
 				m = m.applyBindFailure(msg.Role, msg.Seq, fmt.Errorf("bind %s failed", msg.Role))
 			}
 			return m, nil
+		case ModelAssignmentRequestedMsg:
+			return m, nil
 		default:
 			return m, nil
 		}
@@ -58,9 +52,6 @@ func (m Model) UpdateModel(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, nil
 	case modelapp.RegistryUpdatedMsg:
-		// Cross-layer alias of SnapshotMsg emitted by background workers
-		// that import modelapp instead of the widget. Identical
-		// re-hydration: pointer swap + re-filter + bounds clamp.
 		if msg.Snap != nil {
 			m = m.SetSnapshot(msg.Snap)
 			m.loading = false
@@ -68,8 +59,6 @@ func (m Model) UpdateModel(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, nil
 	case ModelsLoadedMsg:
-		// Legacy RAM push from the parent (background sync result). Rebuild
-		// the derived view without touching disk.
 		m.snap = snapshotFromDescriptors(m.snap, msg.Models)
 		m.refilter()
 		m.resetReasoning()
@@ -102,11 +91,14 @@ func (m Model) UpdateModel(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, nil
 	case modelapp.BindModelToRoleCommand:
-		// Echo path: the command bubbled to the parent and back (e.g. in
-		// tests without an app layer). Treat as persistence confirmation
-		// with the command's Seq so pending saving... resolves truthfully.
 		if string(msg.Role) != "" && msg.ModelID != "" {
 			m = m.applyBindSuccess(string(msg.Role), msg.ModelID, msg.Seq)
+		}
+		return m, nil
+	case ModelAssignmentRequestedMsg:
+		// Echo: treat as confirmation for legacy tests (update roles)
+		if string(msg.Target) != "" && msg.ModelID != "" {
+			m = m.applyBindSuccess(string(msg.Target), msg.ModelID, 0)
 		}
 		return m, nil
 	case modelapp.SyncRequestedMsg:
@@ -116,16 +108,19 @@ func (m Model) UpdateModel(msg tea.Msg) (Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// Also update inner geometry via SetSize
+		m = m.SetSize(msg.Width, msg.Height)
 		return m, nil
 	case tea.KeyMsg:
-		return m.handleKey(msg)
+		if m.state == StateDetail {
+			return m.handleDetailKeys(msg)
+		}
+		return m.handleBrowsingKeys(msg)
 	default:
 		return m, nil
 	}
 }
 
-// snapshotFromDescriptors rebuilds an immutable snapshot value from a pushed
-// descriptor list, preserving providers/version metadata when present.
 func snapshotFromDescriptors(prev *registry.ModelSnapshot, models []registry.ModelDescriptor) *registry.ModelSnapshot {
 	out := &registry.ModelSnapshot{Models: append([]registry.ModelDescriptor(nil), models...)}
 	if prev != nil {
@@ -136,25 +131,27 @@ func snapshotFromDescriptors(prev *registry.ModelSnapshot, models []registry.Mod
 	return out
 }
 
-// handleKey implements the UNIFIED SEARCH & NAVIGATION ENGINE.
-//
-// Spec invariants:
-//   - Search input is ALWAYS active by default (no Tab toggling required).
-//   - Navigation keys (↑, ↓, PgUp, PgDn, Enter, Esc) are intercepted globally
-//     before search input.
-//   - Role bindings use Alt+key (alt+d/p/s/v/a, alt+g) to avoid collision with
-//     typing. Plain d/p/s/v/a are routed to search (typing) for spec compliance
-//     but retained as fallback when Alt is not available (backward compat for
-//     existing tests that send plain runes).
-func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
+func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	k := msg.String()
 
-	// 1. GLOBAL NAVIGATION & SELECTION (intercepted before search input)
 	switch k {
-	case "up", "ctrl+p":
-		return m.MoveCursor(-1), nil
-	case "down", "ctrl+n":
-		return m.MoveCursor(1), nil
+	case "tab":
+		if m.focus == FocusSearch {
+			m.focus = FocusList
+			m.searchFocused = false
+			m.searchInput.Blur()
+		} else {
+			m.focus = FocusSearch
+			m.searchFocused = true
+			m.searchInput.Focus()
+		}
+		return m, nil
+	case "up", "ctrl+p", "k":
+		m.moveCursor(-1)
+		return m, nil
+	case "down", "ctrl+n", "j":
+		m.moveCursor(1)
+		return m, nil
 	case "pgup":
 		budget := m.listRowBudget
 		if budget <= 0 {
@@ -163,7 +160,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 				budget = 5
 			}
 		}
-		return m.MoveCursor(-budget), nil
+		m.moveCursor(-budget)
+		return m, nil
 	case "pgdown":
 		budget := m.listRowBudget
 		if budget <= 0 {
@@ -172,96 +170,54 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 				budget = 5
 			}
 		}
-		return m.MoveCursor(budget), nil
+		m.moveCursor(budget)
+		return m, nil
 	case "enter":
-		if sel := m.Highlighted(); sel != nil {
-			m = m.Select()
-			return m, m.EmitActivateCommand()
+		if sel := m.SelectedModel(); sel != nil {
+			m.state = StateDetail
+			m.targetCursor = m.getInitialTargetIndex()
+		}
+		return m, nil
+	case "a", "shift+enter":
+		if sel := m.SelectedModel(); sel != nil {
+			return m, m.emitAssignmentCmd(sel, m.activeWorkspace)
 		}
 		return m, nil
 	case "esc":
-		if m.query != "" {
-			m.query = ""
-			m.applyFilter()
+		if m.searchInput.Value() != "" || m.query != "" {
+			m.clearSearch()
 			return m, nil
 		}
-		// No query: propagate close request as no-op in widget (parent handles overlay).
-		return m, nil
+		return m, CloseModalCmd()
 	}
 
-	// Handle Ctrl+R globally (sync) before Alt bindings.
+	// Handle Ctrl+R globally (sync)
 	if msg.Type == tea.KeyCtrlR {
 		m.loading = true
 		m.status = "syncing..."
 		return m, func() tea.Msg { return modelapp.SyncRequestedMsg{} }
 	}
 
-	// 2. ROLE BINDINGS VIA ALT / SHORTCUTS (prevents typing collision)
-	switch k {
-	case "alt+d":
-		return m.QueueBind("default")
-	case "alt+p":
-		return m.QueueBind("plan")
-	case "alt+s":
-		return m.QueueBind("smol")
-	case "alt+v":
-		return m.QueueBind("vision")
-	case "alt+a":
-		return m.QueueBind("adviser")
-	case "alt+g":
-		m = m.ToggleScope()
-		scope := "local"
-		if m.isGlobal {
-			scope = "global"
+	// Also handle Shift+Enter via type check (some terminals report as ctrl+enter)
+	// Fallback: if msg.String() contains shift and enter, treat as fast path
+	if k == "shift+enter" || (msg.Type == tea.KeyEnter && strings.Contains(strings.ToLower(k), "shift")) {
+		if sel := m.SelectedModel(); sel != nil {
+			return m, m.emitAssignmentCmd(sel, m.activeWorkspace)
 		}
-		m.status = fmt.Sprintf("scope → %s", scope)
-		return m, nil
-	case "left", "right":
-		delta := -1
-		if k == "right" {
-			delta = 1
-		}
-		return m.CycleReasoning(delta), nil
-	}
-
-	// Tab / ShiftTab legacy: kept as no-op to avoid breaking existing callers,
-	// but search is always active so Tab no longer toggles focus.
-	if msg.Type == tea.KeyTab || msg.Type == tea.KeyShiftTab {
-		// Treat Tab as focus hint no-op; search remains active.
 		return m, nil
 	}
 
-	// 3. SUPPORT LEGACY PLAIN ROLE KEYS FOR BACKWARD COMPAT (tests send "p" etc
-	// without Alt). Plain bindings are only honored when focus is FocusList
-	// (list navigation) to preserve type-to-search in unified engine. When
-	// search is always active, typing "p" in search focus must filter, not bind.
-	if !msg.Alt && msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && m.focus == FocusList {
-		s := string(msg.Runes)
-		switch s {
-		case RoleDefaultKey, RolePlanKey, RoleSmolKey, RoleVisionKey, RoleAdviserKey:
-			return m.QueueBind(map[string]string{
-				RoleDefaultKey: "default",
-				RolePlanKey:    "plan",
-				RoleSmolKey:    "smol",
-				RoleVisionKey:  "vision",
-				RoleAdviserKey: "adviser",
-			}[s])
-		case ScopeToggleKey:
-			m = m.ToggleScope()
-			scope := "local"
-			if m.isGlobal {
-				scope = "global"
-			}
-			m.status = fmt.Sprintf("scope → %s", scope)
-			return m, nil
-		case "/":
-			return m, nil
-		}
+	// Direct input handling when FocusSearch is active
+	if m.focus == FocusSearch {
+		var cmd tea.Cmd
+		m.searchInput, cmd = m.searchInput.Update(msg)
+		m.query = m.searchInput.Value()
+		m.applyFilter()
+		return m, cmd
 	}
 
-	// 4. ALL OTHER RUNES ROUTED TO SEARCH INPUT (unified engine)
-	// Keep focus in sync so legacy tests that assert FocusSearch after typing
-	// still observe the expected state, while navigation remains focus-agnostic.
+	// When FocusList, printable runes should switch to Search and filter
+	// (keeps legacy tests and typing fluid while still supporting Tab toggle)
 	switch msg.Type {
 	case tea.KeyBackspace:
 		m.focus = FocusSearch
@@ -270,6 +226,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if len(m.query) > 0 {
 			r := []rune(m.query)
 			m.query = string(r[:len(r)-1])
+			m.searchInput.SetValue(m.query)
 			m.applyFilter()
 		}
 		return m, nil
@@ -278,6 +235,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.searchFocused = true
 		m.searchInput.Focus()
 		m.query += " "
+		m.searchInput.SetValue(m.query)
 		m.applyFilter()
 		return m, nil
 	case tea.KeyRunes:
@@ -293,6 +251,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.searchFocused = true
 			m.searchInput.Focus()
 			m.query += s
+			m.searchInput.SetValue(m.query)
 			m.applyFilter()
 		}
 		return m, nil
@@ -302,6 +261,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.searchFocused = true
 			m.searchInput.Focus()
 			m.query += k
+			m.searchInput.SetValue(m.query)
 			m.applyFilter()
 			return m, nil
 		}
@@ -309,8 +269,51 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	}
 }
 
-// isPrintableString reports whether s consists entirely of printable
-// characters suitable for auto-routing to search (single or multi-char).
+func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
+	k := msg.String()
+
+	switch k {
+	case "esc":
+		m.state = StateBrowsing
+		return m, nil
+	case "up", "k":
+		m.targetCursor = max(0, m.targetCursor-1)
+		return m, nil
+	case "down", "j":
+		m.targetCursor = min(len(AllWorkspaceTargets)-1, m.targetCursor+1)
+		return m, nil
+	case "1", "2", "3", "4", "5":
+		idx := int(k[0] - '1')
+		if idx >= 0 && idx < len(AllWorkspaceTargets) {
+			m.targetCursor = idx
+			selectedTarget := AllWorkspaceTargets[m.targetCursor]
+			sel := m.SelectedModel()
+			if sel != nil {
+				return m, m.emitAssignmentCmd(sel, selectedTarget)
+			}
+		}
+		return m, nil
+	case "r":
+		m.cycleReasoningPolicy()
+		return m, nil
+	case "enter":
+		if sel := m.SelectedModel(); sel != nil {
+			selectedTarget := AllWorkspaceTargets[m.targetCursor]
+			return m, m.emitAssignmentCmd(sel, selectedTarget)
+		}
+		return m, nil
+	}
+
+	// Allow Ctrl+R in detail as well
+	if msg.Type == tea.KeyCtrlR {
+		m.loading = true
+		m.status = "syncing..."
+		return m, func() tea.Msg { return modelapp.SyncRequestedMsg{} }
+	}
+
+	return m, nil
+}
+
 func isPrintableString(s string) bool {
 	for _, r := range s {
 		if r < 0x20 || r == 0x7f {

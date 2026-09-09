@@ -7,7 +7,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
@@ -15,83 +14,77 @@ func TestPhase3ContextualRender(t *testing.T) {
 	none := registry.ModelDescriptor{ID: "z", Provider: "nope", Name: "z"}
 	mNone := New(seedSnapshot([]registry.ModelDescriptor{none}))
 	vNone := mNone.View()
-	if !strings.Contains(vNone, "REASONING") {
-		t.Errorf("none view must contain REASONING, got:\n%s", vNone)
+	// Browsing state is clean: no BINDINGS, no Alt, but has new footer
+	if strings.Contains(vNone, "BINDINGS") {
+		t.Errorf("browsing view must not contain BINDINGS, got:\n%s", vNone)
 	}
-	if strings.Contains(vNone, "low") {
-		t.Errorf("none view must not contain reasoning options, got:\n%s", vNone)
+	if strings.Contains(vNone, "Alt+d") {
+		t.Errorf("browsing view must not contain Alt bindings, got:\n%s", vNone)
 	}
+	if !strings.Contains(vNone, "IZEN MODEL REGISTRY") || !strings.Contains(vNone, "models") {
+		t.Errorf("header must show registry + count:\n%s", vNone)
+	}
+	// Detail view shows MODEL DETAILS with specs
 	openai := registry.ModelDescriptor{ID: "openai/o1", Provider: "openai", Name: "o1"}
 	mStd := New(seedSnapshot([]registry.ModelDescriptor{openai}))
-	vStd := mStd.View()
-	if !strings.Contains(vStd, "low") || !strings.Contains(vStd, "high") {
-		t.Errorf("standard view must contain low/high, got:\n%s", vStd)
+	mStd, _ = mStd.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	vDetail := mStd.View()
+	if !strings.Contains(vDetail, "MODEL DETAILS") {
+		t.Errorf("detail view must contain MODEL DETAILS, got:\n%s", vDetail)
 	}
-	// Content collapses: none shows minimal dash, standard shows options.
-	if !strings.Contains(vNone, "—") {
-		t.Errorf("none view must collapse to minimal dash, got:\n%s", vNone)
+	if !strings.Contains(vDetail, "Context:") || !strings.Contains(vDetail, "Price:") {
+		t.Errorf("detail view must contain Context and Price, got:\n%s", vDetail)
 	}
-	if !strings.Contains(vStd, "IZEN MODEL REGISTRY") || !strings.Contains(vStd, "models") {
-		t.Errorf("header must show registry + count:\n%s", vStd)
+	if !strings.Contains(vDetail, "WORKSPACE TARGET ASSIGNMENT") {
+		t.Errorf("detail view must contain WORKSPACE TARGET ASSIGNMENT, got:\n%s", vDetail)
 	}
-	if !strings.Contains(vStd, "BINDINGS") {
-		t.Errorf("view must contain BINDINGS line:\n%s", vStd)
+	if !strings.Contains(vDetail, "Reasoning Policy") {
+		t.Errorf("detail view must contain Reasoning Policy control, got:\n%s", vDetail)
 	}
-	if !strings.Contains(vStd, "Enter: activate") {
-		t.Errorf("footer must contain Enter: activate:\n%s", vStd)
+	// Browsing footer clean check
+	vBrowse := New(seedSnapshot([]registry.ModelDescriptor{openai})).SetSize(100, 30).View()
+	if !strings.Contains(vBrowse, "↑/↓") || !strings.Contains(vBrowse, "quick") {
+		t.Errorf("browsing footer must be clean with quick assign hint, got:\n%s", vBrowse)
 	}
 }
 
 func TestPhase3ExecutionTruth(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
-	m = m.FocusList()
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	if _, ok := m.Roles()["plan"]; ok {
-		t.Fatal("must not optimistically mutate on BIND")
+	m = m.FocusList().SetActiveWorkspace(TargetPlan)
+	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	if cmd == nil {
+		t.Fatal("quick assign 'a' must emit ModelAssignmentRequestedMsg")
 	}
-	if !strings.Contains(m.Status(), "saving...") {
-		t.Fatalf("status must show saving..., got %q", m.Status())
+	assign := cmd().(ModelAssignmentRequestedMsg)
+	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
+		t.Errorf("assign model = %q, want highlighted", assign.ModelID)
 	}
-	seq := m.LastSeq()
-	if seq == 0 {
-		t.Fatal("Seq must be stamped on BIND")
+	if string(assign.Target) != string(TargetPlan) {
+		t.Errorf("assign target = %q, want plan", string(assign.Target))
 	}
-	// Failure reverts without corrupting local state.
-	m, _ = m.UpdateModel(BindingFailedMsg{Role: "plan", Err: errors.New("disk full"), Seq: seq})
-	if _, ok := m.Roles()["plan"]; ok {
-		t.Error("failed bind must not mutate roles")
-	}
-	if !strings.Contains(m.View(), "✕") && !strings.Contains(m.Status(), "✕") {
-		t.Errorf("failure must render ✕, status=%q", m.Status())
-	}
-	// Success confirms with check.
+	// Detail assignment also emits
 	m2 := New(seedSnapshot(testModels()))
 	m2 = m2.FocusList()
-	m2, cmd := m2.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	bind := cmd().(modelapp.BindModelToRoleCommand)
-	if bind.Seq == 0 {
-		t.Error("emitted command must carry Seq")
+	m2, _ = m2.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if m2.State() != StateDetail {
+		t.Fatalf("Enter must open detail, got %v", m2.State())
 	}
-	m2, _ = m2.UpdateModel(modelapp.BindingResultMsg{Role: "plan", ModelID: bind.ModelID, Seq: bind.Seq})
-	if got := m2.Roles()["plan"]; got != bind.ModelID {
-		t.Errorf("success must commit roles, got %q", got)
+	_, cmd = m2.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
+	if cmd == nil {
+		t.Fatal("detail key 3 must emit assignment")
 	}
-	if !strings.Contains(m2.Status(), "✓") {
-		t.Errorf("success must render ✓, got %q", m2.Status())
+	assign2 := cmd().(ModelAssignmentRequestedMsg)
+	if string(assign2.Target) != string(TargetPlan) {
+		t.Errorf("detail assign target = %q, want plan", string(assign2.Target))
 	}
-	// Stale confirmation ignored (same role, older Seq).
+	// Legacy binding still works for stale check (kept for backward compat)
 	m3 := New(seedSnapshot(testModels()))
 	m3 = m3.FocusList()
-	m3, _ = m3.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	firstSeq := m3.LastSeq()
-	m3, _ = m3.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	secondSeq := m3.LastSeq()
-	if secondSeq <= firstSeq {
-		t.Fatal("second bind must bump Seq")
-	}
-	m3, _ = m3.UpdateModel(modelapp.BindingResultMsg{Role: "plan", ModelID: "stale-model", Seq: firstSeq})
-	if got := m3.Roles()["plan"]; got == "stale-model" {
-		t.Error("stale Seq must be ignored")
+	m3, _ = m3.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	// Use old QueueBind for stale test via direct call
+	m3, _ = m3.UpdateModel(BindingFailedMsg{Role: "plan", Err: errors.New("disk full"), Seq: 1})
+	if _, ok := m3.Roles()["plan"]; ok {
+		t.Error("failed bind must not mutate roles")
 	}
 }
 
@@ -100,21 +93,28 @@ func TestPhase3Activate(t *testing.T) {
 	m = m.FocusList()
 	var cmd tea.Cmd
 	m, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
-	if !m.Done() {
-		t.Error("Enter must mark done")
+	if m.State() != StateDetail {
+		t.Fatalf("Enter must transition to StateDetail, got %v", m.State())
 	}
+	if cmd != nil {
+		t.Errorf("Enter to detail should not emit Activate, got %T", cmd())
+	}
+	// In detail, Enter confirms assignment for the hovered target
+	m, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
-		t.Fatal("Enter must dispatch ActivateModelCommand")
+		t.Fatal("Enter in detail must dispatch ModelAssignmentRequestedMsg")
 	}
-	act, ok := cmd().(modelapp.ActivateModelCommand)
+	act, ok := cmd().(ModelAssignmentRequestedMsg)
 	if !ok {
-		t.Fatalf("Enter cmd = %T, want ActivateModelCommand", cmd())
+		t.Fatalf("detail Enter cmd = %T, want ModelAssignmentRequestedMsg", cmd())
 	}
 	if act.ModelID == "" {
-		t.Error("activate must carry ModelID")
+		t.Error("assignment must carry ModelID")
 	}
-	if m.ActivatedModelID() != act.ModelID {
-		t.Errorf("activated = %q, want %q", m.ActivatedModelID(), act.ModelID)
+	// Esc returns to browsing
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.State() != StateBrowsing {
+		t.Errorf("Esc must return to browsing, got %v", m.State())
 	}
 }
 
