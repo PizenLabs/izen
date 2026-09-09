@@ -27,11 +27,33 @@ var (
 	dividerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#45475a"))
 
 	// selectedRowStyle is the active-row highlight: Surface0 background
-	// (#313244) with bold white text and the ">" cursor.
+	// (#313244) with Text (#cdd6f4) and the ">" cursor in Mauve (#cba6f7).
 	selectedRowStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("#ffffff")).
+				Foreground(lipgloss.Color("#cdd6f4")).
 				Background(lipgloss.Color("#313244"))
+
+	// normalRowStyle is the unselected row: default background, Text.
+	normalRowStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#cdd6f4"))
+
+	// cursorStyle renders the ">" cursor in Mauve (#cba6f7).
+	cursorStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#cba6f7")).
+			Background(lipgloss.Color("#313244"))
+
+	// metaStyle renders muted metadata (context, pricing) in Subtext0.
+	metaStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6adc8"))
+
+	// selectedMetaStyle renders muted metadata on the selected row:
+	// Subtext0 text on Surface0 background.
+	selectedMetaStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#a6adc8")).
+				Background(lipgloss.Color("#313244"))
+
+	// inactiveProviderStyle renders unselected provider pills in Surface2.
+	inactiveProviderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
 
 	// Per-provider badges (Catppuccin Mocha accents).
 	openRouterBadge = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fab387"))

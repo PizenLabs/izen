@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
+
 	"github.com/PizenLabs/izen/internal/domain/role"
 	"github.com/PizenLabs/izen/internal/provider/adapter"
 	"github.com/PizenLabs/izen/internal/provider/registry"
@@ -19,11 +21,11 @@ import (
 // dynamic viewport budgeting. Empty snapshots render inline, never modal.
 func (m Model) View() string {
 	var b strings.Builder
-	b.WriteString(m.renderHeader())
+	b.WriteString(m.clipLine(m.renderHeader()))
 	b.WriteString("\n")
 	b.WriteString(m.renderDivider())
 	b.WriteString("\n")
-	b.WriteString(m.renderSearchLine())
+	b.WriteString(m.clipLine(m.renderSearchLine()))
 	b.WriteString("\n")
 
 	models := m.snapshotModels()
@@ -33,15 +35,15 @@ func (m Model) View() string {
 		return m.padFooter(b.String())
 	}
 	if m.err != nil {
-		b.WriteString(errStyle.Render(" cache load failed: " + m.err.Error()))
+		b.WriteString(m.clipLine(errStyle.Render(" cache load failed: " + m.err.Error())))
 		b.WriteString("\n")
 	}
 
 	if len(m.filtered) == 0 {
 		if len(models) > 0 {
-			b.WriteString(mutedStyle.Render(fmt.Sprintf(" No models matching query: '%s' ", m.query)))
+			b.WriteString(m.clipLine(mutedStyle.Render(fmt.Sprintf(" No models matching query: '%s' ", m.query))))
 		} else {
-			b.WriteString(mutedStyle.Render(" no models loaded "))
+			b.WriteString(m.clipLine(mutedStyle.Render(" no models loaded ")))
 		}
 		b.WriteString("\n")
 	} else {
@@ -49,16 +51,26 @@ func (m Model) View() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(m.renderReasoningSection())
+	b.WriteString(m.clipLine(m.renderReasoningSection()))
 	b.WriteString("\n")
-	b.WriteString(m.renderBindingsLine())
+	b.WriteString(m.clipLine(m.renderBindingsLine()))
 	b.WriteString("\n")
 
 	if m.status != "" {
-		b.WriteString(mutedStyle.Render(" " + m.status))
+		b.WriteString(m.clipLine(mutedStyle.Render(" " + m.status)))
 		b.WriteString("\n")
 	}
 	return m.padFooter(b.String())
+}
+
+// clipLine enforces strict single-line width: truncates styled lines to the
+// inner width when bounded, stripping any embedded newlines.
+func (m Model) clipLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if m.width <= 0 {
+		return s
+	}
+	return truncateStyled(s, m.width)
 }
 
 // renderDivider renders the subtle horizontal rule separating the header
@@ -84,14 +96,25 @@ func (m Model) footerText() string {
 // padFooter appends height-aware padding plus the anchored footer to body.
 // body holds every line above the footer (each terminated by "\n"). When a
 // height bound is set and the body is shorter, blank lines fill the gap so
-// the keybindings footer lands on the last line of the modal card.
+// the keybindings footer lands on the last line of the modal card. When the
+// body overflows, it is hard-clipped to height-1 lines so the modal border
+// stays stationary (zero frame stretching).
 func (m Model) padFooter(body string) string {
 	footer := m.footerText()
+	if m.width > 0 {
+		footer = truncateStyled(strings.ReplaceAll(footer, "\n", " "), m.width)
+	}
 	if m.height <= 0 {
 		return body + footer
 	}
+	// Hard clip: keep at most height-1 body lines + 1 footer line.
+	lines := strings.Split(strings.TrimSuffix(body, "\n"), "\n")
+	if len(lines) > m.height-1 {
+		lines = lines[:m.height-1]
+	}
+	body = strings.Join(lines, "\n") + "\n"
 	// Body lines used + 1 footer line; filler bridges the remainder.
-	used := strings.Count(body, "\n") + 1
+	used := len(lines) + 1
 	if pad := m.height - used; pad > 0 {
 		body += strings.Repeat("\n", pad)
 	}
@@ -199,7 +222,7 @@ func (m Model) renderSearchLine() string {
 		if m.provider == "" {
 			cells = append(cells, accentStyle.Render("[All]"))
 		} else {
-			cells = append(cells, mutedStyle.Render("All"))
+			cells = append(cells, inactiveProviderStyle.Render("All"))
 		}
 		for _, ps := range m.snap.Providers {
 			var icon string
@@ -217,7 +240,7 @@ func (m Model) renderSearchLine() string {
 			if m.provider != "" && strings.EqualFold(m.provider, ps.Name) {
 				cells = append(cells, accentStyle.Render("["+cell+"]"))
 			} else {
-				cells = append(cells, mutedStyle.Render(cell))
+				cells = append(cells, inactiveProviderStyle.Render(cell))
 			}
 		}
 		line += "  " + strings.Join(cells, "  ")
@@ -238,8 +261,11 @@ func (m Model) renderSearchLine() string {
 }
 
 // visibleWindow computes the dynamic viewport: chrome-aware budget from
-// height (header+search+reasoning+bindings+footer) with cursor-following
-// scroll offset. Zero height = show all (unbounded, for tests).
+// height with cursor-following scroll offset. Static chrome = 7 lines:
+// header title (1) + search/status (2) + divider (1) + reasoning/bindings/
+// footer (3). listRowBudget = max(3, modalH-7) in modal coordinates, which
+// maps to inner height minus chrome here. Zero height = show all
+// (unbounded, for tests).
 func (m Model) visibleWindow() (start, end int) {
 	total := len(m.filtered)
 	if total == 0 {
@@ -247,7 +273,7 @@ func (m Model) visibleWindow() (start, end int) {
 	}
 	budget := total
 	if m.height > 0 {
-		chrome := 7 // header, search, reasoning, bindings, footer + spacing
+		chrome := 7 // header, search, divider, reasoning, bindings, footer + spacing
 		if m.status != "" {
 			chrome++
 		}
@@ -255,8 +281,8 @@ func (m Model) visibleWindow() (start, end int) {
 			chrome++
 		}
 		budget = m.height - chrome
-		if budget < 1 {
-			budget = 1
+		if budget < 3 {
+			budget = 3
 		}
 		if budget > total {
 			budget = total
@@ -279,65 +305,169 @@ func (m Model) visibleWindow() (start, end int) {
 	return start, start + budget
 }
 
+// Fixed column grid widths (visible cells, pre-style plain text).
+const (
+	colNameW     = 32
+	colProviderW = 12
+	colContextW  = 8
+	colPriceW    = 14
+	colCapsMinW  = 10
+)
+
+// renderList renders the strict single-line tabular grid. Every row is
+// EXACTLY 1 physical line: each column is truncated/padded to its fixed
+// width before concatenation, and the assembled line is hard-clipped to the
+// inner width. Zero text wrapping allowed.
 func (m Model) renderList() string {
 	start, end := m.visibleWindow()
 	if start >= end {
 		return ""
 	}
 	window := m.filtered[start:end]
-	// Column widths for alignment (ID, context, price, caps).
-	idW, ctxW, priceW, capsW := 0, 0, 0, 0
-	ids := make([]string, len(window))
-	ctxs := make([]string, len(window))
-	prices := make([]string, len(window))
-	caps := make([]string, len(window))
-	for i, d := range window {
-		ids[i] = d.ID
-		ctxs[i] = formatContext(d.ContextWindow)
-		prices[i] = formatPricePair(d.InputCostPerM, d.OutputCostPerM)
-		caps[i] = formatCaps(d)
-		if len(ids[i]) > idW {
-			idW = len(ids[i])
+	innerW := m.width
+
+	// Unbounded (tests/headless): legacy full render with sanitized pricing,
+	// no truncation so grep-friendly substrings survive.
+	if innerW <= 0 {
+		var b strings.Builder
+		for i, d := range window {
+			idx := start + i
+			badges := renderBadges(BadgesFor(d, m.roles))
+			prov := providerTag(d.Provider)
+			caps := formatCaps(d)
+			ctx := formatContext(d.ContextWindow)
+			price := formatPricePair(d.InputCostPerM, d.OutputCostPerM)
+			tail := strings.TrimSpace(caps + " " + prov + " " + badges)
+			cursor := " "
+			if idx == m.cursor {
+				cursor = ">"
+			}
+			row := fmt.Sprintf("%s %s  %s  %s  %s", cursor, d.ID, ctx, price, tail)
+			if idx == m.cursor {
+				b.WriteString(selectedRowStyle.Render(row))
+			} else {
+				b.WriteString(" " + row)
+			}
+			b.WriteString("\n")
 		}
-		if len(ctxs[i]) > ctxW {
-			ctxW = len(ctxs[i])
+		if end < len(m.filtered) {
+			b.WriteString(mutedStyle.Render(fmt.Sprintf(" … %d more", len(m.filtered)-end)))
+			b.WriteString("\n")
 		}
-		if len(prices[i]) > priceW {
-			priceW = len(prices[i])
+		if start > 0 {
+			return mutedStyle.Render(fmt.Sprintf(" … %d above", start)) + "\n" + strings.TrimSuffix(b.String(), "\n")
 		}
-		if len(caps[i]) > capsW {
-			capsW = len(caps[i])
+		return strings.TrimSuffix(b.String(), "\n")
+	}
+
+	// Fixed grid: adapt the name column on narrow panes so the total always
+	// fits innerW with zero wrapping.
+	nameW, providerW, ctxW, priceW := colNameW, colProviderW, colContextW, colPriceW
+	const separators = 7 // 2 cursor prefix + 4 inter-column spaces + 1
+	minTotal := 10 + providerW + ctxW + priceW + separators + colCapsMinW
+	if innerW < colNameW+providerW+ctxW+priceW+separators+colCapsMinW {
+		nameW = innerW - (providerW + ctxW + priceW + separators + colCapsMinW)
+		if nameW < 10 {
+			nameW = 10
 		}
 	}
+	_ = minTotal
+	capsW := innerW - (2 + nameW + 1 + providerW + 1 + ctxW + 1 + priceW + 1)
+	if capsW < 0 {
+		capsW = 0
+	}
+
 	var b strings.Builder
 	for i, d := range window {
 		idx := start + i
-		badges := renderBadges(BadgesFor(d, m.roles))
-		prov := providerTag(d.Provider)
-		tail := strings.TrimSpace(caps[i] + " " + prov + " " + badges)
-		// Inline role badge for the highlighted model is already in badges;
-		// ensure the current cursor row surfaces it even when roles map is
-		// mid-transition (pending saving shows the target separately).
-		cursor := " "
-		idCell := fmt.Sprintf("%-*s", idW, ids[i])
-		row := fmt.Sprintf("%s %s  %-*s  %-*s  %-*s %s", cursor, idCell, ctxW, ctxs[i], priceW, prices[i], capsW, caps[i], tail)
-		if idx == m.cursor {
-			row = fmt.Sprintf("%s %s  %-*s  %-*s  %-*s %s", ">", idCell, ctxW, ctxs[i], priceW, prices[i], capsW, caps[i], tail)
-			b.WriteString(selectedRowStyle.Render(row))
-		} else {
-			b.WriteString(" " + row)
-		}
+		b.WriteString(m.renderRow(d, idx == m.cursor, nameW, providerW, ctxW, priceW, capsW, innerW))
 		b.WriteString("\n")
 	}
 	if end < len(m.filtered) {
-		b.WriteString(mutedStyle.Render(fmt.Sprintf(" … %d more", len(m.filtered)-end)))
+		b.WriteString(truncateStyled(mutedStyle.Render(fmt.Sprintf(" … %d more", len(m.filtered)-end)), innerW))
 		b.WriteString("\n")
 	}
 	if start > 0 {
 		// Prepend scroll context without shifting the cursor math.
-		return mutedStyle.Render(fmt.Sprintf(" … %d above", start)) + "\n" + strings.TrimSuffix(b.String(), "\n")
+		return truncateStyled(mutedStyle.Render(fmt.Sprintf(" … %d above", start)), innerW) + "\n" + strings.TrimSuffix(b.String(), "\n")
 	}
 	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// renderRow assembles one guaranteed-single-line row: format & truncate
+// EVERY column to its fixed width before concatenation, then hard-clip the
+// assembled line to width. Per-cell colors preserve visible widths.
+func (m Model) renderRow(d registry.ModelDescriptor, selected bool, nameW, providerW, ctxW, priceW, capsW, innerW int) string {
+	// 1. Format & truncate plain cells.
+	nameStr := fitCell(d.ID, nameW)
+	providerStr := fitCell(providerPlainTag(d.Provider), providerW)
+	contextStr := fitCell(formatContext(d.ContextWindow), ctxW)
+	priceStr := fitCell(formatPricePair(d.InputCostPerM, d.OutputCostPerM), priceW)
+	// Capabilities share their budget with role badges so [PLAN]/[DEFAULT]
+	// stay visible when space allows, always within capsW.
+	badges := strings.Join(BadgesFor(d, m.roles), " ")
+	capsPlain := formatCaps(d)
+	capsAndBadges := capsPlain
+	if badges != "" {
+		if capsAndBadges == "" || capsAndBadges == "—" {
+			capsAndBadges = badges
+		} else {
+			capsAndBadges = capsAndBadges + " " + badges
+		}
+	}
+	capsStr := truncateWithEllipsis(capsAndBadges, capsW)
+
+	// 2. Style cells (styling preserves visible width).
+	var nameCell, provCell, ctxCell, priceCell, capsCell, cursor string
+	if selected {
+		nameCell = selectedRowStyle.Render(nameStr)
+		ctxCell = selectedMetaStyle.Render(contextStr)
+		priceCell = selectedMetaStyle.Render(priceStr)
+		capsCell = selectedRowStyle.Render(padRight(capsStr, capsW))
+		cursor = cursorStyle.Render(">")
+		// Re-apply the provider hue on top of the selection background so
+		// the pill stays distinguishable while selected.
+		provCell = providerTagStyled(providerStr, d.Provider, true)
+	} else {
+		nameCell = normalRowStyle.Render(nameStr)
+		provCell = providerTagStyled(providerStr, d.Provider, false)
+		ctxCell = metaStyle.Render(contextStr)
+		priceCell = metaStyle.Render(priceStr)
+		capsCell = mutedStyle.Render(padRight(capsStr, capsW))
+		cursor = " "
+	}
+
+	// 3. Assemble line (guaranteed <= innerW in visible cells).
+	line := cursor + " " + lipgloss.JoinHorizontal(lipgloss.Left,
+		nameCell,
+		" ",
+		provCell,
+		" ",
+		ctxCell,
+		" ",
+		priceCell,
+		" ",
+		capsCell,
+	)
+	// Belt-and-suspenders: hard-clip any ANSI edge case to innerW.
+	line = truncateStyled(line, innerW)
+	if selected {
+		// Ensure the full-width selection background without rewrapping:
+		// pad visible remainder with the selection background.
+		if vw := lipgloss.Width(line); vw < innerW {
+			line += selectedRowStyle.Render(strings.Repeat(" ", innerW-vw))
+		}
+		return lipgloss.NewStyle().Width(innerW).MaxWidth(innerW).MaxHeight(1).Render(line)
+	}
+	return lipgloss.NewStyle().Width(innerW).MaxWidth(innerW).MaxHeight(1).Render(line)
+}
+
+// providerPlainTag returns the grep-friendly uppercase pill text.
+func providerPlainTag(provider string) string {
+	if provider == "" {
+		return ""
+	}
+	return "[" + strings.ToUpper(provider) + "]"
 }
 
 // renderReasoningSection renders the contextual reasoning block. It collapses
@@ -452,6 +582,55 @@ func providerTag(provider string) string {
 	}
 }
 
+// providerTagStyled colors a pre-fitted provider cell (exact visible width)
+// with the per-provider hue. Selected rows keep Surface0 background.
+func providerTagStyled(fitted, provider string, selected bool) string {
+	bg := ""
+	_ = bg
+	switch strings.ToLower(provider) {
+	case "openrouter":
+		if selected {
+			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fab387")).Background(lipgloss.Color("#313244")).Render(fitted)
+		}
+		return openRouterBadge.Render(fitted)
+	case "anthropic":
+		if selected {
+			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7")).Background(lipgloss.Color("#313244")).Render(fitted)
+		}
+		return anthropicBadge.Render(fitted)
+	case "openai":
+		if selected {
+			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1")).Background(lipgloss.Color("#313244")).Render(fitted)
+		}
+		return openAIBadge.Render(fitted)
+	case "ollama":
+		if selected {
+			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89dceb")).Background(lipgloss.Color("#313244")).Render(fitted)
+		}
+		return ollamaBadge.Render(fitted)
+	case "gemini", "google":
+		if selected {
+			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa")).Background(lipgloss.Color("#313244")).Render(fitted)
+		}
+		return geminiBadge.Render(fitted)
+	case "deepseek":
+		if selected {
+			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#94e2d5")).Background(lipgloss.Color("#313244")).Render(fitted)
+		}
+		return deepseekBadge.Render(fitted)
+	case "":
+		if selected {
+			return selectedRowStyle.Render(fitted)
+		}
+		return fitted
+	default:
+		if selected {
+			return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#6c7086")).Background(lipgloss.Color("#313244")).Render(fitted)
+		}
+		return providerBadge.Render(fitted)
+	}
+}
+
 func renderBadges(badges []string) string {
 	if len(badges) == 0 {
 		return ""
@@ -492,12 +671,10 @@ func formatContext(ctx int) string {
 	return strconv.Itoa(ctx)
 }
 
-// formatPricePair renders "$in/$out" compactly ("$0.55/$2.19", "—").
+// formatPricePair renders "$in/$out" compactly ("$0.55/$2.19", "free").
+// Strict float sanitizer: never emits IEEE 754 bloat like $0.099999999.
 func formatPricePair(in, out float64) string {
-	if in == 0 && out == 0 {
-		return "—"
-	}
-	return fmt.Sprintf("$%g/$%g", in, out)
+	return formatPricing(in, out)
 }
 
 // formatCaps renders classifier-effective capabilities ("Thinking Tools").

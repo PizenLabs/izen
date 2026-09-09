@@ -199,17 +199,29 @@ func (m *model) renderModelPickerModal() string {
 
 	modalW, modalH := ModelPickerModalSize(m.width, m.height)
 	// Inner content bounds: border + padding consume 4 columns / 2 rows.
-	m.modelPicker = m.modelPicker.SetSize(modalW-4, modalH-2)
+	innerW, innerH := modalW-4, modalH-2
+	m.modelPicker = m.modelPicker.SetSize(innerW, innerH)
 	rawContent := m.modelPicker.View()
+
+	// Content hard clip: enforce MaxWidth/MaxHeight on the picker blob so
+	// an oversized list can never stretch the modal border or jitter the
+	// viewport. The picker itself already budgets rows (modalH-7) and
+	// single-line rows; this is belt-and-suspenders.
+	boxContent := lipgloss.NewStyle().
+		MaxWidth(innerW).
+		MaxHeight(innerH).
+		Render(rawContent)
 
 	modalBox := lipgloss.NewStyle().
 		Width(modalW).
+		MaxWidth(modalW).
 		Height(modalH).
+		MaxHeight(modalH).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(colorMauve)).
 		Background(lipgloss.Color(colorSurface)).
 		Padding(0, 1).
-		Render(rawContent)
+		Render(boxContent)
 
 	centered := lipgloss.Place(
 		m.width, m.height,
