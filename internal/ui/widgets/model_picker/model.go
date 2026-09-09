@@ -245,16 +245,17 @@ func (m Model) BindHighlighted(roleName string) (Model, error) {
 // with the same semantics.
 func (m *Model) refilter() {
 	var out []registry.ModelDescriptor
-	if m.reg != nil && m.models != nil {
+	switch {
+	case m.reg != nil && m.models != nil:
 		// Prefer the live registry so background syncs are visible; Filter
 		// never touches disk.
 		live := m.reg.Filter(m.query, m.provider)
 		// Intersect with the loaded generation guard: when the picker has
 		// never loaded (models == nil), live is authoritative.
 		out = live
-	} else if m.reg != nil {
+	case m.reg != nil:
 		out = m.reg.Filter(m.query, m.provider)
-	} else {
+	default:
 		out = filterLocal(m.models, m.query, m.provider)
 	}
 	m.filtered = out
