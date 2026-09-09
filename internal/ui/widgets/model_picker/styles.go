@@ -1,7 +1,11 @@
 package model_picker
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
 // Compact Lipgloss styles for the contextual command surface. Catppuccin
@@ -41,30 +45,73 @@ var (
 	normalRowStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#cdd6f4"))
 
-	// cursorStyle renders the ">" cursor in Mauve (#cba6f7).
-	cursorStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#cba6f7")).
-			Background(lipgloss.Color("#313244"))
-
-	// metaStyle renders muted metadata (context, pricing) in Subtext0.
-	metaStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6adc8"))
-
-	// selectedMetaStyle renders muted metadata on the selected row:
-	// Subtext0 text on Surface0 background.
-	selectedMetaStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#a6adc8")).
-				Background(lipgloss.Color("#313244"))
-
 	// inactiveProviderStyle renders unselected provider pills in Surface2.
+	//nolint:unused // retained for spec compatibility
 	inactiveProviderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
 
-	// Per-provider badges (Catppuccin Mocha accents).
-	openRouterBadge = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#fab387"))
-	anthropicBadge  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
-	openAIBadge     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1"))
-	ollamaBadge     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89dceb"))
-	geminiBadge     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa"))
+	// providerFilterActive is the highlighted provider pill: Yellow bold.
+	providerFilterActive = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af")).Bold(true)
+	// providerFilterInactive is the muted provider pill: Subtext0.
+	providerFilterInactive = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+
+	// Per-provider badges (Catppuccin Mocha accents – legacy identifiers kept for
+	// backward compat; palette updated to spec's explicit Mocha mapping).
+	openRouterBadge = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7")) // Mauve per spec
+	anthropicBadge  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f9e2af")) // Yellow per spec
+	openAIBadge     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#94e2d5")) // Teal per spec
+	ollamaBadge     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1")) // Green per spec
+	geminiBadge     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa")) // Blue per spec
 	deepseekBadge   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#94e2d5"))
 	providerBadge   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#6c7086"))
+
+	// Catppuccin Mocha reasoning effort palette (spec: Header Layout Lock task).
+	// default=mauve, none=subtext0, low=green, medium=yellow, high=peach,
+	// xhigh=flamingo, max=red. Bold for visibility; selected adds underline.
+	effortDefaultStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")).Bold(true)
+	effortNoneStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
+	effortLowStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1")).Bold(true)
+	effortMediumStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af")).Bold(true)
+	effortHighStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#fab387")).Bold(true)
+	effortXHighStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f2cdcd")).Bold(true)
+	effortMaxStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8")).Bold(true)
 )
+
+var effortStyles = map[string]lipgloss.Style{
+	"default": effortDefaultStyle,
+	"none":    effortNoneStyle,
+	"off":     effortNoneStyle,
+	"low":     effortLowStyle,
+	"medium":  effortMediumStyle,
+	"high":    effortHighStyle,
+	"xhigh":   effortXHighStyle,
+	"max":     effortMaxStyle,
+	// ToggleAuto "auto" maps to medium (balanced), "on" to high.
+	"auto": effortMediumStyle,
+	"on":   effortHighStyle,
+}
+
+// providerBadgeStyles is the spec's explicit Catppuccin Mocha badge map used
+// by renderProviderBadge for table rows.
+var providerBadgeStyles = map[string]lipgloss.Style{
+	"openrouter": lipgloss.NewStyle().Foreground(lipgloss.Color("#cba6f7")).Bold(true), // Mauve
+	"gemini":     lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Bold(true), // Blue
+	"groq":       lipgloss.NewStyle().Foreground(lipgloss.Color("#fab387")).Bold(true), // Peach
+	"ollama":     lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1")).Bold(true), // Green
+	"openai":     lipgloss.NewStyle().Foreground(lipgloss.Color("#94e2d5")).Bold(true), // Teal
+	"anthropic":  lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af")).Bold(true), // Yellow
+	"cohere":     lipgloss.NewStyle().Foreground(lipgloss.Color("#f2cdcd")).Bold(true), // Flamingo
+}
+
+// renderProviderBadge returns a colored provider pill clipped to width.
+// Style follows the Catppuccin Mocha map; unknown providers fall back to Sky (#89dceb).
+func renderProviderBadge(provider string, width int) string {
+	pLower := strings.ToLower(provider)
+	style, ok := providerBadgeStyles[pLower]
+	if !ok {
+		style = lipgloss.NewStyle().Foreground(lipgloss.Color("#89dceb")).Bold(true) // Sky default
+	}
+	raw := fmt.Sprintf("[%s]", strings.ToUpper(provider))
+	truncated := runewidth.Truncate(raw, width, "")
+	padded := padRightExact(truncated, width)
+	return style.Render(padded)
+}

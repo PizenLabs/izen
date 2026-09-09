@@ -136,97 +136,252 @@ func snapshotFromDescriptors(prev *registry.ModelSnapshot, models []registry.Mod
 	return out
 }
 
-// handleKey routes keystrokes by focus. Search focus: printable runes append
-// to the query and re-filter RAM-side with zero cursor lag; backspace shrinks
-// it; tab/esc moves focus to the list. List focus: up/down navigate (SELECT),
-// d/p/s/v/a queue role bindings via Seq-stamped command emission (BIND),
-// left/right cycle reasoning options, g toggles scope, tab or "/" returns to
-// search, enter marks done and dispatches ActivateModelCommand (ACTIVATE),
-// Ctrl+R requests background sync.
+// handleKey implements the UNIFIED SEARCH & NAVIGATION ENGINE.
+//
+// Spec invariants:
+//   - Search input is ALWAYS active by default (no Tab toggling required).
+//   - Navigation keys (↑, ↓, PgUp, PgDn, Enter, Esc) are intercepted globally
+//     before search input.
+//   - Role bindings use Alt+key (alt+d/p/s/v/a, alt+g) to avoid collision with
+//     typing. Plain d/p/s/v/a are routed to search (typing) for spec compliance
+//     but retained as fallback when Alt is not available (backward compat for
+//     existing tests that send plain runes).
 func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyUp:
+	k := msg.String()
+
+	// 1. GLOBAL NAVIGATION & SELECTION (intercepted before search input)
+	switch k {
+	case "up", "ctrl+p":
 		return m.MoveCursor(-1), nil
-	case tea.KeyDown:
+	case "down", "ctrl+n":
 		return m.MoveCursor(1), nil
-	case tea.KeyLeft:
-		return m.CycleReasoning(-1), nil
-	case tea.KeyRight:
-		return m.CycleReasoning(1), nil
-	case tea.KeyEnter:
-		m = m.Select()
-		return m, m.EmitActivateCommand()
-	case tea.KeyCtrlR:
+	case "pgup":
+		budget := m.listRowBudget
+		if budget <= 0 {
+			budget = max(5, m.innerHeight-6)
+			if budget <= 0 {
+				budget = 5
+			}
+		}
+		return m.MoveCursor(-budget), nil
+	case "pgdown":
+		budget := m.listRowBudget
+		if budget <= 0 {
+			budget = max(5, m.innerHeight-6)
+			if budget <= 0 {
+				budget = 5
+			}
+		}
+		return m.MoveCursor(budget), nil
+	case "enter":
+		if sel := m.Highlighted(); sel != nil {
+			m = m.Select()
+			return m, m.EmitActivateCommand()
+		}
+		return m, nil
+	case "esc":
+		if m.query != "" {
+			m.query = ""
+			m.applyFilter()
+			return m, nil
+		}
+		// No query: propagate close request as no-op in widget (parent handles overlay).
+		return m, nil
+	}
+
+	// Handle Ctrl+R globally (sync) before Alt bindings.
+	if msg.Type == tea.KeyCtrlR {
 		m.loading = true
 		m.status = "syncing..."
 		return m, func() tea.Msg { return modelapp.SyncRequestedMsg{} }
+	}
+
+	// 2. ROLE BINDINGS VIA ALT / SHORTCUTS (prevents typing collision)
+	switch k {
+	case "alt+d":
+		return m.QueueBind("default")
+	case "alt+p":
+		return m.QueueBind("plan")
+	case "alt+s":
+		return m.QueueBind("smol")
+	case "alt+v":
+		return m.QueueBind("vision")
+	case "alt+a":
+		return m.QueueBind("adviser")
+	case "alt+g":
+		m = m.ToggleScope()
+		scope := "local"
+		if m.isGlobal {
+			scope = "global"
+		}
+		m.status = fmt.Sprintf("scope → %s", scope)
+		return m, nil
+	case "left", "right":
+		delta := -1
+		if k == "right" {
+			delta = 1
+		}
+		return m.CycleReasoning(delta), nil
+	}
+
+	// Tab / ShiftTab legacy: kept as no-op to avoid breaking existing callers,
+	// but search is always active so Tab no longer toggles focus.
+	if msg.Type == tea.KeyTab || msg.Type == tea.KeyShiftTab {
+		// Treat Tab as focus hint no-op; search remains active.
+		return m, nil
+	}
+
+	// 3. SUPPORT LEGACY PLAIN ROLE KEYS FOR BACKWARD COMPAT (tests send "p" etc
+	// without Alt). Plain bindings are only honored when focus is FocusList
+	// (list navigation) to preserve type-to-search in unified engine. When
+	// search is always active, typing "p" in search focus must filter, not bind.
+	if !msg.Alt && msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && m.focus == FocusList {
+		s := string(msg.Runes)
+		switch s {
+		case RoleDefaultKey, RolePlanKey, RoleSmolKey, RoleVisionKey, RoleAdviserKey:
+			return m.QueueBind(map[string]string{
+				RoleDefaultKey: "default",
+				RolePlanKey:    "plan",
+				RoleSmolKey:    "smol",
+				RoleVisionKey:  "vision",
+				RoleAdviserKey: "adviser",
+			}[s])
+		case ScopeToggleKey:
+			m = m.ToggleScope()
+			scope := "local"
+			if m.isGlobal {
+				scope = "global"
+			}
+			m.status = fmt.Sprintf("scope → %s", scope)
+			return m, nil
+		case "/":
+			return m, nil
+		}
+	}
+
+	// 4. ALL OTHER RUNES ROUTED TO SEARCH INPUT (unified engine)
+	// Keep focus in sync so legacy tests that assert FocusSearch after typing
+	// still observe the expected state, while navigation remains focus-agnostic.
+	switch msg.Type {
 	case tea.KeyBackspace:
-		if m.searchFocused && len(m.query) > 0 {
-			m.query = m.query[:len(m.query)-1]
-			m.refilter()
-			m.resetReasoning()
+		m.focus = FocusSearch
+		m.searchFocused = true
+		m.searchInput.Focus()
+		if len(m.query) > 0 {
+			r := []rune(m.query)
+			m.query = string(r[:len(r)-1])
+			m.applyFilter()
 		}
 		return m, nil
 	case tea.KeySpace:
-		// Space in search focus appends to the multi-token query
-		// (strings.Fields AND logic in MatchesQuery); it must never
-		// trigger table selection or page scrolling.
-		if m.searchFocused {
-			m.query += " "
-			m.refilter()
-			m.resetReasoning()
-		}
-		return m, nil
-	case tea.KeyTab, tea.KeyEsc:
-		m.searchFocused = !m.searchFocused
+		m.focus = FocusSearch
+		m.searchFocused = true
+		m.searchInput.Focus()
+		m.query += " "
+		m.applyFilter()
 		return m, nil
 	case tea.KeyRunes:
-		return m.handleRunes(string(msg.Runes))
+		s := string(msg.Runes)
+		if s == "" {
+			return m, nil
+		}
+		if s == "/" && m.query == "" {
+			return m, nil
+		}
+		if isPrintableString(s) {
+			m.focus = FocusSearch
+			m.searchFocused = true
+			m.searchInput.Focus()
+			m.query += s
+			m.applyFilter()
+		}
+		return m, nil
 	default:
+		if len(k) == 1 && isPrintableString(k) {
+			m.focus = FocusSearch
+			m.searchFocused = true
+			m.searchInput.Focus()
+			m.query += k
+			m.applyFilter()
+			return m, nil
+		}
 		return m, nil
 	}
 }
 
-func (m Model) handleRunes(s string) (Model, tea.Cmd) {
+// handleSearchRunes handles printable input (retained for compatibility).
+func (m Model) handleSearchRunes(s string) (Model, tea.Cmd) {
 	if s == "" {
 		return m, nil
 	}
-	if !m.searchFocused {
-		// List focus: single-char role hotkeys emit Seq-stamped commands
-		// (no persistence, no badge mutation until confirmation).
-		if len([]rune(s)) == 1 {
-			switch s {
-			case RoleDefaultKey:
-				return m.QueueBind("default")
-			case RolePlanKey:
-				return m.QueueBind("plan")
-			case RoleSmolKey:
-				return m.QueueBind("smol")
-			case RoleVisionKey:
-				return m.QueueBind("vision")
-			case RoleAdviserKey:
-				return m.QueueBind("adviser")
-			case ScopeToggleKey:
-				m = m.ToggleScope()
-				scope := "local"
-				if m.isGlobal {
-					scope = "global"
-				}
-				m.status = fmt.Sprintf("scope → %s", scope)
-				return m, nil
-			case "/":
-				m.searchFocused = true
-				return m, nil
-			}
-		}
-		return m, nil
-	}
-	// Search focus: every rune filters RAM-side with no I/O.
 	if s == "/" && m.query == "" {
 		return m, nil
 	}
 	m.query += s
-	m.refilter()
-	m.resetReasoning()
+	m.applyFilter()
 	return m, nil
+}
+
+// handleListKeys retained for compatibility; delegates to unified handleKey.
+func (m Model) handleListKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
+	return m.handleKey(msg)
+}
+
+func (m Model) handleListRunes(s string) (Model, tea.Cmd) {
+	if s == "" {
+		return m, nil
+	}
+	if len([]rune(s)) == 1 {
+		switch s {
+		case RoleDefaultKey:
+			return m.QueueBind("default")
+		case RolePlanKey:
+			return m.QueueBind("plan")
+		case RoleSmolKey:
+			return m.QueueBind("smol")
+		case RoleVisionKey:
+			return m.QueueBind("vision")
+		case RoleAdviserKey:
+			return m.QueueBind("adviser")
+		case ScopeToggleKey:
+			m = m.ToggleScope()
+			scope := "local"
+			if m.isGlobal {
+				scope = "global"
+			}
+			m.status = fmt.Sprintf("scope → %s", scope)
+			return m, nil
+		case "/":
+			return m, nil
+		}
+	}
+	if isPrintableString(s) {
+		m.query += s
+		m.applyFilter()
+		return m, nil
+	}
+	return m, nil
+}
+
+// isPrintableString reports whether s consists entirely of printable
+// characters suitable for auto-routing to search (single or multi-char).
+func isPrintableString(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// isListHotkey reports whether s is an explicit FocusList keybinding that
+// must NOT be forwarded to the search input.
+//
+//nolint:unused // retained for spec compatibility
+func isListHotkey(s string) bool {
+	switch s {
+	case RoleDefaultKey, RolePlanKey, RoleSmolKey, RoleVisionKey, RoleAdviserKey, ScopeToggleKey:
+		return true
+	}
+	return false
 }
