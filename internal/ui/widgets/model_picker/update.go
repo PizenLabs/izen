@@ -309,60 +309,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	}
 }
 
-// handleSearchRunes handles printable input (retained for compatibility).
-func (m Model) handleSearchRunes(s string) (Model, tea.Cmd) {
-	if s == "" {
-		return m, nil
-	}
-	if s == "/" && m.query == "" {
-		return m, nil
-	}
-	m.query += s
-	m.applyFilter()
-	return m, nil
-}
-
-// handleListKeys retained for compatibility; delegates to unified handleKey.
-func (m Model) handleListKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
-	return m.handleKey(msg)
-}
-
-func (m Model) handleListRunes(s string) (Model, tea.Cmd) {
-	if s == "" {
-		return m, nil
-	}
-	if len([]rune(s)) == 1 {
-		switch s {
-		case RoleDefaultKey:
-			return m.QueueBind("default")
-		case RolePlanKey:
-			return m.QueueBind("plan")
-		case RoleSmolKey:
-			return m.QueueBind("smol")
-		case RoleVisionKey:
-			return m.QueueBind("vision")
-		case RoleAdviserKey:
-			return m.QueueBind("adviser")
-		case ScopeToggleKey:
-			m = m.ToggleScope()
-			scope := "local"
-			if m.isGlobal {
-				scope = "global"
-			}
-			m.status = fmt.Sprintf("scope → %s", scope)
-			return m, nil
-		case "/":
-			return m, nil
-		}
-	}
-	if isPrintableString(s) {
-		m.query += s
-		m.applyFilter()
-		return m, nil
-	}
-	return m, nil
-}
-
 // isPrintableString reports whether s consists entirely of printable
 // characters suitable for auto-routing to search (single or multi-char).
 func isPrintableString(s string) bool {

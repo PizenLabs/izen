@@ -687,14 +687,6 @@ func (m Model) renderRow(d registry.ModelDescriptor, selected bool, nameW, provi
 	return strings.ReplaceAll(out, "\n", "")
 }
 
-// providerPlainTag returns the grep-friendly uppercase pill text.
-func providerPlainTag(provider string) string {
-	if provider == "" {
-		return ""
-	}
-	return "[" + strings.ToUpper(provider) + "]"
-}
-
 // renderReasoningSection renders the contextual reasoning block. It collapses
 // to one minimal line for ReasoningModeNone ("REASONING   —") and formats
 // every other mode natively (no universal low/medium/high forcing).

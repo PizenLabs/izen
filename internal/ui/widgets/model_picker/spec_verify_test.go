@@ -142,7 +142,7 @@ func TestFocusScopeStateMachine(t *testing.T) {
 		var cmd tea.Cmd
 		// Send Alt+key as Runes with Alt flag
 		r := tc.key[4:] // after "alt+"
-		mm, cmd = mm.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r), Alt: true})
+		_, cmd = mm.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r), Alt: true})
 		if cmd == nil {
 			t.Fatalf("alt %q must emit binding cmd", tc.key)
 		}
