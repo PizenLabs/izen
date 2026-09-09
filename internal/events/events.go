@@ -1273,6 +1273,12 @@ const (
 	EventToolBatchStarted      = "task.tool_batch.started"
 	EventToolChunk             = "task.tool_chunk"
 	EventToolBatchCompleted    = "task.tool_batch.completed"
+	// ── CONTEXT WINDOW COMPACTION LIFECYCLE (context/compactor) ──────
+	// Emitted by the context-window compaction engine around every Compact
+	// run so the UI stays a pure projection of the event stream.
+	EventCompactionStarted   = "task.compaction.started"
+	EventCompactionCompleted = "task.compaction.completed"
+	EventCompactionFailed    = "task.compaction.failed"
 )
 
 type ToolBatchStartedPayload struct{ ToolIDs []string }
@@ -1377,4 +1383,54 @@ func NewStateCheckpoint(taskID string, checkpoint interface{}) DomainEvent {
 // questions.
 func NewClarificationRequired(taskID string, questions interface{}) DomainEvent {
 	return newEvent(EventClarificationRequired, ClarificationRequiredPayload{TaskID: taskID, Questions: questions})
+}
+
+// ── Context window compaction payloads ───────────────────────────────────
+
+// CompactionStartedPayload opens a context-window compaction run.
+type CompactionStartedPayload struct {
+	TokensBefore int
+	MaxTokens    int
+	Forced       bool
+}
+
+// CompactionCompletedPayload is the terminal success record of a compaction
+// run. Strategy is the compactor.CompactionStrategy label ("TOOL_PRUNE",
+// "LLM_SUMMARIZE", "HARD_CROP", or "" when no work was needed).
+type CompactionCompletedPayload struct {
+	Strategy        string
+	TokensBefore    int
+	TokensAfter     int
+	FreedTokens     int
+	UncompactedTurn int
+}
+
+// CompactionFailedPayload carries a compaction failure.
+type CompactionFailedPayload struct {
+	Error string
+	Stage string
+}
+
+// NewCompactionStarted publishes that a context-window compaction run began.
+func NewCompactionStarted(tokensBefore, maxTokens int, forced bool) DomainEvent {
+	return newEvent(EventCompactionStarted, CompactionStartedPayload{
+		TokensBefore: tokensBefore, MaxTokens: maxTokens, Forced: forced,
+	})
+}
+
+// NewCompactionCompleted publishes the terminal success of a compaction run.
+func NewCompactionCompleted(strategy string, before, after, freed, uncompacted int) DomainEvent {
+	return newEvent(EventCompactionCompleted, CompactionCompletedPayload{
+		Strategy: strategy, TokensBefore: before, TokensAfter: after,
+		FreedTokens: freed, UncompactedTurn: uncompacted,
+	})
+}
+
+// NewCompactionFailed publishes a compaction failure with its stage.
+func NewCompactionFailed(err error, stage string) DomainEvent {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	return newEvent(EventCompactionFailed, CompactionFailedPayload{Error: msg, Stage: stage})
 }

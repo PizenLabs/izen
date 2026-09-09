@@ -283,6 +283,7 @@ func officialCommands() []CommandDescriptor {
 		{Marker: MarkerSlash, Name: "copy", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "copy the canonical transcript to clipboard"},
 		{Marker: MarkerSlash, Name: "copy-mode", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "enter scrollable inspection mode for precise fragment copy (j/k, / search, v/y)"},
 		{Marker: MarkerSlash, Name: "inspect", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "alias for /copy-mode"},
+		{Marker: MarkerSlash, Name: "compact", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "compact context window: /compact [now|stats|auto <ratio|off>]"},
 
 		// Directives ($).
 		directive("prompt", CategoryActivation, PermissionSet(PermRead), true, "route a raw idea into /ask and refine it"),

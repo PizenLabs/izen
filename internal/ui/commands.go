@@ -95,6 +95,7 @@ var validSystemCommands = map[string]struct{}{
 	"/copy-mode":        {},
 	"/copy_mode":        {},
 	"/inspect":          {},
+	"/compact":          {},
 }
 
 // ansiRe strips terminal ANSI escape color codes (e.g. \x1b[31m) that can
@@ -1895,7 +1896,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  $decide <prompt>     run the intent → workspace → decision trace"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /objective  /drop  /clear  /quit  /copy"))
+		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /objective  /drop  /clear  /quit  /copy  /compact"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>  /copy-mode"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("sessions"))
@@ -2142,6 +2143,9 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			return nil
 		}
 		return m.enterViMode()
+
+	case cmd == "/compact", strings.HasPrefix(cmd, "/compact "):
+		return m.runCompactCmd(cmd)
 
 	}
 
