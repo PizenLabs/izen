@@ -85,3 +85,37 @@ type toolCollapseMsg struct {
 type ToolToggleMsg struct {
 	ID string // empty = most recent card
 }
+
+// ToolBatchStartedMsg spawns a grouped batch card for parallel execution.
+type ToolBatchStartedMsg struct {
+	BatchID string
+	Tools   []struct{ ID, Name, Command string }
+}
+
+// ToolBatchChunkMsg appends stream data to a specific tool inside a batch.
+type ToolBatchChunkMsg struct {
+	BatchID string
+	ToolID  string
+	Chunk   []byte
+}
+
+// ToolBatchCompletedMsg marks a batch and its children as completed.
+type ToolBatchCompletedMsg struct {
+	BatchID string
+	Results []struct {
+		ID       string
+		ExitCode int
+		Err      error
+	}
+}
+
+// ToolBatchSelectMsg navigates selection inside the active batch.
+type ToolBatchSelectMsg struct {
+	BatchID string
+	Delta   int
+}
+
+// ToolBatchToggleMsg expands/collapses the selected tool's overlay.
+type ToolBatchToggleMsg struct {
+	BatchID string
+}

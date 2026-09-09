@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/PizenLabs/izen/internal/infrastructure/capabilities"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/lea"
+	"github.com/PizenLabs/izen/internal/pkg/lock"
 	"github.com/PizenLabs/izen/internal/planner"
 	"github.com/PizenLabs/izen/internal/project"
 	"github.com/PizenLabs/izen/internal/prompt"
@@ -243,6 +245,23 @@ func main() {
 	if localCfg != nil && localCfg.Username != "" {
 		cfg.Username = localCfg.Username
 	}
+
+	// ── Phase 4: inter-process workspace lock ─────────────────────────────
+	// Serialize concurrent izen processes on the same workspace so .izen/
+	// state files and the active session cannot be corrupted by a second
+	// process (second terminal pane, background daemon). The lock is held
+	// for the lifetime of the TUI session; nested agent-loop and patch
+	// application reuse the self-held lock instead of failing.
+	unlockWorkspace, lockErr := lock.TryAcquireWorkspaceLock(root)
+	if lockErr != nil {
+		if errors.Is(lockErr, lock.ErrWorkspaceLocked) {
+			fmt.Fprintf(os.Stderr, "izen: %v — another izen process is active in %s\n", lockErr, root)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "izen: workspace lock: %v\n", lockErr)
+		os.Exit(1)
+	}
+	defer unlockWorkspace()
 
 	// ── Gate: missing local config → launch TUI onboarding ─────────────────
 	// NEVER write .izen/ or .izen/config.json to disk from main.go before the

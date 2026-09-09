@@ -60,6 +60,73 @@ type ToolCard struct {
 	ErrMsg      string
 }
 
+// BatchCard groups parallel tool cards. Each child owns its own ring buffer,
+// so interleaved tool_chunk events can never mix output in the TUI.
+type BatchCard struct {
+	ID       string
+	Tools    []*ToolCard
+	Selected int
+	Expanded bool
+}
+
+func NewBatch(id string, calls []struct{ ID, Name, Command string }) *BatchCard {
+	b := &BatchCard{ID: id}
+	for _, call := range calls {
+		b.Tools = append(b.Tools, New(call.ID, call.Name, call.Command))
+	}
+	return b
+}
+
+func (b *BatchCard) Select(delta int) {
+	if b == nil || len(b.Tools) == 0 {
+		return
+	}
+	b.Selected = (b.Selected + delta) % len(b.Tools)
+	if b.Selected < 0 {
+		b.Selected += len(b.Tools)
+	}
+}
+func (b *BatchCard) SelectedTool() *ToolCard {
+	if b == nil || b.Selected < 0 || b.Selected >= len(b.Tools) {
+		return nil
+	}
+	return b.Tools[b.Selected]
+}
+func (b *BatchCard) ToggleSelected() {
+	if b != nil {
+		b.Expanded = !b.Expanded
+		if t := b.SelectedTool(); t != nil {
+			t.Toggle()
+		}
+	}
+}
+
+func (b *BatchCard) Render(frame, width, tailLines int) string {
+	if b == nil {
+		return ""
+	}
+	var out strings.Builder
+	out.WriteString(toolTitleStyle.Render(fmt.Sprintf("[TOOL BATCH] %d tools", len(b.Tools))))
+	for i, t := range b.Tools {
+		mark := "  "
+		if i == b.Selected {
+			mark = "> "
+		}
+		status := toolDimStyle.Render("[⏳ Running]")
+		if t.Status == StatusSuccess {
+			status = toolSuccessStyle.Render("[✓ Done]")
+		}
+		if t.Status == StatusFailed {
+			status = toolFailedStyle.Render("[✗ Failed]")
+		}
+		out.WriteString("\n" + mark + status + " " + t.ToolName + " (" + t.ID + ")")
+		if b.Expanded && i == b.Selected {
+			out.WriteString("\n" + t.Render(frame, width, tailLines))
+		}
+	}
+	return toolBoxStyle.Render(out.String())
+}
+
 // New creates a RUNNING tool card with a fresh buffer.
 func New(id, toolName, command string) *ToolCard {
 	return &ToolCard{

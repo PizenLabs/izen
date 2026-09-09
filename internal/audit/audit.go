@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/state"
@@ -58,6 +59,9 @@ type PipelineEntry struct {
 
 type Logger struct {
 	root string
+	// mu serializes all log file appends so concurrent writers never
+	// interleave bytes within a JSON line.
+	mu sync.Mutex
 }
 
 func NewLogger(root string) *Logger {
@@ -96,12 +100,17 @@ func (l *Logger) append(path string, data []byte) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("audit mkdir: %w", err)
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("audit open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
 	if _, err := f.Write(data); err != nil {
+		return fmt.Errorf("audit write: %w", err)
+	}
+	if _, err := f.Write([]byte("\n")); err != nil {
 		return fmt.Errorf("audit write: %w", err)
 	}
 	return nil

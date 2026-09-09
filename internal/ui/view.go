@@ -347,8 +347,8 @@ func (m *model) renderEffortSelector(width int) string {
 	b.WriteString(desc)
 	b.WriteString("\n")
 
-	labels := []string{"AUTO", "LOW", "MEDIUM", "HIGH"}
-	effortValues := []EffortLevel{EffortAuto, EffortLow, EffortMedium, EffortHigh}
+	labels := []string{"DEFAULT", "NONE", "LOW", "MEDIUM", "HIGH", "XHIGH", "MAX"}
+	effortValues := []EffortLevel{EffortDefault, EffortNone, EffortLow, EffortMedium, EffortHigh, EffortXHigh, EffortMax}
 
 	b.WriteString("  ")
 	for i, label := range labels {

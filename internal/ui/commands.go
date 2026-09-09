@@ -95,6 +95,7 @@ var validSystemCommands = map[string]struct{}{
 	"/copy-mode":        {},
 	"/copy_mode":        {},
 	"/inspect":          {},
+	"/compact":          {},
 }
 
 // ansiRe strips terminal ANSI escape color codes (e.g. \x1b[31m) that can
@@ -1895,7 +1896,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  $decide <prompt>     run the intent → workspace → decision trace"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /objective  /drop  /clear  /quit  /copy"))
+		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /objective  /drop  /clear  /quit  /copy  /compact"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>  /copy-mode"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("sessions"))
@@ -1972,19 +1973,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return m.runUsageCmd()
 
 	case cmd == "/models":
+		// Phase 3 contextual picker: cache-first, never blocking. Reads
+		// synchronously from the atomic Registry RAM snapshot (<2ms); zero
+		// network I/O, zero Fetching screen. On a cold start (zero cached
+		// models) the picker's Init emits SyncRequestedMsg so background
+		// workers pull provider APIs without blocking the TUI.
 		m.showModelPicker = true
-		m.modelPicker = NewModelPickerModal()
-		m.modelPicker.SetSize(m.width, m.height)
-
-		providers := make(map[string]string)
-		for name, prov := range m.cfg.AI.Providers {
-			providers[name] = prov.APIKey
-		}
-		if len(providers) == 0 {
-			providers["ollama"] = ""
-		}
-
-		return m.modelPicker.LoadModels(providers)
+		m.modelPicker = newModelPickerFromCache(m)
+		return m.modelPicker.Init()
 
 	case strings.HasPrefix(cmd, "/models "):
 		modelArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/models"))
@@ -2142,6 +2138,9 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			return nil
 		}
 		return m.enterViMode()
+
+	case cmd == "/compact", strings.HasPrefix(cmd, "/compact "):
+		return m.runCompactCmd(cmd)
 
 	}
 

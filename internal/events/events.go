@@ -1270,7 +1270,36 @@ const (
 	EventBudgetExceeded        = "budget.exceeded"
 	EventStateCheckpoint       = "state.checkpoint"
 	EventClarificationRequired = "clarification.required"
+	EventToolBatchStarted      = "task.tool_batch.started"
+	EventToolChunk             = "task.tool_chunk"
+	EventToolBatchCompleted    = "task.tool_batch.completed"
+	// ── CONTEXT WINDOW COMPACTION LIFECYCLE (context/compactor) ──────
+	// Emitted by the context-window compaction engine around every Compact
+	// run so the UI stays a pure projection of the event stream.
+	EventCompactionStarted   = "task.compaction.started"
+	EventCompactionCompleted = "task.compaction.completed"
+	EventCompactionFailed    = "task.compaction.failed"
 )
+
+type ToolBatchStartedPayload struct{ ToolIDs []string }
+type ToolChunkPayload struct {
+	ToolID string
+	Chunk  []byte
+}
+type ToolBatchCompletedPayload struct {
+	ToolIDs []string
+	Results interface{}
+}
+
+func NewToolBatchStarted(ids []string) DomainEvent {
+	return newEvent(EventToolBatchStarted, ToolBatchStartedPayload{ToolIDs: append([]string(nil), ids...)})
+}
+func NewToolChunk(id string, chunk []byte) DomainEvent {
+	return newEvent(EventToolChunk, ToolChunkPayload{ToolID: id, Chunk: append([]byte(nil), chunk...)})
+}
+func NewToolBatchCompleted(ids []string, results interface{}) DomainEvent {
+	return newEvent(EventToolBatchCompleted, ToolBatchCompletedPayload{ToolIDs: append([]string(nil), ids...), Results: results})
+}
 
 // TaskStartedPayload carries a task execution start. TaskID links the event
 // to its originating task.
@@ -1354,4 +1383,54 @@ func NewStateCheckpoint(taskID string, checkpoint interface{}) DomainEvent {
 // questions.
 func NewClarificationRequired(taskID string, questions interface{}) DomainEvent {
 	return newEvent(EventClarificationRequired, ClarificationRequiredPayload{TaskID: taskID, Questions: questions})
+}
+
+// ── Context window compaction payloads ───────────────────────────────────
+
+// CompactionStartedPayload opens a context-window compaction run.
+type CompactionStartedPayload struct {
+	TokensBefore int
+	MaxTokens    int
+	Forced       bool
+}
+
+// CompactionCompletedPayload is the terminal success record of a compaction
+// run. Strategy is the compactor.CompactionStrategy label ("TOOL_PRUNE",
+// "LLM_SUMMARIZE", "HARD_CROP", or "" when no work was needed).
+type CompactionCompletedPayload struct {
+	Strategy        string
+	TokensBefore    int
+	TokensAfter     int
+	FreedTokens     int
+	UncompactedTurn int
+}
+
+// CompactionFailedPayload carries a compaction failure.
+type CompactionFailedPayload struct {
+	Error string
+	Stage string
+}
+
+// NewCompactionStarted publishes that a context-window compaction run began.
+func NewCompactionStarted(tokensBefore, maxTokens int, forced bool) DomainEvent {
+	return newEvent(EventCompactionStarted, CompactionStartedPayload{
+		TokensBefore: tokensBefore, MaxTokens: maxTokens, Forced: forced,
+	})
+}
+
+// NewCompactionCompleted publishes the terminal success of a compaction run.
+func NewCompactionCompleted(strategy string, before, after, freed, uncompacted int) DomainEvent {
+	return newEvent(EventCompactionCompleted, CompactionCompletedPayload{
+		Strategy: strategy, TokensBefore: before, TokensAfter: after,
+		FreedTokens: freed, UncompactedTurn: uncompacted,
+	})
+}
+
+// NewCompactionFailed publishes a compaction failure with its stage.
+func NewCompactionFailed(err error, stage string) DomainEvent {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	return newEvent(EventCompactionFailed, CompactionFailedPayload{Error: msg, Stage: stage})
 }

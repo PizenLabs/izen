@@ -48,6 +48,7 @@ import (
 	"github.com/PizenLabs/izen/internal/policy"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
+	"github.com/PizenLabs/izen/internal/provider/registry"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
@@ -62,6 +63,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ui/status"
 	uitool "github.com/PizenLabs/izen/internal/ui/tool"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
+	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
 )
 
 // ── Init stage types ──────────────────────────────────────────────────────────
@@ -1389,10 +1391,20 @@ type model struct {
 	initPrefillUsername string
 	initPrefillProvider string
 
-	// Model Picker Modal
+	// Model Picker — Phase 3 contextual command surface (value type, pure
+	// view). Reads synchronously from the atomic Registry RAM snapshot.
 	showModelPicker bool
-	modelPicker     *ModelPickerModal
-	sessionModel    string // user-selected model override via /models
+	modelPicker     model_picker.Model
+	// modelRegistry is the cache-first RAM catalog backing the picker.
+	// Lazily created on /models from the local JSON cache (zero network);
+	// background sync is owned by the app layer.
+	modelRegistry *registry.Registry
+	sessionModel  string // user-selected model override via /models
+
+	// modelAppSvc is the domain application boundary for model role
+	// bindings (pure-view picker emits BindModelToRoleCommand; this service
+	// persists via ConfigRepository off the UI thread). Nil in harnesses.
+	modelAppSvc ModelServiceBinder
 
 	// Session Picker Modal — interactive /session overlay
 	showSessionPicker bool
@@ -1429,6 +1441,13 @@ type model struct {
 	// deterministic rendering and Tab-toggle targeting.
 	toolCards map[string]*uitool.ToolCard
 	toolOrder []string
+
+	// ── Grouped Batch Tool Cards (join-barrier parallel execution) ──
+	// batchCards maps batch ID → grouped card; batchOrder preserves spawn
+	// order. Each child ToolCard owns its own ring buffer so task.tool_chunk
+	// events never interleave streams.
+	batchCards map[string]*uitool.BatchCard
+	batchOrder []string
 
 	// Authoritative execution-stage record — the single source of truth for
 	// "what is the runtime doing right now". Every progress indicator derives
@@ -1919,17 +1938,27 @@ func (m *model) applyToolCallBuffer() tea.Cmd {
 	}
 }
 
-// cycleEffort cycles the effort level through Auto → Low → Medium → High.
+// cycleEffort cycles the effort level through
+// Default → None → Low → Medium → High → XHigh → Max → Default.
+// Default preserves provider factory behavior (reasoning_effort omitted).
 func (m *model) cycleEffort() {
 	switch m.currentEffort {
-	case EffortAuto:
+	case EffortDefault:
+		m.currentEffort = EffortNone
+	case EffortNone:
 		m.currentEffort = EffortLow
 	case EffortLow:
 		m.currentEffort = EffortMedium
 	case EffortMedium:
 		m.currentEffort = EffortHigh
 	case EffortHigh:
-		m.currentEffort = EffortAuto
+		m.currentEffort = EffortXHigh
+	case EffortXHigh:
+		m.currentEffort = EffortMax
+	case EffortMax:
+		m.currentEffort = EffortDefault
+	default:
+		m.currentEffort = EffortDefault
 	}
 }
 

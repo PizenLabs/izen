@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
+	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	control "github.com/PizenLabs/izen/internal/boundary/scopeguard"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
@@ -35,6 +36,7 @@ import (
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/ui/status"
+	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
 	verification "github.com/PizenLabs/izen/internal/verification"
 )
 
@@ -310,28 +312,57 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 	}
 
-	// ── MODEL PICKER ROUTING: intercept key events during model selection ──
-	if m.showModelPicker && m.modelPicker != nil {
-		if keyMsg, ok := msg.(tea.KeyMsg); ok {
-			if keyMsg.Type == tea.KeyEscape {
+	// ── MODEL PICKER ROUTING: Phase 3 contextual command surface ──
+	// Forwards Bubbletea events directly to widgets/model_picker. Emitted
+	// domain commands (Bind/Activate/Sync) fall through to the main switch;
+	// confirmations and keys are consumed here. Closes on Esc or ACTIVATE.
+	if m.showModelPicker {
+		// Domain commands emitted by the picker are handled by the parent.
+		switch msg := msg.(type) {
+		case modelapp.BindModelToRoleCommand, modelapp.ActivateModelCommand, modelapp.SyncRequestedMsg:
+			// fall through to main switch
+		case model_picker.SnapshotMsg, model_picker.ModelsLoadedMsg, model_picker.ModelsErrMsg,
+			model_picker.BindingSucceededMsg, model_picker.BindingFailedMsg, modelapp.BindingResultMsg,
+			modelapp.RegistryUpdatedMsg:
+			updated, cmd := m.modelPicker.Update(msg)
+			if um, ok := updated.(model_picker.Model); ok {
+				m.modelPicker = um
+			}
+			return m, cmd
+		case tea.KeyMsg:
+			if msg.Type == tea.KeyEscape {
 				m.showModelPicker = false
-				m.modelPicker = nil
 				m.ti.Focus()
 				return m, nil
 			}
-			var cmd tea.Cmd
-			m.modelPicker, cmd = m.modelPicker.Update(msg)
+			updated, cmd := m.modelPicker.Update(msg)
+			if um, ok := updated.(model_picker.Model); ok {
+				m.modelPicker = um
+				if um.Done() {
+					m.showModelPicker = false
+					m.ti.Focus()
+					// Single dispatch: the picker already emitted ActivateModelCommand
+					// via EmitActivateCommand(). Do NOT batch a second
+					// BuildActivateCommand — that duplicates the system log
+					// (✔ Model set to ...) as two Activations.
+					return m, cmd
+				}
+			}
 			return m, cmd
-		}
-		switch msg := msg.(type) {
-		case modelPickerLoadedMsg, modelPickerRefreshMsg:
-			var cmd tea.Cmd
-			m.modelPicker, cmd = m.modelPicker.Update(msg)
-			return m, cmd
-		case modelSelectedMsg, tea.WindowSizeMsg:
+		case tea.WindowSizeMsg:
+			// Keep the picker's dynamic viewport in step, then fall through
+			// so the workspace viewport also resizes.
+			updated, _ := m.modelPicker.Update(msg)
+			if um, ok := updated.(model_picker.Model); ok {
+				m.modelPicker = um
+			}
 			// fall through to main switch
 		default:
-			return m, nil
+			// Swallow clicks/other while the modal is open.
+			if _, ok := msg.(tea.MouseMsg); ok {
+				return m, nil
+			}
+			// fall through to main switch for toasts/confirmations
 		}
 	}
 
@@ -430,6 +461,35 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			msg.Resp.RequestID, msg.Resp.Allowed, msg.Resp.Remember, msg.Resp.Edited)
 		return m, nil
 
+	case modelapp.BindModelToRoleCommand:
+		// Pure-view model picker emission: persist off the UI thread via
+		// the domain ApplicationService and toast the outcome.
+		return m, m.handleBindModelToRole(msg)
+
+	case modelapp.ActivateModelCommand:
+		// ACTIVATE (Enter) from the widget picker: close and apply session.
+		return m, m.pickerActivateCmd(msg)
+
+	case modelapp.SyncRequestedMsg:
+		// Ctrl+R from the widget picker: background refresh, never blocking.
+		return m, m.refreshModelRegistryCmd()
+
+	case modelapp.BindingResultMsg:
+		// Persistence-authority confirmation: project into the widget so
+		// its BINDINGS strip renders saving... -> ok/fail truthfully.
+		m.forwardBindConfirmation(msg)
+		return m, nil
+
+	case RoleBindSuccessMsg:
+		m.handleRoleBindSuccess(msg)
+		m.forwardBindConfirmation(model_picker.BindingSucceededMsg{Role: msg.Role, ModelID: msg.ModelID, Seq: msg.Seq})
+		return m, nil
+
+	case RoleBindFailureMsg:
+		m.handleRoleBindFailure(msg)
+		m.forwardBindConfirmation(model_picker.BindingFailedMsg{Role: msg.Role, Err: msg.Err, Seq: msg.Seq})
+		return m, nil
+
 	case ShowDiffMsg:
 		// Full-screen unified diff viewer modal.
 		m.openDiffView(msg.DiffText, msg.Title)
@@ -485,15 +545,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.wrapWidth = w
 		m.ti.Width = msg.Width - 8
 
-		// NOTE: the model picker's own size is NOT set here. It's derived
-		// from m.width/m.height (just updated above) by
-		// modelPickerDialogSize() and applied in renderModelPickerModal()
-		// on every render — that's what lets it track resizes precisely
-		// and shrink to fit a narrow tmux/terminal split instead of
-		// overflowing it. A SetSize call here used to pass the *full*
-		// terminal size (not the dialog's actual on-screen size) and was
-		// immediately superseded by renderModelPickerModal's own call on
-		// the next View() anyway, so it did nothing but mislead.
+		// NOTE: the widget picker tracks resizes via the WindowSizeMsg
+		// forwarded in the picker routing block above (dynamic viewport).
 
 		vpHeight := m.computeVpHeight()
 
@@ -2049,6 +2102,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.toggleToolCard(msg.ID)
 		return m, nil
 
+	case ToolBatchStartedMsg:
+		m.handleToolBatchStarted(msg)
+		return m, nil
+
+	case ToolBatchChunkMsg:
+		m.handleToolBatchChunk(msg)
+		return m, nil
+
+	case ToolBatchCompletedMsg:
+		m.handleToolBatchCompleted(msg)
+		return m, nil
+
+	case ToolBatchSelectMsg:
+		m.handleToolBatchSelect(msg)
+		return m, nil
+
+	case ToolBatchToggleMsg:
+		m.handleToolBatchToggle(msg)
+		return m, nil
+
 	case FrameTickMsg:
 		// ── DEBOUNCED FRAME TICKER (30ms / ~33 FPS) ─────────────────────
 		// STREAM BUFFER CONTRACT: Option A — Cumulative Overwrite.
@@ -3506,6 +3579,40 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 
+		// ── Grouped Batch Card navigation (Up/Down + Ctrl+O/Enter) ─────
+		if len(m.batchOrder) > 0 && !m.autocompleteActive {
+			if batch := m.batchCards[m.batchOrder[len(m.batchOrder)-1]]; batch != nil && len(batch.Tools) > 1 {
+				switch msg.Type {
+				case tea.KeyUp:
+					batch.Select(-1)
+					if m.Ready {
+						m.refreshViewportContent()
+					}
+					return m, nil
+				case tea.KeyDown:
+					batch.Select(1)
+					if m.Ready {
+						m.refreshViewportContent()
+					}
+					return m, nil
+				case tea.KeyCtrlO:
+					batch.ToggleSelected()
+					if m.Ready {
+						m.refreshViewportContent()
+					}
+					return m, nil
+				case tea.KeyEnter:
+					if len(m.ti.Value()) == 0 {
+						batch.ToggleSelected()
+						if m.Ready {
+							m.refreshViewportContent()
+						}
+						return m, nil
+					}
+				}
+			}
+		}
+
 		if !m.autocompleteActive && !m.streaming && !m.agentRunning {
 			switch msg.Type {
 			case tea.KeyTab:
@@ -3513,6 +3620,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				if len(m.toolOrder) > 0 {
 					m.toggleToolCard("")
 					return m, nil
+				}
+				if len(m.batchOrder) > 0 {
+					if batch := m.batchCards[m.batchOrder[len(m.batchOrder)-1]]; batch != nil {
+						batch.ToggleSelected()
+						if m.Ready {
+							m.refreshViewportContent()
+						}
+						return m, nil
+					}
 				}
 			case tea.KeyUp:
 				if len(m.history) > 0 {
@@ -3575,46 +3691,6 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		resModel, cmd := m.handleKey(msg)
 		return resModel, cmd
-
-	case modelSelectedMsg:
-		m.showModelPicker = false
-		m.modelPicker = nil
-		m.sessionModel = msg.model.ID
-		m.cfg.Models.SessionModel = msg.model.ID
-		m.IsCloudModel = msg.model.Provider != "ollama"
-
-		// Apply effort/intent level to the config tiers.
-		effort := msg.effort
-		tierKey := effort.ConfigTier()
-		m.cfg.SetTierOverride(tierKey, msg.model.ID)
-		m.syncPipelineTiers()
-
-		modelProvider := msg.model.Provider
-		currentProvider := ""
-		if m.provider != nil {
-			currentProvider = m.provider.Name()
-		}
-
-		var cmds []tea.Cmd
-		if modelProvider != "" && modelProvider != currentProvider {
-			envVar, known := validProviders[modelProvider]
-			switch {
-			case known && m.isProviderAvailable(modelProvider, envVar):
-				cmds = append(cmds, m.switchProvider(modelProvider))
-			case modelProvider == "ollama":
-				cmds = append(cmds, m.switchProvider(modelProvider))
-			default:
-				m.push(roleError, fmt.Sprintf("[✗] Provider %q not configured — model set but provider unchanged", modelProvider))
-			}
-		}
-
-		m.ti.Focus()
-		effortLabel := msg.effort.Description()
-		m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s [%s]", msg.model.Name, msg.model.Provider)))
-		m.push(roleSystem, mutedStyle.Render(fmt.Sprintf("  Effort: %s (%s)", msg.effort, effortLabel)))
-		m.refreshViewportContent()
-		m.gotoBottomIfAllowed()
-		return m, tea.Batch(cmds...)
 	}
 
 	// ── Viewport scroll keys (any state) ─────────────────────────────────────
