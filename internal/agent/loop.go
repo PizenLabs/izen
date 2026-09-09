@@ -3,12 +3,14 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/pkg/atomicio"
+	"github.com/PizenLabs/izen/internal/pkg/lock"
 	"github.com/PizenLabs/izen/internal/substrate"
 )
 
@@ -51,6 +53,22 @@ func (l *Loop) Run(ctx context.Context, taskPrompt string) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("agent: context: %w", err)
 	}
+	// Inter-process workspace lock: serialize against concurrent izen
+	// processes before the execution loop touches .izen/ state or the
+	// workspace. A self-held lock (CLI entrypoint already holding) is
+	// reused instead of failing.
+	var unlock func()
+	if u, lerr := lock.TryAcquireWorkspaceLock(l.WorkDir); lerr != nil {
+		if errors.Is(lerr, lock.ErrWorkspaceLocked) && lock.IsHeldByCurrentProcess(l.WorkDir) {
+			unlock = func() {}
+		} else {
+			return fmt.Errorf("agent: workspace lock: %w", lerr)
+		}
+	} else {
+		unlock = u
+	}
+	defer unlock()
+
 	runID := strings.TrimSpace(l.RunID)
 	if runID == "" {
 		runID = fmt.Sprintf("%d", time.Now().UnixNano())

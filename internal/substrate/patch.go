@@ -4,6 +4,7 @@ package substrate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,7 +13,18 @@ import (
 	"github.com/PizenLabs/izen/internal/audit"
 	"github.com/PizenLabs/izen/internal/checkpoint"
 	"github.com/PizenLabs/izen/internal/pkg/atomicio"
+	"github.com/PizenLabs/izen/internal/pkg/lock"
 )
+
+// ErrPatchTransactionFailed wraps any mid-transaction patch write failure
+// after automatic rollback. Use errors.Is(err, ErrPatchTransactionFailed)
+// to detect it; the original cause is wrapped and available via errors.Unwrap.
+var ErrPatchTransactionFailed = errors.New("substrate: patch transaction failed")
+
+// atomicWriteFile is the file-write hook used by ApplyPatch. It defaults to
+// atomicio.WriteFileAtomic and is overrideable in tests to inject mid-patch
+// failures and prove rollback atomicity.
+var atomicWriteFile = atomicio.WriteFileAtomic
 
 // PatchFile is one file mutation inside a candidate patch.
 type PatchFile struct {
@@ -70,14 +82,21 @@ func StagePatch(workDir, runID string, step int, patch Patch) (string, error) {
 	return dst, nil
 }
 
-// ApplyPatch validates a staged patch, creates a pre-patch checkpoint
-// BEFORE touching the workspace, applies the mutations atomically, and logs
-// the result to .izen/audit/mutations.log.
+// ApplyPatch validates a staged patch, creates a pre-patch-tx checkpoint
+// BEFORE touching the workspace, applies the mutations transactionally, and
+// logs the result to .izen/audit/mutations.log.
+//
+// Transactional guarantee: every target write goes through
+// atomicio.WriteFileAtomic and the mutated paths are tracked. On any write
+// error, permission denial, or partial failure the workspace is rolled back
+// to the pre-patch-tx checkpoint, incomplete artifacts are cleaned up, and
+// the returned error wraps ErrPatchTransactionFailed with the original cause.
 //
 // Malformed JSON fails before any checkpoint is taken and leaves the
 // workspace untouched. Semantic validation failures happen after the
-// pre-patch checkpoint is captured, so the workspace is still untouched and
-// the checkpoint is preserved for recovery.
+// pre-patch-tx checkpoint is captured, so the workspace is still untouched
+// and the checkpoint is preserved for recovery (these are validation
+// errors, not transaction failures, and do not trigger rollback).
 func ApplyPatch(workDir string, patchPath string) error {
 	if strings.TrimSpace(workDir) == "" {
 		return fmt.Errorf("substrate: empty workDir")
@@ -94,7 +113,22 @@ func ApplyPatch(workDir string, patchPath string) error {
 		return fmt.Errorf("substrate: malformed patch %q: missing files", patchPath)
 	}
 
-	cpID, err := checkpoint.CreateCheckpoint(workDir, "pre-patch")
+	// Inter-process workspace lock: serialize against concurrent izen
+	// processes. A self-held lock (outer CLI/agent holder in this process)
+	// is reused instead of failing.
+	var unlock func()
+	if u, lerr := lock.TryAcquireWorkspaceLock(workDir); lerr != nil {
+		if errors.Is(lerr, lock.ErrWorkspaceLocked) && lock.IsHeldByCurrentProcess(workDir) {
+			unlock = func() {}
+		} else {
+			return fmt.Errorf("substrate: workspace lock: %w", lerr)
+		}
+	} else {
+		unlock = u
+	}
+	defer unlock()
+
+	cpID, err := checkpoint.CreateCheckpoint(workDir, "pre-patch-tx")
 	if err != nil {
 		return fmt.Errorf("substrate: pre-patch checkpoint: %w", err)
 	}
@@ -108,12 +142,28 @@ func ApplyPatch(workDir string, patchPath string) error {
 	}
 
 	alog := audit.NewLogger(workDir)
+	var mutated []string
+	fail := func(op, target string, cause error) error {
+		rbErr := checkpoint.Rollback(workDir, cpID)
+		cleanupIncompleteArtifacts(workDir, mutated)
+		_ = alog.LogEvent("", audit.EventPatchApplied, map[string]any{
+			"patch": patchPath, "checkpoint": cpID, "status": "rolled_back",
+		})
+		if rbErr != nil {
+			return fmt.Errorf("%w: substrate: %s %s: %w (rollback %s failed: %s)",
+				ErrPatchTransactionFailed, op, target, cause, cpID, rbErr.Error())
+		}
+		return fmt.Errorf("%w: substrate: %s %s: %w (rolled back to %s)",
+			ErrPatchTransactionFailed, op, target, cause, cpID)
+	}
+
 	for _, f := range patch.Files {
 		dst := filepath.Join(workDir, filepath.FromSlash(f.Path))
 		if f.Delete {
 			if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("substrate: delete %s: %w (pre-patch checkpoint %s preserved)", f.Path, err, cpID)
+				return fail("delete", f.Path, err)
 			}
+			mutated = append(mutated, f.Path)
 			_ = alog.LogMutation(audit.MutationEntry{
 				File: f.Path, Action: "delete", PatchID: cpID,
 			})
@@ -124,11 +174,12 @@ func ApplyPatch(workDir string, patchPath string) error {
 			content = *f.Content
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return fmt.Errorf("substrate: mkdir for %s: %w (pre-patch checkpoint %s preserved)", f.Path, err, cpID)
+			return fail("mkdir for", f.Path, err)
 		}
-		if err := atomicio.WriteFileAtomic(dst, []byte(content), 0o644); err != nil {
-			return fmt.Errorf("substrate: write %s: %w (pre-patch checkpoint %s preserved)", f.Path, err, cpID)
+		if err := atomicWriteFile(dst, []byte(content), 0o644); err != nil {
+			return fail("write", f.Path, err)
 		}
+		mutated = append(mutated, f.Path)
 		_ = alog.LogMutation(audit.MutationEntry{
 			File: f.Path, Action: "write", PatchID: cpID, Content: truncate(content, 4096),
 		})
@@ -137,6 +188,31 @@ func ApplyPatch(workDir string, patchPath string) error {
 		"patch": patchPath, "checkpoint": cpID, "files": len(patch.Files),
 	})
 	return nil
+}
+
+// cleanupIncompleteArtifacts best-effort removes atomic-write temp leftovers
+// (<target>.tmp.*) under the mutated files' directories after a rollback.
+func cleanupIncompleteArtifacts(workDir string, mutated []string) {
+	seen := make(map[string]struct{})
+	for _, rel := range mutated {
+		dir := filepath.Dir(filepath.Join(workDir, filepath.FromSlash(rel)))
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if strings.Contains(e.Name(), ".tmp.") {
+				_ = os.Remove(filepath.Join(dir, e.Name()))
+			}
+		}
+	}
 }
 
 // validatePatchFile enforces workspace containment and schema integrity.

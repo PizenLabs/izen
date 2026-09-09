@@ -36,7 +36,15 @@ type CheckpointRecord struct {
 	HeadSHA   string    `json:"head_sha"`
 	Files     []string  `json:"files"`
 	Diff      string    `json:"diff"`
+	// SkippedFiles lists workspace-relative paths excluded from the snapshot
+	// because they matched .gitignore patterns or exceeded the max size
+	// threshold. Rollback preserves these paths instead of deleting them.
+	SkippedFiles []string `json:"skipped_files,omitempty"`
 }
+
+// MaxSnapshotFileSize caps single-file snapshot payloads. Files larger than
+// this are excluded from the snapshot and recorded in SkippedFiles.
+const MaxSnapshotFileSize = 10 << 20 // 10MB
 
 // checkpointsDir returns the Phase 3 checkpoint root for a workspace.
 func checkpointsDir(workDir string) string {
@@ -76,18 +84,20 @@ func CreateCheckpoint(workDir string, label string) (string, error) {
 		}
 	}
 
-	if err := snapshotWorkspace(workDir, snapDir); err != nil {
+	skipped, err := snapshotWorkspace(workDir, snapDir)
+	if err != nil {
 		_ = os.RemoveAll(cpDir)
 		return "", fmt.Errorf("checkpoint: snapshot: %w", err)
 	}
 
 	rec := CheckpointRecord{
-		ID:        id,
-		Label:     label,
-		Timestamp: time.Now(),
-		HeadSHA:   head,
-		Files:     modified,
-		Diff:      diff,
+		ID:           id,
+		Label:        label,
+		Timestamp:    time.Now(),
+		HeadSHA:      head,
+		Files:        modified,
+		Diff:         diff,
+		SkippedFiles: skipped,
 	}
 	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
@@ -162,13 +172,22 @@ func Rollback(workDir string, checkpointID string) error {
 		return fmt.Errorf("checkpoint: restore %s: %w", checkpointID, err)
 	}
 
-	// Remove files created after the checkpoint.
+	// Remove files created after the checkpoint. Skipped files (gitignored
+	// or oversized at snapshot time) are preserved: they were never part of
+	// the snapshot and must not be deleted as "post-checkpoint" files.
+	preserved := make(map[string]struct{}, len(rec.SkippedFiles))
+	for _, s := range rec.SkippedFiles {
+		preserved[filepath.ToSlash(s)] = struct{}{}
+	}
 	current, err := listWorkspaceFiles(workDir)
 	if err != nil {
 		return fmt.Errorf("checkpoint: list workspace: %w", err)
 	}
 	for _, rel := range current {
 		if _, ok := snapshots[rel]; !ok {
+			if _, skip := preserved[rel]; skip {
+				continue
+			}
 			_ = os.Remove(filepath.Join(workDir, filepath.FromSlash(rel)))
 		}
 	}
@@ -205,14 +224,26 @@ func listWorkspaceFiles(workDir string) ([]string, error) {
 }
 
 // snapshotWorkspace copies every workspace file into snapDir, preserving
-// relative layout.
-func snapshotWorkspace(workDir, snapDir string) error {
+// relative layout. Files matching .gitignore patterns or exceeding
+// MaxSnapshotFileSize are skipped and returned as workspace-relative paths
+// so the caller can record them in SkippedFiles.
+func snapshotWorkspace(workDir, snapDir string) ([]string, error) {
 	files, err := listWorkspaceFiles(workDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	patterns := loadGitignorePatterns(workDir)
+	var skipped []string
 	for _, rel := range files {
+		if matchesGitignore(rel, patterns) {
+			skipped = append(skipped, rel)
+			continue
+		}
 		src := filepath.Join(workDir, filepath.FromSlash(rel))
+		if fi, statErr := os.Stat(src); statErr == nil && fi.Size() > MaxSnapshotFileSize {
+			skipped = append(skipped, rel)
+			continue
+		}
 		content, err := os.ReadFile(src)
 		if err != nil {
 			// File vanished mid-snapshot; skip rather than failing the
@@ -221,15 +252,15 @@ func snapshotWorkspace(workDir, snapDir string) error {
 		}
 		dst := filepath.Join(snapDir, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
+			return skipped, err
 		}
 		// Snapshot blobs are written once into a fresh directory; a plain
 		// write is sufficient (the manifest commit is the atomic point).
 		if err := os.WriteFile(dst, content, 0o644); err != nil {
-			return err
+			return skipped, err
 		}
 	}
-	return nil
+	return skipped, nil
 }
 
 // cleanEmptyDirs removes empty directories left behind after deleting
