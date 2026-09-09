@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
+	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	control "github.com/PizenLabs/izen/internal/boundary/scopeguard"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
@@ -428,6 +429,19 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// deliverPermissionResponse; this is the observable terminal event.
 		m.logActivity("[permission] %s allowed=%t remember=%t edited=%t",
 			msg.Resp.RequestID, msg.Resp.Allowed, msg.Resp.Remember, msg.Resp.Edited)
+		return m, nil
+
+	case modelapp.BindModelToRoleCommand:
+		// Pure-view model picker emission: persist off the UI thread via
+		// the domain ApplicationService and toast the outcome.
+		return m, m.handleBindModelToRole(msg)
+
+	case RoleBindSuccessMsg:
+		m.handleRoleBindSuccess(msg)
+		return m, nil
+
+	case RoleBindFailureMsg:
+		m.handleRoleBindFailure(msg)
 		return m, nil
 
 	case ShowDiffMsg:

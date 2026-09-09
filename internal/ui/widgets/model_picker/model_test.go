@@ -1,22 +1,17 @@
 package model_picker
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
-func seedTestRegistry(t *testing.T, models []registry.ModelDescriptor) *registry.Registry {
-	t.Helper()
-	r := registry.NewRegistryWithCachePath("")
-	r.SetSeed(models)
-	return r
+func seedSnapshot(models []registry.ModelDescriptor) *registry.ModelSnapshot {
+	return &registry.ModelSnapshot{Models: append([]registry.ModelDescriptor(nil), models...)}
 }
 
 func testModels() []registry.ModelDescriptor {
@@ -27,49 +22,43 @@ func testModels() []registry.ModelDescriptor {
 	}
 }
 
-// Init must dispatch a tea.Cmd that loads without blocking the caller, and a
-// nil registry must yield a nil command.
-func TestInitAsyncLoad(t *testing.T) {
-	dir := t.TempDir()
-	cachePath := filepath.Join(dir, "models.json")
-	r := registry.NewRegistryWithCachePath(cachePath)
-	r.SetSeed(testModels())
-	// Flush seed to disk via a second registry sharing the path: use Sync
-	// path indirectly by writing the envelope the loader accepts.
-	payload, _ := json.Marshal(map[string]any{"version": 1, "models": testModels()})
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
+// Init must be pure (nil cmd, zero I/O) and construction must populate
+// instantly from the snapshot.
+func TestInitPureNoIO(t *testing.T) {
+	m := New(seedSnapshot(testModels()))
+	if cmd := m.Init(); cmd != nil {
+		t.Error("Init must return nil (pure view, no background I/O)")
 	}
-	if err := os.WriteFile(cachePath, payload, 0644); err != nil {
-		t.Fatal(err)
+	if len(m.Models()) != 3 {
+		t.Errorf("construction must populate instantly, got %d", len(m.Models()))
 	}
-
-	m := New(r, t.TempDir())
-	cmd := m.Init()
-	if cmd == nil {
-		t.Fatal("Init with registry must return a non-nil tea.Cmd")
+	if m.Loading() {
+		t.Error("pure view must not start in loading state")
 	}
-	msg := cmd() // executes synchronously in test; in production it runs off the UI thread
-	loaded, ok := msg.(ModelsLoadedMsg)
-	if !ok {
-		t.Fatalf("Init cmd msg = %T, want ModelsLoadedMsg", msg)
+	if cmd := New(nil).Init(); cmd != nil {
+		t.Error("Init with nil snapshot must return nil")
 	}
-	if len(loaded.Models) != 3 {
-		t.Errorf("loaded %d models, want 3", len(loaded.Models))
-	}
-
-	if cmd := New(nil, "").Init(); cmd != nil {
-		t.Error("Init with nil registry must return nil")
+	view := New(seedSnapshot(testModels())).View()
+	if strings.Contains(view, "Fetching models") {
+		t.Error("view must never render a blocking Fetching modal")
 	}
 }
 
-// Typing in search focus must filter via the RAM registry with instant
-// responsiveness (no I/O, synchronous Update).
+// SnapshotMsg must swap the pointer and rebuild the derived view.
+func TestSnapshotPointerReplacement(t *testing.T) {
+	m := New(seedSnapshot(nil))
+	if len(m.Models()) != 0 {
+		t.Fatalf("empty snapshot, got %d", len(m.Models()))
+	}
+	m, _ = m.UpdateModel(SnapshotMsg{Snap: seedSnapshot(testModels())})
+	if len(m.Models()) != 3 {
+		t.Errorf("after SnapshotMsg, models = %d, want 3", len(m.Models()))
+	}
+}
+
+// Typing in search focus must filter the snapshot RAM slice synchronously.
 func TestSearchInputFiltersRAM(t *testing.T) {
-	r := seedTestRegistry(t, testModels())
-	m := New(r, t.TempDir())
-	// Simulate loaded state.
-	m, _ = m.UpdateModel(ModelsLoadedMsg{Models: r.Snapshot()})
+	m := New(seedSnapshot(testModels()))
 
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("deepseek")})
 	if len(m.Filtered()) != 1 {
@@ -79,76 +68,86 @@ func TestSearchInputFiltersRAM(t *testing.T) {
 		t.Errorf("highlight = %q, want deepseek-r1", got)
 	}
 
-	// Backspace shrinks the query and restores matches.
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyBackspace})
 	if len(m.Filtered()) == 0 {
 		t.Error("backspace must keep matches")
 	}
 }
 
-// Pressing p in list focus must persist .izen/config.json and update badges.
-func TestRoleBindingHotkeyPersists(t *testing.T) {
-	r := seedTestRegistry(t, testModels())
-	work := t.TempDir()
-	m := New(r, work)
-	m, _ = m.UpdateModel(ModelsLoadedMsg{Models: r.Snapshot()})
+// Pressing p in list focus must emit a BindModelToRoleCommand (no file I/O,
+// no direct persistence, no badge mutation until confirmation).
+func TestRoleBindingHotkeyEmitsCommand(t *testing.T) {
+	m := New(seedSnapshot(testModels()))
 	m = m.FocusList()
 
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	var cmd tea.Cmd
+	m, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	if cmd == nil {
+		t.Fatal("role hotkey must return a tea.Cmd emitting BindModelToRoleCommand")
+	}
+	msg := cmd()
+	bind, ok := msg.(modelapp.BindModelToRoleCommand)
+	if !ok {
+		t.Fatalf("cmd msg = %T, want BindModelToRoleCommand", msg)
+	}
+	if string(bind.Role) != "plan" {
+		t.Errorf("role = %q, want plan", string(bind.Role))
+	}
+	if bind.ModelID != "openrouter/deepseek/deepseek-r1" {
+		t.Errorf("model = %q, want highlighted deepseek-r1", bind.ModelID)
+	}
+	// Pure view: badges stay empty until the app layer confirms.
+	if _, ok := m.Roles()["plan"]; ok {
+		t.Error("picker must not mutate badges on keypress; wait for BindingSucceededMsg")
+	}
+	if !strings.Contains(m.Status(), "queued bind") {
+		t.Errorf("status = %q, want queued bind", m.Status())
+	}
 
-	data, err := os.ReadFile(filepath.Join(work, ".izen", "config.json"))
-	if err != nil {
-		t.Fatalf("read config.json: %v", err)
+	// Confirmation path updates badges.
+	m, _ = m.UpdateModel(BindingSucceededMsg{Role: "plan", ModelID: bind.ModelID})
+	if got := m.Roles()["plan"]; got != bind.ModelID {
+		t.Errorf("after confirm, roles[plan] = %q", got)
 	}
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(data, &root); err != nil {
-		t.Fatalf("parse config.json: %v", err)
-	}
-	var roles map[string]string
-	if err := json.Unmarshal(root["roles"], &roles); err != nil {
-		t.Fatalf("parse roles: %v", err)
-	}
-	if roles["plan"] != "openrouter/deepseek/deepseek-r1" {
-		t.Errorf("roles[plan] = %q, want highlighted deepseek-r1", roles["plan"])
-	}
-	if got := m.Roles()["plan"]; got != "openrouter/deepseek/deepseek-r1" {
-		t.Errorf("in-memory roles[plan] = %q", got)
-	}
-	view := m.View()
-	if !strings.Contains(view, "[PLAN]") {
-		t.Errorf("view must render [PLAN] badge after binding:\n%s", view)
+	if view := m.View(); !strings.Contains(view, "[PLAN]") {
+		t.Errorf("view must render [PLAN] badge after confirmation:\n%s", view)
 	}
 }
 
-// d/s hotkeys bind default/smol respectively.
-func TestDefaultSmolHotkeys(t *testing.T) {
-	r := seedTestRegistry(t, testModels())
-	work := t.TempDir()
-	m := New(r, work)
-	m, _ = m.UpdateModel(ModelsLoadedMsg{Models: r.Snapshot()})
-	m = m.FocusList().MoveCursor(2) // gpt-4o-mini
-
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
-	roles := m.Roles()
-	if roles["default"] != "openai/gpt-4o-mini" {
-		t.Errorf("roles[default] = %q", roles["default"])
-	}
-	if roles["smol"] != "openai/gpt-4o-mini" {
-		t.Errorf("roles[smol] = %q", roles["smol"])
+// d/s/v/a hotkeys bind their roles via command emission.
+func TestAllRoleHotkeysEmit(t *testing.T) {
+	cases := map[string]string{"d": "default", "s": "smol", "v": "vision", "a": "adviser"}
+	for key, wantRole := range cases {
+		m := New(seedSnapshot(testModels()))
+		m = m.FocusList().MoveCursor(2) // gpt-4o-mini
+		var cmd tea.Cmd
+		var updated Model
+		updated, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		_ = updated
+		if cmd == nil {
+			t.Fatalf("key %q must emit a command", key)
+		}
+		bind := cmd().(modelapp.BindModelToRoleCommand)
+		if string(bind.Role) != wantRole {
+			t.Errorf("key %q role = %q, want %q", key, string(bind.Role), wantRole)
+		}
+		if bind.ModelID != "openai/gpt-4o-mini" {
+			t.Errorf("key %q model = %q", key, bind.ModelID)
+		}
 	}
 }
 
-// Typing "p" in search focus must filter, never rebind.
+// Typing "p" in search focus must filter, never emit a bind command.
 func TestSearchFocusDoesNotBind(t *testing.T) {
-	r := seedTestRegistry(t, testModels())
-	m := New(r, t.TempDir())
-	m, _ = m.UpdateModel(ModelsLoadedMsg{Models: r.Snapshot()})
-	// Default focus is search.
+	m := New(seedSnapshot(testModels()))
 	if !m.SearchFocused() {
 		t.Fatal("picker must start search-focused")
 	}
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	var cmd tea.Cmd
+	m, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	if cmd != nil {
+		t.Error("typing p in search focus must not emit a bind command")
+	}
 	if _, ok := m.Roles()["plan"]; ok {
 		t.Error("typing p in search focus must not bind the plan role")
 	}
@@ -172,27 +171,77 @@ func TestBadgesRender(t *testing.T) {
 	}
 }
 
-func TestSaveRoleBindingPreservesKeys(t *testing.T) {
-	work := t.TempDir()
-	dir := filepath.Join(work, ".izen")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
+// Reasoning fidelity: openai renders standard trio, gemini toggle trio,
+// openrouter extended quintet; cycling stays within the permitted set.
+func TestReasoningFidelity(t *testing.T) {
+	openai := registry.ModelDescriptor{ID: "openai/o1", Provider: "openai", Name: "o1"}
+	m := New(seedSnapshot([]registry.ModelDescriptor{openai}))
+	if opts := ReasoningOptionsFor(openai); len(opts) != 3 || opts[0] != "low" {
+		t.Errorf("openai options = %v, want [low medium high]", opts)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"roles":{"default":"m1"},"checkpoint_retention":7}`), 0644); err != nil {
-		t.Fatal(err)
+	if bar := m.RenderReasoningBar(); !strings.Contains(bar, "low") || !strings.Contains(bar, "high") {
+		t.Errorf("standard bar = %q, want low/medium/high", bar)
 	}
-	if err := SaveRoleBinding(work, "plan", "m2"); err != nil {
-		t.Fatalf("SaveRoleBinding: %v", err)
+	if strings.Contains(m.RenderReasoningBar(), "xhigh") {
+		t.Errorf("standard bar must not contain xhigh: %q", m.RenderReasoningBar())
 	}
-	data, _ := os.ReadFile(filepath.Join(dir, "config.json"))
-	var root map[string]json.RawMessage
-	_ = json.Unmarshal(data, &root)
-	var roles map[string]string
-	_ = json.Unmarshal(root["roles"], &roles)
-	if roles["plan"] != "m2" || roles["default"] != "m1" {
-		t.Errorf("roles = %v, want preserved default + new plan", roles)
+
+	extended := registry.ModelDescriptor{ID: "x", Provider: "openrouter", Name: "x"}
+	mx := New(seedSnapshot([]registry.ModelDescriptor{extended}))
+	if opts := ReasoningOptionsFor(extended); len(opts) != 5 {
+		t.Errorf("extended options = %v, want 5", opts)
 	}
-	if !strings.Contains(string(data), "checkpoint_retention") {
-		t.Error("SaveRoleBinding must preserve unrelated keys")
+	if bar := mx.RenderReasoningBar(); !strings.Contains(bar, "xhigh") || !strings.Contains(bar, "max") {
+		t.Errorf("extended bar = %q, want xhigh/max", bar)
+	}
+
+	toggle := registry.ModelDescriptor{ID: "y", Provider: "gemini", Name: "y"}
+	mt := New(seedSnapshot([]registry.ModelDescriptor{toggle}))
+	if bar := mt.View(); !strings.Contains(bar, "off") || !strings.Contains(bar, "auto") {
+		t.Errorf("toggle view = %q, want off/auto/on", bar)
+	}
+
+	fixed := registry.ModelDescriptor{ID: "deepseek-r1", Provider: "deepseek", Name: "R1"}
+	mf := New(seedSnapshot([]registry.ModelDescriptor{fixed}))
+	if bar := mf.RenderReasoningBar(); !strings.Contains(bar, "Fixed") || !strings.Contains(bar, "Locked") {
+		t.Errorf("fixed bar = %q, want Fixed/Locked", bar)
+	}
+	if _, ok := mf.CurrentReasoningOption(); ok {
+		t.Error("fixed mode must carry no caller-selected option")
+	}
+
+	unknown := registry.ModelDescriptor{ID: "z", Provider: "nope", Name: "z"}
+	mu := New(seedSnapshot([]registry.ModelDescriptor{unknown}))
+	if bar := mu.RenderReasoningBar(); !strings.Contains(bar, "N/A") {
+		t.Errorf("none bar = %q, want N/A", bar)
+	}
+
+	// Cycling clamps within the standard trio (never reaches xhigh).
+	mc := New(seedSnapshot([]registry.ModelDescriptor{openai}))
+	for i := 0; i < 10; i++ {
+		mc = mc.CycleReasoning(1)
+	}
+	if opt, _ := mc.CurrentReasoningOption(); opt != "high" {
+		t.Errorf("clamped option = %q, want high", opt)
+	}
+}
+
+// Scope toggle flips local/global and flows into the emitted command.
+func TestScopeToggleFlowsIntoCommand(t *testing.T) {
+	m := New(seedSnapshot(testModels()))
+	m = m.FocusList()
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	if !m.IsGlobal() {
+		t.Fatal("g must toggle scope to global")
+	}
+	var cmd tea.Cmd
+	var updated Model
+	updated, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	_ = updated
+	if cmd == nil {
+		t.Fatal("bind must emit a command")
+	}
+	if bind := cmd().(modelapp.BindModelToRoleCommand); !bind.IsGlobal {
+		t.Error("command must carry IsGlobal=true after toggle")
 	}
 }

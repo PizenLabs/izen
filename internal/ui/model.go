@@ -1394,6 +1394,11 @@ type model struct {
 	modelPicker     *ModelPickerModal
 	sessionModel    string // user-selected model override via /models
 
+	// modelAppSvc is the domain application boundary for model role
+	// bindings (pure-view picker emits BindModelToRoleCommand; this service
+	// persists via ConfigRepository off the UI thread). Nil in harnesses.
+	modelAppSvc ModelServiceBinder
+
 	// Session Picker Modal — interactive /session overlay
 	showSessionPicker bool
 	sessionPicker     *SessionPickerModal
