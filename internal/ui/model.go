@@ -48,6 +48,7 @@ import (
 	"github.com/PizenLabs/izen/internal/policy"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
+	"github.com/PizenLabs/izen/internal/provider/registry"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
@@ -62,6 +63,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ui/status"
 	uitool "github.com/PizenLabs/izen/internal/ui/tool"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
+	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
 )
 
 // ── Init stage types ──────────────────────────────────────────────────────────
@@ -1389,10 +1391,15 @@ type model struct {
 	initPrefillUsername string
 	initPrefillProvider string
 
-	// Model Picker Modal
+	// Model Picker — Phase 3 contextual command surface (value type, pure
+	// view). Reads synchronously from the atomic Registry RAM snapshot.
 	showModelPicker bool
-	modelPicker     *ModelPickerModal
-	sessionModel    string // user-selected model override via /models
+	modelPicker     model_picker.Model
+	// modelRegistry is the cache-first RAM catalog backing the picker.
+	// Lazily created on /models from the local JSON cache (zero network);
+	// background sync is owned by the app layer.
+	modelRegistry *registry.Registry
+	sessionModel  string // user-selected model override via /models
 
 	// modelAppSvc is the domain application boundary for model role
 	// bindings (pure-view picker emits BindModelToRoleCommand; this service

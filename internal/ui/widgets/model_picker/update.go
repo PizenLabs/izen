@@ -17,15 +17,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // UpdateModel is the typed transition for hosts embedding the picker. Pure
 // view: zero I/O. Search input filters the snapshot RAM slice synchronously;
-// role hotkeys (d/p/s/v/a) emit modelapp.BindModelToRoleCommand via tea.Cmd
-// for the app layer to persist; arrow keys cycle the provider-native
-// reasoning options; "g" toggles local/global scope.
+// role hotkeys (d/p/s/v/a) stamp a monotonic Seq, record saving... pending
+// state, and emit modelapp.BindModelToRoleCommand via tea.Cmd for the app
+// layer to persist; arrow keys cycle the provider-native reasoning options;
+// "g" toggles local/global scope; Enter dispatches ActivateModelCommand;
+// Ctrl+R emits SyncRequestedMsg. Badges mutate only on persistence-authority
+// confirmation (BindingResultMsg / Succeeded / Failed with matching Seq).
 func (m Model) UpdateModel(msg tea.Msg) (Model, tea.Cmd) {
 	if m.done {
-		return m, nil
+		// Terminal state: still honor persistence confirmations so late
+		// BindingResultMsg updates badges even after ACTIVATE.
+		switch msg := msg.(type) {
+		case modelapp.BindingResultMsg:
+			if msg.Err != nil {
+				m = m.applyBindFailure(msg.Role, msg.Seq, msg.Err)
+			} else {
+				m = m.applyBindSuccess(msg.Role, msg.ModelID, msg.Seq)
+			}
+			return m, nil
+		case BindingSucceededMsg:
+			m = m.applyBindSuccess(msg.Role, msg.ModelID, msg.Seq)
+			return m, nil
+		case BindingFailedMsg:
+			if msg.Err != nil {
+				m = m.applyBindFailure(msg.Role, msg.Seq, msg.Err)
+			} else {
+				m = m.applyBindFailure(msg.Role, msg.Seq, fmt.Errorf("bind %s failed", msg.Role))
+			}
+			return m, nil
+		default:
+			return m, nil
+		}
 	}
 	switch msg := msg.(type) {
 	case SnapshotMsg:
+		if msg.Snap != nil {
+			m = m.SetSnapshot(msg.Snap)
+			m.loading = false
+			m.err = nil
+		}
+		return m, nil
+	case modelapp.RegistryUpdatedMsg:
+		// Cross-layer alias of SnapshotMsg emitted by background workers
+		// that import modelapp instead of the widget. Identical
+		// re-hydration: pointer swap + re-filter + bounds clamp.
 		if msg.Snap != nil {
 			m = m.SetSnapshot(msg.Snap)
 			m.loading = false
@@ -49,34 +84,34 @@ func (m Model) UpdateModel(msg tea.Msg) (Model, tea.Cmd) {
 		m.loading = false
 		m.err = msg.Err
 		return m, nil
-	case BindingSucceededMsg:
-		if msg.Role != "" && msg.ModelID != "" {
-			if m.roles == nil {
-				m.roles = make(map[string]string)
-			}
-			m.roles[msg.Role] = msg.ModelID
-			m.refreshBadges()
-			m.status = fmt.Sprintf("bind %s → %s", msg.Role, msg.ModelID)
+	case modelapp.BindingResultMsg:
+		if msg.Err != nil {
+			m = m.applyBindFailure(msg.Role, msg.Seq, msg.Err)
+		} else {
+			m = m.applyBindSuccess(msg.Role, msg.ModelID, msg.Seq)
 		}
+		return m, nil
+	case BindingSucceededMsg:
+		m = m.applyBindSuccess(msg.Role, msg.ModelID, msg.Seq)
 		return m, nil
 	case BindingFailedMsg:
 		if msg.Err != nil {
-			m.status = fmt.Sprintf("bind %s failed: %v", msg.Role, msg.Err)
-			m.err = msg.Err
+			m = m.applyBindFailure(msg.Role, msg.Seq, msg.Err)
+		} else {
+			m = m.applyBindFailure(msg.Role, msg.Seq, fmt.Errorf("bind %s failed", msg.Role))
 		}
 		return m, nil
 	case modelapp.BindModelToRoleCommand:
 		// Echo path: the command bubbled to the parent and back (e.g. in
-		// tests without an app layer). Apply optimistically to badges only;
-		// persistence already happened (or is stubbed) upstream.
+		// tests without an app layer). Treat as persistence confirmation
+		// with the command's Seq so pending saving... resolves truthfully.
 		if string(msg.Role) != "" && msg.ModelID != "" {
-			if m.roles == nil {
-				m.roles = make(map[string]string)
-			}
-			m.roles[string(msg.Role)] = msg.ModelID
-			m.refreshBadges()
-			m.status = fmt.Sprintf("bind %s → %s", string(msg.Role), msg.ModelID)
+			m = m.applyBindSuccess(string(msg.Role), msg.ModelID, msg.Seq)
 		}
+		return m, nil
+	case modelapp.SyncRequestedMsg:
+		m.loading = true
+		m.status = "syncing..."
 		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -103,9 +138,11 @@ func snapshotFromDescriptors(prev *registry.ModelSnapshot, models []registry.Mod
 
 // handleKey routes keystrokes by focus. Search focus: printable runes append
 // to the query and re-filter RAM-side with zero cursor lag; backspace shrinks
-// it; tab/esc moves focus to the list. List focus: up/down navigate, d/p/s/v/a
-// queue role bindings via command emission, left/right cycle reasoning
-// options, g toggles scope, tab or "/" returns to search, enter selects.
+// it; tab/esc moves focus to the list. List focus: up/down navigate (SELECT),
+// d/p/s/v/a queue role bindings via Seq-stamped command emission (BIND),
+// left/right cycle reasoning options, g toggles scope, tab or "/" returns to
+// search, enter marks done and dispatches ActivateModelCommand (ACTIVATE),
+// Ctrl+R requests background sync.
 func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyUp:
@@ -117,7 +154,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case tea.KeyRight:
 		return m.CycleReasoning(1), nil
 	case tea.KeyEnter:
-		return m.Select(), nil
+		m = m.Select()
+		return m, m.EmitActivateCommand()
+	case tea.KeyCtrlR:
+		m.loading = true
+		m.status = "syncing..."
+		return m, func() tea.Msg { return modelapp.SyncRequestedMsg{} }
 	case tea.KeyBackspace:
 		if m.searchFocused && len(m.query) > 0 {
 			m.query = m.query[:len(m.query)-1]
@@ -140,7 +182,8 @@ func (m Model) handleRunes(s string) (Model, tea.Cmd) {
 		return m, nil
 	}
 	if !m.searchFocused {
-		// List focus: single-char role hotkeys emit commands (no persistence).
+		// List focus: single-char role hotkeys emit Seq-stamped commands
+		// (no persistence, no badge mutation until confirmation).
 		if len([]rune(s)) == 1 {
 			switch s {
 			case RoleDefaultKey:

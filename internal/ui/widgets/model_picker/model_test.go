@@ -22,8 +22,10 @@ func testModels() []registry.ModelDescriptor {
 	}
 }
 
-// Init must be pure (nil cmd, zero I/O) and construction must populate
-// instantly from the snapshot.
+// Init must be pure (zero I/O) and construction must populate instantly
+// from the snapshot. Populated pickers return nil; cold-start (empty)
+// pickers emit SyncRequestedMsg so the parent pulls provider APIs in the
+// background without blocking the TUI.
 func TestInitPureNoIO(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	if cmd := m.Init(); cmd != nil {
@@ -35,12 +37,30 @@ func TestInitPureNoIO(t *testing.T) {
 	if m.Loading() {
 		t.Error("pure view must not start in loading state")
 	}
-	if cmd := New(nil).Init(); cmd != nil {
-		t.Error("Init with nil snapshot must return nil")
+	if cmd := New(nil).Init(); cmd == nil {
+		t.Fatal("Init on empty snapshot must request background sync")
+	} else if _, ok := cmd().(modelapp.SyncRequestedMsg); !ok {
+		t.Errorf("empty Init cmd = %T, want SyncRequestedMsg", cmd())
 	}
 	view := New(seedSnapshot(testModels())).View()
 	if strings.Contains(view, "Fetching models") {
 		t.Error("view must never render a blocking Fetching modal")
+	}
+}
+
+// Init on an empty snapshot must auto-trigger background sync.
+func TestInitColdStartRequestsSync(t *testing.T) {
+	m := New(seedSnapshot(nil))
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatal("cold-start Init must return a sync-request command")
+	}
+	if _, ok := cmd().(modelapp.SyncRequestedMsg); !ok {
+		t.Fatalf("cold-start cmd = %T, want SyncRequestedMsg", cmd())
+	}
+	// Populated picker stays quiet.
+	if cmd := New(seedSnapshot(testModels())).Init(); cmd != nil {
+		t.Error("populated Init must return nil")
 	}
 }
 

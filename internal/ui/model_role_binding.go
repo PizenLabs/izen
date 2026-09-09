@@ -11,16 +11,20 @@ import (
 )
 
 // RoleBindSuccessMsg is the UI toast dispatched after ApplicationService
-// persists a role binding in the background.
+// persists a role binding in the background. Seq correlates the toast with
+// the originating BindModelToRoleCommand for stale-confirmation filtering.
 type RoleBindSuccessMsg struct {
 	Role    string
 	ModelID string
+	Seq     uint64
 }
 
 // RoleBindFailureMsg surfaces a background persistence failure as a toast.
+// Seq correlates the toast with the originating command.
 type RoleBindFailureMsg struct {
 	Role string
 	Err  error
+	Seq  uint64
 }
 
 // ModelServiceBinder is the minimal domain boundary the UI needs for role
@@ -37,22 +41,24 @@ func (m *model) SetModelService(svc ModelServiceBinder) {
 
 // handleBindModelToRole routes a modelapp.BindModelToRoleCommand to
 // ApplicationService.BindRole in a non-blocking background tea.Cmd and
-// dispatches a toast/status message on success or error.
+// dispatches a toast/status message on success or error. Seq is propagated
+// so the contextual picker can match confirmations to pending saving states.
 func (m *model) handleBindModelToRole(cmd modelapp.BindModelToRoleCommand) tea.Cmd {
 	svc := m.modelAppSvc
 	if svc == nil {
 		role := string(cmd.Role)
+		seq := cmd.Seq
 		return func() tea.Msg {
-			return RoleBindFailureMsg{Role: role, Err: fmt.Errorf("model: no application service wired")}
+			return RoleBindFailureMsg{Role: role, Err: fmt.Errorf("model: no application service wired"), Seq: seq}
 		}
 	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := svc.BindRole(ctx, cmd); err != nil {
-			return RoleBindFailureMsg{Role: string(cmd.Role), Err: err}
+			return RoleBindFailureMsg{Role: string(cmd.Role), Err: err, Seq: cmd.Seq}
 		}
-		return RoleBindSuccessMsg{Role: string(cmd.Role), ModelID: cmd.ModelID}
+		return RoleBindSuccessMsg{Role: string(cmd.Role), ModelID: cmd.ModelID, Seq: cmd.Seq}
 	}
 }
 

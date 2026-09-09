@@ -7,6 +7,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/domain/role"
 	"github.com/PizenLabs/izen/internal/provider/detector"
+	"github.com/PizenLabs/izen/internal/provider/discovery"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
@@ -23,11 +24,14 @@ type ApplicationService struct {
 	detect   ProviderDetector
 }
 
-// NewApplicationService wires the service. A nil detect defaults to
-// detector.DetectProviders.
+// NewApplicationService wires the service. A nil detect defaults to live
+// ENV + local-runtime discovery (API keys from the environment plus a
+// reachable Ollama) via the discovery engine.
 func NewApplicationService(reg *registry.Registry, repo ConfigRepository, detect ProviderDetector) *ApplicationService {
 	if detect == nil {
-		detect = detector.DetectProviders
+		detect = func() []detector.ProviderConfig {
+			return discovery.DiscoverProviders(context.Background())
+		}
 	}
 	return &ApplicationService{registry: reg, configs: repo, detect: detect}
 }

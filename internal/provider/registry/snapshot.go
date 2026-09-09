@@ -85,13 +85,24 @@ func NewRegistryWithHome(home string) *Registry {
 }
 
 // NewRegistryWithCachePath builds a Registry with an explicit cache path
-// (tests). An empty path disables persistence.
+// (tests). A leading ~/ prefix is expanded via ExpandPath before any file
+// I/O. An empty path disables persistence.
+//
+// Cold-start guarantee: non-empty (real) cache paths boot with the embedded
+// DefaultSnapshot baseline so the catalog is never empty even without
+// network or API keys. Memory-only registries (empty path, used by tests)
+// boot empty to preserve deterministic test isolation; LoadCache seeds the
+// fallback on missing/empty files.
 func NewRegistryWithCachePath(path string) *Registry {
 	r := &Registry{
-		cachePath: path,
+		cachePath: ExpandPath(path),
 		client:    &http.Client{Timeout: httpTimeout},
 	}
-	r.snapshot.Store(emptySnapshot())
+	if ExpandPath(path) == "" {
+		r.snapshot.Store(emptySnapshot())
+	} else {
+		r.snapshot.Store(DefaultSnapshot())
+	}
 	return r
 }
 

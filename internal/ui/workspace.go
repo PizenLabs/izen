@@ -86,72 +86,19 @@ func (r *Registry) For(mode modes.Mode) (ViewMode, bool) {
 // it resolves UI lifecycle overlays (init / help / loading) and otherwise
 // delegates to the registered ViewMode for the current mode. The renderer
 // never sees mode, banner, prompt, footer, or action logic.
-// modelPickerPreferredWidth/Height are kept for backward compat but the
-// strict viewport spec now governs dimensions deterministically.
-const modelPickerPreferredWidth = 84
-const modelPickerPreferredHeight = 26
-
-// modelPickerEdgeMargin is the minimum gap kept between the modal's own
-// border and the raw edge of the terminal/pane.
-const modelPickerEdgeMargin = 2
-
-// modelPickerDialogSize computes the size to hand to ModelPickerModal.SetSize
-// deterministically per spec: ModalHeight = min(0.75*termHeight,26),
-// ModalWidth = min(0.80*termWidth,84). Outer height is fixed and never
-// jitters when hovering between reasoning/non-reasoning models; only
-// AvailableListRows inside shifts by EffortBlockArea (4 rows).
-func (m *model) modelPickerDialogSize() (int, int) {
-	termH := m.height
-	termW := m.width
-	// Fixed outer dimensions per spec. Use terminal size when known, fallback to preferred.
-	var h, w int
-	if termH > 0 {
-		h = int(float64(termH) * 0.75)
-		if h > 26 {
-			h = 26
-		}
-		// Ensure modal fits inside terminal with edge margin and respects floor.
-		if maxH := termH - modelPickerEdgeMargin; maxH < h {
-			h = maxH
-		}
-		if h < modelPickerMinHeight {
-			h = modelPickerMinHeight
-		}
-		// Also ensure at least header+footer+borders fits (without effort =10 + minRows)
-		if h < modelPickerHeaderAndSearchArea+modelPickerFooterArea+modelPickerBordersAndPadding+modelListMinRows {
-			h = modelPickerHeaderAndSearchArea + modelPickerFooterArea + modelPickerBordersAndPadding + modelListMinRows
-		}
-	} else {
-		h = modelPickerPreferredHeight
-	}
-	if termW > 0 {
-		w = int(float64(termW) * 0.80)
-		if w > 84 {
-			w = 84
-		}
-		if maxW := termW - modelPickerEdgeMargin; maxW < w {
-			w = maxW
-		}
-		if w < modelPickerMinWidth {
-			w = modelPickerMinWidth
-		}
-	} else {
-		w = modelPickerPreferredWidth
-	}
-	return w, h
-}
-
+// sessionPickerDialogSize clamps the session picker dialog to the terminal.
 func (m *model) sessionPickerDialogSize() (int, int) {
 	w := sessionPickerPreferredWidth
 	h := sessionPickerPreferredHeight
 
+	const edgeMargin = 2
 	if m.width > 0 {
-		if maxW := m.width - modelPickerEdgeMargin; maxW < w {
+		if maxW := m.width - edgeMargin; maxW < w {
 			w = maxW
 		}
 	}
 	if m.height > 0 {
-		if maxH := m.height - modelPickerEdgeMargin; maxH < h {
+		if maxH := m.height - edgeMargin; maxH < h {
 			h = maxH
 		}
 	}
@@ -164,7 +111,6 @@ func (m *model) sessionPickerDialogSize() (int, int) {
 	return w, h
 }
 
-// renderSessionPickerModal renders the session picker as a centered modal.
 func (m *model) renderSessionPickerModal() string {
 	var normalWS Workspace
 	if m.Ready && m.viewRegistry != nil {
@@ -202,10 +148,34 @@ func (m *model) renderSessionPickerModal() string {
 	return overlayOn(normalContent, centered, m.width, m.height)
 }
 
-// renderModelPickerModal renders the model picker as a compact, centered
-// floating dialog over the normal workspace background.
+// ModelPickerModalSize computes the adaptive centred-dialog constraints
+// from the parent terminal viewport (Wterm, Hterm):
+//
+//	ModalWidth  = max(64, min(110, Wterm - 6))
+//	ModalHeight = max(16, min(30, Hterm - 4))
+//
+// Unknown dimensions (<= 0) fall back to the preferred 110x30 so headless
+// callers still get a usable card. Split-pane resizes flow through here on
+// every render, guaranteeing zero clipping: the picker list budget derives
+// from the inner bounds via SetSize.
+func ModelPickerModalSize(w, h int) (int, int) {
+	mw, mh := 110, 30
+	if w > 0 {
+		mw = max(64, min(110, w-6))
+	}
+	if h > 0 {
+		mh = max(16, min(30, h-4))
+	}
+	return mw, mh
+}
+
+// renderModelPickerModal wraps the Phase 3 contextual view (IZEN MODEL
+// REGISTRY + table + reasoning + bindings) in a centred, Lipgloss-bordered
+// floating modal (Catppuccin Mocha: mauve rounded border, base background,
+// blue header). The dialog scales adaptively: inner content bounds are set
+// via SetSize on every render so terminal resizes and tmux split-panes
+// recalculate list scrolling budgets with zero UI clipping.
 func (m *model) renderModelPickerModal() string {
-	// Build the normal workspace content first (background).
 	var normalWS Workspace
 	if m.Ready && m.viewRegistry != nil {
 		if v, ok := m.viewRegistry.For(m.resolver.Current()); ok {
@@ -227,39 +197,30 @@ func (m *model) renderModelPickerModal() string {
 	}
 	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
-	// Size the model picker to fit the *actual* terminal/pane, shrinking
-	// below the preferred 68x18 when there isn't room for it (see
-	// modelPickerDialogSize for why this must not be a hardcoded call).
-	dialogW, dialogH := m.modelPickerDialogSize()
-	m.modelPicker.SetSize(dialogW, dialogH)
-	mpView := m.modelPicker.View()
+	modalW, modalH := ModelPickerModalSize(m.width, m.height)
+	// Inner content bounds: border + padding consume 4 columns / 2 rows.
+	m.modelPicker = m.modelPicker.SetSize(modalW-4, modalH-2)
+	rawContent := m.modelPicker.View()
 
-	// Outer modal box. No hardcoded Height/MaxHeight here on purpose: mpView
-	// (renderList in model_picker.go) is a fixed height for any given
-	// dialogH — ModelPickerModal.listRowBudget always pads its row list out
-	// to the same number of lines for that size — so this box naturally
-	// renders at a constant size for the current terminal without needing
-	// cross-file height arithmetic kept in sync by hand. Hardcoding a
-	// Height here previously caused the bottom border to get silently
-	// clipped whenever the true content height drifted even by a line.
-	//
-	// Width follows dialogW (+2 to match the picker's own inner
-	// border/padding math) instead of a fixed 70, so the outer box shrinks
-	// in step with the picker itself rather than overflowing the pane.
 	modalBox := lipgloss.NewStyle().
-		Width(dialogW+2).
+		Width(modalW).
+		Height(modalH).
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(colorBlue)).
+		BorderForeground(lipgloss.Color(colorMauve)).
+		Background(lipgloss.Color(colorSurface)).
 		Padding(0, 1).
-		Render(mpView)
+		Render(rawContent)
 
-	// Use lipgloss.Place for mathematically exact centering on a full-screen
-	// canvas, then blend with the workspace background via overlayOn.
-	centered := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modalBox)
+	centered := lipgloss.Place(
+		m.width, m.height,
+		lipgloss.Center, lipgloss.Center,
+		modalBox,
+		lipgloss.WithWhitespaceChars(" "),
+		lipgloss.WithWhitespaceForeground(lipgloss.Color(colorCrust)),
+	)
 	return overlayOn(normalContent, centered, m.width, m.height)
 }
 
-// renderTraceOverlayModal renders the telemetry trace buffer modal overlay.
 func (m *model) renderTraceOverlayModal() string {
 	var normalWS Workspace
 	if m.Ready && m.viewRegistry != nil {
@@ -384,7 +345,7 @@ func (m *model) BuildWorkspace() Workspace {
 	if m.showHelpOverlay {
 		return Workspace{Overlay: m.renderHelpOverlay()}
 	}
-	if m.showModelPicker && m.modelPicker != nil {
+	if m.showModelPicker {
 		return Workspace{Overlay: m.renderModelPickerModal()}
 	}
 	if m.showSessionPicker && m.sessionPicker != nil {

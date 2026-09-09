@@ -1,12 +1,18 @@
-// Package model_picker is the Phase 2 pure-view TUI model picker.
+// Package model_picker is the Phase 3 contextual command surface TUI picker.
 //
 // Pure-view contract: zero I/O. The picker renders exclusively from the
 // immutable *registry.ModelSnapshot (lock-free RAM read via Registry.Load at
 // construction). It never touches the filesystem, network, or config store.
 // Role bindings are emitted as tea.Cmd messages carrying
-// modelapp.BindModelToRoleCommand for the top-level app layer to persist via
-// ApplicationService.BindRole. State updates arrive via snapshot pointer
-// replacement (SetSnapshot) or non-mutating view models.
+// modelapp.BindModelToRoleCommand (with monotonic Seq) for the top-level app
+// layer to persist via ApplicationService.BindRole. State updates arrive via
+// snapshot pointer replacement (SetSnapshot), BindingResultMsg confirmations,
+// or non-mutating view models.
+//
+// Semantic separation:
+//   - SELECT (up/down): changes focus/highlight in local TUI state.
+//   - BIND (d/p/s/v/a): emits persistence command to assign model to role.
+//   - ACTIVATE (Enter): emits runtime session command to execute with model.
 package model_picker
 
 import (
@@ -14,7 +20,6 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	"github.com/PizenLabs/izen/internal/domain/role"
@@ -51,16 +56,37 @@ type ModelsErrMsg struct {
 
 // BindingSucceededMsg confirms a role binding persisted by the app layer.
 // The picker applies it to its badge view model (snapshot untouched).
+// Seq matches the originating BindModelToRoleCommand; Seq==0 accepts legacy
+// callers without sequence tracking.
 type BindingSucceededMsg struct {
 	Role    string
 	ModelID string
+	Seq     uint64
 }
 
 // BindingFailedMsg surfaces a persistence failure from the app layer.
+// Seq matches the originating command; Seq==0 accepts legacy callers.
 type BindingFailedMsg struct {
 	Role string
 	Err  error
+	Seq  uint64
 }
+
+// PendingBind tracks one in-flight BIND round-trip for truth-over-fabrication
+// rendering: saving... until the persistence authority confirms.
+type PendingBind struct {
+	ModelID string
+	Seq     uint64
+	State   string // "saving", "ok", "fail"
+	ErrMsg  string
+}
+
+// Pending state constants for the bindings line.
+const (
+	PendingSaving = "saving"
+	PendingOK     = "ok"
+	PendingFail   = "fail"
+)
 
 // Model is the picker state. It is a value type designed for embedding in a
 // parent Bubble Tea model; use UpdateModel for the typed transition.
@@ -77,7 +103,7 @@ type Model struct {
 
 	// roles maps role name -> bound model ID for badge rendering. It is a
 	// non-mutating view model seeded by the parent (SetRoles) and updated
-	// only on BindingSucceededMsg — never persisted here.
+	// only on persistence confirmation — never persisted here.
 	roles map[string]string
 
 	// searchFocused selects key routing: true routes printable runes into
@@ -90,6 +116,19 @@ type Model struct {
 	reasoningIdx int
 	// isGlobal selects the BindModelToRoleCommand target scope.
 	isGlobal bool
+
+	// seq is the monotonic BIND sequence counter. Every QueueBind bumps it
+	// and stamps the emitted BindModelToRoleCommand.
+	seq uint64
+	// pending tracks the latest in-flight/confirmed state per role for the
+	// BINDINGS line (saving... -> ok/fail). Never grants mutation authority:
+	// roles mutate only on success confirmation.
+	pending map[string]PendingBind
+
+	// activated records the last ACTIVATE (Enter) target for the session
+	// layer. Set on Enter alongside done.
+	activatedModelID  string
+	activatedProvider string
 
 	loading bool
 	err     error
@@ -110,6 +149,7 @@ func New(snap *registry.ModelSnapshot) Model {
 	m := Model{
 		snap:          snap,
 		roles:         make(map[string]string),
+		pending:       make(map[string]PendingBind),
 		searchFocused: true,
 	}
 	m.refilter()
@@ -119,7 +159,8 @@ func New(snap *registry.ModelSnapshot) Model {
 
 // NewFromRegistry builds a picker by reading the registry's current snapshot
 // via the lock-free Load() (O(1) RAM, zero I/O). It stores only the snapshot
-// pointer, never the registry itself.
+// pointer, never the registry itself. Cache-first: populates synchronously
+// before any background sync goroutine is spawned; never blocks on network.
 func NewFromRegistry(reg *registry.Registry) Model {
 	if reg == nil {
 		return New(nil)
@@ -141,10 +182,16 @@ func NewFromRegistryWithRoles(reg *registry.Registry, roles map[string]string) M
 	return m
 }
 
-// Init implements tea.Model. Pure view: never performs I/O, never dispatches
-// background loads. Background sync is owned by the app layer via
-// ApplicationService.RefreshRegistry; fresh snapshots arrive as SnapshotMsg.
-func (m Model) Init() tea.Cmd { return nil }
+// Init implements tea.Model. Pure view: never performs I/O itself. On a
+// cold start (zero snapshot models) it emits SyncRequestedMsg so the parent
+// immediately pulls provider APIs in the background without blocking the TUI;
+// populated pickers return nil. Fresh snapshots arrive as SnapshotMsg.
+func (m Model) Init() tea.Cmd {
+	if m.snap == nil || len(m.snap.Models) == 0 {
+		return func() tea.Msg { return modelapp.SyncRequestedMsg{} }
+	}
+	return nil
+}
 
 // SetSnapshot replaces the snapshot pointer (immutable swap) and rebuilds the
 // derived filtered view. The old snapshot is never mutated.
@@ -170,6 +217,24 @@ func (m Model) Roles() map[string]string {
 	return cloneRoles(m.roles)
 }
 
+// Pending returns a copy of the pending/confirmed bind states per role.
+func (m Model) Pending() map[string]PendingBind {
+	out := make(map[string]PendingBind, len(m.pending))
+	for k, v := range m.pending {
+		out[k] = v
+	}
+	return out
+}
+
+// PendingFor reports the pending state for one role.
+func (m Model) PendingFor(roleName string) (PendingBind, bool) {
+	pb, ok := m.pending[roleName]
+	return pb, ok
+}
+
+// LastSeq reports the last emitted BIND sequence (0 = none yet).
+func (m Model) LastSeq() uint64 { return m.seq }
+
 // SetQuery replaces the search query and re-filters against RAM.
 func (m Model) SetQuery(q string) Model {
 	m.query = q
@@ -188,6 +253,34 @@ func (m Model) SetProviderFilter(p string) Model {
 	m.resetReasoning()
 	return m
 }
+
+// ProviderFilter returns the current provider filter.
+func (m Model) ProviderFilter() string { return m.provider }
+
+// SetSize adapts the picker to its modal/dialog bounds. It recalculates the
+// list scrolling budget on the next render (via visibleWindow) so resize and
+// split-pane events never clip text or break borders. Non-positive dimensions
+// are floored to 1; cursor is clamped to the filtered list.
+func (m Model) SetSize(w, h int) Model {
+	if w < 1 {
+		w = 1
+	}
+	if h < 1 {
+		h = 1
+	}
+	m.width = w
+	m.height = h
+	if m.cursor >= len(m.filtered) {
+		m.cursor = len(m.filtered) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	return m
+}
+
+// Size reports the current picker content bounds (0 = unbounded).
+func (m Model) Size() (w, h int) { return m.width, m.height }
 
 // FocusSearch routes printable runes into the search box.
 func (m Model) FocusSearch() Model { m.searchFocused = true; return m }
@@ -237,6 +330,10 @@ func (m Model) Cursor() int { return m.cursor }
 // Loading reports whether the background load is pending.
 func (m Model) Loading() bool { return m.loading }
 
+// Syncing is the spec-named alias of Loading: true while a Ctrl+R
+// background refresh is in flight (⟳ syncing header state).
+func (m Model) Syncing() bool { return m.loading }
+
 // Err reports the last load/binding error.
 func (m Model) Err() error { return m.err }
 
@@ -245,6 +342,20 @@ func (m Model) Status() string { return m.status }
 
 // Done reports whether the picker resolved (enter pressed).
 func (m Model) Done() bool { return m.done }
+
+// ActivatedModelID reports the last ACTIVATE target (Enter), "" if none.
+func (m Model) ActivatedModelID() string { return m.activatedModelID }
+
+// ActivatedProvider reports the provider of the last ACTIVATE target.
+func (m Model) ActivatedProvider() string { return m.activatedProvider }
+
+// Providers returns the snapshot provider summaries (for the header line).
+func (m Model) Providers() []registry.ProviderSummary {
+	if m.snap == nil {
+		return nil
+	}
+	return append([]registry.ProviderSummary(nil), m.snap.Providers...)
+}
 
 // MoveCursor shifts the highlight, clamped to the filtered list.
 func (m Model) MoveCursor(delta int) Model {
@@ -280,18 +391,24 @@ func (m Model) SetCursor(i int) Model {
 	return m
 }
 
-// Select marks the picker done on the highlighted model.
+// Select marks the picker done on the highlighted model and records the
+// ACTIVATE target. Pure: emits no command by itself; use EmitActivateCommand
+// to dispatch the runtime session command.
 func (m Model) Select() Model {
-	if m.Highlighted() == nil {
+	hl := m.Highlighted()
+	if hl == nil {
 		return m
 	}
 	m.done = true
+	m.activatedModelID = hl.ID
+	m.activatedProvider = hl.Provider
 	return m
 }
 
 // BuildBindCommand constructs the domain command for binding the highlighted
 // model to roleName. It carries model ID, provider, the selected reasoning
-// effort option (nil for Fixed/None modes), and target scope. Pure: no I/O.
+// effort option (nil for Fixed/None modes), target scope, and the latest Seq
+// (call QueueBind for a fresh sequence). Pure: no I/O.
 func (m Model) BuildBindCommand(roleName string) (modelapp.BindModelToRoleCommand, bool) {
 	hl := m.Highlighted()
 	if hl == nil {
@@ -303,12 +420,13 @@ func (m Model) BuildBindCommand(roleName string) (modelapp.BindModelToRoleComman
 		Provider:  hl.Provider,
 		Reasoning: m.CurrentReasoningSelection(),
 		IsGlobal:  m.isGlobal,
+		Seq:       m.seq,
 	}, true
 }
 
 // EmitBindCommand returns a non-blocking tea.Cmd yielding the domain command
-// for the highlighted model. The parent routes it to ApplicationService.
-// Nil highlighted model yields nil (no-op).
+// for the highlighted model using the current Seq. The parent routes it to
+// ApplicationService. Nil highlighted model yields nil (no-op).
 func (m Model) EmitBindCommand(roleName string) tea.Cmd {
 	cmd, ok := m.BuildBindCommand(roleName)
 	if !ok {
@@ -317,26 +435,118 @@ func (m Model) EmitBindCommand(roleName string) tea.Cmd {
 	return func() tea.Msg { return cmd }
 }
 
-// QueueBind records a queued-bind status (no persistence, no badge mutation)
-// and returns the emission command. Badges update only on
-// BindingSucceededMsg from the app layer.
+// QueueBind stamps a fresh Seq, records the saving... pending state (no
+// persistence, no badge mutation), and returns the emission command carrying
+// the same Seq. Badges update only on persistence confirmation.
 func (m Model) QueueBind(roleName string) (Model, tea.Cmd) {
 	hl := m.Highlighted()
 	if hl == nil {
 		m.status = "no model highlighted"
 		return m, nil
 	}
+	m.seq++
+	if m.pending == nil {
+		m.pending = make(map[string]PendingBind)
+	}
+	m.pending[roleName] = PendingBind{ModelID: hl.ID, Seq: m.seq, State: PendingSaving}
 	scope := "local"
 	if m.isGlobal {
 		scope = "global"
 	}
-	m.status = fmt.Sprintf("queued bind %s → %s (%s)", roleName, hl.ID, scope)
-	return m, m.EmitBindCommand(roleName)
+	// Keep the legacy "queued bind" prefix for backward compatibility while
+	// surfacing the Phase 3 saving... transition truthfully.
+	m.status = fmt.Sprintf("queued bind %s → %s (%s) · saving...", roleName, hl.ID, scope)
+	cmd := modelapp.BindModelToRoleCommand{
+		Role:      role.Role(roleName),
+		ModelID:   hl.ID,
+		Provider:  hl.Provider,
+		Reasoning: m.CurrentReasoningSelection(),
+		IsGlobal:  m.isGlobal,
+		Seq:       m.seq,
+	}
+	return m, func() tea.Msg { return cmd }
+}
+
+// BuildActivateCommand constructs the runtime session command for the
+// highlighted model (ACTIVATE on Enter). Pure: no I/O.
+func (m Model) BuildActivateCommand() (modelapp.ActivateModelCommand, bool) {
+	hl := m.Highlighted()
+	if hl == nil {
+		return modelapp.ActivateModelCommand{}, false
+	}
+	return modelapp.ActivateModelCommand{
+		ModelID:   hl.ID,
+		Provider:  hl.Provider,
+		Reasoning: m.CurrentReasoningSelection(),
+	}, true
+}
+
+// EmitActivateCommand returns a tea.Cmd yielding ActivateModelCommand.
+func (m Model) EmitActivateCommand() tea.Cmd {
+	cmd, ok := m.BuildActivateCommand()
+	if !ok {
+		return nil
+	}
+	return func() tea.Msg { return cmd }
+}
+
+// applyBindSuccess applies a persistence confirmation for role. Stale Seqs
+// (older than the latest pending for that role) are ignored. Returns the
+// updated model.
+func (m Model) applyBindSuccess(roleName, modelID string, seq uint64) Model {
+	if m.roles == nil {
+		m.roles = make(map[string]string)
+	}
+	if m.pending == nil {
+		m.pending = make(map[string]PendingBind)
+	}
+	if pb, ok := m.pending[roleName]; ok && seq != 0 && seq < pb.Seq {
+		return m // stale confirmation: ignore
+	}
+	m.roles[roleName] = modelID
+	m.pending[roleName] = PendingBind{ModelID: modelID, Seq: seq, State: PendingOK}
+	m.refreshBadges()
+	m.status = fmt.Sprintf("bind %s → %s ✓", roleName, modelID)
+	m.err = nil
+	return m
+}
+
+// applyBindFailure records a persistence failure without mutating roles
+// (truth over fabrication: revert to prior binding, show transient error).
+// Stale Seqs are ignored.
+func (m Model) applyBindFailure(roleName string, seq uint64, bindErr error) Model {
+	if m.pending == nil {
+		m.pending = make(map[string]PendingBind)
+	}
+	if pb, ok := m.pending[roleName]; ok && seq != 0 && seq < pb.Seq {
+		return m // stale failure: ignore
+	}
+	prev := ""
+	if m.pending[roleName].ModelID != "" {
+		prev = m.pending[roleName].ModelID
+	} else if bound, ok := m.roles[roleName]; ok {
+		prev = bound
+	}
+	msg := ""
+	if bindErr != nil {
+		msg = bindErr.Error()
+		m.err = bindErr
+	}
+	m.pending[roleName] = PendingBind{ModelID: prev, Seq: seq, State: PendingFail, ErrMsg: msg}
+	switch {
+	case prev != "":
+		m.status = fmt.Sprintf("bind %s → %s ✕ %s", roleName, prev, msg)
+	case bindErr != nil:
+		m.status = fmt.Sprintf("bind %s failed: %v ✕", roleName, bindErr)
+	default:
+		m.status = fmt.Sprintf("bind %s failed ✕", roleName)
+	}
+	return m
 }
 
 // refilter recomputes the filtered list against the snapshot RAM only
-// (zero I/O). Filtering mirrors Registry.Filter semantics: case-insensitive
-// substring on ID+Name with exact provider match.
+// (zero I/O) using the deterministic multi-field token matcher shared with
+// Registry.Filter (ID, context, provider, price, capabilities).
 func (m *Model) refilter() {
 	var src []registry.ModelDescriptor
 	if m.snap != nil {
@@ -356,21 +566,19 @@ func (m *Model) refilter() {
 // the badge-update dataflow explicit at binding-confirmation time.
 func (m *Model) refreshBadges() {}
 
-// filterLocal mirrors Registry.Filter for snapshot slices: case-insensitive
-// substring on ID+Name with exact provider match. Zero I/O.
+// filterLocal mirrors Registry.Filter for snapshot slices via the shared
+// MatchesQuery matcher (multi-field tokens) plus exact provider match.
+// Zero I/O.
 func filterLocal(models []registry.ModelDescriptor, query, providerFilter string) []registry.ModelDescriptor {
-	q := strings.ToLower(strings.TrimSpace(query))
-	pf := strings.ToLower(strings.TrimSpace(providerFilter))
+	pf := strings.ToLower(strings.TrimSpace(query))
+	_ = pf
+	prov := strings.ToLower(strings.TrimSpace(providerFilter))
 	out := make([]registry.ModelDescriptor, 0, len(models))
 	for _, d := range models {
-		if pf != "" && strings.ToLower(d.Provider) != pf {
+		if prov != "" && strings.ToLower(d.Provider) != prov {
 			continue
 		}
-		if q == "" {
-			out = append(out, d)
-			continue
-		}
-		if strings.Contains(strings.ToLower(d.ID), q) || strings.Contains(strings.ToLower(d.Name), q) {
+		if registry.MatchesQuery(d, query) {
 			out = append(out, d)
 		}
 	}
@@ -416,15 +624,3 @@ func cloneRoles(in map[string]string) map[string]string {
 	}
 	return out
 }
-
-var (
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
-	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
-	accentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#f5a623")).Bold(true)
-	defaultBadge = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1"))
-	planBadge    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa"))
-	thinkBadge   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
-	visionBadge  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89dceb"))
-	otherBadge   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f5a623"))
-	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))
-)

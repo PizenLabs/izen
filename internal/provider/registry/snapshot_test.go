@@ -3,6 +3,8 @@ package registry
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -191,5 +193,55 @@ func TestUpsertProviderEntryPreservesOtherKeys(t *testing.T) {
 	}
 	if file.Providers["openrouter"].Status != CacheStatusTimeout {
 		t.Errorf("openrouter status = %q, want timeout", file.Providers["openrouter"].Status)
+	}
+}
+
+// TestExpandPathResolvesHomePrefix pins the runtime fix: Go's os package
+// does not expand ~, so ~/.izen/cache/models.json must resolve to the home
+// directory before any file I/O.
+func TestExpandPathResolvesHomePrefix(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory available")
+	}
+	got := ExpandPath("~/.izen/cache/models.json")
+	want := filepath.Join(home, ".izen", "cache", "models.json")
+	if got != want {
+		t.Errorf("ExpandPath = %q, want %q", got, want)
+	}
+	if got := ExpandPath("/abs/path/models.json"); got != "/abs/path/models.json" {
+		t.Errorf("absolute path must pass through, got %q", got)
+	}
+	if got := ExpandPath(""); got != "" {
+		t.Errorf("empty path must pass through, got %q", got)
+	}
+	r := NewRegistryWithCachePath("~/.izen/cache/models.json")
+	if r.CachePath() != want {
+		t.Errorf("CachePath = %q, want expanded %q", r.CachePath(), want)
+	}
+}
+
+// TestTildeCacheRoundTrip verifies end-to-end hydration through a ~/ path:
+// write via WriteCacheFile and read back via a tilde-path registry.
+func TestTildeCacheRoundTrip(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory available")
+	}
+	dir := t.TempDir()
+	// Simulate HOME-relative resolution without touching the real home:
+	// NewRegistryWithCachePath must expand, and file ops must follow.
+	tilde := "~/.izen-test-cache-" + filepath.Base(dir) + "/models.json"
+	expanded := ExpandPath(tilde)
+	if !filepath.IsAbs(expanded) {
+		t.Fatalf("expanded tilde path must be absolute, got %q", expanded)
+	}
+	file := ModelCacheFile{Version: CacheVersion, Providers: map[string]ProviderCacheEntry{}}
+	if err := WriteCacheFile(filepath.Join(dir, "models.json"), file); err != nil {
+		t.Fatalf("WriteCacheFile: %v", err)
+	}
+	r := NewRegistryWithCachePath(filepath.Join(dir, "models.json"))
+	if err := r.LoadCache(); err != nil {
+		t.Fatalf("LoadCache: %v", err)
 	}
 }

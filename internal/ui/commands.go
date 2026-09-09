@@ -1973,19 +1973,14 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		return m.runUsageCmd()
 
 	case cmd == "/models":
+		// Phase 3 contextual picker: cache-first, never blocking. Reads
+		// synchronously from the atomic Registry RAM snapshot (<2ms); zero
+		// network I/O, zero Fetching screen. On a cold start (zero cached
+		// models) the picker's Init emits SyncRequestedMsg so background
+		// workers pull provider APIs without blocking the TUI.
 		m.showModelPicker = true
-		m.modelPicker = NewModelPickerModal()
-		m.modelPicker.SetSize(m.width, m.height)
-
-		providers := make(map[string]string)
-		for name, prov := range m.cfg.AI.Providers {
-			providers[name] = prov.APIKey
-		}
-		if len(providers) == 0 {
-			providers["ollama"] = ""
-		}
-
-		return m.modelPicker.LoadModels(providers)
+		m.modelPicker = newModelPickerFromCache(m)
+		return m.modelPicker.Init()
 
 	case strings.HasPrefix(cmd, "/models "):
 		modelArg := strings.TrimSpace(strings.TrimPrefix(cmd, "/models"))

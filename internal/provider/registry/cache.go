@@ -50,10 +50,30 @@ type cacheEnvelope struct {
 	Models  []ModelDescriptor `json:"models"`
 }
 
+// ExpandPath resolves a leading ~/ prefix to the OS home directory.
+// Go's os package does not expand ~, so ~/.izen/cache/models.json would
+// otherwise fail to load. Non-tilde and empty paths pass through unchanged.
+func ExpandPath(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	if path == "~" {
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			return home
+		}
+	}
+	return path
+}
+
 // LoadCacheFile reads a ModelCacheFile from path. A missing file yields an
 // empty (non-nil map) file and no error. Malformed content returns an error.
 func LoadCacheFile(path string) (ModelCacheFile, error) {
 	out := ModelCacheFile{Version: CacheVersion, Providers: map[string]ProviderCacheEntry{}}
+	path = ExpandPath(path)
 	if path == "" {
 		return out, nil
 	}
@@ -107,6 +127,7 @@ func DecodeCacheFile(data []byte) (ModelCacheFile, error) {
 
 // WriteCacheFile persists file to path (mkdir -p + 0644) atomically.
 func WriteCacheFile(path string, file ModelCacheFile) error {
+	path = ExpandPath(path)
 	if path == "" {
 		return nil
 	}
@@ -139,6 +160,7 @@ func WriteCacheFile(path string, file ModelCacheFile) error {
 // per-provider write helper: failures from one provider never destroy the
 // cached models of the others.
 func UpsertProviderEntry(path string, provider string, entry ProviderCacheEntry) error {
+	path = ExpandPath(path)
 	if path == "" || provider == "" {
 		return nil
 	}
@@ -182,9 +204,16 @@ func decodeCache(data []byte) ([]ModelDescriptor, error) {
 }
 
 // LoadCache reads the cache file into memory synchronously (startup path).
-// A missing file is not an error (fresh install → empty registry).
-// A malformed file returns an explicit error and leaves memory untouched.
+// A missing file is not an error: the registry falls back to the embedded
+// DefaultSnapshot baseline so cold-start is never empty (fresh install →
+// default catalog instead of 0 models). A file that parses to 0 models
+// likewise seeds the default baseline when memory is empty. A malformed
+// file returns an explicit error and leaves memory untouched.
 // Both the modern per-provider shape and legacy flat shapes are accepted.
+//
+// When the file yields models, its contents are authoritative: the snapshot
+// is reset before applying entries so the embedded defaults never leak into
+// a populated cache (no double-counting).
 func (r *Registry) LoadCache() error {
 	if r.cachePath == "" {
 		return nil
@@ -192,6 +221,9 @@ func (r *Registry) LoadCache() error {
 	data, err := os.ReadFile(r.cachePath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if r.Len() == 0 {
+				r.snapshot.Store(DefaultSnapshot())
+			}
 			return nil
 		}
 		return fmt.Errorf("read model cache %s: %w", r.cachePath, err)
@@ -200,6 +232,14 @@ func (r *Registry) LoadCache() error {
 	if err != nil {
 		return fmt.Errorf("parse model cache %s: %w", r.cachePath, err)
 	}
+	if len(file.FlattenModels()) == 0 {
+		if r.Len() == 0 {
+			r.snapshot.Store(DefaultSnapshot())
+		}
+		return nil
+	}
+	// Authoritative reset: file contents replace the embedded defaults.
+	r.snapshot.Store(emptySnapshot())
 	for name, entry := range file.Providers {
 		if entry.Status == "" {
 			entry.Status = CacheStatusOK
@@ -211,76 +251,8 @@ func (r *Registry) LoadCache() error {
 	return nil
 }
 
-// Sync fetches every provider synchronously with per-provider provenance:
-// a failure or timeout for one provider updates only that provider's status
-// and never purges cached models from any provider (memory or disk).
-// A total failure (or an empty aggregate result with an empty registry)
-// never clears the existing valid cache.
-func (r *Registry) Sync(ctx context.Context, providers []detector.ProviderConfig) error {
-	fetch := r.activeFetch()
-	var lastErr error
-	succeeded := 0
-	for _, p := range providers {
-		if p.APIKey == "" || p.BaseURL == "" {
-			continue
-		}
-		got, err := fetch(ctx, p)
-		now := time.Now()
-		if err != nil {
-			lastErr = err
-			status := classifyFetchError(err)
-			// Preserve existing models: UpdateProvider keeps old models
-			// for non-ok statuses; persist status without wiping disk.
-			r.UpdateProvider(p.Name, ProviderCacheEntry{
-				UpdatedAt: now,
-				Status:    status,
-				ErrorMsg:  err.Error(),
-			})
-			r.persistProviderEntry(p.Name, ProviderCacheEntry{
-				UpdatedAt: now,
-				Status:    status,
-				ErrorMsg:  err.Error(),
-				Models:    r.modelsForProvider(p.Name),
-			})
-			continue
-		}
-		succeeded++
-		entry := ProviderCacheEntry{
-			UpdatedAt: now,
-			Status:    CacheStatusOK,
-			Models:    got,
-		}
-		r.UpdateProvider(p.Name, entry)
-		r.persistProviderEntry(p.Name, entry)
-	}
-	if succeeded == 0 {
-		if lastErr != nil {
-			return fmt.Errorf("model sync: all providers failed: %w", lastErr)
-		}
-		if r.Len() == 0 {
-			return fmt.Errorf("model sync: no models returned, keeping existing cache")
-		}
-		return fmt.Errorf("model sync: no models returned, keeping existing cache")
-	}
-	return nil
-}
-
-// SyncProviders is an alias for Sync kept for explicit call sites.
-func (r *Registry) SyncProviders(ctx context.Context, providers []detector.ProviderConfig) error {
-	return r.Sync(ctx, providers)
-}
-
-// SyncBackground runs Sync in a background goroutine and reports its result
-// on the returned channel (buffered, exactly one value, then closed).
-// A background failure never clears the existing in-memory cache.
-func (r *Registry) SyncBackground(ctx context.Context, providers []detector.ProviderConfig) <-chan error {
-	done := make(chan error, 1)
-	go func() {
-		done <- r.Sync(ctx, providers)
-		close(done)
-	}()
-	return done
-}
+// sync.go owns Sync/SyncProviders/SyncBackground (concurrent errgroup live
+// discovery). This file owns persistence, caching, and HTTP mapping.
 
 // modelsForProvider returns a copy of the current snapshot models for one
 // provider (used to persist failure statuses without wiping disk models).
