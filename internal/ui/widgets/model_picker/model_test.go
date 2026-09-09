@@ -191,25 +191,37 @@ func TestBadgesRender(t *testing.T) {
 	}
 }
 
-// Reasoning fidelity: openai renders standard trio, gemini toggle trio,
-// openrouter extended quintet; cycling stays within the permitted set.
+// Reasoning fidelity: openai renders default + standard trio, gemini default +
+// toggle trio, openrouter default + extended quintet; cycling stays within the
+// permitted set; the default tier yields a nil selection (reasoning_effort
+// omitted downstream, provider factory behavior).
 func TestReasoningFidelity(t *testing.T) {
 	openai := registry.ModelDescriptor{ID: "openai/o1", Provider: "openai", Name: "o1"}
 	m := New(seedSnapshot([]registry.ModelDescriptor{openai}))
-	if opts := ReasoningOptionsFor(openai); len(opts) != 3 || opts[0] != "low" {
-		t.Errorf("openai options = %v, want [low medium high]", opts)
+	if opts := ReasoningOptionsFor(openai); len(opts) != 4 || opts[0] != "default" || opts[1] != "low" {
+		t.Errorf("openai options = %v, want [default low medium high]", opts)
 	}
 	if bar := m.RenderReasoningBar(); !strings.Contains(bar, "low") || !strings.Contains(bar, "high") {
 		t.Errorf("standard bar = %q, want low/medium/high", bar)
 	}
+	if bar := m.RenderReasoningBar(); !strings.Contains(bar, "default") {
+		t.Errorf("standard bar = %q, want default fallback tier", bar)
+	}
 	if strings.Contains(m.RenderReasoningBar(), "xhigh") {
 		t.Errorf("standard bar must not contain xhigh: %q", m.RenderReasoningBar())
+	}
+	// Default tier omits the API parameter (nil selection).
+	if sel := m.CurrentReasoningSelection(); sel != nil {
+		t.Errorf("default selection = %+v, want nil (reasoning_effort omitted)", sel)
+	}
+	if opt, ok := m.CurrentReasoningOption(); !ok || opt != "default" {
+		t.Errorf("initial option = %q,%v, want default,true", opt, ok)
 	}
 
 	extended := registry.ModelDescriptor{ID: "x", Provider: "openrouter", Name: "x"}
 	mx := New(seedSnapshot([]registry.ModelDescriptor{extended}))
-	if opts := ReasoningOptionsFor(extended); len(opts) != 5 {
-		t.Errorf("extended options = %v, want 5", opts)
+	if opts := ReasoningOptionsFor(extended); len(opts) != 6 || opts[0] != "default" {
+		t.Errorf("extended options = %v, want 6 (default + 5)", opts)
 	}
 	if bar := mx.RenderReasoningBar(); !strings.Contains(bar, "xhigh") || !strings.Contains(bar, "max") {
 		t.Errorf("extended bar = %q, want xhigh/max", bar)

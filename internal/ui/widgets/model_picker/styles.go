@@ -24,6 +24,10 @@ var (
 	syncWarnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))
 
 	// dividerStyle is the subtle horizontal rule under the header.
+	// The modal interior deliberately carries NO solid background fill so
+	// the terminal-native background/transparency shows through; only the
+	// mauve rounded outer-frame border (#cba6f7) and Surface1 structural
+	// tones (#45475a) are applied.
 	dividerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#45475a"))
 
 	// selectedRowStyle is the active-row highlight: Surface0 background

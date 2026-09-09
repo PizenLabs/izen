@@ -1938,17 +1938,27 @@ func (m *model) applyToolCallBuffer() tea.Cmd {
 	}
 }
 
-// cycleEffort cycles the effort level through Auto → Low → Medium → High.
+// cycleEffort cycles the effort level through
+// Default → None → Low → Medium → High → XHigh → Max → Default.
+// Default preserves provider factory behavior (reasoning_effort omitted).
 func (m *model) cycleEffort() {
 	switch m.currentEffort {
-	case EffortAuto:
+	case EffortDefault:
+		m.currentEffort = EffortNone
+	case EffortNone:
 		m.currentEffort = EffortLow
 	case EffortLow:
 		m.currentEffort = EffortMedium
 	case EffortMedium:
 		m.currentEffort = EffortHigh
 	case EffortHigh:
-		m.currentEffort = EffortAuto
+		m.currentEffort = EffortXHigh
+	case EffortXHigh:
+		m.currentEffort = EffortMax
+	case EffortMax:
+		m.currentEffort = EffortDefault
+	default:
+		m.currentEffort = EffortDefault
 	}
 }
 

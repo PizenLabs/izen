@@ -13,11 +13,27 @@ func ReasoningModeFor(d registry.ModelDescriptor) adapter.ReasoningMode {
 	return adapter.CapabilityForProvider(d.Provider).ReasoningMode
 }
 
-// ReasoningOptionsFor returns the exact option list permitted for a model.
-// It is strictly adapter.OptionsForMode(mode): Fixed and None yield zero
-// options so callers never force universal low/medium/high variants.
+// DefaultReasoningOption is the provider-factory fallback tier. When it is
+// the selected option, CurrentReasoningSelection returns nil so downstream
+// model API request payloads omit the reasoning_effort key entirely.
+const DefaultReasoningOption = "default"
+
+// ReasoningOptionsFor returns the selectable option list for a model:
+// "default" followed by the adapter's provider-native options.
+//
+//	EnumStandard: default • low • medium • high
+//	EnumExtended: default • low • medium • high • xhigh • max
+//	ToggleAuto:   default • off • auto • on
+//	Fixed/None:   zero options (no caller-selected effort)
+//
+// Fixed and None yield zero options so callers never force universal
+// low/medium/high variants and the section collapses.
 func ReasoningOptionsFor(d registry.ModelDescriptor) []string {
-	return adapter.OptionsForMode(ReasoningModeFor(d))
+	base := adapter.OptionsForMode(ReasoningModeFor(d))
+	if len(base) == 0 {
+		return []string{}
+	}
+	return append([]string{DefaultReasoningOption}, base...)
 }
 
 // clampedReasoningIdx keeps idx inside options (0 when empty).
@@ -36,7 +52,7 @@ func clampedReasoningIdx(idx int, options []string) int {
 
 // CurrentReasoningOption reports the selected option for the highlighted
 // model, or ("", false) when the mode carries no caller-selected option
-// (Fixed / None).
+// (Fixed / None). The initial selection is always "default".
 func (m Model) CurrentReasoningOption() (string, bool) {
 	hl := m.Highlighted()
 	if hl == nil {
@@ -50,10 +66,13 @@ func (m Model) CurrentReasoningOption() (string, bool) {
 }
 
 // CurrentReasoningSelection builds the domain ReasoningSelection for the
-// highlighted model, or nil when the mode carries no caller-selected option.
+// highlighted model, or nil when the mode carries no caller-selected option
+// (Fixed / None) or when the "default" fallback tier is selected. A nil
+// selection omits the reasoning_effort key downstream, preserving provider
+// factory behavior.
 func (m Model) CurrentReasoningSelection() *adapter.ReasoningSelection {
 	opt, ok := m.CurrentReasoningOption()
-	if !ok {
+	if !ok || opt == DefaultReasoningOption {
 		return nil
 	}
 	return &adapter.ReasoningSelection{Option: opt}
@@ -87,15 +106,16 @@ func (m *Model) resetReasoning() {
 }
 
 // RenderReasoningBar renders the provider-native reasoning effort bar for the
-// highlighted model:
+// highlighted model ("default" first, then the mode-native grades):
 //
-//	EnumStandard: low • medium • high
-//	EnumExtended: low • medium • high • xhigh • max
-//	ToggleAuto:   off • auto • on
+//	EnumStandard: default • low • medium • high
+//	EnumExtended: default • low • medium • high • xhigh • max
+//	ToggleAuto:   default • off • auto • on
 //	Fixed:        Fixed (Pure Chain-of-Thought) [Locked]
 //	None:         N/A (Standard Latency)
 //
-// The selected option renders highlighted; siblings render muted.
+// The selected option renders highlighted; siblings render muted. Selecting
+// "default" preserves provider factory behavior (reasoning_effort omitted).
 func (m Model) RenderReasoningBar() string {
 	hl := m.Highlighted()
 	if hl == nil {
@@ -104,7 +124,7 @@ func (m Model) RenderReasoningBar() string {
 	mode := ReasoningModeFor(*hl)
 	switch mode {
 	case adapter.ReasoningModeEnumStandard, adapter.ReasoningModeEnumExtended, adapter.ReasoningModeToggleAuto:
-		options := adapter.OptionsForMode(mode)
+		options := ReasoningOptionsFor(*hl)
 		sel := clampedReasoningIdx(m.reasoningIdx, options)
 		cells := make([]string, 0, len(options))
 		for i, opt := range options {

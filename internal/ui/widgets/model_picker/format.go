@@ -32,6 +32,26 @@ func formatPricing(prompt, completion float64) string {
 	return fmt.Sprintf("$%s/$%s", formatPriceVal(prompt), formatPriceVal(completion))
 }
 
+// formatContextWindow renders a context window with dynamic units:
+// 1000000+ → "1M"/"2M"/"1.5M", 1000+ → "128k"/"256k", else raw digits.
+// Non-positive windows render "-" (unknown). Zero I/O.
+func formatContextWindow(tokens int) string {
+	if tokens <= 0 {
+		return "-"
+	}
+	if tokens >= 1_000_000 {
+		val := float64(tokens) / 1_000_000.0
+		if val == float64(int(val)) {
+			return fmt.Sprintf("%dM", int(val))
+		}
+		return fmt.Sprintf("%.1fM", val)
+	}
+	if tokens >= 1_000 {
+		return fmt.Sprintf("%dk", tokens/1000)
+	}
+	return fmt.Sprintf("%d", tokens)
+}
+
 // truncateWithEllipsis cuts s to at most n visible runes, using "…" as the
 // last rune when truncation occurs. ASCII-fast, rune-safe for IDs.
 func truncateWithEllipsis(s string, n int) string {

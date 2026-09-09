@@ -657,10 +657,20 @@ func styleBadge(badge string) string {
 	}
 }
 
-// formatContext renders a context window compactly ("128k", "163k", "—").
+// formatContext renders a context window compactly ("1M", "2M", "128k",
+// "163k", "—"). Values >= 1M use dynamic M units (whole → "2M", fractional
+// → "1.5M"); values >= 1k use "k"; non-positive renders "—". It delegates to
+// the shared formatContextWindow helper for unit math.
 func formatContext(ctx int) string {
 	if ctx <= 0 {
 		return "—"
+	}
+	if ctx >= 1_000_000 {
+		val := float64(ctx) / 1_000_000.0
+		if val == float64(int(val)) {
+			return fmt.Sprintf("%dM", int(val))
+		}
+		return fmt.Sprintf("%.1fM", val)
 	}
 	if ctx >= 1000 {
 		if ctx%1000 == 0 {

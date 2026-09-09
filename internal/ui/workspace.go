@@ -171,10 +171,12 @@ func ModelPickerModalSize(w, h int) (int, int) {
 
 // renderModelPickerModal wraps the Phase 3 contextual view (IZEN MODEL
 // REGISTRY + table + reasoning + bindings) in a centred, Lipgloss-bordered
-// floating modal (Catppuccin Mocha: mauve rounded border, base background,
-// blue header). The dialog scales adaptively: inner content bounds are set
-// via SetSize on every render so terminal resizes and tmux split-panes
-// recalculate list scrolling budgets with zero UI clipping.
+// floating modal with a terminal-native transparent interior: no solid
+// background fill is applied, so the terminal's own background/transparency
+// shows through inside the mauve rounded border. The dialog scales
+// adaptively: inner content bounds are set via SetSize on every render so
+// terminal resizes and tmux split-panes recalculate list scrolling budgets
+// with zero UI clipping.
 func (m *model) renderModelPickerModal() string {
 	var normalWS Workspace
 	if m.Ready && m.viewRegistry != nil {
@@ -219,7 +221,6 @@ func (m *model) renderModelPickerModal() string {
 		MaxHeight(modalH).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(colorMauve)).
-		Background(lipgloss.Color(colorSurface)).
 		Padding(0, 1).
 		Render(boxContent)
 
@@ -227,8 +228,8 @@ func (m *model) renderModelPickerModal() string {
 		m.width, m.height,
 		lipgloss.Center, lipgloss.Center,
 		modalBox,
+		// Fill surrounding workspace overlay with neutral dimmed whitespace.
 		lipgloss.WithWhitespaceChars(" "),
-		lipgloss.WithWhitespaceForeground(lipgloss.Color(colorCrust)),
 	)
 	return overlayOn(normalContent, centered, m.width, m.height)
 }

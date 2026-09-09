@@ -810,7 +810,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Enter confirms the highlighted mode, Esc falls back to /ask.
 		// ── Effort Selector (←/→) ────────────────────────────────────
 		if msg.Type == tea.KeyLeft {
-			if m.currentEffort > EffortAuto {
+			if m.currentEffort > EffortDefault {
 				m.currentEffort--
 			}
 			m.recalcViewportHeight()
@@ -819,7 +819,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.Type == tea.KeyRight {
-			if m.currentEffort < EffortHigh {
+			if m.currentEffort < EffortMax {
 				m.currentEffort++
 			}
 			m.recalcViewportHeight()

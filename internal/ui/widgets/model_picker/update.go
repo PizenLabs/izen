@@ -167,6 +167,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.resetReasoning()
 		}
 		return m, nil
+	case tea.KeySpace:
+		// Space in search focus appends to the multi-token query
+		// (strings.Fields AND logic in MatchesQuery); it must never
+		// trigger table selection or page scrolling.
+		if m.searchFocused {
+			m.query += " "
+			m.refilter()
+			m.resetReasoning()
+		}
+		return m, nil
 	case tea.KeyTab, tea.KeyEsc:
 		m.searchFocused = !m.searchFocused
 		return m, nil

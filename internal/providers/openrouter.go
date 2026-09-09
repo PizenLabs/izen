@@ -421,6 +421,10 @@ func reasoningFor(req ai.Request) *openrouterReasoning {
 		return &openrouterReasoning{Enabled: &enabled}
 	}
 	r := &openrouterReasoning{Effort: req.Reasoning.Level}
+	if r.Effort == "default" {
+		// Provider-factory fallback: omit the effort key entirely.
+		r.Effort = ""
+	}
 	switch {
 	case req.Reasoning.CoTLimit > 0:
 		r.MaxTokens = req.Reasoning.CoTLimit

@@ -31,9 +31,15 @@ func (c *ReasoningConfig) IsZero() bool {
 	return c == nil || (!c.Disabled && c.Level == "" && c.BudgetTokens == 0 && c.CoTLimit == 0)
 }
 
-// LevelOrDefault returns the configured effort level, or "".
+// LevelOrDefault returns the configured effort level, or "" when unset or
+// when the "default" fallback tier is selected. The empty string preserves
+// provider factory behavior: API payload structs carry it with `omitempty`,
+// so the reasoning_effort key is omitted entirely.
 func (c *ReasoningConfig) LevelOrDefault() string {
 	if c == nil {
+		return ""
+	}
+	if c.Level == "default" {
 		return ""
 	}
 	return c.Level
