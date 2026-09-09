@@ -1430,6 +1430,13 @@ type model struct {
 	toolCards map[string]*uitool.ToolCard
 	toolOrder []string
 
+	// ── Grouped Batch Tool Cards (join-barrier parallel execution) ──
+	// batchCards maps batch ID → grouped card; batchOrder preserves spawn
+	// order. Each child ToolCard owns its own ring buffer so task.tool_chunk
+	// events never interleave streams.
+	batchCards map[string]*uitool.BatchCard
+	batchOrder []string
+
 	// Authoritative execution-stage record — the single source of truth for
 	// "what is the runtime doing right now". Every progress indicator derives
 	// from it; it is updated ONLY at real execution boundaries (see stage.go).

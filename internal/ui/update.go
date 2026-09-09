@@ -2049,6 +2049,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.toggleToolCard(msg.ID)
 		return m, nil
 
+	case ToolBatchStartedMsg:
+		m.handleToolBatchStarted(msg)
+		return m, nil
+
+	case ToolBatchChunkMsg:
+		m.handleToolBatchChunk(msg)
+		return m, nil
+
+	case ToolBatchCompletedMsg:
+		m.handleToolBatchCompleted(msg)
+		return m, nil
+
+	case ToolBatchSelectMsg:
+		m.handleToolBatchSelect(msg)
+		return m, nil
+
+	case ToolBatchToggleMsg:
+		m.handleToolBatchToggle(msg)
+		return m, nil
+
 	case FrameTickMsg:
 		// ── DEBOUNCED FRAME TICKER (30ms / ~33 FPS) ─────────────────────
 		// STREAM BUFFER CONTRACT: Option A — Cumulative Overwrite.
@@ -3506,6 +3526,40 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 
+		// ── Grouped Batch Card navigation (Up/Down + Ctrl+O/Enter) ─────
+		if len(m.batchOrder) > 0 && !m.autocompleteActive {
+			if batch := m.batchCards[m.batchOrder[len(m.batchOrder)-1]]; batch != nil && len(batch.Tools) > 1 {
+				switch msg.Type {
+				case tea.KeyUp:
+					batch.Select(-1)
+					if m.Ready {
+						m.refreshViewportContent()
+					}
+					return m, nil
+				case tea.KeyDown:
+					batch.Select(1)
+					if m.Ready {
+						m.refreshViewportContent()
+					}
+					return m, nil
+				case tea.KeyCtrlO:
+					batch.ToggleSelected()
+					if m.Ready {
+						m.refreshViewportContent()
+					}
+					return m, nil
+				case tea.KeyEnter:
+					if len(m.ti.Value()) == 0 {
+						batch.ToggleSelected()
+						if m.Ready {
+							m.refreshViewportContent()
+						}
+						return m, nil
+					}
+				}
+			}
+		}
+
 		if !m.autocompleteActive && !m.streaming && !m.agentRunning {
 			switch msg.Type {
 			case tea.KeyTab:
@@ -3513,6 +3567,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				if len(m.toolOrder) > 0 {
 					m.toggleToolCard("")
 					return m, nil
+				}
+				if len(m.batchOrder) > 0 {
+					if batch := m.batchCards[m.batchOrder[len(m.batchOrder)-1]]; batch != nil {
+						batch.ToggleSelected()
+						if m.Ready {
+							m.refreshViewportContent()
+						}
+						return m, nil
+					}
 				}
 			case tea.KeyUp:
 				if len(m.history) > 0 {

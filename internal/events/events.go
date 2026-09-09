@@ -1270,7 +1270,30 @@ const (
 	EventBudgetExceeded        = "budget.exceeded"
 	EventStateCheckpoint       = "state.checkpoint"
 	EventClarificationRequired = "clarification.required"
+	EventToolBatchStarted      = "task.tool_batch.started"
+	EventToolChunk             = "task.tool_chunk"
+	EventToolBatchCompleted    = "task.tool_batch.completed"
 )
+
+type ToolBatchStartedPayload struct{ ToolIDs []string }
+type ToolChunkPayload struct {
+	ToolID string
+	Chunk  []byte
+}
+type ToolBatchCompletedPayload struct {
+	ToolIDs []string
+	Results interface{}
+}
+
+func NewToolBatchStarted(ids []string) DomainEvent {
+	return newEvent(EventToolBatchStarted, ToolBatchStartedPayload{ToolIDs: append([]string(nil), ids...)})
+}
+func NewToolChunk(id string, chunk []byte) DomainEvent {
+	return newEvent(EventToolChunk, ToolChunkPayload{ToolID: id, Chunk: append([]byte(nil), chunk...)})
+}
+func NewToolBatchCompleted(ids []string, results interface{}) DomainEvent {
+	return newEvent(EventToolBatchCompleted, ToolBatchCompletedPayload{ToolIDs: append([]string(nil), ids...), Results: results})
+}
 
 // TaskStartedPayload carries a task execution start. TaskID links the event
 // to its originating task.

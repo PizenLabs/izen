@@ -330,6 +330,49 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// ── GROUPED BATCH TOOL CARD NAVIGATION ──────────────────────────
+	// When a BatchCard is present, Up/Down highlights a sub-tool and
+	// Ctrl+O / Enter expands its isolated stdout/stderr overlay.
+	if len(m.batchOrder) > 0 {
+		if batch := m.batchCards[m.batchOrder[len(m.batchOrder)-1]]; batch != nil && len(batch.Tools) > 0 {
+			switch msg.Type {
+			case tea.KeyUp:
+				batch.Select(-1)
+				if m.Ready {
+					m.refreshViewportContent()
+				}
+				return m, nil
+			case tea.KeyDown:
+				batch.Select(1)
+				if m.Ready {
+					m.refreshViewportContent()
+				}
+				return m, nil
+			case tea.KeyEnter:
+				// Only hijack Enter when input is empty or batch is expanded;
+				// otherwise let submit flow through.
+				if m.ti.Focused() && msg.String() == "" || len(batch.Tools) > 1 {
+					// When a batch is active and has multiple tools, Enter toggles overlay
+					// if input is empty; if input has content, still allow submit via Update path
+					if len(m.ti.Value()) == 0 {
+						batch.ToggleSelected()
+						if m.Ready {
+							m.refreshViewportContent()
+						}
+						return m, nil
+					}
+				}
+			}
+			if msg.Type == tea.KeyCtrlO {
+				batch.ToggleSelected()
+				if m.Ready {
+					m.refreshViewportContent()
+				}
+				return m, nil
+			}
+		}
+	}
+
 	// ── GLOBAL: Ctrl+O toggles the active thought block ──────────────
 	// Expands/collapses the reasoning block for the currently active message
 	// (ThinkingBuffer). When no thought block is active, falls back to cycling
