@@ -8,20 +8,20 @@ import (
 // ModelTokenBudget maps model name prefixes to conservative token ceilings.
 // These are deliberately conservative to prevent hallucination on small models.
 var ModelTokenBudget = map[string]int{
-	"qwen2.5-coder:":   6000,
-	"llama3.1:":        8000,
-	"codellama:":       8000,
-	"deepseek-coder:":  8000,
-	"phi3:":            4000,
-	"phi4:":            8000,
-	"gemma2:":          8000,
-	"mistral:":         8000,
-	"mixtral:":         16000,
-	"claude-3-haiku":   8000,
-	"claude-3-sonnet":  16000,
-	"claude-sonnet-4":  16000,
-	"gpt-4o-mini":      16000,
-	"gpt-4o":           32000,
+	"qwen2.5-coder:":  6000,
+	"llama3.1:":       8000,
+	"codellama:":      8000,
+	"deepseek-coder:": 8000,
+	"phi3:":           4000,
+	"phi4:":           8000,
+	"gemma2:":         8000,
+	"mistral:":        8000,
+	"mixtral:":        16000,
+	"claude-3-haiku":  8000,
+	"claude-3-sonnet": 16000,
+	"claude-sonnet-4": 16000,
+	"gpt-4o-mini":     16000,
+	"gpt-4o":          32000,
 }
 
 // DefaultTokenBudget is the fallback ceiling for unrecognised models.

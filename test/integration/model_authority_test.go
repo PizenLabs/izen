@@ -6,10 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	registry "github.com/PizenLabs/izen/internal/provider/registry"
 	"github.com/PizenLabs/izen/internal/providers/capability"
 	"github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/runtime/authority"
-	registry "github.com/PizenLabs/izen/internal/provider/registry"
 )
 
 // ── Test A: Unified Active Model ─────────────────────────────────────────────

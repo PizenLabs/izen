@@ -31,7 +31,7 @@ func collectProductionFiles(t *testing.T) []string {
 	var files []string
 	err := filepath.Walk(filepath.Join(prodRoot, "internal"), func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // skip unreadable paths
+			return nil //nolint:nilerr // skip unreadable paths
 		}
 		if info.IsDir() {
 			return nil

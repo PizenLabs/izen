@@ -654,7 +654,7 @@ func (m Model) renderModelsPane() string {
 		innerW = 64
 	}
 	paneW := innerW - providersPaneWidth - 1 // -1 for separator; guarantee equality
-	_ = paneW + providersPaneWidth + 1 // assert: left + sep + right == innerW
+	_ = paneW + providersPaneWidth + 1       // assert: left + sep + right == innerW
 	if paneW < 16 {
 		paneW = 16
 	}
@@ -724,14 +724,14 @@ func (m Model) renderModelsPane() string {
 // individual cells never introduce partial ANSI sequences that could break
 // on truncation.
 func (m Model) renderModelRow(item registry.ModelDescriptor, rightPaneW int) string {
-	ctxW := 6
-	priceW := 12
-	flagsW := 16
+	ctxW := tableCtxColW
+	priceW := tablePriceColW
+	flagsW := tableFlagsMaxW
 	spacing := 3 // spaces between 4 columns
 
 	idW := rightPaneW - (ctxW + priceW + flagsW + spacing)
-	if idW < 10 {
-		idW = 10
+	if idW < tableIDMinW {
+		idW = tableIDMinW
 	}
 
 	// 1. Hard-truncate Model ID first.

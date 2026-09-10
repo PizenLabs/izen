@@ -26,7 +26,7 @@ func encryptedRead(filePath, provider string) ([]byte, error) {
 		if os.IsNotExist(err) {
 			return nil, ErrNotFound
 		}
-		return nil, fmt.Errorf("%w: %v", ErrPermissionDenied, err)
+		return nil, fmt.Errorf("%w: %v", ErrPermissionDenied, err) //nolint:errorlint // wrap sentinel, include cause
 	}
 
 	// Enforce 0600 permissions: file must not be readable by group/others.

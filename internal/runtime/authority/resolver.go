@@ -76,13 +76,13 @@ var ErrProviderDisabled = errors.New("authority: provider disabled")
 
 // ResolveModel implements the pure, stateless Policy Resolver.
 // Rules:
-//   1. Explicit Policy Override: if policy defines a binding for the role,
-//      return that complete tuple.
-//   2. Default Active Model: otherwise return the runtime active tuple.
-//   3. Tuple Integrity: NEVER combine policy.Model with runtime.ActiveProvider.
-//   4. Missing Binding: if ModelID is empty, return ErrUnassignedModel.
-//   5. Invalid Model/Provider: validate compatibility; on mismatch return
-//      ErrProviderModelMismatch.
+//  1. Explicit Policy Override: if policy defines a binding for the role,
+//     return that complete tuple.
+//  2. Default Active Model: otherwise return the runtime active tuple.
+//  3. Tuple Integrity: NEVER combine policy.Model with runtime.ActiveProvider.
+//  4. Missing Binding: if ModelID is empty, return ErrUnassignedModel.
+//  5. Invalid Model/Provider: validate compatibility; on mismatch return
+//     ErrProviderModelMismatch.
 func ResolveModel(intent string, runtime ModelState, policy ModelPolicy) (ModelBinding, error) {
 	role := RoleForIntent(intent)
 

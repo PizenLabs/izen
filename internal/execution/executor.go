@@ -2491,7 +2491,7 @@ func (x *RuntimeExecutor) manifestSystemPromptFor() string {
 // gate signal. A finish_reason="length" truncated response likewise crosses as
 // raw bytes — ParseMutationManifest rejects the truncated JSON — so the DAG
 // strategy decision falls back silently instead of surfacing exhaustion.
-func (x *RuntimeExecutor) resolveManifestModel() (string, error) {
+func (x *RuntimeExecutor) resolveManifestModel() (string, error) { //nolint:staticcheck
 	return "", fmt.Errorf("executor: manifest pass requires an explicit model binding (no fallback allowed)")
 }
 
@@ -2505,8 +2505,8 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 	if p == nil {
 		return "", fmt.Errorf("executor: no provider configured for the manifest pass")
 	}
-	model, err := x.resolveManifestModel()
-	if err != nil {
+	model, err := x.resolveManifestModel() //nolint:staticcheck
+	if err != nil {                        //nolint:staticcheck
 		return "", err
 	}
 	var user strings.Builder

@@ -31,13 +31,16 @@ func TestNegativeArchitecture_NoStaticModelDefaults(t *testing.T) {
 
 	for _, dir := range productionDirs {
 		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.Contains(path, "_test.go") {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.Contains(path, "_test.go") {
 				return nil
 			}
 			fset := token.NewFileSet()
-			f, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
-			if err != nil {
-				return nil // ignore unparseable
+			f, parseErr := parser.ParseFile(fset, path, nil, parser.ParseComments)
+			if parseErr != nil {
+				return nil //nolint:nilerr // ignore unparseable files
 			}
 			ast.Inspect(f, func(n ast.Node) bool {
 				switch x := n.(type) {

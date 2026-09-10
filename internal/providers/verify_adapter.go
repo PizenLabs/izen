@@ -43,7 +43,7 @@ func (v *ProviderVerificationAdapter) Verify(ctx context.Context, providerName, 
 	if err != nil {
 		return false, fmt.Errorf("provider %s: connection failed: %w", providerName, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusNoContent:

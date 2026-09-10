@@ -5,9 +5,9 @@ package capability
 type ReasoningSupportState int
 
 const (
-	ReasoningUnknown ReasoningSupportState = iota // Capability metadata absent
-	ReasoningUnsupported                         // Provider explicitly reports no reasoning
-	ReasoningSupported                           // Provider explicitly reports reasoning
+	ReasoningUnknown     ReasoningSupportState = iota // Capability metadata absent
+	ReasoningUnsupported                              // Provider explicitly reports no reasoning
+	ReasoningSupported                                // Provider explicitly reports reasoning
 )
 
 // String returns the machine-readable label.
@@ -32,9 +32,9 @@ func (s ReasoningSupportState) IsExplicit() bool {
 // It preserves the distinction between Unknown (absent metadata) and
 // Unsupported (explicit denial), and never infers grades.
 type CapabilityTruth struct {
-	Reasoning ReasoningSupportState
+	Reasoning    ReasoningSupportState
 	Configurable bool
-	Options []string
+	Options      []string
 }
 
 // ToCapabilityTruth builds an explicit truth record from provider-advertised

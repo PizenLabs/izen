@@ -1,6 +1,7 @@
 package credentials
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,7 +43,7 @@ func TestEncryptedFallbackRoundTrip(t *testing.T) {
 		t.Fatalf("Delete failed: %v", err)
 	}
 	_, err = store.Get(ProviderID("openrouter"))
-	if err != ErrNotFound {
+	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("expected ErrNotFound after delete, got %v", err)
 	}
 }
@@ -53,10 +54,14 @@ func TestEncryptedFallbackInvalidPermission(t *testing.T) {
 		filePath: filepath.Join(dir, "test_store"),
 	}
 
-	store.Set(ProviderID("test"), []byte("secret"))
+	if err := store.Set(ProviderID("test"), []byte("secret")); err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
 
 	// Change permissions to something other than 0600
-	os.Chmod(store.filePath, 0o644)
+	if err := os.Chmod(store.filePath, 0o644); err != nil {
+		t.Fatalf("Chmod failed: %v", err)
+	}
 
 	_, err := store.Get(ProviderID("test"))
 	if err == nil {
