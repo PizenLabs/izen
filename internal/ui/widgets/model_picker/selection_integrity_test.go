@@ -27,35 +27,21 @@ func integrityModels() []registry.ModelDescriptor {
 	}
 }
 
-// Selection integrity: navigating to a non-default model, opening Detail,
-// and confirming must carry the EXACT model ID into the assignment payload —
-// never the index-0 default.
+// Selection integrity: navigating to a non-default model and pressing Enter
+// must carry the EXACT model ID into the assignment payload — never the
+// index-0 default.
 func TestDetailAssignmentCarriesExactModelID(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetActiveWorkspace("ask")
-	m = m.SetCursor(1)
+	m = m.SetPaneFocus(PaneModels).SetCursor(1)
 	if got := m.SelectedModel().ID; got != "inclusionai/ling-3.0-flash-fin:free" {
 		t.Fatalf("highlight = %q, want inclusionai", got)
 	}
 
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
-	if m.State() != StateDetail {
-		t.Fatalf("state = %v, want StateDetail", m.State())
-	}
-	if got := m.SelectedModel().ID; got != "inclusionai/ling-3.0-flash-fin:free" {
-		t.Fatalf("detail selection = %q, want inclusionai (cursor lost)", got)
-	}
-	if got := m.DetailModel(); got == nil || got.ID != "inclusionai/ling-3.0-flash-fin:free" {
-		t.Fatalf("pinned detail model = %+v, want inclusionai", got)
-	}
-	if view := m.View(); !strings.Contains(view, "inclusionai/ling-3.0-flash-fin:free") {
-		t.Fatalf("detail header must show the exact model id:\n%s", view)
-	}
-
+	// Enter commits directly in PaneModels
 	var cmd tea.Cmd
 	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
-		t.Fatal("detail Enter must emit an assignment command")
+		t.Fatal("Enter in PaneModels must emit an assignment command")
 	}
 	assign := unwrapAssignmentMsg(t, cmd())
 	if assign.ModelID != "inclusionai/ling-3.0-flash-fin:free" {
@@ -66,15 +52,15 @@ func TestDetailAssignmentCarriesExactModelID(t *testing.T) {
 	}
 }
 
-// Detail key 1: workspace target matrix removed; no-op.
+// Key 1 maps to search input (workspace matrix removed); no-op for assignment.
 func TestDetailHotkeyOneAssignsPinnedModel(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetActiveWorkspace("ask")
-	m = m.SetCursor(1)
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	m = m.SetPaneFocus(PaneModels).SetCursor(1)
 
 	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1")})
-	_ = cmd // no-op after removal of 1-5 workspace bindings
+	if cmd != nil {
+		t.Fatalf("key 1 must not emit a command (goes to search), got %T", cmd())
+	}
 }
 
 // Ordered teardown contract: assignment emissions must be a BARE
@@ -85,26 +71,15 @@ func TestDetailHotkeyOneAssignsPinnedModel(t *testing.T) {
 // the Runtime Authority commit lands.
 func TestAssignmentEmissionIsUnbatched(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetActiveWorkspace("ask")
-
-	// Browsing fast-path.
-	if _, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")}); cmd == nil {
-		t.Fatal("browsing 'a' must emit an assignment command")
-	} else if _, ok := cmd().(ModelAssignmentRequestedMsg); !ok {
-		t.Fatalf("browsing 'a' cmd = %T, want bare ModelAssignmentRequestedMsg", cmd())
-	}
-
-	// Detail confirm + detail hotkey.
+	m = m.SetPaneFocus(PaneModels)
 	m = m.SetCursor(1)
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+
+	// Enter in PaneModels commits directly.
 	if _, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter}); cmd == nil {
-		t.Fatal("detail Enter must emit an assignment command")
+		t.Fatal("Enter in PaneModels must emit an assignment command")
 	} else if _, ok := cmd().(ModelAssignmentRequestedMsg); !ok {
-		t.Fatalf("detail Enter cmd = %T, want bare ModelAssignmentRequestedMsg", cmd())
+		t.Fatalf("Enter cmd = %T, want bare ModelAssignmentRequestedMsg", cmd())
 	}
-	// Detail key 1: workspace target matrix removed; no-op.
-	_, cmd1 := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1")})
-	_ = cmd1
 }
 
 // Background snapshot refresh mid-detail re-sorts the filtered list by
@@ -114,9 +89,8 @@ func TestAssignmentEmissionIsUnbatched(t *testing.T) {
 // different model.
 func TestDetailPinSurvivesBackgroundResort(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetActiveWorkspace("plan")
-	m = m.SetCursor(1) // inclusionai
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	m = m.SetPaneFocus(PaneModels).SetCursor(1) // inclusionai
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
 	if m.State() != StateDetail {
 		t.Fatalf("state = %v, want StateDetail", m.State())
 	}
@@ -149,10 +123,10 @@ func TestDetailPinSurvivesBackgroundResort(t *testing.T) {
 // Esc from detail releases the pin and returns to live-highlight binding.
 func TestEscClearsDetailPin(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetCursor(1)
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	m = m.SetPaneFocus(PaneModels).SetCursor(1)
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
 	if m.DetailModel() == nil {
-		t.Fatal("detail pin must be set after Enter")
+		t.Fatal("detail pin must be set after inspect")
 	}
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEsc})
 	if m.State() != StateBrowsing {
@@ -169,9 +143,8 @@ func TestEscClearsDetailPin(t *testing.T) {
 // options for explicitly non-reasoning families.
 func TestDetailReasoningTruthfulForNonReasoningModel(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetActiveWorkspace("ask")
-	m = m.SetCursor(1)
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	m = m.SetPaneFocus(PaneModels).SetCursor(1)
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
 
 	view := m.View()
 	if !strings.Contains(view, "Reasoning: Not supported by model") {

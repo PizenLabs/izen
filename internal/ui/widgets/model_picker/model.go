@@ -153,6 +153,16 @@ type Model struct {
 	focus         FocusScope
 	searchFocused bool
 
+	// paneFocus selects which pane has keyboard focus in the dual-pane
+	// browsing layout: PaneProviders (left) or PaneModels (right).
+	// Replaces FocusScope for browsing navigation.
+	paneFocus PaneFocus
+
+	// providerCursor is the highlight index within the derived provider
+	// list (from snap.Providers). Drives the left-pane selection and
+	// determines which provider's models appear in the right pane.
+	providerCursor int
+
 	// state is the two-step picker state machine (browsing vs detail).
 	state PickerState
 
@@ -229,10 +239,17 @@ func New(snap *registry.ModelSnapshot) Model {
 		pending:         make(map[string]PendingBind),
 		focus:           FocusList,
 		searchFocused:   false,
+		paneFocus:       PaneProviders,
+		providerCursor:  0,
 		searchInput:     searchInputModel{Width: searchInputWidth, focused: false},
 		state:           StateBrowsing,
 		activeWorkspace: "",
 		reasoningPolicy: "default",
+	}
+	// Sync initial provider from providerCursor so right pane shows
+	// the first provider's models from the start.
+	if names := m.providerNames(); len(names) > 0 {
+		m.provider = names[0]
 	}
 	m.refilter()
 	m.resetReasoning()
@@ -420,6 +437,94 @@ func (m Model) FocusList() Model {
 
 // SearchFocused reports the current focus.
 func (m Model) SearchFocused() bool { return m.focus == FocusSearch }
+
+// PaneFocus returns the active pane focus (PaneProviders or PaneModels).
+func (m Model) PaneFocus() PaneFocus { return m.paneFocus }
+
+// SetPaneFocus sets the active pane focus.
+func (m Model) SetPaneFocus(p PaneFocus) Model {
+	m.paneFocus = p
+	return m
+}
+
+// ProviderCursor returns the highlight index within the provider list.
+func (m Model) ProviderCursor() int { return m.providerCursor }
+
+// SetProviderCursor jumps to a provider index, clamped to bounds, and
+// syncs the provider filter for the models pane.
+func (m Model) SetProviderCursor(i int) Model {
+	names := m.providerNames()
+	if len(names) == 0 {
+		m.providerCursor = 0
+		return m
+	}
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(names) {
+		i = len(names) - 1
+	}
+	m.providerCursor = i
+	m.provider = names[i]
+	m.cursor = 0
+	m.refilter()
+	m.resetReasoning()
+	return m
+}
+
+// providerNames returns the ordered provider name list from the snapshot.
+func (m Model) providerNames() []string {
+	if m.snap == nil {
+		return nil
+	}
+	names := make([]string, 0, len(m.snap.Providers))
+	for _, ps := range m.snap.Providers {
+		names = append(names, ps.Name)
+	}
+	return names
+}
+
+// highlightedProvider returns the provider name at providerCursor, or "" if empty.
+func (m Model) highlightedProvider() string {
+	names := m.providerNames()
+	if len(names) == 0 || m.providerCursor < 0 || m.providerCursor >= len(names) {
+		return ""
+	}
+	return names[m.providerCursor]
+}
+
+// isProviderConfigured reports whether a provider has successfully loaded
+// models (Status ok or non-zero ModelCount).
+func (m Model) isProviderConfigured(name string) bool {
+	if m.snap == nil {
+		return false
+	}
+	for _, ps := range m.snap.Providers {
+		if strings.EqualFold(ps.Name, name) {
+			return ps.Status == "" || ps.Status == "ok" || ps.ModelCount > 0
+		}
+	}
+	return false
+}
+
+// moveProviderCursor shifts the provider highlight and syncs the filter.
+func (m *Model) moveProviderCursor(delta int) {
+	names := m.providerNames()
+	if len(names) == 0 {
+		return
+	}
+	m.providerCursor += delta
+	if m.providerCursor < 0 {
+		m.providerCursor = 0
+	}
+	if m.providerCursor >= len(names) {
+		m.providerCursor = len(names) - 1
+	}
+	m.provider = names[m.providerCursor]
+	m.cursor = 0
+	m.refilter()
+	m.resetReasoning()
+}
 
 // State returns the current PickerState.
 func (m Model) State() PickerState { return m.state }

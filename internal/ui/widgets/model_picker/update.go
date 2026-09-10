@@ -2,7 +2,6 @@ package model_picker
 
 import (
 	"fmt"
-	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -142,21 +141,25 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	switch k {
 	case "tab":
-		if m.focus == FocusSearch {
-			m.focus = FocusList
-			m.searchFocused = false
-			m.searchInput.Blur()
+		if m.paneFocus == PaneProviders {
+			m.paneFocus = PaneModels
 		} else {
-			m.focus = FocusSearch
-			m.searchFocused = true
-			m.searchInput.Focus()
+			m.paneFocus = PaneProviders
 		}
 		return m, nil
 	case "up", "ctrl+p", "k":
-		m.moveCursor(-1)
+		if m.paneFocus == PaneProviders {
+			m.moveProviderCursor(-1)
+		} else {
+			m.moveCursor(-1)
+		}
 		return m, nil
 	case "down", "ctrl+n", "j":
-		m.moveCursor(1)
+		if m.paneFocus == PaneProviders {
+			m.moveProviderCursor(1)
+		} else {
+			m.moveCursor(1)
+		}
 		return m, nil
 	case "pgup":
 		budget := m.listRowBudget
@@ -166,7 +169,11 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 				budget = 5
 			}
 		}
-		m.moveCursor(-budget)
+		if m.paneFocus == PaneModels {
+			m.moveCursor(-budget)
+		} else {
+			m.moveProviderCursor(-budget)
+		}
 		return m, nil
 	case "pgdown":
 		budget := m.listRowBudget
@@ -176,15 +183,30 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 				budget = 5
 			}
 		}
-		m.moveCursor(budget)
+		if m.paneFocus == PaneModels {
+			m.moveCursor(budget)
+		} else {
+			m.moveProviderCursor(budget)
+		}
 		return m, nil
 	case "enter":
-		// Enter ALWAYS inspects via StateDetail (never quick-assigns):
-		// users must see capabilities, Reasoning Policy ('r'), and the
-		// explicit target list before confirming. Fast-path is 'a'.
-		// The highlighted instance is pinned immutably: StateDetail binds
-		// to the pin, never to the mutable cursor, so later refilters
-		// cannot retarget the inspection or the assignment.
+		// Enter commits the highlighted model and closes the overlay.
+		// Only active in the models pane.
+		if m.paneFocus == PaneModels {
+			if sel := m.SelectedModel(); sel != nil {
+				m = m.Select()
+				assign := m.emitAssignmentCmd(sel, "")
+				if assign == nil {
+					return m, nil
+				}
+				return m, assign
+			}
+		}
+		return m, nil
+	case "i":
+		// Inspect: pin the highlighted model into StateDetail. Enables
+		// detail view + reasoning policy cycling without committing.
+		// Any browsing focus enters detail for the highlighted model.
 		if sel := m.SelectedModel(); sel != nil {
 			m.pinDetail()
 			m.state = StateDetail
@@ -192,63 +214,36 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.searchInput.Blur()
 		}
 		return m, nil
-	case "a", "shift+enter":
-		// Fast-path quick assignment for the active workspace. Emits ONLY
-		// the assignment: the parent commits it to Runtime Authority and
-		// then tears the modal down deterministically. Batching
-		// CloseModalCmd here races the teardown ahead of the assignment;
-		// a closed modal no longer routes the message, so the commit is
-		// silently dropped and the status bar keeps the stale default.
-		if m.activeWorkspace == "" {
-			return m, nil
-		}
-		if sel := m.SelectedModel(); sel != nil {
-			assign := m.emitAssignmentCmd(sel, m.activeWorkspace)
-			if assign == nil {
-				return m, nil
-			}
-			return m, assign
-		}
-		return m, nil
 	case "esc":
 		return m, CloseModalCmd()
 	}
 
-	// Handle Ctrl+R globally (sync)
+	// Alt+A: credential entry for the highlighted provider.
+	if k == "alt+a" && m.paneFocus == PaneProviders {
+		prov := m.highlightedProvider()
+		if prov != "" {
+			return m, func() tea.Msg { return ConfigureProviderMsg{Provider: prov} }
+		}
+		return m, nil
+	}
+
+	// Ctrl+R: background sync.
 	if msg.Type == tea.KeyCtrlR {
 		m.loading = true
 		m.status = "syncing..."
 		return m, func() tea.Msg { return modelapp.SyncRequestedMsg{} }
 	}
 
-	// Also handle Shift+Enter via type check (some terminals report as ctrl+enter)
-	// Fallback: if msg.String() contains shift and enter, treat as fast path
-	if k == "shift+enter" || (msg.Type == tea.KeyEnter && strings.Contains(strings.ToLower(k), "shift")) {
-		// Ordered teardown: assignment only; the parent closes post-commit.
-		if m.activeWorkspace == "" {
-			return m, nil
-		}
-		if sel := m.SelectedModel(); sel != nil {
-			assign := m.emitAssignmentCmd(sel, m.activeWorkspace)
-			if assign == nil {
-				return m, nil
-			}
-			return m, assign
-		}
-		return m, nil
+	// Typing: auto-switch to models pane and filter.
+	if m.paneFocus == PaneProviders {
+		m.paneFocus = PaneModels
 	}
+	return m.handleSearchInput(msg)
+}
 
-	// Direct input handling when FocusSearch is active
-	if m.focus == FocusSearch {
-		var cmd tea.Cmd
-		m.searchInput, cmd = m.searchInput.Update(msg)
-		m.query = m.searchInput.Value()
-		m.applyFilter()
-		return m, cmd
-	}
-
-	// When FocusList, printable runes should switch to Search and filter
-	// (keeps legacy tests and typing fluid while still supporting Tab toggle)
+// handleSearchInput processes printable runes, backspace, and space as
+// search query mutations when the models pane has focus.
+func (m Model) handleSearchInput(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyBackspace:
 		m.focus = FocusSearch
@@ -287,6 +282,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 	default:
+		k := msg.String()
 		if len(k) == 1 && isPrintableString(k) {
 			m.focus = FocusSearch
 			m.searchFocused = true

@@ -17,7 +17,6 @@ var (
 	colorText     = lipgloss.Color("#cdd6f4")
 	colorSubtext0 = lipgloss.Color("#6c7086")
 	colorMauve    = lipgloss.Color("#cba6f7")
-	colorSurface0 = lipgloss.Color("#313244")
 	colorSurface1 = lipgloss.Color("#45475a")
 )
 
@@ -44,42 +43,37 @@ func (m Model) View() string {
 	return m.renderBrowsingLayout()
 }
 
-// renderBrowsingLayout renders the list/search view with header, search bar,
-// model list, and browsing footer.
+// renderBrowsingLayout renders the dual-pane provider-centric layout:
+//
+//	┌────────────────┬────────────────────────────────┐
+//	│ PROVIDERS      │ MODELS                         │
+//	│ ✓ OpenRouter   │ cohere/north-mini-code:free    │
+//	│ · Ollama       │ thinkingmachines/inkling...    │
+//	└────────────────┴────────────────────────────────┘
+//
+// Left pane: provider list with configured status (✓/·).
+// Right pane: models belonging to the highlighted provider.
+// Tab toggles focus between panes.
 func (m Model) renderBrowsingLayout() string {
 	var b strings.Builder
 	b.WriteString(m.clipLine(m.renderHeader()))
 	b.WriteString("\n")
 	b.WriteString(m.renderDivider())
 	b.WriteString("\n")
-	b.WriteString(m.clipLine(m.renderSearchLine()))
+
+	// Dual pane: left providers, right models, with vertical separator.
+	leftPane := m.renderProvidersPane()
+	rightPane := m.renderModelsPane()
+	separator := m.buildVerticalSeparator()
+	panes := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, separator, rightPane)
+	b.WriteString(panes)
 	b.WriteString("\n")
 
-	models := m.snapshotModels()
-	if len(models) == 0 {
-		b.WriteString(m.renderZeroStatePanel())
-		b.WriteString("\n")
-		return m.padFooter(b.String())
-	}
-	if m.err != nil {
-		b.WriteString(m.clipLine(errStyle.Render(" cache load failed: " + m.err.Error())))
-		b.WriteString("\n")
-	}
-
-	if len(m.filtered) == 0 {
-		if len(models) > 0 {
-			b.WriteString(m.clipLine(mutedStyle.Render(fmt.Sprintf(" No models matching query: '%s' ", m.query))))
-		} else {
-			b.WriteString(m.clipLine(mutedStyle.Render(" No models loaded for provider. Press Alt+A to configure or trigger sync. ")))
-		}
-		b.WriteString("\n")
-	} else {
-		b.WriteString(m.renderList())
-		b.WriteString("\n")
-	}
-
-	// Browsing state: clean footer only (no reasoning/bindings controls on list).
 	b.WriteString(m.renderDivider())
+	b.WriteString("\n")
+	b.WriteString(m.clipLine(m.renderActiveLine()))
+	b.WriteString("\n")
+	b.WriteString(m.clipLine(m.renderVariantLine()))
 	b.WriteString("\n")
 
 	if m.status != "" {
@@ -152,8 +146,7 @@ func (m Model) footerText() string {
 	return m.renderBrowsingFooter()
 }
 
-// renderBrowsingFooter delivers the spec's clean 1-line footer with no
-// BINDINGS or Alt bindings. It is the sole footer for StateBrowsing.
+// renderBrowsingFooter delivers the dual-pane keybinding footer.
 func (m Model) renderBrowsingFooter() string {
 	keyStyle := lipgloss.NewStyle().Foreground(colorText).Bold(true)
 	descStyle := lipgloss.NewStyle().Foreground(colorSubtext0)
@@ -167,14 +160,12 @@ func (m Model) renderBrowsingFooter() string {
 	}
 
 	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s   %s %s",
-		keyStyle.Render("↑/↓"), descStyle.Render("select"),
-		keyStyle.Render("type"), descStyle.Render("search"),
-		keyStyle.Render("Enter"), descStyle.Render("inspect & assign"),
-		keyStyle.Render("a"), descStyle.Render("quick assign"),
-		keyStyle.Render("Esc"), descStyle.Render("cancel"),
+		keyStyle.Render("Tab"), descStyle.Render("select"),
+		keyStyle.Render("↑/↓"), descStyle.Render("navigate"),
+		keyStyle.Render("Enter"), descStyle.Render("activate"),
+		keyStyle.Render("Alt+A"), descStyle.Render("configure"),
+		keyStyle.Render("Esc"), descStyle.Render("close"),
 	)
-	// Unbounded (tests/headless): no truncation so the full key contract
-	// stays grep-friendly. Bounded modals clip to the inner width.
 	if m.innerWidth <= 0 && m.width <= 0 {
 		return help
 	}
@@ -189,7 +180,7 @@ func (m Model) renderDetailView() string {
 		return ""
 	}
 
-	var lines []string
+	lines := make([]string, 0, 12)
 
 	// Header & Identity
 	title := lipgloss.NewStyle().Foreground(colorMauve).Bold(true).Render("MODEL DETAILS")
@@ -352,40 +343,6 @@ func (m Model) padFooter(body string) string {
 	return body + footer
 }
 
-// renderZeroStatePanel renders the structured empty-catalog help panel.
-// It replaces the legacy single "no models loaded" line with actionable
-// guidance while keeping the legacy substring for grep compatibility.
-func (m Model) renderZeroStatePanel() string {
-	inner := 61
-	pad := func(s string) string {
-		// Pad content to the inner width (ASCII-safe: panel strings are
-		// plain ASCII; rune count == display width here).
-		n := len([]rune(s))
-		if n < inner {
-			return s + strings.Repeat(" ", inner-n)
-		}
-		if n > inner {
-			runes := []rune(s)
-			return string(runes[:inner])
-		}
-		return s
-	}
-	title := "NO MODELS AVAILABLE"
-	titlePadLeft := (inner - len([]rune(title))) / 2
-	titlePadRight := inner - len([]rune(title)) - titlePadLeft
-	titleLine := "│" + strings.Repeat(" ", titlePadLeft) + title + strings.Repeat(" ", titlePadRight) + "│"
-	var b strings.Builder
-	b.WriteString("┌" + strings.Repeat("─", inner) + "┐\n")
-	b.WriteString(titleLine + "\n")
-	b.WriteString("│" + strings.Repeat(" ", inner) + "│\n")
-	b.WriteString("│" + pad("  No models loaded for provider. Press Alt+A to configure credentials or trigger sync.") + "│\n")
-	b.WriteString("│" + strings.Repeat(" ", inner) + "│\n")
-	b.WriteString("│" + pad("  • Press Ctrl+R to fetch models from configured providers") + "│\n")
-	b.WriteString("│" + pad("  • Check environment variables (OPENAI_API_KEY, etc.)") + "│\n")
-	b.WriteString("└" + strings.Repeat("─", inner) + "┘")
-	return mutedStyle.Render(b.String())
-}
-
 // snapshotModels reads the immutable snapshot RAM slice (no copy on the hot
 // render path; callers must not mutate).
 func (m Model) snapshotModels() []registry.ModelDescriptor {
@@ -393,6 +350,163 @@ func (m Model) snapshotModels() []registry.ModelDescriptor {
 		return nil
 	}
 	return m.snap.Models
+}
+
+// paneHeight returns the height available for the dual-pane content area.
+// Chrome above and below the panes: header(1) + divider(1) + divider(1) +
+// active(1) + variant(1) = 5 lines, plus padFooter's 1-line footer = 6 total.
+func (m Model) paneHeight() int {
+	innerH := m.innerHeight
+	if innerH <= 0 {
+		innerH = m.height
+	}
+	if innerH <= 0 {
+		return 16
+	}
+	return max(3, innerH-6)
+}
+
+// renderProvidersPane renders the left pane: provider list with configured
+// status icons (✓ for ok/configured, · for unconfigured/error).
+func (m Model) renderProvidersPane() string {
+	paneW := providersPaneWidth
+	paneH := m.paneHeight()
+
+	var lines []string
+
+	// Pane header.
+	lines = append(lines, mutedStyle.Render("PROVIDERS"))
+	lines = append(lines, "")
+
+	names := m.providerNames()
+	for i, name := range names {
+		if len(lines) >= paneH {
+			break
+		}
+		configured := m.isProviderConfigured(name)
+		selected := i == m.providerCursor && m.paneFocus == PaneProviders
+
+		icon := "·"
+		if configured {
+			icon = "✓"
+		}
+
+		cell := fmt.Sprintf("%s %s", icon, name)
+		cell = runewidth.Truncate(cell, paneW, "…")
+		cell = padRightExact(cell, paneW)
+
+		if selected {
+			lines = append(lines, selectedRowStyle.Render(cell))
+		} else {
+			lines = append(lines, mutedStyle.Render(cell))
+		}
+	}
+
+	// Pad to paneH.
+	for len(lines) < paneH {
+		lines = append(lines, strings.Repeat(" ", paneW))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// renderModelsPane renders the right pane: model list filtered to the
+// highlighted provider, with search query display and cursor highlight.
+func (m Model) renderModelsPane() string {
+	innerW := m.innerWidth
+	if innerW <= 0 {
+		innerW = m.width
+	}
+	if innerW <= 0 {
+		innerW = 64
+	}
+	paneW := innerW - providersPaneWidth - 1 // -1 for separator
+	if paneW < 10 {
+		paneW = 10
+	}
+	paneH := m.paneHeight()
+
+	var lines []string
+
+	// Pane header with optional search query.
+	header := "MODELS"
+	if m.query != "" {
+		header += "  /" + m.query
+	}
+	lines = append(lines, mutedStyle.Render(header))
+	lines = append(lines, "")
+
+	// Model list from visible window.
+	start, end := m.visibleWindow()
+	window := m.filtered[start:end]
+
+	for i, d := range window {
+		if len(lines) >= paneH {
+			break
+		}
+		idx := start + i
+		selected := idx == m.cursor && m.paneFocus == PaneModels
+
+		cell := runewidth.Truncate(d.ID, paneW, "…")
+		cell = padRightExact(cell, paneW)
+
+		if selected {
+			lines = append(lines, selectedRowStyle.Render(cell))
+		} else {
+			lines = append(lines, mutedStyle.Render(cell))
+		}
+	}
+
+	if len(window) == 0 {
+		lines = append(lines, mutedStyle.Render("  (no models)"))
+	}
+
+	// Pad to paneH.
+	for len(lines) < paneH {
+		lines = append(lines, strings.Repeat(" ", paneW))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// buildVerticalSeparator renders the divider line between the two panes.
+func (m Model) buildVerticalSeparator() string {
+	paneH := m.paneHeight()
+	lines := make([]string, paneH)
+	for i := range lines {
+		lines[i] = dividerStyle.Render("│")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderActiveLine shows the currently highlighted provider and model.
+func (m Model) renderActiveLine() string {
+	prov := m.highlightedProvider()
+	if prov == "" {
+		prov = "—"
+	}
+	modelID := "—"
+	if hl := m.Highlighted(); hl != nil {
+		modelID = hl.ID
+	}
+	return mutedStyle.Render("Active: ") + accentStyle.Render(prov) + mutedStyle.Render(" / ") + accentStyle.Render(modelID)
+}
+
+// renderVariantLine shows the reasoning policy variant for the highlighted model.
+func (m Model) renderVariantLine() string {
+	sel := m.Highlighted()
+	if sel == nil {
+		return mutedStyle.Render("Variant: —")
+	}
+	opt, ok := m.CurrentReasoningOption()
+	if !ok {
+		return mutedStyle.Render("Variant: Fixed")
+	}
+	label := opt
+	if label == "" {
+		label = "Default"
+	}
+	return mutedStyle.Render("Variant: ") + accentStyle.Render(label)
 }
 
 // renderHeader renders the registry title with total count and sync state:
@@ -406,10 +520,10 @@ func (m Model) renderHeader() string {
 	status, style := m.syncIndicator()
 	leftTitle := headerStyle.Render("IZEN MODEL REGISTRY (Provider-Centric)")
 	countText := fmt.Sprintf("%d models loaded", total)
-	// Active focus indicator: Focus: [SEARCH] (Tab to List) / [LIST] (Tab to Search).
-	focusLabel, focusHint := "SEARCH", "Tab to List"
-	if m.focus == FocusList {
-		focusLabel, focusHint = "LIST", "Tab to Search"
+	// Active focus indicator for dual-pane layout: PROVIDERS or MODELS.
+	focusLabel, focusHint := "PROVIDERS", "Tab to Models"
+	if m.paneFocus == PaneModels {
+		focusLabel, focusHint = "MODELS", "Tab to Providers"
 	}
 	focusPill := mutedStyle.Render("Focus: [") + accentStyle.Render(focusLabel) + mutedStyle.Render(fmt.Sprintf("] (%s)", focusHint))
 	avail := m.innerWidth
@@ -487,134 +601,6 @@ func (m Model) syncIndicator() (string, interface {
 	return "● synced", syncOkStyle
 }
 
-// renderSearchLine renders the search query and compact provider filter.
-// SPEC: Strict zero-wrap single-line guarantee. Search input is always active
-// (Width 16 lock), no wrapping, provider bar clipped to remaining width,
-// final sanitation strips any embedded newlines.
-func (m Model) renderSearchLine() string {
-	m.searchInput.Width = 16
-	avail := m.innerWidth
-	if avail <= 0 {
-		avail = m.width
-	}
-	// Spec uses lipgloss subtext0 for label and guarantees single line.
-	colorSubtext0 := lipgloss.Color("#6c7086")
-	searchLabel := lipgloss.NewStyle().Foreground(colorSubtext0).Render("Search: ")
-	// Render query cell with strict truncation; sanitize newlines.
-	qDisplay := fitCell(m.query, searchInputWidth)
-	qDisplay = strings.ReplaceAll(qDisplay, "\n", "")
-	inputStr := qDisplay
-	inputStr = strings.ReplaceAll(inputStr, "\n", "")
-	leftBlock := searchLabel + inputStr + "  "
-	leftBlock = strings.ReplaceAll(leftBlock, "\n", "")
-	leftW := lipgloss.Width(leftBlock)
-
-	// Unbounded (tests/headless): no truncation so grep-friendly substrings survive.
-	if avail <= 0 {
-		prov := "All"
-		if m.provider != "" {
-			prov = m.provider
-		}
-		var providerPart string
-		if m.snap != nil && len(m.snap.Providers) > 0 {
-			cells := make([]string, 0, len(m.snap.Providers)+1)
-			if m.provider == "" {
-				cells = append(cells, providerFilterActive.Render("[All]"))
-			} else {
-				cells = append(cells, providerFilterInactive.Render("all"))
-			}
-			for _, ps := range m.snap.Providers {
-				var icon string
-				switch ps.Status {
-				case registry.CacheStatusTimeout:
-					icon = "⟳"
-				case registry.CacheStatusError:
-					icon = "⚠"
-				case registry.CacheStatusOK, "":
-					icon = "✓"
-				default:
-					icon = ps.Status
-				}
-				cell := fmt.Sprintf("%s %s", ps.Name, icon)
-				if m.provider != "" && strings.EqualFold(m.provider, ps.Name) {
-					cells = append(cells, providerFilterActive.Render("["+cell+"]"))
-				} else {
-					cells = append(cells, providerFilterInactive.Render(cell))
-				}
-			}
-			providerPart = fmt.Sprintf("Provider: %s  %s", prov, strings.Join(cells, "  "))
-		} else {
-			providerPart = fmt.Sprintf("Provider: %s", "All")
-		}
-		scope := "local"
-		if m.isGlobal {
-			scope = "global"
-		}
-		tail := mutedStyle.Render(fmt.Sprintf("  scope:%s %d/%d matches", scope, len(m.filtered), len(m.snapshotModels())))
-		full := leftBlock + providerPart + tail
-		return strings.ReplaceAll(full, "\n", "")
-	}
-
-	remainingW := max(0, avail-leftW)
-	providerBar := m.renderProviderFilterBar(remainingW)
-	providerBar = strings.ReplaceAll(providerBar, "\n", "")
-
-	fullLine := leftBlock + providerBar
-	// Also append scope/matches within remaining budget (kept for match-count tests)
-	scope := "local"
-	if m.isGlobal {
-		scope = "global"
-	}
-	tail := mutedStyle.Render(fmt.Sprintf("  scope:%s %d/%d matches", scope, len(m.filtered), len(m.snapshotModels())))
-	tail = strings.ReplaceAll(tail, "\n", "")
-	if tail != "" && lipgloss.Width(fullLine+tail) <= avail {
-		fullLine += tail
-	} else if tail != "" {
-		// Truncate combined right side as whole to avoid overflow – spec renderSearchLine clips fullLine.
-		combined := providerBar + tail
-		clippedRight := runewidth.Truncate(combined, remainingW, "")
-		clippedRight = strings.ReplaceAll(clippedRight, "\n", "")
-		fullLine = leftBlock + clippedRight
-	}
-	clipped := runewidth.Truncate(fullLine, avail, "")
-	clipped = strings.ReplaceAll(clipped, "\n", "")
-	// Ensure ANSI-aware width clamp without wrap.
-	return truncateStyled(clipped, avail)
-}
-
-// renderProviderFilterBar is the spec-named helper for search header composition.
-// It renders the provider pill strip clipped to maxW with Catppuccin Mocha
-// palette: active provider = yellow bold, inactive = subtext0 muted.
-// Hard truncation via runewidth.Truncate ensures no overflow before assembly.
-func (m Model) renderProviderFilterBar(maxW int) string {
-	if maxW <= 0 {
-		return ""
-	}
-	var items []string
-	if m.snap != nil && len(m.snap.Providers) > 0 {
-		// Include "All" pill first for UX parity with unbounded mode.
-		if m.provider == "" {
-			items = append(items, providerFilterActive.Render("[ALL]"))
-		} else {
-			items = append(items, providerFilterInactive.Render("all"))
-		}
-		for _, ps := range m.snap.Providers {
-			label := ps.Name
-			if m.provider != "" && strings.EqualFold(m.provider, ps.Name) {
-				items = append(items, providerFilterActive.Render("["+strings.ToUpper(label)+"]"))
-			} else {
-				items = append(items, providerFilterInactive.Render(strings.ToLower(label)))
-			}
-		}
-	} else {
-		// No providers yet: still show All placeholder for layout stability.
-		items = append(items, providerFilterInactive.Render("all"))
-	}
-	bar := lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086")).Render("Provider: ") + strings.Join(items, " ")
-	// Cell-level hard truncation before assembly (ANSI-aware).
-	return truncateStyled(bar, maxW)
-}
-
 // visibleWindow computes the dynamic viewport: chrome-aware budget from
 // innerHeight with cursor-following scroll offset. Spec: Total Chrome = 6
 // (Title, Search, Divider, Reasoning, Bindings, Help footer).
@@ -656,98 +642,13 @@ func (m Model) visibleWindow() (start, end int) {
 	return start, start + budget
 }
 
-// Fixed column grid widths (visible cells, pre-style plain text).
+// Fixed layout constants.
 const (
-	colNameW         = 32
-	colProviderW     = 12
-	colContextW      = 8
-	colPriceW        = 14
-	colCapsMinW      = 10
 	searchInputWidth = 16
+	// providersPaneWidth is the fixed width of the left providers pane
+	// in the dual-pane browsing layout. Right pane gets the remainder.
+	providersPaneWidth = 22
 )
-
-// renderList renders the strict single-line tabular grid. Every row is
-// EXACTLY 1 physical line: each column is truncated/padded to its fixed
-// width before concatenation, and the assembled line is hard-clipped to the
-// inner width (innerWidth = modalW - 4). Zero text wrapping allowed.
-func (m Model) renderList() string {
-	start, end := m.visibleWindow()
-	if start >= end {
-		return ""
-	}
-	window := m.filtered[start:end]
-	innerW := m.innerWidth
-	if innerW <= 0 {
-		innerW = m.width
-	}
-
-	// Unbounded (tests/headless): legacy full render with sanitized pricing,
-	// no truncation so grep-friendly substrings survive.
-	if innerW <= 0 {
-		var b strings.Builder
-		for i, d := range window {
-			idx := start + i
-			badges := renderBadges(BadgesFor(d, m.roles))
-			prov := providerTag(d.Provider)
-			caps := formatCaps(d)
-			ctx := formatContext(d.ContextWindow)
-			price := formatPricePair(d.InputCostPerM, d.OutputCostPerM)
-			tail := strings.TrimSpace(caps + " " + prov + " " + badges)
-			cursor := " "
-			if idx == m.cursor {
-				cursor = ">"
-			}
-			row := fmt.Sprintf("%s %s  %s  %s  %s", cursor, d.ID, ctx, price, tail)
-			if idx == m.cursor {
-				b.WriteString(selectedRowStyle.Render(row))
-			} else {
-				b.WriteString(" " + row)
-			}
-			b.WriteString("\n")
-		}
-		if end < len(m.filtered) {
-			b.WriteString(mutedStyle.Render(fmt.Sprintf(" … %d more", len(m.filtered)-end)))
-			b.WriteString("\n")
-		}
-		if start > 0 {
-			return mutedStyle.Render(fmt.Sprintf(" … %d above", start)) + "\n" + strings.TrimSuffix(b.String(), "\n")
-		}
-		return strings.TrimSuffix(b.String(), "\n")
-	}
-
-	// Fixed grid: adapt the name column on narrow panes so the total always
-	// fits innerW with zero wrapping.
-	nameW, providerW, ctxW, priceW := colNameW, colProviderW, colContextW, colPriceW
-	const separators = 7 // 2 cursor prefix + 4 inter-column spaces + 1
-	minTotal := 10 + providerW + ctxW + priceW + separators + colCapsMinW
-	if innerW < colNameW+providerW+ctxW+priceW+separators+colCapsMinW {
-		nameW = innerW - (providerW + ctxW + priceW + separators + colCapsMinW)
-		if nameW < 10 {
-			nameW = 10
-		}
-	}
-	_ = minTotal
-	capsW := innerW - (2 + nameW + 1 + providerW + 1 + ctxW + 1 + priceW + 1)
-	if capsW < 0 {
-		capsW = 0
-	}
-
-	var b strings.Builder
-	for i, d := range window {
-		idx := start + i
-		b.WriteString(m.renderRow(d, idx == m.cursor, nameW, providerW, ctxW, priceW, capsW, innerW))
-		b.WriteString("\n")
-	}
-	if end < len(m.filtered) {
-		b.WriteString(truncateStyled(mutedStyle.Render(fmt.Sprintf(" … %d more", len(m.filtered)-end)), innerW))
-		b.WriteString("\n")
-	}
-	if start > 0 {
-		// Prepend scroll context without shifting the cursor math.
-		return truncateStyled(mutedStyle.Render(fmt.Sprintf(" … %d above", start)), innerW) + "\n" + strings.TrimSuffix(b.String(), "\n")
-	}
-	return strings.TrimSuffix(b.String(), "\n")
-}
 
 // padRightExact pads s with spaces to exactly w visible cells using
 // lipgloss.Width. s is assumed already truncated to <= w.
@@ -757,76 +658,6 @@ func padRightExact(s string, w int) string {
 		return s
 	}
 	return s + strings.Repeat(" ", w-vw)
-}
-
-// renderRow assembles one guaranteed-single-line row with CELL-LEVEL hard
-// truncation via runewidth.Truncate BEFORE column assembly. Never allows cell
-// content to exceed allocated column width, preventing hyphen-wrap bleed for
-// long IDs like cohere/north-mini-code:free.
-// SPEC: ZERO-WRAP – no .Width() on row styles, every column truncated and padded
-// to exact width, whole line clipped to avail and sanitized to single line.
-func (m Model) renderRow(d registry.ModelDescriptor, selected bool, nameW, providerW, ctxW, priceW, capsW, innerW int) string {
-	if capsW < 6 {
-		capsW = 6
-	}
-	avail := innerW - 2
-	if avail < 0 {
-		avail = 0
-	}
-	// Spec budgeting recalculated per row to guarantee capsW fits avail.
-	// If caller capsW is inconsistent with avail, recompute safely.
-	expectedAvail := nameW + providerW + ctxW + priceW + 4 // 4 inter-col spaces
-	if capsW < 6 || avail < expectedAvail+6 {
-		// Re-derive capsW from avail to ensure 1 line.
-		capsW = max(6, avail-(nameW+providerW+ctxW+priceW+4))
-	}
-	// 1. Cell-level hard truncation (MUST run before styling or assembly).
-	cleanID := strings.ReplaceAll(d.ID, "\n", " ")
-	cName := padRightExact(runewidth.Truncate(cleanID, nameW, "…"), nameW)
-
-	// Colored provider badge per spec Catppuccin palette.
-	cProvider := renderProviderBadge(d.Provider, providerW)
-
-	cleanCtx := strings.ReplaceAll(formatContext(d.ContextWindow), "\n", " ")
-	cContext := padRightExact(runewidth.Truncate(cleanCtx, ctxW, ""), ctxW)
-
-	cleanPrice := strings.ReplaceAll(formatPricePair(d.InputCostPerM, d.OutputCostPerM), "\n", " ")
-	cPrice := padRightExact(runewidth.Truncate(cleanPrice, priceW, ""), priceW)
-
-	// Capabilities cell sanitized to single line.
-	badges := strings.ReplaceAll(strings.Join(BadgesFor(d, m.roles), " "), "\n", " ")
-	capsPlain := strings.ReplaceAll(formatCaps(d), "\n", " ")
-	capsAndBadges := capsPlain
-	if badges != "" {
-		if capsAndBadges == "" || capsAndBadges == "—" {
-			capsAndBadges = badges
-		} else {
-			capsAndBadges = capsAndBadges + " " + badges
-		}
-	}
-	cleanCaps := strings.ReplaceAll(capsAndBadges, "\n", " ")
-	cCaps := padRightExact(runewidth.Truncate(cleanCaps, capsW, "…"), capsW)
-
-	// 2. Assemble plain buffer then clip to avail (spec: 32/12/8/12 grid).
-	// Include ANSI-aware provider badge width via lipgloss.Width for line budget.
-	lineBuffer := fmt.Sprintf("%s %s %s %s %s", cName, cProvider, cContext, cPrice, cCaps)
-	// Clip visible width to avail (innerWidth-2) then pad to exact avail.
-	// Use runewidth for plain portion but ANSI-aware truncateStyled for final.
-	clippedLine := runewidth.Truncate(lineBuffer, avail, "")
-	// When provider badge ANSI inflates width, truncateStyled will handle later;
-	// pad to avail using visible width.
-	clippedLine = padRightExact(clippedLine, avail)
-
-	var out string
-	if selected {
-		out = selectedRowStyle.Render("> " + clippedLine)
-	} else {
-		out = normalRowStyle.Render("  " + clippedLine)
-	}
-	// ABSOLUTE SANITATION: guarantee 1 physical line.
-	out = strings.ReplaceAll(out, "\n", "")
-	out = truncateStyled(out, innerW)
-	return strings.ReplaceAll(out, "\n", "")
 }
 
 // renderReasoningSection renders the dynamic reasoning variant block for the
@@ -985,32 +816,6 @@ func providerTag(provider string) string {
 	}
 }
 
-func renderBadges(badges []string) string {
-	if len(badges) == 0 {
-		return ""
-	}
-	cells := make([]string, 0, len(badges))
-	for _, badge := range badges {
-		cells = append(cells, styleBadge(badge))
-	}
-	return strings.Join(cells, " ")
-}
-
-func styleBadge(badge string) string {
-	switch badge {
-	case "[DEFAULT]":
-		return defaultBadge.Render(badge)
-	case "[PLAN]":
-		return planBadge.Render(badge)
-	case "[THINKING]":
-		return thinkBadge.Render(badge)
-	case "[VISION]":
-		return visionBadge.Render(badge)
-	default:
-		return otherBadge.Render(badge)
-	}
-}
-
 // formatContext renders a context window compactly ("1M", "2M", "128k",
 // "163k", "—"). Values >= 1M use dynamic M units (whole → "2M", fractional
 // → "1.5M"); values >= 1k use "k"; non-positive renders "—". It delegates to
@@ -1033,33 +838,6 @@ func formatContext(ctx int) string {
 		return strconv.Itoa(ctx/1000) + "k"
 	}
 	return strconv.Itoa(ctx)
-}
-
-// formatPricePair renders "$in/$out" compactly ("$0.55/$2.19", "free").
-// Strict float sanitizer: never emits IEEE 754 bloat like $0.099999999.
-func formatPricePair(in, out float64) string {
-	return formatPricing(in, out)
-}
-
-// formatCaps renders classifier-effective capabilities ("Thinking Tools").
-func formatCaps(d registry.ModelDescriptor) string {
-	caps := role.EffectiveCapabilities(d)
-	var parts []string
-	if role.EffectiveIsThinking(d) {
-		parts = append(parts, "Thinking")
-	} else if role.HasCapability(caps, registry.CapThinking) {
-		parts = append(parts, "Thinking")
-	}
-	if role.HasCapability(caps, registry.CapVision) {
-		parts = append(parts, "Vision")
-	}
-	if role.HasCapability(caps, registry.CapTools) {
-		parts = append(parts, "Tools")
-	}
-	if len(parts) == 0 {
-		return "—"
-	}
-	return strings.ReplaceAll(strings.Join(parts, " "), "\n", " ")
 }
 
 // shortenID truncates long model IDs for the bindings strip (keep tail).

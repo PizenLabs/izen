@@ -56,45 +56,6 @@ func formatContextWindow(tokens int) string {
 	return strings.ReplaceAll(s, "\n", " ")
 }
 
-// truncateWithEllipsis cuts s to at most n visible runes, using "…" as the
-// last rune when truncation occurs. ASCII-fast, rune-safe for IDs.
-func truncateWithEllipsis(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	if n == 1 {
-		return "…"
-	}
-	return string(runes[:n-1]) + "…"
-}
-
-// padRight pads s with spaces to exactly w visible cells using lipgloss.Width.
-// Over-wide input is truncated with ellipsis first so output width is always <= w.
-func padRight(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-	// Truncate with ellipsis if over width (rune-safe fallback), then pad.
-	runes := []rune(s)
-	if len(runes) > w {
-		s = truncateWithEllipsis(s, w)
-	}
-	vw := lipgloss.Width(s)
-	if vw >= w {
-		return s
-	}
-	return s + strings.Repeat(" ", w-vw)
-}
-
-// fitCell truncates then pads a plain cell to exactly w columns.
-func fitCell(s string, w int) string {
-	return padRight(truncateWithEllipsis(s, w), w)
-}
-
 // padVisible pads a (potentially ANSI-styled) string with trailing spaces so
 // its visible width equals exactly w cells. Uses lipgloss.Width for correct
 // measurement of styled and wide-character content.

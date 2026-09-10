@@ -56,3 +56,10 @@ type CloseModalMsg struct{}
 func CloseModalCmd() tea.Cmd {
 	return func() tea.Msg { return CloseModalMsg{} }
 }
+
+// ConfigureProviderMsg is emitted on Alt+A when focused on the providers
+// pane. The parent should open a credential-entry overlay for the named
+// provider.
+type ConfigureProviderMsg struct {
+	Provider string
+}

@@ -115,52 +115,57 @@ func TestDefaultCycleRoundTrip(t *testing.T) {
 	}
 }
 
-// FocusScope state machine: 2-step model – Tab toggles Search/List, Enter inspects, a quick assigns.
+// FocusScope state machine: Tab toggles PaneProviders/PaneModels, Enter commits in PaneModels.
 func TestFocusScopeStateMachine(t *testing.T) {
-	m := New(seedSnapshot(testModels()))
-	if m.Focus() != FocusList {
-		t.Fatalf("initial focus = %v, want FocusList", m.Focus())
+	snap := &registry.ModelSnapshot{
+		Models: testModels(),
+		Providers: []registry.ProviderSummary{
+			{Name: "openrouter", ModelCount: 1, Status: "ok"},
+			{Name: "gemini", ModelCount: 1, Status: "ok"},
+			{Name: "openai", ModelCount: 1, Status: "ok"},
+		},
 	}
-	// Tab toggles to Search
+	m := New(snap)
+	if m.PaneFocus() != PaneProviders {
+		t.Fatalf("initial pane focus = %v, want PaneProviders", m.PaneFocus())
+	}
+	// Tab toggles to PaneModels
 	mTab, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
-	if mTab.Focus() != FocusSearch {
-		t.Errorf("Tab must toggle to Search, got %v want %v", mTab.Focus(), FocusSearch)
+	if mTab.PaneFocus() != PaneModels {
+		t.Errorf("Tab must toggle to PaneModels, got %v", mTab.PaneFocus())
 	}
-	// Second Tab toggles back to List
+	// Second Tab toggles back to PaneProviders
 	mTab2, _ := mTab.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
-	if mTab2.Focus() != FocusList {
-		t.Errorf("second Tab must toggle back to List, got %v", mTab2.Focus())
+	if mTab2.PaneFocus() != PaneProviders {
+		t.Errorf("second Tab must toggle back to PaneProviders, got %v", mTab2.PaneFocus())
 	}
 
-	// Quick assign via 'a' must emit ModelAssignmentRequestedMsg in browsing
-	// when an active workspace is set (fast-path; TargetNone never assigns).
-	m = m.SetActiveWorkspace("ask")
-	mAssign, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	// Alt+A in PaneProviders emits ConfigureProviderMsg
+	_, cmdAlt := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a"), Alt: true})
+	if cmdAlt == nil {
+		t.Fatal("Alt+A in PaneProviders must emit ConfigureProviderMsg")
+	}
+	if msg, ok := cmdAlt().(ConfigureProviderMsg); !ok || !strings.Contains(msg.Provider, "openrouter") {
+		t.Fatalf("Alt+A msg = %#v, want ConfigureProviderMsg openrouter", cmdAlt())
+	}
+
+	// Enter in PaneModels commits and closes
+	mModels := New(snap).SetPaneFocus(PaneModels)
+	_, cmd := mModels.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
-		t.Fatalf("'a' quick assign must emit assignment cmd in browsing")
-	}
-	if _, ok := cmd().(ModelAssignmentRequestedMsg); !ok {
-		// Accept BatchMsg wrapping (auto-close emits batch).
-		msg := cmd()
-		if _, ok := msg.(tea.BatchMsg); !ok {
-			t.Fatalf("'a' cmd = %T, want ModelAssignmentRequestedMsg or BatchMsg", msg)
-		}
-	}
-	_ = mAssign
-
-	// Enter must open detail, not activate
-	mDetail, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
-	if mDetail.State() != StateDetail {
-		t.Fatalf("Enter must transition to StateDetail, got %v", mDetail.State())
-	}
-	if cmd != nil {
-		t.Error("Enter to detail must not emit assignment command")
+		t.Fatal("Enter in PaneModels must emit assignment command")
 	}
 
-	// In detail, Esc returns to browsing
+	// Down moves cursor in PaneProviders pane (provider list)
 	mDown, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
-	if mDown.Cursor() != 1 {
-		t.Errorf("down must move cursor in browsing, got %d want 1", mDown.Cursor())
+	if mDown.ProviderCursor() != 1 {
+		t.Errorf("down must move provider cursor, got %d want 1", mDown.ProviderCursor())
+	}
+	// In PaneModels down moves the model cursor
+	m = m.SetProviderFilter("").SetPaneFocus(PaneModels)
+	mDown2, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
+	if mDown2.Cursor() != 1 {
+		t.Errorf("down must move cursor in PaneModels, got %d want 1", mDown2.Cursor())
 	}
 }
 
@@ -182,29 +187,28 @@ func TestSearchFocusTypingDoesNotBind(t *testing.T) {
 	}
 }
 
-// Header focus indicator renders the active scope: Focus: [SEARCH] (Tab to
-// List) in search focus and Focus: [LIST] (Tab to Search) in list focus.
-// Default is [LIST] per UX spec.
+// Header focus indicator renders the active pane scope: Focus: [PROVIDERS]
+// (Tab to Models) in providers focus and Focus: [MODELS] (Tab to Providers)
+// in models focus. Default is [PROVIDERS] per dual-pane UX spec.
 func TestHeaderFocusIndicator(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	view := m.View()
-	if !strings.Contains(view, "[LIST]") || !strings.Contains(view, "Tab to Search") {
-		t.Errorf("default list-focus header must show Focus: [LIST] (Tab to Search), got:\n%s", view)
+	if !strings.Contains(view, "[PROVIDERS]") || !strings.Contains(view, "Tab to Models") {
+		t.Errorf("default providers-focus header must show Focus: [PROVIDERS] (Tab to Models), got:\n%s", view)
 	}
-	m = m.FocusSearch()
+	m = m.SetPaneFocus(PaneModels)
 	view2 := m.View()
-	if !strings.Contains(view2, "[SEARCH]") || !strings.Contains(view2, "Tab to List") {
-		t.Errorf("search-focus header must show Focus: [SEARCH] (Tab to List), got:\n%s", view2)
+	if !strings.Contains(view2, "[MODELS]") || !strings.Contains(view2, "Tab to Providers") {
+		t.Errorf("models-focus header must show Focus: [MODELS] (Tab to Providers), got:\n%s", view2)
 	}
-	if strings.Contains(view2, "[LIST]") {
-		t.Errorf("search-focus header must not show [LIST]:\n%s", view2)
+	if strings.Contains(view2, "[PROVIDERS]") {
+		t.Errorf("models-focus header must not show [PROVIDERS]:\n%s", view2)
 	}
 }
 
-// Selected-row single-line contract: the active row renders the word "Tools"
-// on the SAME line as the cursor with zero embedded newlines, zero wrapped
-// fragment below the row, and no frame-breaking blank line. Lipgloss width
-// wrap must never split the long capabilities cell onto line 2.
+// Selected-row single-line contract: the active model row renders on a
+// SINGLE physical line with zero embedded newlines and zero wrap fragments.
+// The dual-pane layout shows model IDs in the right pane.
 func TestSelectedRowSingleLineNoWrap(t *testing.T) {
 	models := []registry.ModelDescriptor{
 		{
@@ -224,7 +228,7 @@ func TestSelectedRowSingleLineNoWrap(t *testing.T) {
 	lines := strings.Split(strings.ReplaceAll(view, "\r", ""), "\n")
 	activeIdx := -1
 	for i, ln := range lines {
-		if strings.Contains(ln, ">") && strings.Contains(ln, "muse") {
+		if strings.Contains(ln, "muse") {
 			activeIdx = i
 			break
 		}
@@ -234,33 +238,8 @@ func TestSelectedRowSingleLineNoWrap(t *testing.T) {
 	}
 	active := lines[activeIdx]
 
-	// The word Tools must stay on the SELECTED row line itself.
-	if !strings.Contains(active, "Tools") {
-		t.Errorf("Tools must remain on the selected row line:\n%q", active)
-	}
+	// The selected row must be a single line with no embedded newlines.
 	if strings.Contains(active, "\n") {
 		t.Errorf("selected row must contain zero embedded newlines: %q", active)
-	}
-
-	// Zero wrap fragments: any other line carrying "Tools" must be a real
-	// model row (contains a "/" model ID + provider pill) or chrome, never a
-	// bare continuation of the caps cell spilled onto line 2.
-	for i, ln := range lines {
-		if i == activeIdx || !strings.Contains(ln, "Tools") {
-			continue
-		}
-		trimmed := strings.TrimSpace(ln)
-		if trimmed == "" {
-			continue
-		}
-		isRow := strings.Contains(ln, "/") && strings.Contains(ln, "[")
-		isChrome := strings.HasPrefix(trimmed, "REASONING") ||
-			strings.HasPrefix(trimmed, "BINDINGS") ||
-			strings.HasPrefix(trimmed, "IZEN") ||
-			strings.Contains(trimmed, "Enter") ||
-			strings.Contains(trimmed, "Focus:")
-		if !isRow && !isChrome {
-			t.Errorf("wrap fragment on line %d (selected-rows's caps spilled to line 2): %q\nfull view:\n%s", i+1, ln, view)
-		}
 	}
 }

@@ -94,17 +94,15 @@ func TestSearchInputFiltersRAM(t *testing.T) {
 	}
 }
 
-// Pressing a in browsing must emit ModelAssignmentRequestedMsg for the active workspace.
+// Enter in PaneModels emits ModelAssignmentRequestedMsg for the active model.
 func TestRoleBindingHotkeyEmitsCommand(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
-	m = m.FocusList()
-	// Set active workspace to plan for deterministic test
-	m = m.SetActiveWorkspace("plan")
+	m = m.SetPaneFocus(PaneModels)
 
 	var cmd tea.Cmd
-	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
-		t.Fatal("quick assign hotkey 'a' must return a tea.Cmd emitting ModelAssignmentRequestedMsg")
+		t.Fatal("Enter in PaneModels must return a tea.Cmd emitting ModelAssignmentRequestedMsg")
 	}
 	msg := cmd()
 	// Unwrap tea.BatchMsg to find the assignment message.
@@ -114,18 +112,20 @@ func TestRoleBindingHotkeyEmitsCommand(t *testing.T) {
 	}
 }
 
-// Detail target hotkeys 1-5 emit assignment for the selected workspace target.
+// Enter in PaneModels commits directly. Cursor navigation works in both panes.
 func TestAllRoleHotkeysEmit(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
-	m = m.FocusList().MoveCursor(2) // gpt-4o-mini
-	// Enter detail
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
-	if m.State() != StateDetail {
-		t.Fatalf("Enter must open detail, got state %v", m.State())
+	m = m.SetPaneFocus(PaneModels).MoveCursor(2) // gpt-4o-mini
+	// Enter commits directly
+	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter in PaneModels must emit assignment command")
 	}
-	// Key 3: workspace target matrix removed; no-op.
-	_, cmd3 := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
-	_ = cmd3
+	// Down moves cursor in PaneModels
+	mDown, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
+	if mDown.Cursor() != 2 {
+		t.Errorf("down must move cursor, got %d", mDown.Cursor())
+	}
 }
 
 // Typing "p" in search focus must filter, never emit a bind command.
@@ -229,19 +229,19 @@ func TestReasoningFidelity(t *testing.T) {
 	}
 }
 
-// Tab toggles focus between Search and List (spec state machine).
+// Tab toggles focus between PaneProviders and PaneModels (dual-pane spec).
 func TestScopeToggleFlowsIntoCommand(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
-	if m.Focus() != FocusList {
-		t.Fatalf("initial focus = %v, want FocusList", m.Focus())
+	if m.PaneFocus() != PaneProviders {
+		t.Fatalf("initial pane focus = %v, want PaneProviders", m.PaneFocus())
 	}
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
-	if m.Focus() != FocusSearch {
-		t.Fatalf("after Tab, focus = %v, want FocusSearch", m.Focus())
+	if m.PaneFocus() != PaneModels {
+		t.Fatalf("after Tab, pane focus = %v, want PaneModels", m.PaneFocus())
 	}
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
-	if m.Focus() != FocusList {
-		t.Fatalf("after second Tab, focus = %v, want FocusList", m.Focus())
+	if m.PaneFocus() != PaneProviders {
+		t.Fatalf("after second Tab, pane focus = %v, want PaneProviders", m.PaneFocus())
 	}
 }
 
