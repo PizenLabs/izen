@@ -62,7 +62,12 @@ func (m Model) UpdateModel(msg tea.Msg) (Model, tea.Cmd) {
 		m.snap = snapshotFromDescriptors(m.snap, msg.Models)
 		m.refilter()
 		m.resetReasoning()
-		m.cursor = 0
+		if m.state != StateDetail {
+			// Anchor fresh loads at the top only while browsing. In
+			// StateDetail the pinned selection owns truth; the cursor
+			// must not be yanked to index 0 under the user.
+			m.cursor = 0
+		}
 		m.loading = false
 		m.err = nil
 		if m.query != "" || m.provider != "" {
@@ -173,21 +178,39 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.moveCursor(budget)
 		return m, nil
 	case "enter":
+		// Enter ALWAYS inspects via StateDetail (never quick-assigns):
+		// users must see capabilities, Reasoning Policy ('r'), and the
+		// explicit target list before confirming. Fast-path is 'a'.
+		// The highlighted instance is pinned immutably: StateDetail binds
+		// to the pin, never to the mutable cursor, so later refilters
+		// cannot retarget the inspection or the assignment.
 		if sel := m.SelectedModel(); sel != nil {
+			m.pinDetail()
 			m.state = StateDetail
+			m.focus = FocusList
+			m.searchInput.Blur()
 			m.targetCursor = m.getInitialTargetIndex()
 		}
 		return m, nil
 	case "a", "shift+enter":
+		// Fast-path quick assignment for the active workspace. Emits ONLY
+		// the assignment: the parent commits it to Runtime Authority and
+		// then tears the modal down deterministically. Batching
+		// CloseModalCmd here races the teardown ahead of the assignment;
+		// a closed modal no longer routes the message, so the commit is
+		// silently dropped and the status bar keeps the stale default.
+		if m.activeWorkspace == TargetNone {
+			return m, nil
+		}
 		if sel := m.SelectedModel(); sel != nil {
-			return m, m.emitAssignmentCmd(sel, m.activeWorkspace)
+			assign := m.emitAssignmentCmd(sel, m.activeWorkspace)
+			if assign == nil {
+				return m, nil
+			}
+			return m, assign
 		}
 		return m, nil
 	case "esc":
-		if m.searchInput.Value() != "" || m.query != "" {
-			m.clearSearch()
-			return m, nil
-		}
 		return m, CloseModalCmd()
 	}
 
@@ -201,8 +224,16 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	// Also handle Shift+Enter via type check (some terminals report as ctrl+enter)
 	// Fallback: if msg.String() contains shift and enter, treat as fast path
 	if k == "shift+enter" || (msg.Type == tea.KeyEnter && strings.Contains(strings.ToLower(k), "shift")) {
+		// Ordered teardown: assignment only; the parent closes post-commit.
+		if m.activeWorkspace == TargetNone {
+			return m, nil
+		}
 		if sel := m.SelectedModel(); sel != nil {
-			return m, m.emitAssignmentCmd(sel, m.activeWorkspace)
+			assign := m.emitAssignmentCmd(sel, m.activeWorkspace)
+			if assign == nil {
+				return m, nil
+			}
+			return m, assign
 		}
 		return m, nil
 	}
@@ -275,6 +306,7 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch k {
 	case "esc":
 		m.state = StateBrowsing
+		m.clearDetail()
 		return m, nil
 	case "up", "k":
 		m.targetCursor = max(0, m.targetCursor-1)
@@ -287,19 +319,46 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if idx >= 0 && idx < len(AllWorkspaceTargets) {
 			m.targetCursor = idx
 			selectedTarget := AllWorkspaceTargets[m.targetCursor]
+			// Binds to the pinned detail instance (SelectedModel is
+			// detail-aware), never to a recalculated cursor position.
+			// Ordered teardown: assignment only; the parent closes
+			// the modal after the Runtime Authority commit lands.
 			sel := m.SelectedModel()
 			if sel != nil {
-				return m, m.emitAssignmentCmd(sel, selectedTarget)
+				assign := m.emitAssignmentCmd(sel, selectedTarget)
+				if assign == nil {
+					return m, nil
+				}
+				return m, assign
 			}
 		}
 		return m, nil
 	case "r":
+		// Dynamic capability guard: ONLY cycle through caps.Options when the
+		// model actually supports configurable reasoning. Non-configurable
+		// models are a NO-OP with zero state change.
+		sel := m.SelectedModel()
+		if sel == nil {
+			return m, nil
+		}
+		caps := sel.GetReasoningCapability()
+		if !caps.Supported || !caps.Configurable || len(caps.Options) == 0 {
+			return m, nil // Guard: NO-OP for non-configurable models
+		}
+		// Cycle strictly through valid model options
 		m.cycleReasoningPolicy()
 		return m, nil
 	case "enter":
+		// Binds to the pinned detail instance (SelectedModel is
+		// detail-aware). Ordered teardown: assignment only; the parent
+		// closes the modal after the Runtime Authority commit lands.
 		if sel := m.SelectedModel(); sel != nil {
 			selectedTarget := AllWorkspaceTargets[m.targetCursor]
-			return m, m.emitAssignmentCmd(sel, selectedTarget)
+			assign := m.emitAssignmentCmd(sel, selectedTarget)
+			if assign == nil {
+				return m, nil
+			}
+			return m, assign
 		}
 		return m, nil
 	}

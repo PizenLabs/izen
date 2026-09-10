@@ -153,6 +153,7 @@ func (m *model) executeAutonomyViaRuntime(trace autonomy.Trace) tea.Cmd {
 		TargetConfidence: trace.TargetConfidence,
 		Scope:            string(trace.Route.Workspace),
 		Evidence:         evidence,
+		Model:            m.getActiveModelName(),
 	}
 	return m.runRuntimeExecuteCmd(req)
 }
@@ -248,6 +249,7 @@ func (m *model) runStagedBuildViaRuntime() tea.Cmd {
 			Prompt:   prompt,
 			Targets:  targets,
 			Strategy: &profile,
+			Model:    m.getActiveModelName(),
 		}
 		return m.runRuntimeExecuteCmd(req)
 	}
@@ -287,6 +289,7 @@ func (m *model) runRuntimeTaskRequest(task *plan.Task) tea.Cmd {
 		Prompt:   prompt,
 		Targets:  targets,
 		Strategy: &profile,
+		Model:    m.getActiveModelName(),
 	}
 	return m.runRuntimeExecuteCmd(req)
 }
@@ -319,6 +322,7 @@ func (m *model) runRuntimePrompt(content string) tea.Cmd {
 		Prompt:   content,
 		Targets:  targets,
 		Strategy: &profile,
+		Model:    m.getActiveModelName(),
 	}
 	return m.runRuntimeExecuteCmd(req)
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/llm"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/state"
 )
 
@@ -435,10 +436,48 @@ func (m *model) getActiveProviderName() string {
 }
 
 func (m *model) getActiveModelName() string {
+	// Effective model derives exclusively from Runtime Authority (I5).
+	if m.modelRuntime != nil {
+		if ref := m.modelRuntime.ActiveModel(); ref.ID != "" {
+			return ref.ID
+		}
+	}
 	if m.sessionModel != "" {
 		return m.sessionModel
 	}
 	return m.cfg.ActiveModelName()
+}
+
+// ensureModelRuntime lazily creates the Runtime Authority, seeds it from the
+// persisted config assignments once, and tracks the resolver's current mode
+// so ActiveModel() always reflects the active workspace target.
+func (m *model) ensureModelRuntime() *appruntime.RuntimeAuthority {
+	if m.modelRuntime == nil {
+		m.modelRuntime = appruntime.NewRuntimeAuthority()
+		// Seed from persisted config (bootstrap only; later commits own truth).
+		if m.cfg != nil {
+			seeds := map[string]string{
+				"ask":         m.cfg.Assignments.Ask,
+				"investigate": m.cfg.Assignments.Investigate,
+				"plan":        m.cfg.Assignments.Plan,
+				"build":       m.cfg.Assignments.Build,
+				"review":      m.cfg.Assignments.Review,
+			}
+			for target, id := range seeds {
+				if id != "" {
+					m.modelRuntime.SeedAssignment(appruntime.WorkspaceTarget(target), appruntime.ModelRef{ID: id})
+				}
+			}
+			if m.sessionModel != "" {
+				m.modelRuntime.SeedAssignment(m.modelRuntime.CurrentMode(), appruntime.ModelRef{ID: m.sessionModel})
+			}
+		}
+	}
+	// Track the active workspace target from the mode resolver (I8).
+	if m.resolver != nil {
+		m.modelRuntime.SetCurrentMode(appruntime.WorkspaceTarget(m.resolver.Current().String()))
+	}
+	return m.modelRuntime
 }
 
 // activeContextLimit returns the maximum context window for the currently

@@ -122,7 +122,7 @@ func TestOpenRouterExecute_ReasoningFallback(t *testing.T) {
 	defer srv.Close()
 
 	p := NewOpenRouterProvider("test-key", "anthropic/test-model", srv.URL)
-	resp, err := p.Execute(context.Background(), ai.Request{})
+	resp, err := p.Execute(context.Background(), ai.Request{Model: "anthropic/test-model"})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestOpenRouterExecute_ReasoningContentField(t *testing.T) {
 	defer srv.Close()
 
 	p := NewOpenRouterProvider("test-key", "anthropic/test-model", srv.URL)
-	resp, err := p.Execute(context.Background(), ai.Request{})
+	resp, err := p.Execute(context.Background(), ai.Request{Model: "anthropic/test-model"})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestOpenRouterExecute_ContentWinsOverReasoning(t *testing.T) {
 	defer srv.Close()
 
 	p := NewOpenRouterProvider("test-key", "anthropic/test-model", srv.URL)
-	resp, err := p.Execute(context.Background(), ai.Request{})
+	resp, err := p.Execute(context.Background(), ai.Request{Model: "anthropic/test-model"})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}

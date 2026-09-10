@@ -85,7 +85,22 @@ type AIConfig struct {
 	Providers        map[string]AIProviderConfig `yaml:"providers"`
 }
 
+type AssignmentsConfig struct {
+	Ask         string `yaml:"ask,omitempty"`
+	Investigate string `yaml:"investigate,omitempty"`
+	Plan        string `yaml:"plan,omitempty"`
+	Build       string `yaml:"build,omitempty"`
+	Review      string `yaml:"review,omitempty"`
+}
+
 type Config struct {
+	// Legacy fields retained for migration
+	DefaultModel string `yaml:"default_model,omitempty"`
+	PlanModel    string `yaml:"plan_model,omitempty"`
+
+	// New structured assignments
+	Assignments AssignmentsConfig `yaml:"assignments"`
+
 	AI        AIConfig        `yaml:"ai"`
 	Models    ModelConfig     `yaml:"models"`
 	Execution ExecutionConfig `yaml:"execution"`
@@ -496,6 +511,55 @@ func Save(cfg *Config) error {
 }
 
 type ConfigChangeMsg struct{}
+
+func (c *Config) MigrateLegacyConfig() bool {
+	migrated := false
+	if c.Assignments.Ask == "" && c.DefaultModel != "" {
+		c.Assignments.Ask = c.DefaultModel
+		migrated = true
+	}
+	if c.Assignments.Plan == "" && c.PlanModel != "" {
+		c.Assignments.Plan = c.PlanModel
+		migrated = true
+	}
+	return migrated
+}
+
+func PersistAssignment(target string, modelID string) error {
+	cfg := GetGlobalConfig()
+
+	switch target {
+	case "ask":
+		cfg.Assignments.Ask = modelID
+	case "investigate":
+		cfg.Assignments.Investigate = modelID
+	case "plan":
+		cfg.Assignments.Plan = modelID
+	case "build":
+		cfg.Assignments.Build = modelID
+	case "review":
+		cfg.Assignments.Review = modelID
+	default:
+		return fmt.Errorf("unknown workspace target: %s", target)
+	}
+
+	return Save(cfg)
+}
+
+var globalConfig *Config
+
+func GetGlobalConfig() *Config {
+	if globalConfig != nil {
+		return globalConfig
+	}
+	cfg, err := Load()
+	if err != nil {
+		cfg = Default()
+	}
+	cfg.MigrateLegacyConfig()
+	globalConfig = cfg
+	return globalConfig
+}
 
 func StartConfigWatcher(ch chan<- bool) {
 	path := configPath()

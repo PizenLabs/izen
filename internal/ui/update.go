@@ -321,6 +321,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		switch msg := msg.(type) {
 		case modelapp.BindModelToRoleCommand, modelapp.ActivateModelCommand, modelapp.SyncRequestedMsg:
 			// fall through to main switch
+		case model_picker.ModelAssignmentRequestedMsg:
+			// Atomic control-plane transaction pipeline (I2/I3/I4) via
+			// the shared commit helper (modal-open fast path). The picker
+			// emits the assignment alone; teardown follows the commit
+			// deterministically inside the helper (ordered, race-free).
+			return m, m.commitModelAssignment(msg)
+		case model_picker.CloseModalMsg:
+			m.showModelPicker = false
+			m.ti.Focus()
+			return m, nil
 		case model_picker.SnapshotMsg, model_picker.ModelsLoadedMsg, model_picker.ModelsErrMsg,
 			model_picker.BindingSucceededMsg, model_picker.BindingFailedMsg, modelapp.BindingResultMsg,
 			modelapp.RegistryUpdatedMsg:
@@ -469,6 +479,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case modelapp.ActivateModelCommand:
 		// ACTIVATE (Enter) from the widget picker: close and apply session.
 		return m, m.pickerActivateCmd(msg)
+
+	case model_picker.ModelAssignmentRequestedMsg:
+		// Modal-closed fallback: the assignment outlived the picker modal
+		// (ordered teardown normally commits before closing, but a racing
+		// Esc/teardown or a future emitter may deliver after close). The
+		// commit is safe here: every message instance flows through this
+		// loop exactly once, so the modal-open case above and this case
+		// are mutually exclusive — never a double commit.
+		return m, m.commitModelAssignment(msg)
 
 	case modelapp.SyncRequestedMsg:
 		// Ctrl+R from the widget picker: background refresh, never blocking.

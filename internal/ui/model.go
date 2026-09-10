@@ -1399,7 +1399,12 @@ type model struct {
 	// Lazily created on /models from the local JSON cache (zero network);
 	// background sync is owned by the app layer.
 	modelRegistry *registry.Registry
-	sessionModel  string // user-selected model override via /models
+	sessionModel  string // user-selected model override via /models (legacy mirror; authority owns truth)
+
+	// modelRuntime is the Runtime Authority single source of truth for the
+	// effective model (I5). The picker never owns runtime state (I1); the
+	// status bar derives exclusively from here via ActiveModel.
+	modelRuntime *appruntime.RuntimeAuthority
 
 	// modelAppSvc is the domain application boundary for model role
 	// bindings (pure-view picker emits BindModelToRoleCommand; this service

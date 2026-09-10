@@ -9,7 +9,6 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"github.com/PizenLabs/izen/internal/domain/role"
-	"github.com/PizenLabs/izen/internal/provider/adapter"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
@@ -18,7 +17,6 @@ var (
 	colorText     = lipgloss.Color("#cdd6f4")
 	colorSubtext0 = lipgloss.Color("#6c7086")
 	colorMauve    = lipgloss.Color("#cba6f7")
-	colorYellow   = lipgloss.Color("#f9e2af")
 	colorSurface0 = lipgloss.Color("#313244")
 	colorSurface1 = lipgloss.Color("#45475a")
 )
@@ -39,26 +37,14 @@ func formatCapabilities(caps []registry.ModelCapability) string {
 // per the two-step state machine. Pure view, zero I/O.
 func (m Model) View() string {
 	if m.state == StateDetail {
-		// Detail overlay: header + divider + search line remain for context,
-		// followed by the detail drawer. Footer is detail hint.
-		var b strings.Builder
-		b.WriteString(m.clipLine(m.renderHeader()))
-		b.WriteString("\n")
-		b.WriteString(m.renderDivider())
-		b.WriteString("\n")
-		b.WriteString(m.clipLine(m.renderSearchLine()))
-		b.WriteString("\n")
-		b.WriteString(m.renderDivider())
-		b.WriteString("\n")
-		b.WriteString(m.renderDetailView())
-		b.WriteString("\n")
-		if m.status != "" {
-			b.WriteString(m.clipLine(mutedStyle.Render(" " + m.status)))
-			b.WriteString("\n")
-		}
-		return m.padFooter(b.String())
+		return m.renderDetailLayout()
 	}
+	return m.renderBrowsingLayout()
+}
 
+// renderBrowsingLayout renders the list/search view with header, search bar,
+// model list, and browsing footer.
+func (m Model) renderBrowsingLayout() string {
 	var b strings.Builder
 	b.WriteString(m.clipLine(m.renderHeader()))
 	b.WriteString("\n")
@@ -99,6 +85,31 @@ func (m Model) View() string {
 		b.WriteString("\n")
 	}
 	return m.padFooter(b.String())
+}
+
+// renderDetailLayout renders the model detail view with header, detail body,
+// and a dedicated detail footer. No search bar or browsing list leaks through.
+func (m Model) renderDetailLayout() string {
+	header := m.clipLine(m.renderHeader())
+	body := m.renderDetailView()
+	footer := m.renderDetailFooter()
+
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteString("\n")
+	b.WriteString(m.renderDivider())
+	b.WriteString("\n")
+	b.WriteString(body)
+	b.WriteString("\n")
+	if m.status != "" {
+		b.WriteString(m.clipLine(mutedStyle.Render(" " + m.status)))
+		b.WriteString("\n")
+	}
+	b.WriteString(m.renderDivider())
+	b.WriteString("\n")
+	b.WriteString(footer)
+
+	return b.String()
 }
 
 // clipLine enforces strict single-line width: truncates styled lines to the
@@ -156,18 +167,16 @@ func (m Model) renderBrowsingFooter() string {
 	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s   %s %s",
 		keyStyle.Render("↑/↓"), descStyle.Render("select"),
 		keyStyle.Render("type"), descStyle.Render("search"),
-		keyStyle.Render("Tab"), descStyle.Render("focus"),
-		keyStyle.Render("Enter"), descStyle.Render("inspect"),
+		keyStyle.Render("Enter"), descStyle.Render("inspect & assign"),
 		keyStyle.Render("a"), descStyle.Render("quick assign"),
+		keyStyle.Render("Esc"), descStyle.Render("cancel"),
 	)
-	// Ensure legacy substring for older tests that grep for "Enter: activate" remains
-	// via an invisible suffix when space allows, but the core footer is spec-clean.
-	// We keep the visible help strictly per spec; the legacy check is satisfied
-	// elsewhere via View containing "Enter" (so we don't pollute the clean footer).
+	// Unbounded (tests/headless): no truncation so the full key contract
+	// stays grep-friendly. Bounded modals clip to the inner width.
+	if m.innerWidth <= 0 && m.width <= 0 {
+		return help
+	}
 	return truncateStyled(help, inner)
-	// Note: to keep old tests that require "Enter: activate", we also ensure View
-	// contains that substring via the status line or by appending in padFooter
-	// when needed, but the footer itself remains BINDINGS-free per verification.
 }
 
 // renderDetailView renders the contextual Model Detail View & Workspace Target
@@ -205,14 +214,14 @@ func (m Model) renderDetailView() string {
 		"",
 	)
 
-	// Reasoning Policy Control
-	reasoningLabel := lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("Reasoning Policy (Press 'r' to toggle): ")
-	policy := m.reasoningPolicy
-	if policy == "" {
-		policy = "default"
-	}
-	reasoningVal := lipgloss.NewStyle().Foreground(colorText).Render(fmt.Sprintf("[%s]", policy))
-	lines = append(lines, reasoningLabel+reasoningVal, "")
+	// Reasoning Policy Control — dynamic variant rendering (truthful I6):
+	// the section binds strictly to the selected model's real
+	// ReasoningCapability via CapabilityResolver (Model ID / Provider
+	// matching). Non-reasoning models render PATH A with zero variant line;
+	// provider-managed models render PATH B; configurable models render PATH C
+	// with REAL options from caps.Options.
+	lines = append(lines, strings.Split(strings.TrimSuffix(m.renderReasoningSection(model), "\n"), "\n")...)
+	lines = append(lines, "")
 
 	// Workspace Target Assignment
 	targetHeader := lipgloss.NewStyle().Foreground(colorMauve).Bold(true).Render("WORKSPACE TARGET ASSIGNMENT")
@@ -242,9 +251,33 @@ func (m Model) renderDetailView() string {
 		lines = append(lines, line)
 	}
 
-	lines = append(lines, "", lipgloss.NewStyle().Foreground(colorSubtext0).Render("Enter confirm • 1-5 select target • r reasoning • Esc back"))
-
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// renderDetailFooter renders the dedicated keybinding footer for the detail view.
+func (m Model) renderDetailFooter() string {
+	keyStyle := lipgloss.NewStyle().Foreground(colorText).Bold(true)
+	descStyle := lipgloss.NewStyle().Foreground(colorSubtext0)
+
+	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s",
+		keyStyle.Render("1-5 / ↑↓"), descStyle.Render("select target"),
+		keyStyle.Render("r"), descStyle.Render("reasoning policy"),
+		keyStyle.Render("Enter"), descStyle.Render("confirm & exit"),
+		keyStyle.Render("Esc"), descStyle.Render("back"),
+	)
+	inner := m.innerWidth
+	if inner <= 0 {
+		inner = m.width
+	}
+	if inner <= 0 {
+		inner = 64
+	}
+	// Unbounded (tests/headless): no truncation so the full key contract
+	// stays grep-friendly. Bounded modals clip to the inner width.
+	if m.innerWidth <= 0 && m.width <= 0 {
+		return help
+	}
+	return truncateStyled(help, inner)
 }
 
 // renderReasoningOptions returns the reasoning effort pills for the bottom panel.
@@ -823,26 +856,66 @@ func (m Model) renderRow(d registry.ModelDescriptor, selected bool, nameW, provi
 	return strings.ReplaceAll(out, "\n", "")
 }
 
-// renderReasoningSection renders the contextual reasoning block. It collapses
-// to one minimal line for ReasoningModeNone ("REASONING   —") and formats
-// every other mode natively (no universal low/medium/high forcing).
+// renderReasoningSection renders the dynamic reasoning variant block for the
+// selected model from its real ReasoningCapability (CapabilityResolver,
+// Model ID / Provider matching). It never renders a hardcoded variant line:
 //
-//nolint:unused // retained for legacy browsing view compatibility
-func (m Model) renderReasoningSection() string {
-	hl := m.Highlighted()
-	if hl == nil {
-		return mutedStyle.Render("REASONING   —")
+//	PATH A (unsupported): "Reasoning: Not supported by model" (zero variants).
+//	PATH B (provider-managed): "Reasoning: Provider managed / Not configurable".
+//	PATH C (configurable): "Reasoning Policy (Press 'r' to cycle): [Label]"
+//	  plus the REAL option labels from caps.Options joined by "  ·  " with the
+//	  selected index bracketed.
+func (m *Model) renderReasoningSection(sel *registry.ModelDescriptor) string {
+	var sb strings.Builder
+	if sel == nil {
+		sb.WriteString("──────────────────────────────────────────────────\n\n")
+		sb.WriteString("Reasoning: Not supported by model\n")
+		return sb.String()
 	}
-	mode := ReasoningModeFor(*hl)
-	switch mode {
-	case adapter.ReasoningModeNone:
-		return mutedStyle.Render("REASONING   —")
-	case adapter.ReasoningModeFixed:
-		// Spec: "Fixed · locked" / "Fixed · provider controlled".
-		return mutedStyle.Render("REASONING   ") + mutedStyle.Render("Fixed · provider controlled ") + otherBadge.Render("[Locked]")
-	default:
-		return mutedStyle.Render("REASONING   ") + m.RenderReasoningBar()
+	caps := sel.GetReasoningCapability()
+
+	sb.WriteString("──────────────────────────────────────────────────\n\n")
+
+	// PATH A: Model does NOT support reasoning
+	if !caps.Supported {
+		sb.WriteString("Reasoning: Not supported by model\n")
+		return sb.String()
 	}
+
+	// PATH B: Supported but Provider Managed / Always On (e.g. DeepSeek R1)
+	if !caps.Configurable || len(caps.Options) == 0 {
+		sb.WriteString("Reasoning: Provider managed / Not configurable\n")
+		return sb.String()
+	}
+
+	// PATH C: Configurable — Render REAL options from caps.Options
+	idx := m.selectedReasoningOptIdx
+	if idx < 0 || idx >= len(caps.Options) {
+		idx = 0
+	}
+	currentOpt := caps.Options[idx]
+	label := currentOpt.Label
+	if label == "" {
+		label = currentOpt.ID
+	}
+	fmt.Fprintf(&sb, "Reasoning Policy (Press 'r' to cycle): [%s]\n\n", label)
+
+	var optionLabels []string
+	for i, opt := range caps.Options {
+		l := opt.Label
+		if l == "" {
+			l = opt.ID
+		}
+		if i == idx {
+			optionLabels = append(optionLabels, fmt.Sprintf("[%s]", l))
+		} else {
+			optionLabels = append(optionLabels, l)
+		}
+	}
+	sb.WriteString(strings.Join(optionLabels, "  ·  "))
+	sb.WriteString("\n")
+
+	return sb.String()
 }
 
 // renderBindingsLine renders active role mappings with focus highlight and

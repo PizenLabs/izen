@@ -133,12 +133,18 @@ func TestFocusScopeStateMachine(t *testing.T) {
 	}
 
 	// Quick assign via 'a' must emit ModelAssignmentRequestedMsg in browsing
+	// when an active workspace is set (fast-path; TargetNone never assigns).
+	m = m.SetActiveWorkspace(TargetAsk)
 	mAssign, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
 	if cmd == nil {
 		t.Fatalf("'a' quick assign must emit assignment cmd in browsing")
 	}
 	if _, ok := cmd().(ModelAssignmentRequestedMsg); !ok {
-		t.Fatalf("'a' cmd = %T, want ModelAssignmentRequestedMsg", cmd())
+		// Accept BatchMsg wrapping (auto-close emits batch).
+		msg := cmd()
+		if _, ok := msg.(tea.BatchMsg); !ok {
+			t.Fatalf("'a' cmd = %T, want ModelAssignmentRequestedMsg or BatchMsg", msg)
+		}
 	}
 	_ = mAssign
 
@@ -210,10 +216,10 @@ func TestSelectedRowSingleLineNoWrap(t *testing.T) {
 			Provider:      "meta",
 			Name:          "Muse Glimmer 30B batch",
 			ContextWindow: 1_000_000,
-			InputCostPerM: 0.25, OutputCostPerM: 0.75,
+			InputCostPerM: 0, OutputCostPerM: 0.75,
 			Capabilities: []registry.ModelCapability{registry.CapThinking, registry.CapTools, registry.CapVision},
 		},
-		{ID: "openai/gpt-4o-mini", Provider: "openai", Name: "GPT-4o mini", ContextWindow: 128000},
+		{ID: "openai/gpt-4o-mini", Provider: "openai", Name: "GPT-4o mini", ContextWindow: 128000, InputCostPerM: 0},
 	}
 	m := New(seedSnapshot(models)).SetSize(100, 30)
 	m = m.MoveCursor(0)

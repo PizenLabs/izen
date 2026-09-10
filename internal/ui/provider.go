@@ -3,11 +3,14 @@ package ui
 import (
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/llm"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
 )
 
 var validProviders = map[string]string{
@@ -144,6 +147,66 @@ func (m *model) switchProvider(name string) tea.Cmd {
 	// request (OpenRouter rejects e.g. "qwen2.5-coder:7b" with HTTP 400).
 	m.syncPipelineTiers()
 
+	// Provider switch state invalidation: clear stale target assignments that
+	// do not belong to the newly active provider. Without this, an Ollama
+	// assignment (qwen2.5-coder:7b) leaks into an OpenRouter worker context
+	// and is correctly rejected by the OpenRouter regex validator, but the
+	// root cause is stale authority state. Switching must re-resolve.
+	if rt := m.ensureModelRuntime(); rt != nil {
+		newDefault := ""
+		if provCfg, ok := m.cfg.AI.Providers[name]; ok {
+			newDefault = provCfg.DefaultModel
+		}
+		for _, tgtStr := range []string{"ask", "investigate", "plan", "build", "review"} {
+			tgt := appruntime.WorkspaceTarget(tgtStr)
+			ref := rt.EffectiveModel(tgt)
+			if ref.ID != "" && !modelBelongsToProvider(name, ref.ID) {
+				// Clear stale assignment
+				rt.SeedAssignment(tgt, appruntime.ModelRef{})
+				switch tgtStr {
+				case "ask":
+					m.cfg.Assignments.Ask = ""
+				case "investigate":
+					m.cfg.Assignments.Investigate = ""
+				case "plan":
+					m.cfg.Assignments.Plan = ""
+				case "build":
+					m.cfg.Assignments.Build = ""
+				case "review":
+					m.cfg.Assignments.Review = ""
+				}
+				// Re-resolve with new provider's default to keep harnesses functional
+				if newDefault != "" && modelBelongsToProvider(name, newDefault) {
+					rt.SeedAssignment(tgt, appruntime.ModelRef{ID: newDefault, Provider: name})
+					switch tgtStr {
+					case "ask":
+						m.cfg.Assignments.Ask = newDefault
+					case "investigate":
+						m.cfg.Assignments.Investigate = newDefault
+					case "plan":
+						m.cfg.Assignments.Plan = newDefault
+					case "build":
+						m.cfg.Assignments.Build = newDefault
+					case "review":
+						m.cfg.Assignments.Review = newDefault
+					}
+				}
+			}
+		}
+		if m.sessionModel != "" && !modelBelongsToProvider(name, m.sessionModel) {
+			m.sessionModel = ""
+			m.cfg.Models.SessionModel = ""
+			if newDefault != "" && modelBelongsToProvider(name, newDefault) {
+				m.sessionModel = newDefault
+				m.cfg.Models.SessionModel = newDefault
+			}
+		}
+		// Also clear the active target's session override if stale
+		if m.cfg != nil && m.cfg.Models.SessionModel != "" && !modelBelongsToProvider(name, m.cfg.Models.SessionModel) {
+			m.cfg.Models.SessionModel = ""
+		}
+	}
+
 	m.push(roleSystem, fmt.Sprintf("[✓] Provider switched: %s → %s", oldName, name))
 
 	return func() tea.Msg {
@@ -181,6 +244,24 @@ func GetActiveProviderFromEnv() string {
 		return "groq"
 	}
 	return "ollama"
+}
+
+var openRouterModelIDRe = regexp.MustCompile(`^[^/\s]+/[^/\s]+$`)
+
+func modelBelongsToProvider(provider, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	isOpenRouterStyle := openRouterModelIDRe.MatchString(model)
+	switch provider {
+	case "openrouter":
+		return isOpenRouterStyle
+	case "ollama":
+		return !isOpenRouterStyle
+	default:
+		return true
+	}
 }
 
 func init() {

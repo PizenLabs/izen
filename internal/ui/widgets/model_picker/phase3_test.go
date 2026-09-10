@@ -55,7 +55,7 @@ func TestPhase3ExecutionTruth(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("quick assign 'a' must emit ModelAssignmentRequestedMsg")
 	}
-	assign := cmd().(ModelAssignmentRequestedMsg)
+	assign := unwrapAssignmentMsg(t, cmd())
 	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
 		t.Errorf("assign model = %q, want highlighted", assign.ModelID)
 	}
@@ -73,7 +73,7 @@ func TestPhase3ExecutionTruth(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("detail key 3 must emit assignment")
 	}
-	assign2 := cmd().(ModelAssignmentRequestedMsg)
+	assign2 := unwrapAssignmentMsg(t, cmd())
 	if string(assign2.Target) != string(TargetPlan) {
 		t.Errorf("detail assign target = %q, want plan", string(assign2.Target))
 	}
@@ -104,10 +104,7 @@ func TestPhase3Activate(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("Enter in detail must dispatch ModelAssignmentRequestedMsg")
 	}
-	act, ok := cmd().(ModelAssignmentRequestedMsg)
-	if !ok {
-		t.Fatalf("detail Enter cmd = %T, want ModelAssignmentRequestedMsg", cmd())
-	}
+	act := unwrapAssignmentMsg(t, cmd())
 	if act.ModelID == "" {
 		t.Error("assignment must carry ModelID")
 	}

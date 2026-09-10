@@ -114,6 +114,10 @@ type Application struct {
 	// WithAuditDir. Empty disables auditing.
 	auditDir string
 
+	// Authority is the single source of truth for workspace model state (I5).
+	// It owns the per-target model assignments and the active mode.
+	Authority *runtime.RuntimeAuthority
+
 	// Approver resolves patch approvals for the approval command handlers.
 	// Defaults to handlers.NewInMemoryApprover when not supplied.
 	Approver handlers.PatchApprover
@@ -545,6 +549,41 @@ func Wire(opts ...Option) (*Application, error) {
 	wf := workflow.NewWorkflowRuntime()
 	a.Workflow = wf
 
+	// ── WORKSPACE MODEL AUTHORITY (I5) ────────────────────────────────
+	// The RuntimeAuthority is the single source of truth for workspace model
+	// state. It is seeded from persisted config assignments at wire time so
+	// every invocation request carries an explicit TargetModel resolved at
+	// admission, never a hardcoded fallback.
+	a.Authority = runtime.NewRuntimeAuthority()
+	if a.Inputs.Config != nil {
+		seeds := map[runtime.WorkspaceTarget]string{
+			runtime.TargetAsk:         a.Inputs.Config.Assignments.Ask,
+			runtime.TargetInvestigate: a.Inputs.Config.Assignments.Investigate,
+			runtime.TargetPlan:        a.Inputs.Config.Assignments.Plan,
+			runtime.TargetBuild:       a.Inputs.Config.Assignments.Build,
+			runtime.TargetReview:      a.Inputs.Config.Assignments.Review,
+		}
+		for target, id := range seeds {
+			if id != "" {
+				a.Authority.SeedAssignment(target, runtime.ModelRef{ID: id})
+			}
+		}
+		// Ensure every target has at least the global active model so headless
+		// harnesses (which have no explicit per-target assignment) still carry
+		// an explicit TargetModel and do not trigger ErrUnassignedTargetModel.
+		// This is not a hardcoded fallback — it is the persisted config's active
+		// model, and an explicitly cleared assignment (ModelID="") still errors.
+		if active := a.Inputs.Config.ActiveModelName(); active != "" {
+			for _, tgt := range []runtime.WorkspaceTarget{
+				runtime.TargetAsk, runtime.TargetInvestigate, runtime.TargetPlan, runtime.TargetBuild, runtime.TargetReview,
+			} {
+				if a.Authority.EffectiveModel(tgt).ID == "" {
+					a.Authority.SeedAssignment(tgt, runtime.ModelRef{ID: active})
+				}
+			}
+		}
+	}
+
 	// ── RUNTIME EXECUTOR (authority boundary) ───────────────────────────
 	// The RuntimeExecutor is the execution authority the presentation layer
 	// submits requests to on the migrated paths ($prompt targeted mutation,
@@ -586,6 +625,8 @@ func Wire(opts ...Option) (*Application, error) {
 		Executor:        a.Executor,
 		PreflightWorker: preflightWorker,
 		Root:            a.Inputs.Root,
+		Authority:       a.Authority,
+		Config:          a.Inputs.Config,
 		Telemetry:       izentelemetry.Default(),
 	})
 	if err := hs.Register(dispatcher); err != nil {
@@ -757,8 +798,10 @@ func Wire(opts ...Option) (*Application, error) {
 	// through the RuntimeExecutor, forwards approvals via Approve/Reject, and
 	// publishes loop.transition transitions on the shared bus. The presentation
 	// layer only projects those events.
+	adapter := runtimeAutonomy.NewExecutorAdapter(root, a.Gateway, a.Executor)
+	adapter.SetAuthority(a.Authority)
 	a.Autonomous = runtimeAutonomy.NewDriver(
-		runtimeAutonomy.NewExecutorAdapter(root, a.Gateway, a.Executor),
+		adapter,
 		a.Bus,
 		runtimeAutonomy.WithPreflightBarrier(loopBarrier),
 		runtimeAutonomy.WithPreflightState(preflightState),

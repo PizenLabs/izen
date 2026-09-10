@@ -14,10 +14,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
@@ -80,6 +82,20 @@ type HandlerDeps struct {
 	// / preflight_latency / first_stream_latency. Nil defaults to the global
 	// recorder.
 	Telemetry *telemetry.Recorder
+	// Authority is the single source of truth for workspace model state.
+	// When wired, SubmitPrompt resolves the explicit TargetModel dynamically
+	// from the active Workspace Target at admission and passes it to the
+	// background worker. An empty model is rejected locally with
+	// ErrUnassignedTargetModel before any provider call. Workers MUST NOT
+	// maintain independent model configuration state or fallback to a
+	// hardcoded default.
+	Authority *runtime.RuntimeAuthority
+	// Config is the global configuration used to resolve the active provider
+	// for strict provider-model compatibility verification. When set, a
+	// model that does not belong to the active provider is rejected before
+	// dispatch, preventing stale Ollama models from leaking into OpenRouter
+	// workers.
+	Config *config.Config
 }
 
 // ApprovalResult reports the file a resolved approval maps to and its net
@@ -192,7 +208,37 @@ func (h *SubmitPromptHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 	h.emit(events.NewIntentParsed(intent, c.Prompt, confidence))
 	h.emit(events.NewActivity(fmt.Sprintf("[submit_prompt] intent parsed intent=%s", intent)))
 
-	// 2. Admission: emit PromptAdmitted IMMEDIATELY on the UI critical path.
+	// 2. Resolve workspace target for model binding (I5). This is the
+	// authoritative target the active Workspace Target configuration owns.
+	target := intent
+	if ph, ok := ParsePhase(c.Mode); ok {
+		target = ph.String()
+	} else if c.Mode != "" {
+		return fmt.Errorf("%w: %q", ErrInvalidMode, c.Mode)
+	}
+
+	// 3. Explicit TargetModel binding: resolve the model for the active
+	// Workspace Target at admission time. Workers MUST NOT fallback to a
+	// hardcoded default — an empty model is rejected locally with
+	// ErrUnassignedTargetModel before any HTTP.
+	var targetModel string
+	if h.deps.Authority != nil {
+		ref := h.deps.Authority.EffectiveModel(runtime.WorkspaceTarget(target))
+		targetModel = strings.TrimSpace(ref.ID)
+		if targetModel == "" {
+			return fmt.Errorf("%w [%s]", execution.ErrUnassignedTargetModel, target)
+		}
+		// Strict provider-model compatibility: a stale Ollama model must not
+		// leak into an OpenRouter worker. The active provider owns the model.
+		if h.deps.Config != nil {
+			activeProvider := h.deps.Config.ActiveProviderName()
+			if activeProvider != "" && !handlerModelBelongsToProvider(activeProvider, targetModel) {
+				return fmt.Errorf("%w: model %q does not belong to provider %q [%s]", execution.ErrProviderModelMismatch, targetModel, activeProvider, target)
+			}
+		}
+	}
+
+	// 4. Admission: emit PromptAdmitted IMMEDIATELY on the UI critical path.
 	elapsed := time.Since(wallStart)
 	// Use wall-clock elapsed for the PromptAdmitted latency; handler clock
 	// (h.now) is used for stage duration telemetry.
@@ -204,7 +250,7 @@ func (h *SubmitPromptHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 	h.emit(events.NewPromptAdmitted(c.Prompt, intent, elapsed))
 	h.emit(events.NewActivity(fmt.Sprintf("[event] PromptAdmitted intent=%s latency=%s", intent, elapsed)))
 
-	// 3. Dispatch BackgroundPreflight async — NEVER synchronously read/scan.
+	// 5. Dispatch BackgroundPreflight async — NEVER synchronously read/scan.
 	if w := h.deps.PreflightWorker; w != nil {
 		targets := h.deps.PreflightTargets
 		// Synchronous target resolution: extract @-referenced targets from
@@ -215,16 +261,14 @@ func (h *SubmitPromptHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 		}
 		// Use a detached context so the bg worker outlives the handler's ctx.
 		bgCtx := context.Background()
-		w.Start(bgCtx, c.Prompt, targets) //nolint:contextcheck // detached bg preflight context outlives the handler
+		if h.deps.Authority != nil {
+			w.Start(bgCtx, c.Prompt, targets, targetModel) //nolint:contextcheck // detached bg preflight context outlives the handler
+		} else {
+			w.Start(bgCtx, c.Prompt, targets) //nolint:contextcheck // legacy harness without authority
+		}
 	}
 
-	// 4. Phase routing: an explicit target mode transitions the domain phase.
-	target := intent
-	if ph, ok := ParsePhase(c.Mode); ok {
-		target = ph.String()
-	} else if c.Mode != "" {
-		return fmt.Errorf("%w: %q", ErrInvalidMode, c.Mode)
-	}
+	// 6. Phase routing: transition the domain phase to target.
 	if err := h.enterPhase(ctx, target); err != nil {
 		return err
 	}
@@ -634,4 +678,22 @@ func (a *InMemoryApprover) Resolve(ctx context.Context, patchID string, approve 
 		return res, nil
 	}
 	return ApprovalResult{}, fmt.Errorf("handlers: no registered approval record for patch %q", patchID)
+}
+
+var handlerOpenRouterModelIDRe = regexp.MustCompile(`^[^/\s]+/[^/\s]+$`)
+
+func handlerModelBelongsToProvider(provider, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	isOpenRouterStyle := handlerOpenRouterModelIDRe.MatchString(model)
+	switch provider {
+	case "openrouter":
+		return isOpenRouterStyle
+	case "ollama":
+		return !isOpenRouterStyle
+	default:
+		return true
+	}
 }

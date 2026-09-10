@@ -30,6 +30,9 @@ const (
 	TargetPlan        WorkspaceTarget = "plan"
 	TargetBuild       WorkspaceTarget = "build"
 	TargetReview      WorkspaceTarget = "review"
+	// TargetNone marks global context: no active workspace. Enter in
+	// browsing must inspect (StateDetail) instead of assigning (I2).
+	TargetNone WorkspaceTarget = "none"
 )
 
 // AllWorkspaceTargets is the ordered set of assignable workspace targets.

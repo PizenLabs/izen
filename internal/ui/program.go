@@ -167,6 +167,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		microkernel:         app.Microkernel,
 		intentCompiler:      app.IntentCompiler,
 		ledger:              NewContextLedger(),
+		modelRuntime:        app.Authority,
 		ti:                  ti,
 		showBanner:          true,
 		IsCloudModel:        cfg.ActiveProviderName() != "ollama",

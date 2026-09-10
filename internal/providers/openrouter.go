@@ -25,9 +25,16 @@ import (
 // and displays a clear actionable banner instead of a raw HTTP status message.
 var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401): invalid or missing OPENROUTER_API_KEY — check your environment variables or run: export OPENROUTER_API_KEY=<your_key>")
 
-// DefaultOpenRouterModel is the safe fallback model ID used when a request
-// carries no model resolvable to OpenRouter's vendor/model schema.
+// DefaultOpenRouterModel is the default model ID used for initial
+// configuration. Runtime invocations MUST carry an explicit model binding
+// from the active Workspace Target — background workers MUST NOT fallback to
+// this constant. An empty request model is rejected locally with
+// ErrUnassignedTargetModel before any HTTP request.
 const DefaultOpenRouterModel = "anthropic/claude-3.5-sonnet"
+
+// ErrUnassignedTargetModel is returned when an OpenRouter request carries no
+// explicit model ID. The worker MUST reject locally before dispatch.
+var ErrUnassignedTargetModel = errors.New("openrouter: no model assigned to target node")
 
 // defaultOpenRouterMaxTokens is the output limit applied when a request
 // carries no explicit MaxTokens. 4096 keeps long code-generation answers
@@ -60,11 +67,12 @@ var openRouterRateLimitBackoffBase = time.Second
 // ID" and must be mapped before dispatch.
 var openRouterModelIDRe = regexp.MustCompile(`^[^/\s]+/[^/\s]+$`)
 
-// SanitizeModelForOpenRouter maps a model ID onto a valid OpenRouter model ID.
-// Local/Ollama IDs (e.g. "qwen2.5-coder:7b") carry no vendor prefix and are
-// rejected by OpenRouter with status 400; they are remapped to the provider's
-// default model. Returns "" only when neither the requested nor the fallback
-// model is valid for OpenRouter.
+// SanitizeModelForOpenRouter validates a model ID against OpenRouter's
+// vendor/model schema. It returns the trimmed model when it matches
+// vendor/model, otherwise "". The fallback argument is retained for
+// backward compatibility with callers that probe both values but is NOT used
+// as an implicit substitution during live invocation — invalid IDs are
+// rejected rather than remapped.
 func SanitizeModelForOpenRouter(model, fallback string) string {
 	for _, candidate := range []string{model, fallback} {
 		candidate = strings.TrimSpace(candidate)
@@ -75,16 +83,19 @@ func SanitizeModelForOpenRouter(model, fallback string) string {
 	return ""
 }
 
-// resolveModel returns the effective model ID for a request, remapping any
-// local/non-OpenRouter ID onto the provider default so the API never rejects
-// the payload with HTTP 400. Returns an error when no valid ID is available.
+// resolveModel returns the effective model ID for a request. The model ID is
+// passed verbatim — no hardcoded fallback substitution. An empty model is
+// rejected locally with ErrUnassignedTargetModel before any HTTP request.
+// An invalid vendor/model format is rejected with a deterministic error.
+// The provider's configured p.model is NOT used as a silent fallback; every
+// invocation MUST carry an explicit model binding from the Workspace Target.
 func (p *OpenRouterProvider) resolveModel(reqModel string) (string, error) {
-	model := p.model
-	if reqModel != "" {
-		model = reqModel
+	model := strings.TrimSpace(reqModel)
+	if model == "" {
+		return "", fmt.Errorf("%w", ErrUnassignedTargetModel)
 	}
-	if model = SanitizeModelForOpenRouter(model, p.model); model == "" {
-		return "", fmt.Errorf("openrouter: no valid model ID configured (got %q)", p.model)
+	if !openRouterModelIDRe.MatchString(model) {
+		return "", fmt.Errorf("openrouter: invalid model ID %q: must match vendor/model", model)
 	}
 	return model, nil
 }

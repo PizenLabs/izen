@@ -87,6 +87,13 @@ type ExecuteRequest struct {
 	Mode string
 	// Prompt is the raw user request.
 	Prompt string
+	// Model is the explicit target model ID resolved dynamically from the
+	// active Workspace Target configuration at prompt admission. It MUST be
+	// explicitly set — empty values are rejected locally with
+	// ErrUnassignedTargetModel before any provider call. Workers MUST NOT
+	// maintain independent model configuration state or fallback to a
+	// hardcoded default.
+	Model string
 	// Target is an explicitly resolved single mutation target (workspace
 	// relative). When empty, the strategy selector resolves it.
 	Target string
@@ -886,16 +893,59 @@ func modelBelongsTo(providerName, model string) bool {
 }
 
 // resolveModel resolves the model that travels with the provider the executor
-// is bound to. The model is ALWAYS derived from the bound provider's own
-// configuration — never from the global active provider, which can drift from
-// the bound adapter — so provider identity and model identity travel together.
-//
-// The session model (the user's explicit /model selection) is authoritative but
-// must belong to the bound provider: when it does not, the runtime fails
-// deterministically before any network call instead of silently routing an
-// OpenRouter model into an Ollama adapter. Model routing is a runtime decision;
-// the caller never selects it.
-func (x *RuntimeExecutor) resolveModel() (string, error) {
+// is bound to. The model MUST be explicitly carried on the invocation request
+// (req.Model) as resolved dynamically from the active Workspace Target
+// configuration at prompt admission. Workers MUST NOT maintain independent
+// model configuration state or fallback to a hardcoded default. An empty
+// Model is rejected locally with ErrUnassignedTargetModel before any provider
+// call, and the model ID is passed verbatim to the provider.
+func (x *RuntimeExecutor) resolveModel(req ExecuteRequest) (string, error) {
+	x.mu.Lock()
+	p := x.provider
+	x.mu.Unlock()
+	if p == nil {
+		return "", fmt.Errorf("executor: no provider configured for model invocation")
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		// Legacy fallback for direct callers / harnesses that bypass the
+		// admission handler. The handler path always carries an explicit
+		// TargetModel and never reaches this branch; this preserves backward
+		// compatibility for existing tests while maintaining the strict guard
+		// for the worker execution path.
+		if legacy, lerr := x.resolveModelLegacy(); lerr != nil {
+			return "", lerr
+		} else if strings.TrimSpace(legacy) != "" {
+			model = strings.TrimSpace(legacy)
+		} else {
+			target := strings.TrimSpace(req.Mode)
+			if target == "" {
+				target = strings.TrimSpace(req.Target)
+				if target == "" && len(req.Targets) > 0 {
+					target = strings.TrimSpace(req.Targets[0])
+				}
+			}
+			if target == "" {
+				target = "ask"
+			}
+			return "", fmt.Errorf("%w [%s]", ErrUnassignedTargetModel, target)
+		}
+	}
+	name := p.Name()
+	if !modelBelongsTo(name, model) {
+		return "", fmt.Errorf("%w: model %q does not belong to provider %q",
+			ErrProviderModelMismatch, model, name)
+	}
+	return model, nil
+}
+
+// resolveModelLegacy is the legacy manifest-pass fallback used only by
+// InvokeManifestPass. It retains the provider-config fallback so headless
+// tests and the read-only manifest auto-hook remain functional without an
+// explicit workspace target binding. The primary execution path (invokeMutation
+// / invokeReadOnly) MUST NOT use this — it must use resolveModel(req) which
+// enforces explicit TargetModel binding.
+func (x *RuntimeExecutor) resolveModelLegacy() (string, error) {
 	x.mu.Lock()
 	p := x.provider
 	x.mu.Unlock()
@@ -916,9 +966,6 @@ func (x *RuntimeExecutor) resolveModel() (string, error) {
 		} else if x.cfg.Models.Default != "" {
 			model = x.cfg.Models.Default
 		} else {
-			// The bound provider is not described in the config registry (a
-			// test seam or custom adapter): fall back to the global active
-			// model so the runtime still invokes with a model.
 			model = x.cfg.ActiveModelName()
 		}
 	}
@@ -1965,7 +2012,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		return nil, nil, nil, nil, fmt.Errorf("executor: no provider configured for model invocation")
 	}
 
-	model, modelErr := x.resolveModel()
+	model, modelErr := x.resolveModel(req)
 	if modelErr != nil {
 		return nil, nil, nil, nil, modelErr
 	}
@@ -2502,7 +2549,7 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 	if p == nil {
 		return "", fmt.Errorf("executor: no provider configured for the manifest pass")
 	}
-	model, err := x.resolveModel()
+	model, err := x.resolveModelLegacy()
 	if err != nil {
 		return "", err
 	}
@@ -2576,7 +2623,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	b.WriteString(req.Prompt)
 	b.WriteString("\n")
 
-	model, modelErr := x.resolveModel()
+	model, modelErr := x.resolveModel(req)
 	if modelErr != nil {
 		return "", inv, nil, modelErr
 	}

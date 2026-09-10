@@ -107,10 +107,8 @@ func TestRoleBindingHotkeyEmitsCommand(t *testing.T) {
 		t.Fatal("quick assign hotkey 'a' must return a tea.Cmd emitting ModelAssignmentRequestedMsg")
 	}
 	msg := cmd()
-	assign, ok := msg.(ModelAssignmentRequestedMsg)
-	if !ok {
-		t.Fatalf("cmd msg = %T, want ModelAssignmentRequestedMsg", msg)
-	}
+	// Unwrap tea.BatchMsg to find the assignment message.
+	assign := unwrapAssignmentMsg(t, msg)
 	if string(assign.Target) != "plan" {
 		t.Errorf("target = %q, want plan", string(assign.Target))
 	}
@@ -134,7 +132,8 @@ func TestAllRoleHotkeysEmit(t *testing.T) {
 	if cmd == nil {
 		t.Fatalf("key 3 must emit assignment command in detail")
 	}
-	assign := cmd().(ModelAssignmentRequestedMsg)
+	msg := cmd()
+	assign := unwrapAssignmentMsg(t, msg)
 	if string(assign.Target) != string(TargetPlan) {
 		t.Errorf("target = %q, want %q", string(assign.Target), TargetPlan)
 	}
@@ -258,4 +257,31 @@ func TestScopeToggleFlowsIntoCommand(t *testing.T) {
 	if m.Focus() != FocusList {
 		t.Fatalf("after second Tab, focus = %v, want FocusList", m.Focus())
 	}
+}
+
+// unwrapAssignmentMsg extracts ModelAssignmentRequestedMsg from a tea.Msg that
+// may be it directly or wrapped inside a tea.BatchMsg.
+func unwrapAssignmentMsg(t *testing.T, msg tea.Msg) ModelAssignmentRequestedMsg {
+	t.Helper()
+	if msg == nil {
+		t.Fatal("msg is nil")
+	}
+	if assign, ok := msg.(ModelAssignmentRequestedMsg); ok {
+		return assign
+	}
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("msg = %T, want ModelAssignmentRequestedMsg or tea.BatchMsg", msg)
+	}
+	for _, cmdFn := range batch {
+		if cmdFn == nil {
+			continue
+		}
+		result := cmdFn()
+		if assign, ok := result.(ModelAssignmentRequestedMsg); ok {
+			return assign
+		}
+	}
+	t.Fatalf("no ModelAssignmentRequestedMsg found in BatchMsg of length %d", len(batch))
+	return ModelAssignmentRequestedMsg{}
 }

@@ -17,6 +17,7 @@ package model_picker
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -155,6 +156,14 @@ type Model struct {
 	// state is the two-step picker state machine (browsing vs detail).
 	state PickerState
 
+	// detailModel is the immutable selection pinned on the
+	// StateBrowsing -> StateDetail transition (Enter). StateDetail binds
+	// exclusively to this copy — never to m.filtered[m.cursor] — so
+	// background SnapshotMsg refilters (relevance re-sort) or cursor
+	// clamps can never retarget the inspected model mid-detail. Cleared
+	// on Esc back to browsing. Nil outside StateDetail.
+	detailModel *registry.ModelDescriptor
+
 	// activeWorkspace is the contextual workspace target for fast-path assignment.
 	activeWorkspace WorkspaceTarget
 
@@ -166,7 +175,13 @@ type Model struct {
 
 	// reasoningIdx selects within the highlighted model's permitted options
 	// (adapter.OptionsForMode). Fixed/None modes ignore it.
+	// Deprecated alias of selectedReasoningOptIdx: both are kept in sync.
 	reasoningIdx int
+	// selectedReasoningOptIdx is the canonical index into the model's real
+	// ReasoningCapability.Options (see CapabilityResolver). The r key cycles
+	// strictly through valid model options; assignment payloads derive the
+	// concrete ReasoningOption.ID from this index.
+	selectedReasoningOptIdx int
 	// isGlobal selects the BindModelToRoleCommand target scope.
 	isGlobal bool
 
@@ -219,7 +234,7 @@ func New(snap *registry.ModelSnapshot) Model {
 		searchFocused:   false,
 		searchInput:     searchInputModel{Width: searchInputWidth, focused: false},
 		state:           StateBrowsing,
-		activeWorkspace: TargetAsk,
+		activeWorkspace: TargetNone,
 		targetCursor:    0,
 		reasoningPolicy: "default",
 	}
@@ -437,8 +452,42 @@ func (m Model) ReasoningPolicyValue() string { return m.reasoningPolicy }
 // SetReasoningPolicy sets the reasoning policy.
 func (m Model) SetReasoningPolicy(p string) Model { m.reasoningPolicy = p; return m }
 
-// SelectedModel returns the highlighted model or nil (spec alias of Highlighted).
-func (m Model) SelectedModel() *registry.ModelDescriptor { return m.Highlighted() }
+// SelectedModel returns the model the picker acts on: the immutable pinned
+// detail selection while in StateDetail, the live highlight otherwise.
+// Detail binding must never recalculate against the mutable filtered list
+// (a background refilter re-sort would silently retarget the assignment).
+func (m Model) SelectedModel() *registry.ModelDescriptor {
+	if m.state == StateDetail && m.detailModel != nil {
+		return m.detailModel
+	}
+	return m.Highlighted()
+}
+
+// DetailModel reports the pinned StateDetail selection, or nil when not in
+// detail (or when detail was entered with no highlight, which cannot happen
+// via the Enter transition — it requires a non-nil highlight to pin).
+func (m Model) DetailModel() *registry.ModelDescriptor {
+	if m.state == StateDetail && m.detailModel != nil {
+		return m.detailModel
+	}
+	return nil
+}
+
+// pinDetail captures an immutable copy of the highlighted model for the
+// StateDetail session. The copy (not a slice alias) survives refilter
+// reallocations and re-sorts.
+func (m *Model) pinDetail() {
+	hl := m.Highlighted()
+	if hl == nil {
+		m.detailModel = nil
+		return
+	}
+	cp := *hl
+	m.detailModel = &cp
+}
+
+// clearDetail releases the pinned selection on exit back to browsing.
+func (m *Model) clearDetail() { m.detailModel = nil }
 
 // getInitialTargetIndex returns the cursor init position for the assignment drawer.
 func (m Model) getInitialTargetIndex() int {
@@ -461,25 +510,19 @@ func (m Model) isModelAssignedToTarget(modelID string, target WorkspaceTarget) b
 	return false
 }
 
-// cycleReasoningPolicy rotates through default/off/auto/on.
+// cycleReasoningPolicy cycles strictly through the highlighted model's real
+// ReasoningCapability.Options via selectedReasoningOptIdx.
+// Truthful guard (I6): no-op when the highlighted model is unsupported,
+// provider-managed (not configurable), or declares zero options, so pressing
+// r never fabricates state.
 func (m *Model) cycleReasoningPolicy() {
-	policies := []string{"default", "off", "auto", "on"}
-	idx := 0
-	for i, p := range policies {
-		if p == m.reasoningPolicy {
-			idx = i
-			break
-		}
+	rcap := m.CapabilityForHighlighted()
+	if !rcap.Supported || !rcap.Configurable || len(rcap.Options) == 0 {
+		return
 	}
-	m.reasoningPolicy = policies[(idx+1)%len(policies)]
-}
-
-// clearSearch empties the query and reapplies filter.
-func (m *Model) clearSearch() {
-	m.query = ""
-	m.searchInput.SetValue("")
-	m.searchInput.value = ""
-	m.applyFilter()
+	m.selectedReasoningOptIdx = (m.selectedReasoningOptIdx + 1) % len(rcap.Options)
+	m.reasoningIdx = m.selectedReasoningOptIdx
+	m.syncReasoningPolicy()
 }
 
 // moveCursor shifts cursor clamped to filtered list (lowercase alias for MoveCursor).
@@ -487,14 +530,29 @@ func (m *Model) moveCursor(delta int) {
 	*m = m.MoveCursor(delta)
 }
 
-// emitAssignmentCmd builds a ModelAssignmentRequestedMsg command.
+// emitAssignmentCmd builds a ModelAssignmentRequestedMsg command carrying the
+// concrete semantic intent: the selected ReasoningOption.ID derived from
+// caps.Options[selectedReasoningOptIdx] (e.g. "low", "high", "budget_8k"),
+// not a generic "default". Non-configurable models fall back to "default".
 func (m Model) emitAssignmentCmd(model *registry.ModelDescriptor, target WorkspaceTarget) tea.Cmd {
 	if model == nil {
 		return nil
 	}
-	policy := m.reasoningPolicy
-	if policy == "" {
-		policy = "default"
+	policy := "default"
+	if caps := model.GetReasoningCapability(); caps.Supported && caps.Configurable && len(caps.Options) > 0 {
+		idx := m.selectedReasoningOptIdx
+		if idx < 0 || idx >= len(caps.Options) {
+			idx = 0
+		}
+		if id := caps.Options[idx].ID; id != "" {
+			policy = id
+		}
+	} else if m.reasoningPolicy != "" {
+		// Preserve legacy explicit policy for non-configurable paths.
+		policy = m.reasoningPolicy
+		if policy == "" {
+			policy = "default"
+		}
 	}
 	return func() tea.Msg {
 		return ModelAssignmentRequestedMsg{
@@ -515,8 +573,13 @@ func (m Model) SetScope(global bool) Model { m.isGlobal = global; return m }
 // ToggleScope flips local vs global.
 func (m Model) ToggleScope() Model { m.isGlobal = !m.isGlobal; return m }
 
-// ReasoningIndex reports the raw reasoning option index.
-func (m Model) ReasoningIndex() int { return m.reasoningIdx }
+// ReasoningIndex reports the raw reasoning option index (canonical
+// selectedReasoningOptIdx).
+func (m Model) ReasoningIndex() int { return m.selectedReasoningOptIdx }
+
+// SelectedReasoningOptIdx reports the canonical index into the model's real
+// ReasoningCapability.Options.
+func (m Model) SelectedReasoningOptIdx() int { return m.selectedReasoningOptIdx }
 
 // Models returns the full snapshot list (defensive copy; snapshot untouched).
 func (m Model) Models() []registry.ModelDescriptor {
@@ -768,6 +831,14 @@ func (m *Model) refilter() {
 		src = m.snap.Models
 	}
 	m.filtered = filterLocal(src, m.query, m.provider)
+	// Sort by workspace-relevance score (highest first), then preserve original
+	// insertion order for equal scores (stable sort) so unfiltered lists stay
+	// deterministic.
+	sort.SliceStable(m.filtered, func(i, j int) bool {
+		si := m.calculateRelevanceScore(&m.filtered[i])
+		sj := m.calculateRelevanceScore(&m.filtered[j])
+		return si > sj // higher score first; stable preserves insertion on tie
+	})
 	if m.cursor >= len(m.filtered) {
 		m.cursor = len(m.filtered) - 1
 	}
@@ -788,6 +859,43 @@ func (m *Model) applyFilter() {
 // classifier in View, so no cached state needs rebuilding. It exists to make
 // the badge-update dataflow explicit at binding-confirmation time.
 func (m *Model) refreshBadges() {}
+
+// filterLocal mirrors Registry.Filter for snapshot slices via the shared
+// MatchesQuery matcher (multi-field tokens) plus exact provider match.
+// Zero I/O.
+func (m Model) calculateRelevanceScore(desc *registry.ModelDescriptor) int {
+	score := 0
+	if desc == nil {
+		return score
+	}
+	switch m.activeWorkspace {
+	case TargetPlan, TargetInvestigate:
+		if desc.IsThinking || hasCapability(desc.Capabilities, registry.CapThinking) {
+			score += 50
+		}
+		if desc.ContextWindow >= 100000 {
+			score += 30
+		}
+	case TargetBuild:
+		if hasCapability(desc.Capabilities, registry.CapTools) {
+			score += 40
+		}
+	case TargetAsk:
+		if desc.InputCostPerM == 0 {
+			score += 20
+		}
+	}
+	return score
+}
+
+func hasCapability(caps []registry.ModelCapability, cap registry.ModelCapability) bool {
+	for _, c := range caps {
+		if c == cap {
+			return true
+		}
+	}
+	return false
+}
 
 // filterLocal mirrors Registry.Filter for snapshot slices via the shared
 // MatchesQuery matcher (multi-field tokens) plus exact provider match.
