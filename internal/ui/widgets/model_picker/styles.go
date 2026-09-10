@@ -37,6 +37,11 @@ var (
 				Foreground(lipgloss.Color("#cdd6f4")).
 				Background(lipgloss.Color("#313244"))
 
+	// allModelsStyle distinguishes the synthetic [All models] global-scope
+	// entry in the providers pane. Sky (#89dceb) keeps it visually distinct
+	// from provider rows while staying quieter than the active highlight.
+	allModelsStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89dceb"))
+
 	// inactiveProviderStyle renders unselected provider pills in Surface2.
 	//nolint:unused // retained for spec compatibility
 	inactiveProviderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))

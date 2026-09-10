@@ -229,7 +229,7 @@ func TestReasoningFidelity(t *testing.T) {
 	}
 }
 
-// Tab toggles focus between PaneProviders and PaneModels (dual-pane spec).
+// Tab cycles focus Providers -> Models -> Roles -> Providers (3-pane spec).
 func TestScopeToggleFlowsIntoCommand(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	if m.PaneFocus() != PaneProviders {
@@ -240,8 +240,12 @@ func TestScopeToggleFlowsIntoCommand(t *testing.T) {
 		t.Fatalf("after Tab, pane focus = %v, want PaneModels", m.PaneFocus())
 	}
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
-	if m.PaneFocus() != PaneProviders {
-		t.Fatalf("after second Tab, pane focus = %v, want PaneProviders", m.PaneFocus())
+	if m.PaneFocus() != PaneRoles || !m.ShowingRoles() {
+		t.Fatalf("after second Tab, pane focus = %v/showingRoles=%v, want PaneRoles/true", m.PaneFocus(), m.ShowingRoles())
+	}
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if m.PaneFocus() != PaneProviders || m.ShowingRoles() {
+		t.Fatalf("after third Tab, pane focus = %v/showingRoles=%v, want PaneProviders/false", m.PaneFocus(), m.ShowingRoles())
 	}
 }
 

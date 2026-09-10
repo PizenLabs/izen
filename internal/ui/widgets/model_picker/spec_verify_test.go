@@ -115,7 +115,10 @@ func TestDefaultCycleRoundTrip(t *testing.T) {
 	}
 }
 
-// FocusScope state machine: Tab toggles PaneProviders/PaneModels, Enter commits in PaneModels.
+// FocusScope state machine: Tab cycles Providers -> Models -> Roles ->
+// Providers; Enter commits in PaneModels (or binds roles while Roles Pane is
+// active); Enter/Alt+A on an unconfigured provider opens the secure API-key
+// overlay (SaveProviderKeyMsg on submit, ApiKeyInputClosedMsg on Esc).
 func TestFocusScopeStateMachine(t *testing.T) {
 	snap := &registry.ModelSnapshot{
 		Models: testModels(),
@@ -129,34 +132,75 @@ func TestFocusScopeStateMachine(t *testing.T) {
 	if m.PaneFocus() != PaneProviders {
 		t.Fatalf("initial pane focus = %v, want PaneProviders", m.PaneFocus())
 	}
-	// Tab toggles to PaneModels
+	// Tab cycles to PaneModels
 	mTab, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
 	if mTab.PaneFocus() != PaneModels {
-		t.Errorf("Tab must toggle to PaneModels, got %v", mTab.PaneFocus())
+		t.Errorf("Tab must cycle to PaneModels, got %v", mTab.PaneFocus())
 	}
-	// Second Tab toggles back to PaneProviders
+	// Second Tab cycles to PaneRoles (showingRoles turns on)
 	mTab2, _ := mTab.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
-	if mTab2.PaneFocus() != PaneProviders {
-		t.Errorf("second Tab must toggle back to PaneProviders, got %v", mTab2.PaneFocus())
+	if mTab2.PaneFocus() != PaneRoles {
+		t.Errorf("second Tab must cycle to PaneRoles, got %v", mTab2.PaneFocus())
+	}
+	if !mTab2.ShowingRoles() {
+		t.Errorf("PaneRoles entry must show the roles pane (showingRoles=true)")
+	}
+	// Third Tab cycles back to PaneProviders (roles pane off)
+	mTab3, _ := mTab2.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if mTab3.PaneFocus() != PaneProviders || mTab3.ShowingRoles() {
+		t.Errorf("third Tab must cycle to PaneProviders with showingRoles off, got %v/%v", mTab3.PaneFocus(), mTab3.ShowingRoles())
 	}
 
-	// Alt+A in PaneProviders emits ConfigureProviderMsg
-	_, cmdAlt := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a"), Alt: true})
-	if cmdAlt == nil {
-		t.Fatal("Alt+A in PaneProviders must emit ConfigureProviderMsg")
+	// Alt+A in PaneProviders (on a real provider, past the All models entry)
+	// opens the secure API-key overlay.
+	nav, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
+	mOpen, cmdKey := nav.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a"), Alt: true})
+	if cmdKey == nil {
+		t.Fatal("Alt+A in PaneProviders must open the API-key overlay")
 	}
-	if msg, ok := cmdAlt().(ConfigureProviderMsg); !ok || !strings.Contains(msg.Provider, "openrouter") {
-		t.Fatalf("Alt+A msg = %#v, want ConfigureProviderMsg openrouter", cmdAlt())
+	if msg, ok := cmdKey().(ApiKeyInputOpenedMsg); !ok || msg.Provider != "openrouter" {
+		t.Fatalf("Alt+A msg = %#v, want ApiKeyInputOpenedMsg openrouter", cmdKey())
+	}
+	if mOpen.apiKeyInput == nil {
+		t.Fatal("Alt+A must activate the inline API-key input")
+	}
+	// Esc cancels the overlay.
+	mClosed, cmdClose := mOpen.UpdateModel(tea.KeyMsg{Type: tea.KeyEsc})
+	if mClosed.apiKeyInput != nil {
+		t.Fatal("Esc must close the API-key overlay")
+	}
+	if msg, ok := cmdClose().(ApiKeyInputClosedMsg); !ok || msg.Provider != "openrouter" {
+		t.Fatalf("Esc msg = %#v, want ApiKeyInputClosedMsg openrouter", cmdClose())
 	}
 
-	// Enter in PaneModels commits and closes
-	mModels := New(snap).SetPaneFocus(PaneModels)
+	// Enter in the overlay submits SaveProviderKeyMsg with the masked value.
+	mSubmit, _ := mOpen.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("sk-test-123")})
+	mSubmit, cmdSave := mSubmit.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if msg, ok := cmdSave().(SaveProviderKeyMsg); !ok || msg.Provider != "openrouter" || msg.APIKey != "sk-test-123" {
+		t.Fatalf("Enter msg = %#v, want SaveProviderKeyMsg openrouter/sk-test-123", cmdSave())
+	}
+	if mSubmit.apiKeyInput != nil {
+		t.Fatal("Enter must close the API-key overlay after submit")
+	}
+
+	// Enter in PaneRoles switches to the models pane for assignment.
+	mRole := m.SetPaneFocus(PaneRoles).SetShowingRoles(true)
+	mAssign, _ := mRole.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if mAssign.PaneFocus() != PaneModels {
+		t.Errorf("Enter in PaneRoles must switch to PaneModels, got %v", mAssign.PaneFocus())
+	}
+
+	// Enter in PaneModels while showing roles binds the model to the role.
+	mModels := New(snap).SetPaneFocus(PaneModels).SetShowingRoles(true)
 	_, cmd := mModels.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
-		t.Fatal("Enter in PaneModels must emit assignment command")
+		t.Fatal("Enter in PaneModels (roles active) must emit role override command")
+	}
+	if msg, ok := cmd().(RolePolicyOverrideMsg); !ok || msg.Role != RoleOverridePlan || msg.ModelID == "" {
+		t.Fatalf("roles Enter msg = %#v, want RolePolicyOverrideMsg plan with model", cmd())
 	}
 
-	// Down moves cursor in PaneProviders pane (provider list)
+	// Down moves provider cursor in PaneProviders pane (0 = All models entry)
 	mDown, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
 	if mDown.ProviderCursor() != 1 {
 		t.Errorf("down must move provider cursor, got %d want 1", mDown.ProviderCursor())
@@ -188,8 +232,9 @@ func TestSearchFocusTypingDoesNotBind(t *testing.T) {
 }
 
 // Header focus indicator renders the active pane scope: Focus: [PROVIDERS]
-// (Tab to Models) in providers focus and Focus: [MODELS] (Tab to Providers)
-// in models focus. Default is [PROVIDERS] per dual-pane UX spec.
+// (Tab to Models) in providers focus, Focus: [MODELS] (Tab to Roles) in
+// models focus and Focus: [ROLES] (Tab to Providers) in roles focus.
+// Default is [PROVIDERS] per the 3-pane UX spec.
 func TestHeaderFocusIndicator(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	view := m.View()
@@ -198,11 +243,19 @@ func TestHeaderFocusIndicator(t *testing.T) {
 	}
 	m = m.SetPaneFocus(PaneModels)
 	view2 := m.View()
-	if !strings.Contains(view2, "[MODELS]") || !strings.Contains(view2, "Tab to Providers") {
-		t.Errorf("models-focus header must show Focus: [MODELS] (Tab to Providers), got:\n%s", view2)
+	if !strings.Contains(view2, "[MODELS]") || !strings.Contains(view2, "Tab to Roles") {
+		t.Errorf("models-focus header must show Focus: [MODELS] (Tab to Roles), got:\n%s", view2)
 	}
 	if strings.Contains(view2, "[PROVIDERS]") {
 		t.Errorf("models-focus header must not show [PROVIDERS]:\n%s", view2)
+	}
+	m = m.SetPaneFocus(PaneRoles).SetShowingRoles(true)
+	view3 := m.View()
+	if !strings.Contains(view3, "[ROLES]") || !strings.Contains(view3, "Tab to Providers") {
+		t.Errorf("roles-focus header must show Focus: [ROLES] (Tab to Providers), got:\n%s", view3)
+	}
+	if !strings.Contains(view3, "Plan / Thinking") {
+		t.Errorf("roles view must render the Plan/Thinking override entry:\n%s", view3)
 	}
 }
 

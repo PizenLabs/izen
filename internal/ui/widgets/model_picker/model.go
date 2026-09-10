@@ -20,11 +20,13 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	"github.com/PizenLabs/izen/internal/domain/role"
 	"github.com/PizenLabs/izen/internal/provider/registry"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 )
 
 // searchInputModel mirrors the task spec's TextInput lock: width is forced
@@ -158,10 +160,34 @@ type Model struct {
 	// Replaces FocusScope for browsing navigation.
 	paneFocus PaneFocus
 
-	// providerCursor is the highlight index within the derived provider
-	// list (from snap.Providers). Drives the left-pane selection and
+	// providerCursor is the highlight index within the DERIVED provider list:
+	// index 0 is the synthetic "[All models]" entry (filter ""), indexes
+	// 1..N are the snapshot providers. Drives the left-pane selection and
 	// determines which provider's models appear in the right pane.
 	providerCursor int
+
+	// recentBindings is the most-recently-used model list, newest first.
+	// It is a non-mutating view model seeded by the parent (SetRecentBindings)
+	// and rendered as a pinned RECENTLY USED section; the parent persists it
+	// to .izen/state.json. This widget never performs that I/O itself.
+	recentBindings []authority.ModelBinding
+
+	// showingRoles selects the top-level Roles policy pane on the left side
+	// (Plan/Thinking and Commit/Fast overrides) instead of the providers list.
+	showingRoles bool
+	// roleCursor selects within the Roles list while displaying the roles pane.
+	roleCursor int
+
+	// apiKeyInput is non-nil while the secure inline API-key overlay is open.
+	// When set, all browsing keys route to the textinput (EchoPassword) and
+	// submission emits SaveProviderKeyMsg for the parent to persist.
+	apiKeyInput    *textinput.Model
+	apiKeyProvider string
+
+	// policyOverrides is the picker-local read model of role policy overrides
+	// (seeded by the parent from persisted config via SetRoleOverrides). It
+	// powers the Roles pane summaries; mutations go out as RolePolicyOverrideMsg.
+	policyOverrides map[string]OverrideBinding
 
 	// state is the two-step picker state machine (browsing vs detail).
 	state PickerState
@@ -241,16 +267,16 @@ func New(snap *registry.ModelSnapshot) Model {
 		searchFocused:   false,
 		paneFocus:       PaneProviders,
 		providerCursor:  0,
+		showingRoles:    false,
+		roleCursor:      0,
 		searchInput:     searchInputModel{Width: searchInputWidth, focused: false},
 		state:           StateBrowsing,
 		activeWorkspace: "",
 		reasoningPolicy: "default",
 	}
-	// Sync initial provider from providerCursor so right pane shows
-	// the first provider's models from the start.
-	if names := m.providerNames(); len(names) > 0 {
-		m.provider = names[0]
-	}
+	// providerCursor 0 is the synthetic "[All models]" entry: the right pane
+	// starts in global scope across every provider.
+	m.syncProviderFromCursor()
 	m.refilter()
 	m.resetReasoning()
 	return m
@@ -450,22 +476,48 @@ func (m Model) SetPaneFocus(p PaneFocus) Model {
 // ProviderCursor returns the highlight index within the provider list.
 func (m Model) ProviderCursor() int { return m.providerCursor }
 
-// SetProviderCursor jumps to a provider index, clamped to bounds, and
-// syncs the provider filter for the models pane.
-func (m Model) SetProviderCursor(i int) Model {
+// providerEntryCount returns the size of the derived provider list shown in
+// the left pane: the synthetic "[All models]" entry plus one row per
+// snapshot provider.
+func (m Model) providerEntryCount() int {
+	return len(m.providerNames()) + 1
+}
+
+// isAllModelsSelected reports whether the provider cursor is on the
+// synthetic "[All models]" entry (global scope).
+func (m Model) isAllModelsSelected() bool {
+	return m.providerCursor <= 0
+}
+
+// syncProviderFromCursor derives the provider filter from providerCursor:
+// index 0 (All models) yields the empty filter (global scope); indexes 1..N
+// map onto snapshot providers.
+func (m *Model) syncProviderFromCursor() {
 	names := m.providerNames()
-	if len(names) == 0 {
+	if m.providerCursor <= 0 || len(names) == 0 || m.providerCursor-1 >= len(names) {
+		m.provider = ""
+		return
+	}
+	m.provider = names[m.providerCursor-1]
+}
+
+// SetProviderCursor jumps to a provider-list index (0 = [All models]),
+// clamped to bounds, and syncs the provider filter for the models pane.
+func (m Model) SetProviderCursor(i int) Model {
+	count := m.providerEntryCount()
+	if count == 0 {
 		m.providerCursor = 0
+		m.provider = ""
 		return m
 	}
 	if i < 0 {
 		i = 0
 	}
-	if i >= len(names) {
-		i = len(names) - 1
+	if i >= count {
+		i = count - 1
 	}
 	m.providerCursor = i
-	m.provider = names[i]
+	m.syncProviderFromCursor()
 	m.cursor = 0
 	m.refilter()
 	m.resetReasoning()
@@ -484,13 +536,31 @@ func (m Model) providerNames() []string {
 	return names
 }
 
-// highlightedProvider returns the provider name at providerCursor, or "" if empty.
+// highlightedProvider returns the actual provider name at providerCursor
+// (without the [All models] entry), or "" when the All models entry or no
+// provider is highlighted.
 func (m Model) highlightedProvider() string {
-	names := m.providerNames()
-	if len(names) == 0 || m.providerCursor < 0 || m.providerCursor >= len(names) {
+	if m.isAllModelsSelected() {
 		return ""
 	}
-	return names[m.providerCursor]
+	names := m.providerNames()
+	idx := m.providerCursor - 1
+	if len(names) == 0 || idx < 0 || idx >= len(names) {
+		return ""
+	}
+	return names[idx]
+}
+
+// highlightedProviderLabel returns the display label for the left-pane
+// highlight: "[All models]" for the synthetic entry, else the provider name.
+func (m Model) highlightedProviderLabel() string {
+	if m.isAllModelsSelected() {
+		return "All models"
+	}
+	if name := m.highlightedProvider(); name != "" {
+		return name
+	}
+	return "—"
 }
 
 // isProviderConfigured reports whether a provider has successfully loaded
@@ -509,21 +579,130 @@ func (m Model) isProviderConfigured(name string) bool {
 
 // moveProviderCursor shifts the provider highlight and syncs the filter.
 func (m *Model) moveProviderCursor(delta int) {
-	names := m.providerNames()
-	if len(names) == 0 {
+	count := m.providerEntryCount()
+	if count <= 0 {
 		return
 	}
 	m.providerCursor += delta
 	if m.providerCursor < 0 {
 		m.providerCursor = 0
 	}
-	if m.providerCursor >= len(names) {
-		m.providerCursor = len(names) - 1
+	if m.providerCursor >= count {
+		m.providerCursor = count - 1
 	}
-	m.provider = names[m.providerCursor]
+	m.syncProviderFromCursor()
 	m.cursor = 0
 	m.refilter()
 	m.resetReasoning()
+}
+
+// SetRecentBindings seeds the MRU list (newest first). The widget treats it
+// as an immutable view model; persistence to .izen/state.json is owned by the
+// parent.
+func (m Model) SetRecentBindings(recent []authority.ModelBinding) Model {
+	m.recentBindings = make([]authority.ModelBinding, len(recent))
+	copy(m.recentBindings, recent)
+	return m
+}
+
+// RecentBindings returns a copy of the MRU list (newest first).
+func (m Model) RecentBindings() []authority.ModelBinding {
+	return append([]authority.ModelBinding(nil), m.recentBindings...)
+}
+
+// AddRecentModel records a model activation at the front of the MRU list,
+// deduplicating against the full backing list. The parent persists the
+// resulting list; the picker renders it pinned at the top of the models pane.
+func (m Model) AddRecentModel(id, provider string) Model {
+	if id == "" {
+		return m
+	}
+	var out []authority.ModelBinding
+	out = append(out, authority.ModelBinding{ProviderID: authority.ProviderID(provider), ModelID: authority.ModelID(id)})
+	for _, b := range m.recentBindings {
+		if string(b.ModelID) == id {
+			continue
+		}
+		out = append(out, b)
+	}
+	const maxRecent = 12
+	if len(out) > maxRecent {
+		out = out[:maxRecent]
+	}
+	m.recentBindings = out
+	return m
+}
+
+// ShowingRoles reports whether the Roles policy pane is displayed on the left.
+func (m Model) ShowingRoles() bool { return m.showingRoles }
+
+// SetShowingRoles toggles the Roles pane (Plan/Thinking, Commit/Fast).
+func (m Model) SetShowingRoles(v bool) Model {
+	m.showingRoles = v
+	return m
+}
+
+// ApiKeyInputActive reports whether the secure inline API-key capture overlay
+// is open. The parent uses it to keep Esc local to the overlay instead of
+// tearing down the whole modal.
+func (m Model) ApiKeyInputActive() bool { return m.apiKeyInput != nil }
+
+// RoleCursor returns the highlight index within the Roles list.
+func (m Model) RoleCursor() int { return m.roleCursor }
+
+// SetRoleCursor jumps to a Roles-list index, clamped to bounds.
+func (m Model) SetRoleCursor(i int) Model {
+	if i < 0 {
+		i = 0
+	}
+	if i >= roleOverrideCount {
+		i = roleOverrideCount - 1
+	}
+	m.roleCursor = i
+	return m
+}
+
+// moveRoleCursor shifts the Roles highlight, clamped to bounds.
+func (m *Model) moveRoleCursor(delta int) {
+	m.roleCursor += delta
+	if m.roleCursor < 0 {
+		m.roleCursor = 0
+	}
+	if m.roleCursor >= roleOverrideCount {
+		m.roleCursor = roleOverrideCount - 1
+	}
+}
+
+// HighlightedRole returns the role override key at the Roles cursor
+// (RoleOverridePlan | RoleOverrideCommit).
+func (m Model) HighlightedRole() string {
+	if m.roleCursor <= 0 {
+		return RoleOverridePlan
+	}
+	return RoleOverrideCommit
+}
+
+// RoleOverrideCount is the number of top-level role policy entries.
+const roleOverrideCount = 2
+
+// SetRoleOverrides seeds the picker-local read model of role policy
+// overrides from the parent's persisted config. Keys are the role override
+// constants (RoleOverridePlan | RoleOverrideCommit).
+func (m Model) SetRoleOverrides(overrides map[string]OverrideBinding) Model {
+	m.policyOverrides = make(map[string]OverrideBinding, len(overrides))
+	for k, v := range overrides {
+		if k == "" {
+			continue
+		}
+		m.policyOverrides[k] = v
+	}
+	return m
+}
+
+// RoleOverrideFor returns the seeded override binding for a role key.
+func (m Model) RoleOverrideFor(key string) (OverrideBinding, bool) {
+	ob, ok := m.policyOverrides[key]
+	return ob, ok
 }
 
 // State returns the current PickerState.
@@ -753,6 +932,7 @@ func (m Model) Select() Model {
 	m.done = true
 	m.activatedModelID = hl.ID
 	m.activatedProvider = hl.Provider
+	m = m.AddRecentModel(hl.ID, hl.Provider)
 	return m
 }
 

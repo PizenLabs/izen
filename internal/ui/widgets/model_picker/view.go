@@ -35,12 +35,65 @@ func formatCapabilities(caps []registry.ModelCapability) string {
 // View implements tea.Model. Renders the redesigned provider-centric control
 // surface: [PROVIDERS pane | MODELS pane] with capability-truthful variant
 // rendering (Supported / Unsupported / Unknown). The 5-workspace matrix and
-// 3-role assignment matrix are removed per Phase 3 spec.
+// 3-role assignment matrix are removed per Phase 3 spec. When the secure
+// inline API-key overlay is open it renders exclusively as that dialog.
 func (m Model) View() string {
+	if m.apiKeyInput != nil {
+		return m.renderApiKeyOverlay()
+	}
 	if m.state == StateDetail {
 		return m.renderDetailLayout()
 	}
 	return m.renderBrowsingLayout()
+}
+
+// renderApiKeyOverlay renders the secure inline API-key capture dialog. It is
+// the entire picker surface while open: title, masked text input (EchoPassword),
+// and save/cancel hints. Zero I/O: submission emits SaveProviderKeyMsg.
+func (m Model) renderApiKeyOverlay() string {
+	innerW := m.innerWidth
+	if innerW <= 0 {
+		innerW = m.width
+	}
+	if innerW <= 0 {
+		innerW = 64
+	}
+	innerH := m.innerHeight
+	if innerH <= 0 {
+		innerH = m.height
+	}
+
+	title := accentStyle.Render("SET API KEY — " + strings.ToUpper(m.apiKeyProvider))
+	hint := mutedStyle.Render("API key is masked · stored in provider config")
+
+	fieldPlain := "  " + m.apiKeyInput.View()
+	field := lipgloss.NewStyle().MaxWidth(innerW - 4).MaxHeight(1).Render(fieldPlain)
+
+	body := lipgloss.JoinVertical(lipgloss.Left,
+		title,
+		"",
+		hint,
+		"",
+		field,
+		"",
+		mutedStyle.Render("Enter save · Esc cancel"),
+	)
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#cba6f7")).
+		Width(max(16, innerW-4)).
+		Padding(1, 2).
+		Render(body)
+
+	// Hard clip to the modal bounds (strict single-line contract preserved).
+	if innerH > 0 {
+		lines := strings.Split(strings.ReplaceAll(box, "\r", ""), "\n")
+		if len(lines) > innerH {
+			lines = lines[:innerH]
+		}
+		box = strings.Join(lines, "\n")
+	}
+	return box
 }
 
 // renderBrowsingLayout renders the dual-pane provider-centric layout:
@@ -61,8 +114,8 @@ func (m Model) renderBrowsingLayout() string {
 	b.WriteString(m.renderDivider())
 	b.WriteString("\n")
 
-	// Dual pane: left providers, right models, with vertical separator.
-	leftPane := m.renderProvidersPane()
+	// Dual pane: left providers (or roles tab), right models, with vertical separator.
+	leftPane := m.renderLeftPane()
 	rightPane := m.renderModelsPane()
 	separator := m.buildVerticalSeparator()
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, separator, rightPane)
@@ -159,11 +212,12 @@ func (m Model) renderBrowsingFooter() string {
 		inner = 64
 	}
 
-	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s   %s %s",
-		keyStyle.Render("Tab"), descStyle.Render("select"),
+	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s   %s %s   %s %s",
+		keyStyle.Render("Tab"), descStyle.Render("select pane"),
 		keyStyle.Render("↑/↓"), descStyle.Render("navigate"),
-		keyStyle.Render("Enter"), descStyle.Render("activate"),
-		keyStyle.Render("Alt+A"), descStyle.Render("configure"),
+		keyStyle.Render("Enter"), descStyle.Render("activate / save key"),
+		keyStyle.Render("Alt+A"), descStyle.Render("set API key"),
+		keyStyle.Render("i"), descStyle.Render("details"),
 		keyStyle.Render("Esc"), descStyle.Render("close"),
 	)
 	if m.innerWidth <= 0 && m.width <= 0 {
@@ -366,8 +420,36 @@ func (m Model) paneHeight() int {
 	return max(3, innerH-6)
 }
 
-// renderProvidersPane renders the left pane: provider list with configured
-// status icons (✓ for ok/configured, · for unconfigured/error).
+// renderLeftPane dispatches the left pane: the Roles policy list when the
+// Roles tab is active, else the provider list (with [All models] first).
+func (m Model) renderLeftPane() string {
+	if m.showingRoles {
+		return m.renderRolesPane()
+	}
+	return m.renderProvidersPane()
+}
+
+// Fixed layout constants.
+const (
+	searchInputWidth = 16
+	// providersPaneWidth is the fixed width of the left providers pane
+	// in the dual-pane browsing layout. Right pane gets the remainder.
+	providersPaneWidth = 24
+)
+
+// Tabular column widths for the MODELS pane: Model ID (flexible), Context
+// Window (fixed), Pricing (fixed), Capability flags (leftover, capped).
+const (
+	tableCtxColW   = 6
+	tablePriceColW = 12
+	tableFlagsMaxW = 24
+	tableIDMinW    = 10
+)
+
+// renderProvidersPane renders the left pane: the synthetic [All models] entry
+// followed by the provider list. Configured providers render ✓ (green-ish);
+// unconfigured providers render a dim ○. Every row is hard-truncated to
+// paneWidth with MaxWidth/MaxHeight(1) so nothing ever wraps the 2 columns.
 func (m Model) renderProvidersPane() string {
 	paneW := providersPaneWidth
 	paneH := m.paneHeight()
@@ -378,28 +460,22 @@ func (m Model) renderProvidersPane() string {
 	lines = append(lines, mutedStyle.Render("PROVIDERS"))
 	lines = append(lines, "")
 
+	// Synthetic [All models] entry (global scope) pinned first.
+	m.appendProviderRow(&lines, 0, fmt.Sprintf("All models (%d)", m.allModelsCount()), true, paneW)
+
 	names := m.providerNames()
 	for i, name := range names {
 		if len(lines) >= paneH {
 			break
 		}
+		idx := i + 1
 		configured := m.isProviderConfigured(name)
-		selected := i == m.providerCursor && m.paneFocus == PaneProviders
-
-		icon := "·"
+		icon := "○"
 		if configured {
 			icon = "✓"
 		}
-
 		cell := fmt.Sprintf("%s %s", icon, name)
-		cell = runewidth.Truncate(cell, paneW, "…")
-		cell = padRightExact(cell, paneW)
-
-		if selected {
-			lines = append(lines, selectedRowStyle.Render(cell))
-		} else {
-			lines = append(lines, mutedStyle.Render(cell))
-		}
+		m.appendProviderRow(&lines, idx, cell, false, paneW)
 	}
 
 	// Pad to paneH.
@@ -410,8 +486,99 @@ func (m Model) renderProvidersPane() string {
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
-// renderModelsPane renders the right pane: model list filtered to the
-// highlighted provider, with search query display and cursor highlight.
+// appendProviderRow appends one single-line provider-row to lines. The cell
+// is hard-clipped to paneW cells and wrapped in MaxWidth(paneW).MaxHeight(1)
+// so a long provider name can never wrap and break the 2-column alignment.
+func (m Model) appendProviderRow(lines *[]string, idx int, cell string, isAll bool, paneW int) {
+	if len(*lines) >= m.paneHeight() {
+		return
+	}
+	selected := idx == m.providerCursor && m.paneFocus == PaneProviders && !m.showingRoles
+	raw := runewidth.Truncate(cell, paneW, "…")
+	raw = padRightExact(raw, paneW)
+	switch {
+	case selected:
+		*lines = append(*lines, selectedRowStyle.Render(raw))
+	case isAll:
+		*lines = append(*lines, allModelsStyle.Render(raw))
+	default:
+		*lines = append(*lines, mutedStyle.Render(raw))
+	}
+}
+
+// renderRolesPane renders the left pane in Roles mode: the two top-level
+// policy overrides (Plan/Thinking and Commit/Fast) with their bound model /
+// reasoning effort summary lines.
+func (m Model) renderRolesPane() string {
+	paneW := providersPaneWidth
+	paneH := m.paneHeight()
+
+	var lines []string
+	lines = append(lines, mutedStyle.Render("ROLES"))
+	lines = append(lines, "")
+
+	for i, ro := range roleOverrideEntries {
+		if len(lines) >= paneH {
+			break
+		}
+		selected := i == m.roleCursor && m.paneFocus == PaneRoles
+		cell := fmt.Sprintf("%s %s", "▶", ro.Label)
+		raw := runewidth.Truncate(cell, paneW, "…")
+		raw = padRightExact(raw, paneW)
+		if selected {
+			lines = append(lines, lipgloss.NewStyle().MaxWidth(paneW).MaxHeight(1).Render(selectedRowStyle.Render(raw)))
+		} else {
+			lines = append(lines, lipgloss.NewStyle().MaxWidth(paneW).MaxHeight(1).Render(mutedStyle.Render(raw)))
+		}
+		// Binding summary sub-line.
+		if len(lines) < paneH {
+			sub := m.roleOverrideSummary(ro.Key)
+			sub = runewidth.Truncate(sub, paneW-subPrefixW, "…")
+			sub = padRightExact(sub, paneW-subPrefixW)
+			lines = append(lines, mutedStyle.Render("  "+sub))
+		}
+	}
+
+	for len(lines) < paneH {
+		lines = append(lines, strings.Repeat(" ", paneW))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// roleOverrideEntries is the closed set of top-level role policy overrides.
+var roleOverrideEntries = []struct{ Key, Label string }{
+	{RoleOverridePlan, "Plan / Thinking"},
+	{RoleOverrideCommit, "Commit / Fast"},
+}
+
+// subPrefixW reserves the leading "  " indent for roles-pane summary rows.
+const subPrefixW = 2
+
+// roleOverrideSummary renders the bound model + reasoning effort for a role
+// override key, or the unbound marker when none is set.
+func (m Model) roleOverrideSummary(key string) string {
+	if ob, ok := m.policyOverrides[key]; ok && ob.ModelID != "" {
+		s := "→ " + ob.ModelID
+		if ob.Effort != "" && ob.Effort != DefaultReasoningOption {
+			s += " · " + ob.Effort
+		}
+		return s
+	}
+	return "→ —"
+}
+
+// allModelsCount reports the total number of models in the snapshot.
+func (m Model) allModelsCount() int {
+	if m.snap == nil {
+		return 0
+	}
+	return len(m.snap.Models)
+}
+
+// renderModelsPane renders the right pane: a pinned RECENTLY USED section
+// (when browsing providers, matches the current scope) is followed by the
+// tabular model list (ID · Context · Price · Capability flags). Every row is a
+// single hard-clipped line; columns are derived from ModelDescriptor fields.
 func (m Model) renderModelsPane() string {
 	innerW := m.innerWidth
 	if innerW <= 0 {
@@ -421,35 +588,44 @@ func (m Model) renderModelsPane() string {
 		innerW = 64
 	}
 	paneW := innerW - providersPaneWidth - 1 // -1 for separator
-	if paneW < 10 {
-		paneW = 10
+	if paneW < 16 {
+		paneW = 16
 	}
 	paneH := m.paneHeight()
 
 	var lines []string
 
-	// Pane header with optional search query.
+	// Pane header with optional search query / roles target.
 	header := "MODELS"
-	if m.query != "" {
+	if m.showingRoles {
+		header = fmt.Sprintf("MODELS — assign %s", m.HighlightedRole())
+	} else if m.query != "" {
 		header += "  /" + m.query
 	}
 	lines = append(lines, mutedStyle.Render(header))
 	lines = append(lines, "")
 
-	// Model list from visible window.
-	start, end := m.visibleWindow()
+	// Pinned RECENTLY USED section (provider browsing scope only).
+	recent := m.recentSectionLines(paneW, paneH-len(lines))
+	lines = append(lines, recent...)
+
+	// Model list from visible window (budget shrunk by the pinned rows above).
+	listBudget := paneH - len(lines)
+	if listBudget < 3 {
+		listBudget = 3
+	}
+	start, end := m.visibleWindowBudget(listBudget)
 	window := m.filtered[start:end]
 
-	for i, d := range window {
+	for _, d := range window {
 		if len(lines) >= paneH {
 			break
 		}
-		idx := start + i
+		idx := start
 		selected := idx == m.cursor && m.paneFocus == PaneModels
+		start++
 
-		cell := runewidth.Truncate(d.ID, paneW, "…")
-		cell = padRightExact(cell, paneW)
-
+		cell := m.renderModelRow(d, paneW)
 		if selected {
 			lines = append(lines, selectedRowStyle.Render(cell))
 		} else {
@@ -469,6 +645,129 @@ func (m Model) renderModelsPane() string {
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
+// renderModelRow builds one tabular model row: ID | context | price | flags.
+// Column widths are derived from the fixed table constants and the remaining
+// pane width; context/price/flags come straight from ModelDescriptor fields.
+func (m Model) renderModelRow(d registry.ModelDescriptor, paneW int) string {
+	flagsW := paneW - tableIDMinW - tableCtxColW - tablePriceColW - 3
+	if flagsW > tableFlagsMaxW {
+		flagsW = tableFlagsMaxW
+	}
+	if flagsW < 3 {
+		flagsW = 3
+	}
+	idW := paneW - tableCtxColW - tablePriceColW - flagsW - 3
+	if idW < 4 {
+		idW = 4
+	}
+
+	id := runewidth.Truncate(d.ID, idW, "…")
+	id = padRightExact(id, idW)
+	ctx := padRightExact(formatContextWindow(d.ContextWindow), tableCtxColW)
+	price := truncateStyled(formatPricing(d.InputCostPerM, d.OutputCostPerM), tablePriceColW)
+	price = padRightExact(price, tablePriceColW)
+	flags := truncateStyled(capabilityFlags(d), flagsW)
+	flags = padRightExact(flags, flagsW)
+
+	return fmt.Sprintf("%s %s %s %s", id, ctx, price, flags)
+}
+
+// capabilityFlags renders the [Thinking]/[Vision]/[Tools] badge set for a
+// model, derived strictly from its ModelDescriptor capabilities (falling back
+// to the classifier for unlisted but detectable caps).
+func capabilityFlags(d registry.ModelDescriptor) string {
+	caps := d.Capabilities
+	if len(caps) == 0 {
+		caps = role.EffectiveCapabilities(d)
+	}
+	if len(caps) == 0 {
+		return "—"
+	}
+	var parts []string
+	for _, c := range caps {
+		switch c {
+		case registry.CapThinking:
+			parts = append(parts, "[Thinking]")
+		case registry.CapVision:
+			parts = append(parts, "[Vision]")
+		case registry.CapTools:
+			parts = append(parts, "[Tools]")
+		default:
+			parts = append(parts, "["+string(c)+"]")
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// recentSectionLines renders the pinned RECENTLY USED block (up to 3 rows)
+// from the MRU bindings, filtered to the current provider scope and snapshot.
+// Returns nil when empty, when the Roles tab is active, or when the budget is
+// too small to justify a pinned section.
+func (m Model) recentSectionLines(paneW, budget int) []string {
+	if len(m.recentBindings) == 0 || budget < 3 || m.showingRoles {
+		return nil
+	}
+	byID := make(map[string]registry.ModelDescriptor, len(m.snapshotModels()))
+	for _, d := range m.snapshotModels() {
+		if m.provider != "" && !strings.EqualFold(d.Provider, m.provider) {
+			continue
+		}
+		if _, ok := byID[d.ID]; !ok {
+			byID[d.ID] = d
+		}
+	}
+	lines := []string{mutedStyle.Render("RECENTLY USED")}
+	maxRows := min(3, budget-1)
+	rows := 0
+	for _, b := range m.recentBindings {
+		if rows >= maxRows {
+			break
+		}
+		d, ok := byID[string(b.ModelID)]
+		if !ok {
+			continue
+		}
+		cell := runewidth.Truncate("  "+d.ID, paneW, "…")
+		cell = padRightExact(cell, paneW)
+		lines = append(lines, lipgloss.NewStyle().MaxWidth(paneW).MaxHeight(1).Render(mutedStyle.Render(cell)))
+		rows++
+	}
+	if len(lines) == 1 {
+		return nil
+	}
+	return lines
+}
+
+// visibleWindowBudget computes the cursor-following scroll window for an
+// explicit row budget (used when recent-section rows shrink the list area).
+func (m Model) visibleWindowBudget(budget int) (start, end int) {
+	total := len(m.filtered)
+	if total == 0 {
+		return 0, 0
+	}
+	if budget <= 0 {
+		budget = total
+	}
+	if budget > total {
+		budget = total
+	}
+	if budget >= total {
+		return 0, total
+	}
+	// Cursor-following offset: keep highlight visible with minimal scroll.
+	start = m.cursor - budget + 1
+	if start < 0 {
+		start = 0
+	}
+	if start+budget > total {
+		start = total - budget
+	}
+	if start < 0 {
+		start = 0
+	}
+	return start, start + budget
+}
+
 // buildVerticalSeparator renders the divider line between the two panes.
 func (m Model) buildVerticalSeparator() string {
 	paneH := m.paneHeight()
@@ -479,11 +778,20 @@ func (m Model) buildVerticalSeparator() string {
 	return strings.Join(lines, "\n")
 }
 
-// renderActiveLine shows the currently highlighted provider and model.
+// renderActiveLine shows the currently highlighted provider and model. In
+// Roles mode it surfaces the highlighted role policy override instead.
 func (m Model) renderActiveLine() string {
+	if m.showingRoles {
+		role := m.HighlightedRole()
+		suffix := ""
+		if ob, ok := m.policyOverrides[role]; ok && ob.ModelID != "" {
+			suffix = " → " + ob.ModelID
+		}
+		return mutedStyle.Render("Role: ") + accentStyle.Render(role) + mutedStyle.Render(suffix)
+	}
 	prov := m.highlightedProvider()
 	if prov == "" {
-		prov = "—"
+		prov = "All models"
 	}
 	modelID := "—"
 	if hl := m.Highlighted(); hl != nil {
@@ -520,10 +828,13 @@ func (m Model) renderHeader() string {
 	status, style := m.syncIndicator()
 	leftTitle := headerStyle.Render("IZEN MODEL REGISTRY (Provider-Centric)")
 	countText := fmt.Sprintf("%d models loaded", total)
-	// Active focus indicator for dual-pane layout: PROVIDERS or MODELS.
+	// Active focus indicator for the 3-pane layout: PROVIDERS, MODELS or ROLES.
 	focusLabel, focusHint := "PROVIDERS", "Tab to Models"
-	if m.paneFocus == PaneModels {
-		focusLabel, focusHint = "MODELS", "Tab to Providers"
+	switch m.paneFocus {
+	case PaneModels:
+		focusLabel, focusHint = "MODELS", "Tab to Roles"
+	case PaneRoles:
+		focusLabel, focusHint = "ROLES", "Tab to Providers"
 	}
 	focusPill := mutedStyle.Render("Focus: [") + accentStyle.Render(focusLabel) + mutedStyle.Render(fmt.Sprintf("] (%s)", focusHint))
 	avail := m.innerWidth
@@ -605,6 +916,8 @@ func (m Model) syncIndicator() (string, interface {
 // innerHeight with cursor-following scroll offset. Spec: Total Chrome = 6
 // (Title, Search, Divider, Reasoning, Bindings, Help footer).
 // listRowBudget = max(3, innerHeight - 6). Zero height = show all.
+//
+//nolint:unused // retained as the pane-agnostic contract ancestor of visibleWindowBudget
 func (m Model) visibleWindow() (start, end int) {
 	total := len(m.filtered)
 	if total == 0 {
@@ -641,14 +954,6 @@ func (m Model) visibleWindow() (start, end int) {
 	}
 	return start, start + budget
 }
-
-// Fixed layout constants.
-const (
-	searchInputWidth = 16
-	// providersPaneWidth is the fixed width of the left providers pane
-	// in the dual-pane browsing layout. Right pane gets the remainder.
-	providersPaneWidth = 22
-)
 
 // padRightExact pads s with spaces to exactly w visible cells using
 // lipgloss.Width. s is assumed already truncated to <= w.

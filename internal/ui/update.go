@@ -339,6 +339,18 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.showModelPicker = false
 			m.ti.Focus()
 			return m, nil
+		case model_picker.SaveProviderKeyMsg:
+			// Secure inline API-key overlay submitted: persist to config,
+			// mirror into env, refresh catalog. Modal stays open.
+			return m, m.applySaveProviderKey(msg)
+		case model_picker.RolePolicyOverrideMsg:
+			// Bind highlighted model to a top-level role policy override
+			// (roles pane). Applies onto authority.ModelPolicy + config and
+			// re-seeds the open picker; modal stays open for further edits.
+			return m, m.applyRoleOverride(msg)
+		case model_picker.ApiKeyInputOpenedMsg, model_picker.ApiKeyInputClosedMsg:
+			// Informational only; the picker keeps its own overlay state.
+			return m, nil
 		case model_picker.SnapshotMsg, model_picker.ModelsLoadedMsg, model_picker.ModelsErrMsg,
 			model_picker.BindingSucceededMsg, model_picker.BindingFailedMsg, modelapp.BindingResultMsg,
 			modelapp.RegistryUpdatedMsg:
@@ -348,7 +360,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 			return m, cmd
 		case tea.KeyMsg:
-			if msg.Type == tea.KeyEscape {
+			if msg.Type == tea.KeyEscape && !m.modelPicker.ApiKeyInputActive() {
 				m.showModelPicker = false
 				m.ti.Focus()
 				return m, nil

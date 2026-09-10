@@ -27,6 +27,7 @@ type PaneFocus int
 const (
 	PaneProviders PaneFocus = iota // Left pane: provider selection
 	PaneModels                     // Right pane: model selection
+	PaneRoles                      // Left pane: role policy overrides
 )
 
 // ProviderState tracks activation status for the provider-centric surface.
@@ -62,4 +63,56 @@ func CloseModalCmd() tea.Cmd {
 // provider.
 type ConfigureProviderMsg struct {
 	Provider string
+}
+
+// SaveProviderKeyMsg is emitted when the secure inline API-key overlay is
+// submitted (Enter). The parent persists the key into the config store and
+// immediately triggers dynamic model catalog discovery for that provider.
+type SaveProviderKeyMsg struct {
+	Provider string
+	APIKey   string
+}
+
+// ApiKeyInputOpenedMsg announces that the secure inline API-key overlay is
+// now active for a provider. The parent may use it to pause background
+// activity; it carries no secrets.
+type ApiKeyInputOpenedMsg struct {
+	Provider string
+}
+
+// ApiKeyInputClosedMsg announces that the API-key overlay was dismissed
+// (Esc) or submitted (Enter). No secrets travel through it.
+type ApiKeyInputClosedMsg struct {
+	Provider string
+}
+
+// Roles lists the top-level role policy overrides offered by the Roles pane.
+// Each override maps onto an authority.ModelPolicy slot.
+const (
+	// RoleOverridePlan is the Plan/Thinking policy override (deep analysis
+	// workflows: /plan, /investigate, /review). It drives ModelPolicy.Thinking.
+	RoleOverridePlan = "plan"
+	// RoleOverrideCommit is the Commit/Fast policy override (quick commit
+	// messages/summaries: /commit). It drives ModelPolicy.Fast.
+	RoleOverrideCommit = "commit"
+)
+
+// RolePolicyOverrideMsg is emitted from the Roles pane when the user binds
+// the highlighted model to a top-level role policy override. The parent
+// wires it onto authority.ModelPolicy (Thinking/Fast) in the runtime
+// authority and persists the config change.
+type RolePolicyOverrideMsg struct {
+	Role     string // RoleOverridePlan | RoleOverrideCommit
+	ModelID  string
+	Provider string
+	Effort   string // reasoning effort (low/medium/high/max); "" = default
+}
+
+// OverrideBinding is the picker-local read model of a role policy override
+// (seeded by the parent from the persisted config). It is display-only in the
+// widget; the parent owns all persistence.
+type OverrideBinding struct {
+	ModelID  string
+	Provider string
+	Effort   string // reasoning effort; "" = provider default
 }

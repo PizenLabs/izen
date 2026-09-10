@@ -541,6 +541,41 @@ func GetGlobalConfig() *Config {
 	return globalConfig
 }
 
+// WellKnownBaseURL returns the canonical base URL for a known provider name,
+// or the empty string when the provider has no well-known endpoint.
+func WellKnownBaseURL(provider string) string {
+	lower := strings.ToLower(strings.TrimSpace(provider))
+	return wellKnownBaseURLs[lower]
+}
+
+// SaveProviderAPIKey persists a provider API key into the unified config
+// store (~/.izen/config.yml) and immediately refreshes the in-memory global
+// config so the running session sees it without a restart. The provider block
+// is created on demand with its well-known base URL when absent. This is the
+// ONLY persistence path for the model picker's inline API-key overlay.
+func SaveProviderAPIKey(provider, apiKey string) error {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return fmt.Errorf("provider name required")
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		return fmt.Errorf("api key required for %q", provider)
+	}
+	cfg := GetGlobalConfig()
+	if cfg.AI.Providers == nil {
+		cfg.AI.Providers = make(map[string]AIProviderConfig)
+	}
+	prov, ok := cfg.AI.Providers[provider]
+	if !ok || prov.BaseURL == "" {
+		if defURL := WellKnownBaseURL(provider); defURL != "" {
+			prov.BaseURL = defURL
+		}
+	}
+	prov.APIKey = apiKey
+	cfg.AI.Providers[provider] = prov
+	return Save(cfg)
+}
+
 func StartConfigWatcher(ch chan<- bool) {
 	path := configPath()
 	var lastMod time.Time

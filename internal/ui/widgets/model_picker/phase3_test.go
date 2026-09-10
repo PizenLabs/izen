@@ -28,9 +28,9 @@ func TestPhase3ContextualRender(t *testing.T) {
 	if !strings.Contains(vNone, "PROVIDERS") || !strings.Contains(vNone, "MODELS") {
 		t.Errorf("browsing view must show PROVIDERS and MODELS panes:\n%s", vNone)
 	}
-	// Footer shows new dual-pane keybindings
-	if !strings.Contains(vNone, "Tab") || !strings.Contains(vNone, "configure") {
-		t.Errorf("browsing footer must show Tab and configure hints, got:\n%s", vNone)
+	// Footer shows new 3-pane keybindings
+	if !strings.Contains(vNone, "Tab") || !strings.Contains(vNone, "API key") {
+		t.Errorf("browsing footer must show Tab and API key hints, got:\n%s", vNone)
 	}
 	// Active line shows provider/model
 	if !strings.Contains(vNone, "Active:") {

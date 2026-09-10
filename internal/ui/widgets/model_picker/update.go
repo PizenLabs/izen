@@ -2,7 +2,9 @@ package model_picker
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	modelapp "github.com/PizenLabs/izen/internal/app/model"
@@ -137,27 +139,34 @@ func snapshotFromDescriptors(prev *registry.ModelSnapshot, models []registry.Mod
 }
 
 func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
+	// While the secure inline API-key overlay is open, every browsing key
+	// routes to the textinput (EchoPassword). Esc cancels, Enter submits.
+	if m.apiKeyInput != nil {
+		return m.handleApiKeyInput(msg)
+	}
 	k := msg.String()
 
 	switch k {
 	case "tab":
-		if m.paneFocus == PaneProviders {
-			m.paneFocus = PaneModels
-		} else {
-			m.paneFocus = PaneProviders
-		}
+		m.cyclePane()
 		return m, nil
 	case "up", "ctrl+p", "k":
-		if m.paneFocus == PaneProviders {
+		switch m.paneFocus {
+		case PaneProviders:
 			m.moveProviderCursor(-1)
-		} else {
+		case PaneRoles:
+			m.moveRoleCursor(-1)
+		default:
 			m.moveCursor(-1)
 		}
 		return m, nil
 	case "down", "ctrl+n", "j":
-		if m.paneFocus == PaneProviders {
+		switch m.paneFocus {
+		case PaneProviders:
 			m.moveProviderCursor(1)
-		} else {
+		case PaneRoles:
+			m.moveRoleCursor(1)
+		default:
 			m.moveCursor(1)
 		}
 		return m, nil
@@ -169,9 +178,12 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 				budget = 5
 			}
 		}
-		if m.paneFocus == PaneModels {
+		switch m.paneFocus {
+		case PaneModels:
 			m.moveCursor(-budget)
-		} else {
+		case PaneRoles:
+			m.moveRoleCursor(-1)
+		default:
 			m.moveProviderCursor(-budget)
 		}
 		return m, nil
@@ -183,16 +195,36 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 				budget = 5
 			}
 		}
-		if m.paneFocus == PaneModels {
+		switch m.paneFocus {
+		case PaneModels:
 			m.moveCursor(budget)
-		} else {
+		case PaneRoles:
+			m.moveRoleCursor(1)
+		default:
 			m.moveProviderCursor(budget)
 		}
 		return m, nil
 	case "enter":
-		// Enter commits the highlighted model and closes the overlay.
-		// Only active in the models pane.
-		if m.paneFocus == PaneModels {
+		switch m.paneFocus {
+		case PaneRoles:
+			// Choose the highlighted role override; switch to the models
+			// pane to pick the binding model.
+			m.paneFocus = PaneModels
+			return m, nil
+		case PaneProviders:
+			// All models / configured provider: jump to the models pane.
+			if m.isAllModelsSelected() || m.isProviderConfigured(m.highlightedProvider()) {
+				m.paneFocus = PaneModels
+				return m, nil
+			}
+			// Unconfigured provider: open the secure API-key overlay.
+			return m.openApiKeyInput(m.highlightedProvider())
+		case PaneModels:
+			// Roles-target assignment: bind highlighted model to the role.
+			if m.showingRoles {
+				return m.emitRoleOverride()
+			}
+			// Plain activation: commit highlighted model and close the overlay.
 			if sel := m.SelectedModel(); sel != nil {
 				m = m.Select()
 				assign := m.emitAssignmentCmd(sel, "")
@@ -218,11 +250,13 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, CloseModalCmd()
 	}
 
-	// Alt+A: credential entry for the highlighted provider.
-	if k == "alt+a" && m.paneFocus == PaneProviders {
+	// Enter or Alt+A on the providers pane: open the secure API-key overlay
+	// for the highlighted provider (masks input with EchoPassword, emits
+	// SaveProviderKeyMsg on submit). Supersedes the previous ConfigureProviderMsg.
+	if (k == "enter" || k == "alt+a") && m.paneFocus == PaneProviders {
 		prov := m.highlightedProvider()
-		if prov != "" {
-			return m, func() tea.Msg { return ConfigureProviderMsg{Provider: prov} }
+		if prov != "" && !m.isAllModelsSelected() {
+			return m.openApiKeyInput(prov)
 		}
 		return m, nil
 	}
@@ -239,6 +273,81 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.paneFocus = PaneModels
 	}
 	return m.handleSearchInput(msg)
+}
+
+// cyclePane advances the pane focus Providers -> Models -> Roles -> Providers,
+// toggling the Roles surface on the left pane on entry/exit.
+func (m *Model) cyclePane() {
+	switch m.paneFocus {
+	case PaneProviders:
+		m.paneFocus = PaneModels
+	case PaneModels:
+		m.paneFocus = PaneRoles
+		m.showingRoles = true
+	case PaneRoles:
+		m.paneFocus = PaneProviders
+		m.showingRoles = false
+	}
+}
+
+// openApiKeyInput opens the secure inline API-key overlay for a provider,
+// announcing it via ApiKeyInputOpenedMsg. Zero secrets cross the message
+// boundary until SaveProviderKeyMsg is submitted by the user on Enter.
+func (m Model) openApiKeyInput(provider string) (Model, tea.Cmd) {
+	if provider == "" {
+		return m, nil
+	}
+	in := textinput.New()
+	in.Placeholder = "sk-..."
+	in.EchoMode = textinput.EchoPassword
+	in.EchoCharacter = '•'
+	in.CharLimit = 256
+	in.Focus()
+	in.Width = max(16, m.innerWidth-16)
+	m.apiKeyInput = &in
+	m.apiKeyProvider = provider
+	return m, func() tea.Msg { return ApiKeyInputOpenedMsg{Provider: provider} }
+}
+
+// handleApiKeyInput routes keys while the API-key overlay is open.
+func (m Model) handleApiKeyInput(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		prov := m.apiKeyProvider
+		m.apiKeyInput = nil
+		return m, func() tea.Msg { return ApiKeyInputClosedMsg{Provider: prov} }
+	case tea.KeyEnter:
+		key := strings.TrimSpace(m.apiKeyInput.Value())
+		if key == "" {
+			m.status = "API key cannot be empty"
+			return m, nil
+		}
+		prov := m.apiKeyProvider
+		m.apiKeyInput = nil
+		return m, func() tea.Msg { return SaveProviderKeyMsg{Provider: prov, APIKey: key} }
+	default:
+		in := *m.apiKeyInput
+		updated, cmd := in.Update(msg)
+		m.apiKeyInput = &updated
+		return m, cmd
+	}
+}
+
+// emitRoleOverride emits RolePolicyOverrideMsg binding the highlighted model
+// to the highlighted top-level role, carrying the active reasoning effort.
+func (m Model) emitRoleOverride() (Model, tea.Cmd) {
+	sel := m.SelectedModel()
+	if sel == nil {
+		return m, nil
+	}
+	role := m.HighlightedRole()
+	effort := ""
+	if opt, ok := m.CurrentReasoningOption(); ok && opt != DefaultReasoningOption {
+		effort = opt
+	}
+	return m, func() tea.Msg {
+		return RolePolicyOverrideMsg{Role: role, ModelID: sel.ID, Provider: sel.Provider, Effort: effort}
+	}
 }
 
 // handleSearchInput processes printable runes, backspace, and space as
