@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
 // Strict single-line tabular layout helpers. Zero I/O.
@@ -65,6 +66,20 @@ func padVisible(s string, w int) string {
 	vw := lipgloss.Width(s)
 	if vw >= w {
 		return s
+	}
+	return s + strings.Repeat(" ", w-vw)
+}
+
+// padOrTruncateExact returns s padded or truncated to exactly w visible
+// characters. Plain-text operation: no ANSI handling. When truncating, a
+// trailing "…" replaces the last character.
+func padOrTruncateExact(s string, w int) string {
+	vw := lipgloss.Width(s)
+	if vw == w {
+		return s
+	}
+	if vw > w {
+		return runewidth.Truncate(s, w, "…")
 	}
 	return s + strings.Repeat(" ", w-vw)
 }

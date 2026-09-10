@@ -17,7 +17,6 @@ var (
 	colorText     = lipgloss.Color("#cdd6f4")
 	colorSubtext0 = lipgloss.Color("#6c7086")
 	colorMauve    = lipgloss.Color("#cba6f7")
-	colorSurface1 = lipgloss.Color("#45475a")
 )
 
 // formatCapabilities is the spec alias for formatCaps (capability string).
@@ -226,51 +225,119 @@ func (m Model) renderBrowsingFooter() string {
 	return truncateStyled(help, inner)
 }
 
-// renderDetailView renders the contextual Model Detail View & Workspace Target
-// Assignment Drawer per spec.
+// renderDetailView renders the model detail card: a bordered information card
+// with MODEL DETAILS header, provider badge, specifications, and reasoning
+// policy control. Clean Lipgloss borders, consistent padding, and clear
+// key-value alignments.
 func (m Model) renderDetailView() string {
 	model := m.SelectedModel()
 	if model == nil {
 		return ""
 	}
 
-	lines := make([]string, 0, 12)
+	innerW := m.innerWidth
+	if innerW <= 0 {
+		innerW = m.width
+	}
+	if innerW <= 0 {
+		innerW = 64
+	}
 
-	// Header & Identity
-	title := lipgloss.NewStyle().Foreground(colorMauve).Bold(true).Render("MODEL DETAILS")
-	idStr := lipgloss.NewStyle().Foreground(colorText).Bold(true).Render(model.ID)
-	badge := renderProviderBadge(model.Provider, 12)
+	// ── Card title ──
+	titleStyle := lipgloss.NewStyle().Foreground(colorMauve).Bold(true)
+	title := titleStyle.Render("MODEL DETAILS: " + model.ID)
 
-	lines = append(lines, title, fmt.Sprintf("%s  %s", idStr, badge), "")
+	// Provider badge
+	providerLine := mutedStyle.Render("Provider: ") + renderProviderBadge(model.Provider, 16)
 
-	// Technical Specs
-	ctxStr := fmt.Sprintf("Context: %s", formatContextWindow(model.ContextWindow))
-	priceStr := fmt.Sprintf("Price: %s", formatPricing(model.InputCostPerM, model.OutputCostPerM))
+	// ── SPECIFICATIONS section ──
+	sectionStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Bold(true)
+	labelStyle := lipgloss.NewStyle().Foreground(colorText)
+	valueStyle := lipgloss.NewStyle().Foreground(colorSubtext0)
+
+	ctxWin := formatContextWindow(model.ContextWindow)
+	price := formatPricing(model.InputCostPerM, model.OutputCostPerM)
+
 	caps := model.Capabilities
 	if len(caps) == 0 {
-		// Derive from classifier for display parity
 		caps = role.EffectiveCapabilities(*model)
 	}
-	capsStr := fmt.Sprintf("Capabilities: %s", formatCapabilities(caps))
+	capsStr := formatCapabilities(caps)
 
-	lines = append(lines,
-		lipgloss.NewStyle().Foreground(colorSubtext0).Render(ctxStr+" • "+priceStr),
-		lipgloss.NewStyle().Foreground(colorSubtext0).Render(capsStr),
+	specLines := []string{
 		"",
-		lipgloss.NewStyle().Foreground(colorSurface1).Render(strings.Repeat("─", max(16, m.innerWidth))),
+		sectionStyle.Render("SPECIFICATIONS"),
 		"",
-	)
+		labelStyle.Render("  Context Window  : ") + valueStyle.Render(ctxWin+" tokens"),
+		labelStyle.Render("  Pricing         : ") + valueStyle.Render(price+" per 1M tokens"),
+		labelStyle.Render("  Capabilities    : ") + capsStr,
+	}
 
-	// Reasoning Policy Control — dynamic variant rendering (truthful I6):
-	// the section binds strictly to the selected model's real
-	// ReasoningCapability via CapabilityResolver (Model ID / Provider
-	// matching). Non-reasoning models render PATH A with zero variant line;
-	// provider-managed models render PATH B; configurable models render PATH C
-	// with REAL options from caps.Options.
-	lines = append(lines, strings.Split(strings.TrimSuffix(m.renderReasoningSection(model), "\n"), "\n")...)
-	lines = append(lines, "")
+	// ── REASONING POLICY section ──
+	reasoningLines := []string{
+		"",
+		sectionStyle.Render("REASONING POLICY OVERRIDE (Press 'r' to cycle)"),
+		"",
+	}
+	// Inline reasoning options: [default] • low • medium • high • xhigh • max
+	sel := m.SelectedModel()
+	if sel != nil {
+		reasoningLines = append(reasoningLines, "  "+m.renderReasoningOptionsInline(sel))
+	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	// ── Assemble card ──
+	allLines := append([]string{title, providerLine}, specLines...)
+	allLines = append(allLines, reasoningLines...)
+	body := lipgloss.JoinVertical(lipgloss.Left, allLines...)
+
+	card := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#cba6f7")).
+		Width(max(16, innerW-4)).
+		Padding(0, 1).
+		Render(body)
+
+	return card
+}
+
+// renderReasoningOptionsInline renders the reasoning effort options as a
+// single horizontal line with the selected option highlighted:
+//
+//	[default]  •  low  •  medium  •  high  •  xhigh  •  max
+//
+// Non-reasoning models return "Not supported by model". Provider-managed
+// models return "Provider managed / Not configurable".
+func (m Model) renderReasoningOptionsInline(sel *registry.ModelDescriptor) string {
+	if sel == nil {
+		return mutedStyle.Render("Not supported by model")
+	}
+	caps := sel.GetReasoningCapability()
+
+	if !caps.Supported {
+		return mutedStyle.Render("Not supported by model")
+	}
+	if !caps.Configurable || len(caps.Options) == 0 {
+		return mutedStyle.Render("Provider managed / Not configurable")
+	}
+
+	idx := m.selectedReasoningOptIdx
+	if idx < 0 || idx >= len(caps.Options) {
+		idx = 0
+	}
+
+	var cells []string
+	for i, opt := range caps.Options {
+		label := opt.Label
+		if label == "" {
+			label = opt.ID
+		}
+		if i == idx {
+			cells = append(cells, effortStyle(opt.ID).Underline(true).Render("["+label+"]"))
+		} else {
+			cells = append(cells, mutedStyle.Render(label))
+		}
+	}
+	return strings.Join(cells, mutedStyle.Render("  •  "))
 }
 
 // renderDetailFooter renders the dedicated keybinding footer for the detail view.
@@ -526,9 +593,9 @@ func (m Model) renderRolesPane() string {
 		raw := runewidth.Truncate(cell, paneW, "…")
 		raw = padRightExact(raw, paneW)
 		if selected {
-			lines = append(lines, lipgloss.NewStyle().MaxWidth(paneW).MaxHeight(1).Render(selectedRowStyle.Render(raw)))
+			lines = append(lines, selectedRowStyle.Render(raw))
 		} else {
-			lines = append(lines, lipgloss.NewStyle().MaxWidth(paneW).MaxHeight(1).Render(mutedStyle.Render(raw)))
+			lines = append(lines, mutedStyle.Render(raw))
 		}
 		// Binding summary sub-line.
 		if len(lines) < paneH {
@@ -580,14 +647,14 @@ func (m Model) allModelsCount() int {
 // tabular model list (ID · Context · Price · Capability flags). Every row is a
 // single hard-clipped line; columns are derived from ModelDescriptor fields.
 func (m Model) renderModelsPane() string {
-	innerW := m.innerWidth
-	if innerW <= 0 {
-		innerW = m.width
-	}
+	// Correct inner width math: account for outer modal borders and padding.
+	frameH, _ := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1, 2).GetFrameSize()
+	innerW := max(40, m.width-frameH)
 	if innerW <= 0 {
 		innerW = 64
 	}
-	paneW := innerW - providersPaneWidth - 1 // -1 for separator
+	paneW := innerW - providersPaneWidth - 1 // -1 for separator; guarantee equality
+	_ = paneW + providersPaneWidth + 1 // assert: left + sep + right == innerW
 	if paneW < 16 {
 		paneW = 16
 	}
@@ -626,9 +693,10 @@ func (m Model) renderModelsPane() string {
 		start++
 
 		cell := m.renderModelRow(d, paneW)
-		if selected {
+		switch {
+		case selected:
 			lines = append(lines, selectedRowStyle.Render(cell))
-		} else {
+		default:
 			lines = append(lines, mutedStyle.Render(cell))
 		}
 	}
@@ -642,34 +710,44 @@ func (m Model) renderModelsPane() string {
 		lines = append(lines, strings.Repeat(" ", paneW))
 	}
 
+	// Sanitize: no embedded newlines before joining.
+	for i := range lines {
+		lines[i] = strings.ReplaceAll(lines[i], "\n", " ")
+	}
+
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
-// renderModelRow builds one tabular model row: ID | context | price | flags.
-// Column widths are derived from the fixed table constants and the remaining
-// pane width; context/price/flags come straight from ModelDescriptor fields.
-func (m Model) renderModelRow(d registry.ModelDescriptor, paneW int) string {
-	flagsW := paneW - tableIDMinW - tableCtxColW - tablePriceColW - 3
-	if flagsW > tableFlagsMaxW {
-		flagsW = tableFlagsMaxW
-	}
-	if flagsW < 3 {
-		flagsW = 3
-	}
-	idW := paneW - tableCtxColW - tablePriceColW - flagsW - 3
-	if idW < 4 {
-		idW = 4
+// renderModelRow builds one tabular model row as pure unstyled plain text,
+// truncated/padded to EXACTLY paneW characters. Styling (selectedRowStyle /
+// mutedStyle) is applied atomically by the caller (renderModelsPane) so
+// individual cells never introduce partial ANSI sequences that could break
+// on truncation.
+func (m Model) renderModelRow(item registry.ModelDescriptor, rightPaneW int) string {
+	ctxW := 6
+	priceW := 12
+	flagsW := 16
+	spacing := 3 // spaces between 4 columns
+
+	idW := rightPaneW - (ctxW + priceW + flagsW + spacing)
+	if idW < 10 {
+		idW = 10
 	}
 
-	id := runewidth.Truncate(d.ID, idW, "…")
-	id = padRightExact(id, idW)
-	ctx := padRightExact(formatContextWindow(d.ContextWindow), tableCtxColW)
-	price := truncateStyled(formatPricing(d.InputCostPerM, d.OutputCostPerM), tablePriceColW)
-	price = padRightExact(price, tablePriceColW)
-	flags := truncateStyled(capabilityFlags(d), flagsW)
-	flags = padRightExact(flags, flagsW)
+	// 1. Hard-truncate Model ID first.
+	truncatedID := runewidth.Truncate(item.ID, idW, "…")
+	paddedID := padRightExact(truncatedID, idW)
 
-	return fmt.Sprintf("%s %s %s %s", id, ctx, price, flags)
+	// 2. Format remaining columns with exact fixed widths.
+	paddedCtx := padLeftExact(formatContextWindow(item.ContextWindow), ctxW)
+	paddedPrice := padLeftExact(formatPricing(item.InputCostPerM, item.OutputCostPerM), priceW)
+	paddedFlags := padRightExact(capabilityFlags(item), flagsW)
+
+	// 3. Assemble single plain string.
+	plainRow := paddedID + " " + paddedCtx + " " + paddedPrice + " " + paddedFlags
+
+	// 4. Force exact fit to rightPaneW.
+	return padOrTruncateExact(plainRow, rightPaneW)
 }
 
 // capabilityFlags renders the [Thinking]/[Vision]/[Tools] badge set for a
@@ -729,7 +807,7 @@ func (m Model) recentSectionLines(paneW, budget int) []string {
 		}
 		cell := runewidth.Truncate("  "+d.ID, paneW, "…")
 		cell = padRightExact(cell, paneW)
-		lines = append(lines, lipgloss.NewStyle().MaxWidth(paneW).MaxHeight(1).Render(mutedStyle.Render(cell)))
+		lines = append(lines, mutedStyle.Render(cell))
 		rows++
 	}
 	if len(lines) == 1 {
@@ -955,6 +1033,15 @@ func (m Model) visibleWindow() (start, end int) {
 	return start, start + budget
 }
 
+// padLeftExact pads s with leading spaces to exactly w visible cells.
+func padLeftExact(s string, w int) string {
+	vw := lipgloss.Width(s)
+	if vw >= w {
+		return s
+	}
+	return strings.Repeat(" ", w-vw) + s
+}
+
 // padRightExact pads s with spaces to exactly w visible cells using
 // lipgloss.Width. s is assumed already truncated to <= w.
 func padRightExact(s string, w int) string {
@@ -974,16 +1061,15 @@ func padRightExact(s string, w int) string {
 //	PATH C (configurable): "Reasoning Policy (Press 'r' to cycle): [Label]"
 //	  plus the REAL option labels from caps.Options joined by "  ·  " with the
 //	  selected index bracketed.
+//
+//nolint:unused // retained for spec compatibility and external callers
 func (m *Model) renderReasoningSection(sel *registry.ModelDescriptor) string {
 	var sb strings.Builder
 	if sel == nil {
-		sb.WriteString("──────────────────────────────────────────────────\n\n")
 		sb.WriteString("Reasoning: Not supported by model\n")
 		return sb.String()
 	}
 	caps := sel.GetReasoningCapability()
-
-	sb.WriteString("──────────────────────────────────────────────────\n\n")
 
 	// PATH A: Model does NOT support reasoning
 	if !caps.Supported {
@@ -1007,7 +1093,7 @@ func (m *Model) renderReasoningSection(sel *registry.ModelDescriptor) string {
 	if label == "" {
 		label = currentOpt.ID
 	}
-	fmt.Fprintf(&sb, "Reasoning Policy (Press 'r' to cycle): [%s]\n\n", label)
+	fmt.Fprintf(&sb, "Reasoning Policy (Press 'r' to cycle): [%s]\n", label)
 
 	var optionLabels []string
 	for i, opt := range caps.Options {
