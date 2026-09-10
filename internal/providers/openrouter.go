@@ -25,11 +25,9 @@ import (
 // and displays a clear actionable banner instead of a raw HTTP status message.
 var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401): invalid or missing OPENROUTER_API_KEY — check your environment variables or run: export OPENROUTER_API_KEY=<your_key>")
 
-// DefaultOpenRouterModel is the default model ID used for initial
-// configuration. Runtime invocations MUST carry an explicit model binding
-// from the active Workspace Target — background workers MUST NOT fallback to
-// this constant. An empty request model is rejected locally with
-// ErrUnassignedTargetModel before any HTTP request.
+// DefaultOpenRouterModel is retained for backward compatibility with legacy
+// configuration references but is NEVER used as an implicit fallback during
+// live invocation. Every invocation MUST carry an explicit ModelBinding.
 const DefaultOpenRouterModel = "anthropic/claude-3.5-sonnet"
 
 // ErrUnassignedTargetModel is returned when an OpenRouter request carries no

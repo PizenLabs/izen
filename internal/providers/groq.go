@@ -39,9 +39,9 @@ func (p *GroqProvider) Name() string {
 }
 
 func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
-	model := p.model
-	if req.Model != "" {
-		model = req.Model
+	model := req.Model
+	if model == "" {
+		return nil, fmt.Errorf("groq: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
 
 	msgs := p.buildMessages(req)
@@ -123,9 +123,9 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 }
 
 func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
-	model := p.model
-	if req.Model != "" {
-		model = req.Model
+	model := req.Model
+	if model == "" {
+		return nil, fmt.Errorf("groq: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
 
 	msgs := p.buildMessages(req)

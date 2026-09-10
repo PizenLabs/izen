@@ -157,9 +157,9 @@ func (p *OllamaProvider) buildMessages(req ai.Request) []ollamaMessage {
 }
 
 func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
-	model := p.model
-	if req.Model != "" {
-		model = req.Model
+	model := req.Model
+	if model == "" {
+		return nil, fmt.Errorf("ollama: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
 
 	msgs := p.buildMessages(req)
@@ -271,9 +271,9 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 }
 
 func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
-	model := p.model
-	if req.Model != "" {
-		model = req.Model
+	model := req.Model
+	if model == "" {
+		return nil, fmt.Errorf("ollama: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
 
 	msgs := p.buildMessages(req)

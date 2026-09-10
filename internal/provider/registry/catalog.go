@@ -2,10 +2,10 @@ package registry
 
 import "time"
 
-// DefaultModels returns the static embedded catalog used as a cold-start
-// baseline when no cache file exists (fresh install, no network, no API
-// keys). It is compiled into the binary so the Registry is never empty on
-// first launch.
+// DefaultModels is a cold-start baseline ONLY: it is never used as a live
+// registry source. The live registry is always populated from provider
+// evidence (API endpoints, tags endpoints). Having hardcoded arrays is
+// explicitly prohibited for live catalog synchronization.
 func DefaultModels() []ModelDescriptor {
 	return []ModelDescriptor{
 		{ID: "claude-3-7-sonnet-latest", Name: "Claude 3.7 Sonnet", Provider: "anthropic", ContextWindow: 200000},
