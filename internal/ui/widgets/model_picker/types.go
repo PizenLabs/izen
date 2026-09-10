@@ -7,7 +7,7 @@ type PickerState int
 
 const (
 	StateBrowsing PickerState = iota // 0: Searching & Browsing Registry
-	StateDetail                      // 1: Inspecting Model & Assigning Targets
+	StateDetail                      // 1: Inspecting Model & Activating
 )
 
 // InputFocus toggles keyboard routing between the search input and the table.
@@ -21,7 +21,8 @@ const (
 // FocusScope is the legacy alias of InputFocus for backward compatibility.
 type FocusScope = InputFocus
 
-// WorkspaceTarget is the workspace assignment drawer target.
+// WorkspaceTarget — DEPRECATED: the 5-workspace assignment matrix is removed.
+// Kept for compilation compatibility only.
 type WorkspaceTarget string
 
 const (
@@ -30,12 +31,10 @@ const (
 	TargetPlan        WorkspaceTarget = "plan"
 	TargetBuild       WorkspaceTarget = "build"
 	TargetReview      WorkspaceTarget = "review"
-	// TargetNone marks global context: no active workspace. Enter in
-	// browsing must inspect (StateDetail) instead of assigning (I2).
 	TargetNone WorkspaceTarget = "none"
 )
 
-// AllWorkspaceTargets is the ordered set of assignable workspace targets.
+// AllWorkspaceTargets — DEPRECATED: removed from control surface.
 var AllWorkspaceTargets = []WorkspaceTarget{
 	TargetAsk,
 	TargetInvestigate,
@@ -44,17 +43,32 @@ var AllWorkspaceTargets = []WorkspaceTarget{
 	TargetReview,
 }
 
-// InvocationPolicy carries the reasoning policy for an assignment.
+// PaneFocus selects the control surface focus scope.
+type PaneFocus int
+
+const (
+	PaneProviders PaneFocus = iota // Left pane: provider selection
+	PaneModels                     // Right pane: model selection
+)
+
+// ProviderState tracks activation status for the provider-centric surface.
+type ProviderState struct {
+	Name         string `json:"name"`
+	Active       bool   `json:"active"`
+	Configured   bool   `json:"configured"`
+	ModelCount   int    `json:"model_count"`
+}
+
+// InvocationPolicy carries the reasoning policy for activation.
 type InvocationPolicy struct {
 	Reasoning string `json:"reasoning"`
 }
 
-// ModelAssignmentRequestedMsg is emitted when the picker requests a model
-// assignment to a workspace target (fast-path or detail confirmation).
+// ModelAssignmentRequestedMsg is emitted when the picker activates a model.
 type ModelAssignmentRequestedMsg struct {
 	ModelID  string           `json:"model_id"`
 	Provider string           `json:"provider"`
-	Target   WorkspaceTarget  `json:"target"`
+	Target   WorkspaceTarget  `json:"target,omitempty"` // Deprecated: workspace matrix removed
 	Policy   InvocationPolicy `json:"policy"`
 }
 

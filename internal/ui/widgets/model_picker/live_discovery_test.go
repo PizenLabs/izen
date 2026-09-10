@@ -62,10 +62,10 @@ func TestSelectedRowCursor(t *testing.T) {
 	}
 }
 
-// Registry-level live baseline: embedded defaults stay non-empty.
-func TestDefaultSnapshotNonEmpty(t *testing.T) {
+// Registry-level live baseline: cold start is empty until provider sync.
+func TestDefaultSnapshotEmpty(t *testing.T) {
 	snap := registry.DefaultSnapshot()
-	if len(snap.Models) == 0 {
-		t.Fatal("DefaultSnapshot must be non-empty")
+	if len(snap.Models) != 0 {
+		t.Errorf("DefaultSnapshot must be empty (live data from providers only), got %d models", len(snap.Models))
 	}
 }

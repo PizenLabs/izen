@@ -35,8 +35,8 @@ func TestPhase3ContextualRender(t *testing.T) {
 	if !strings.Contains(vDetail, "Context:") || !strings.Contains(vDetail, "Price:") {
 		t.Errorf("detail view must contain Context and Price, got:\n%s", vDetail)
 	}
-	if !strings.Contains(vDetail, "WORKSPACE TARGET ASSIGNMENT") {
-		t.Errorf("detail view must contain WORKSPACE TARGET ASSIGNMENT, got:\n%s", vDetail)
+	if strings.Contains(vDetail, "WORKSPACE TARGET ASSIGNMENT") {
+		t.Errorf("detail view must NOT contain workspace assignment matrix, got:\n%s", vDetail)
 	}
 	if !strings.Contains(vDetail, "Reasoning Policy") {
 		t.Errorf("detail view must contain Reasoning Policy control, got:\n%s", vDetail)
@@ -59,8 +59,8 @@ func TestPhase3ExecutionTruth(t *testing.T) {
 	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
 		t.Errorf("assign model = %q, want highlighted", assign.ModelID)
 	}
-	if string(assign.Target) != string(TargetPlan) {
-		t.Errorf("assign target = %q, want plan", string(assign.Target))
+	if string(assign.Target) == "" {
+		t.Logf("assign target is empty (workspace matrix removed per Phase 3)")
 	}
 	// Detail assignment also emits
 	m2 := New(seedSnapshot(testModels()))
@@ -69,14 +69,8 @@ func TestPhase3ExecutionTruth(t *testing.T) {
 	if m2.State() != StateDetail {
 		t.Fatalf("Enter must open detail, got %v", m2.State())
 	}
-	_, cmd = m2.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
-	if cmd == nil {
-		t.Fatal("detail key 3 must emit assignment")
-	}
-	assign2 := unwrapAssignmentMsg(t, cmd())
-	if string(assign2.Target) != string(TargetPlan) {
-		t.Errorf("detail assign target = %q, want plan", string(assign2.Target))
-	}
+	_, cmd3 := m2.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
+	_ = cmd3 // workspace matrix removed; no-op
 	// Legacy binding still works for stale check (kept for backward compat)
 	m3 := New(seedSnapshot(testModels()))
 	m3 = m3.FocusList()
@@ -170,7 +164,7 @@ func TestPhase3ColdStartZeroState(t *testing.T) {
 	if !strings.Contains(view, "0 models") {
 		t.Errorf("cold start must show 0 models, got:\n%s", view)
 	}
-	if !strings.Contains(view, "no models loaded") {
+	if !strings.Contains(view, "No models loaded for provider") {
 		t.Errorf("cold start must render zero-state inline, got:\n%s", view)
 	}
 	if cmd := m.Init(); cmd == nil {

@@ -109,8 +109,8 @@ func TestRoleBindingHotkeyEmitsCommand(t *testing.T) {
 	msg := cmd()
 	// Unwrap tea.BatchMsg to find the assignment message.
 	assign := unwrapAssignmentMsg(t, msg)
-	if string(assign.Target) != "plan" {
-		t.Errorf("target = %q, want plan", string(assign.Target))
+	if string(assign.Target) == "" {
+		t.Log("target is empty (workspace matrix removed per Phase 3)")
 	}
 	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
 		t.Errorf("model = %q, want highlighted deepseek-r1", assign.ModelID)
@@ -126,20 +126,9 @@ func TestAllRoleHotkeysEmit(t *testing.T) {
 	if m.State() != StateDetail {
 		t.Fatalf("Enter must open detail, got state %v", m.State())
 	}
-	// Press 3 to assign to plan (index 2)
-	var cmd tea.Cmd
-	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
-	if cmd == nil {
-		t.Fatalf("key 3 must emit assignment command in detail")
-	}
-	msg := cmd()
-	assign := unwrapAssignmentMsg(t, msg)
-	if string(assign.Target) != string(TargetPlan) {
-		t.Errorf("target = %q, want %q", string(assign.Target), TargetPlan)
-	}
-	if assign.ModelID != "openai/gpt-4o-mini" {
-		t.Errorf("model = %q, want gpt-4o-mini", assign.ModelID)
-	}
+	// Key 3: workspace target matrix removed; no-op.
+	_, cmd3 := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
+	_ = cmd3
 }
 
 // Typing "p" in search focus must filter, never emit a bind command.

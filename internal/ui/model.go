@@ -985,6 +985,10 @@ type model struct {
 	// completes immediately (Explicit Over Implicit).
 	fastTrackTargets map[string]bool
 
+	// Unconfigured boot: when no active model is configured for the provider,
+	// the TUI opens directly into the model picker overlay instead of exiting.
+	unconfigured bool
+
 	investigateInvocationCount int
 
 	// Command history

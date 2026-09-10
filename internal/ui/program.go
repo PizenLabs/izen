@@ -180,7 +180,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		initStage:           initStage,
 		initProviderIdx:     0,
 		initProviderFilter:  "",
-		initPrefillUsername: globalUsername,
+		unconfigured:         cfg.ActiveProviderName() != "" && cfg.ActiveModelName() == "",		initPrefillUsername: globalUsername,
 		initPrefillProvider: globalProvider,
 		viewRegistry:        reg,
 		logStore:            NewLogStore(),

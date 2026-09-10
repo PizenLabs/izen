@@ -33,8 +33,10 @@ func formatCapabilities(caps []registry.ModelCapability) string {
 	return strings.Join(parts, " ")
 }
 
-// View implements tea.Model. Dispatches to browsing or detail renderers
-// per the two-step state machine. Pure view, zero I/O.
+// View implements tea.Model. Renders the redesigned provider-centric control
+// surface: [PROVIDERS pane | MODELS pane] with capability-truthful variant
+// rendering (Supported / Unsupported / Unknown). The 5-workspace matrix and
+// 3-role assignment matrix are removed per Phase 3 spec.
 func (m Model) View() string {
 	if m.state == StateDetail {
 		return m.renderDetailLayout()
@@ -68,7 +70,7 @@ func (m Model) renderBrowsingLayout() string {
 		if len(models) > 0 {
 			b.WriteString(m.clipLine(mutedStyle.Render(fmt.Sprintf(" No models matching query: '%s' ", m.query))))
 		} else {
-			b.WriteString(m.clipLine(mutedStyle.Render(" no models loaded ")))
+			b.WriteString(m.clipLine(mutedStyle.Render(" No models loaded for provider. Press Alt+A to configure or trigger sync. ")))
 		}
 		b.WriteString("\n")
 	} else {
@@ -223,34 +225,6 @@ func (m Model) renderDetailView() string {
 	lines = append(lines, strings.Split(strings.TrimSuffix(m.renderReasoningSection(model), "\n"), "\n")...)
 	lines = append(lines, "")
 
-	// Workspace Target Assignment
-	targetHeader := lipgloss.NewStyle().Foreground(colorMauve).Bold(true).Render("WORKSPACE TARGET ASSIGNMENT")
-	lines = append(lines, targetHeader)
-
-	for i, target := range AllWorkspaceTargets {
-		isHovered := (i == m.targetCursor)
-		isCurrent := m.isModelAssignedToTarget(model.ID, target)
-
-		prefix := "  "
-		if isHovered {
-			prefix = "> "
-		}
-
-		check := "─"
-		if isCurrent {
-			check = "✓"
-		}
-
-		numKey := lipgloss.NewStyle().Foreground(colorSubtext0).Render(fmt.Sprintf("[%d]", i+1))
-		targetName := padRight(string(target), 12)
-
-		line := fmt.Sprintf("%s%s %s %s", prefix, numKey, check, targetName)
-		if isHovered {
-			line = lipgloss.NewStyle().Background(colorSurface0).Bold(true).Render(line)
-		}
-		lines = append(lines, line)
-	}
-
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
@@ -260,9 +234,9 @@ func (m Model) renderDetailFooter() string {
 	descStyle := lipgloss.NewStyle().Foreground(colorSubtext0)
 
 	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s",
-		keyStyle.Render("1-5 / ↑↓"), descStyle.Render("select target"),
+		keyStyle.Render("↑↓"), descStyle.Render("select"),
 		keyStyle.Render("r"), descStyle.Render("reasoning policy"),
-		keyStyle.Render("Enter"), descStyle.Render("confirm & exit"),
+		keyStyle.Render("Enter"), descStyle.Render("activate & exit"),
 		keyStyle.Render("Esc"), descStyle.Render("back"),
 	)
 	inner := m.innerWidth
@@ -404,8 +378,7 @@ func (m Model) renderZeroStatePanel() string {
 	b.WriteString("┌" + strings.Repeat("─", inner) + "┐\n")
 	b.WriteString(titleLine + "\n")
 	b.WriteString("│" + strings.Repeat(" ", inner) + "│\n")
-	b.WriteString("│" + pad("  No cached models found in ~/.izen/cache/models.json") + "│\n")
-	b.WriteString("│" + pad("  (no models loaded)") + "│\n")
+	b.WriteString("│" + pad("  No models loaded for provider. Press Alt+A to configure credentials or trigger sync.") + "│\n")
 	b.WriteString("│" + strings.Repeat(" ", inner) + "│\n")
 	b.WriteString("│" + pad("  • Press Ctrl+R to fetch models from configured providers") + "│\n")
 	b.WriteString("│" + pad("  • Check environment variables (OPENAI_API_KEY, etc.)") + "│\n")
@@ -431,7 +404,7 @@ func (m Model) renderHeader() string {
 	m.searchInput.Width = 16
 	total := len(m.snapshotModels())
 	status, style := m.syncIndicator()
-	leftTitle := headerStyle.Render("IZEN MODEL REGISTRY")
+	leftTitle := headerStyle.Render("IZEN MODEL REGISTRY (Provider-Centric)")
 	countText := fmt.Sprintf("%d models loaded", total)
 	// Active focus indicator: Focus: [SEARCH] (Tab to List) / [LIST] (Tab to Search).
 	focusLabel, focusHint := "SEARCH", "Tab to List"

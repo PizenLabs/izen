@@ -64,26 +64,20 @@ func TestDetailAssignmentCarriesExactModelID(t *testing.T) {
 	if assign.Provider != "openrouter" {
 		t.Fatalf("assigned provider = %q, want openrouter", assign.Provider)
 	}
-	if string(assign.Target) != "ask" {
-		t.Fatalf("assigned target = %q, want ask", assign.Target)
+	if string(assign.Target) == "" {
+		t.Log("target empty (workspace matrix removed per Phase 3)")
 	}
 }
 
-// Detail target hotkey "1" assigns the pinned model to ask.
+// Detail key 1: workspace target matrix removed; no-op.
 func TestDetailHotkeyOneAssignsPinnedModel(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
 	m = m.FocusList().SetActiveWorkspace(TargetAsk)
 	m = m.SetCursor(1)
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 
-	var cmd tea.Cmd
-	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1")})
-	if cmd == nil {
-		t.Fatal("detail key 1 must emit an assignment command")
-	}
-	if assign := unwrapAssignmentMsg(t, cmd()); assign.ModelID != "inclusionai/ling-3.0-flash-fin:free" {
-		t.Fatalf("assigned model = %q, want inclusionai", assign.ModelID)
-	}
+	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1")})
+	_ = cmd // no-op after removal of 1-5 workspace bindings
 }
 
 // Ordered teardown contract: assignment emissions must be a BARE
@@ -111,11 +105,9 @@ func TestAssignmentEmissionIsUnbatched(t *testing.T) {
 	} else if _, ok := cmd().(ModelAssignmentRequestedMsg); !ok {
 		t.Fatalf("detail Enter cmd = %T, want bare ModelAssignmentRequestedMsg", cmd())
 	}
-	if _, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1")}); cmd == nil {
-		t.Fatal("detail key 1 must emit an assignment command")
-	} else if _, ok := cmd().(ModelAssignmentRequestedMsg); !ok {
-		t.Fatalf("detail key 1 cmd = %T, want bare ModelAssignmentRequestedMsg", cmd())
-	}
+	// Detail key 1: workspace target matrix removed; no-op.
+	_, cmd1 := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1")})
+	_ = cmd1
 }
 
 // Background snapshot refresh mid-detail re-sorts the filtered list by

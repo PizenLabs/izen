@@ -101,9 +101,10 @@ func (m Model) UpdateModel(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, nil
 	case ModelAssignmentRequestedMsg:
-		// Echo: treat as confirmation for legacy tests (update roles)
-		if string(msg.Target) != "" && msg.ModelID != "" {
-			m = m.applyBindSuccess(string(msg.Target), msg.ModelID, 0)
+		// Echo activation (target removed per Phase 3 control surface redesign).
+		if msg.ModelID != "" {
+			m.activatedModelID = msg.ModelID
+			m.activatedProvider = msg.Provider
 		}
 		return m, nil
 	case modelapp.SyncRequestedMsg:
@@ -189,7 +190,6 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.state = StateDetail
 			m.focus = FocusList
 			m.searchInput.Blur()
-			m.targetCursor = m.getInitialTargetIndex()
 		}
 		return m, nil
 	case "a", "shift+enter":
@@ -308,31 +308,6 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.state = StateBrowsing
 		m.clearDetail()
 		return m, nil
-	case "up", "k":
-		m.targetCursor = max(0, m.targetCursor-1)
-		return m, nil
-	case "down", "j":
-		m.targetCursor = min(len(AllWorkspaceTargets)-1, m.targetCursor+1)
-		return m, nil
-	case "1", "2", "3", "4", "5":
-		idx := int(k[0] - '1')
-		if idx >= 0 && idx < len(AllWorkspaceTargets) {
-			m.targetCursor = idx
-			selectedTarget := AllWorkspaceTargets[m.targetCursor]
-			// Binds to the pinned detail instance (SelectedModel is
-			// detail-aware), never to a recalculated cursor position.
-			// Ordered teardown: assignment only; the parent closes
-			// the modal after the Runtime Authority commit lands.
-			sel := m.SelectedModel()
-			if sel != nil {
-				assign := m.emitAssignmentCmd(sel, selectedTarget)
-				if assign == nil {
-					return m, nil
-				}
-				return m, assign
-			}
-		}
-		return m, nil
 	case "r":
 		// Dynamic capability guard: ONLY cycle through caps.Options when the
 		// model actually supports configurable reasoning. Non-configurable
@@ -349,12 +324,10 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.cycleReasoningPolicy()
 		return m, nil
 	case "enter":
-		// Binds to the pinned detail instance (SelectedModel is
-		// detail-aware). Ordered teardown: assignment only; the parent
-		// closes the modal after the Runtime Authority commit lands.
+		// Strict single model activation (Phase 3): commit active binding
+		// directly to runtime ModelState without workspace sub-menu.
 		if sel := m.SelectedModel(); sel != nil {
-			selectedTarget := AllWorkspaceTargets[m.targetCursor]
-			assign := m.emitAssignmentCmd(sel, selectedTarget)
+			assign := m.emitAssignmentCmd(sel, WorkspaceTarget(""))
 			if assign == nil {
 				return m, nil
 			}

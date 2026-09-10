@@ -6,8 +6,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/config"
-	coredomain "github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
 )
 
@@ -81,8 +81,8 @@ type App struct {
 	configRepo ConfigRepo
 	messages   []string
 	viewport   Viewport
-	// currentMode is the active semantic policy target (I8).
-	currentMode coredomain.WorkspaceTarget
+	// currentMode is the active semantic policy target.
+	currentMode runtime.WorkspaceTarget
 }
 
 func NewApp() *App {
@@ -90,7 +90,7 @@ func NewApp() *App {
 		runtimeState: NewRuntimeAuthorityState(),
 		runtime:      runtime.NewRuntimeAuthority(),
 		configRepo:   defaultConfigRepo{},
-		currentMode:  coredomain.WorkspaceAsk,
+		currentMode:  runtime.TargetAsk,
 	}
 }
 
@@ -102,7 +102,7 @@ func (a *App) SetConfigRepo(r ConfigRepo) {
 }
 
 // SetCurrentMode sets the active workspace target.
-func (a *App) SetCurrentMode(m coredomain.WorkspaceTarget) {
+func (a *App) SetCurrentMode(m runtime.WorkspaceTarget) {
 	a.currentMode = m
 	if a.runtime != nil {
 		a.runtime.SetCurrentMode(m)
@@ -110,18 +110,18 @@ func (a *App) SetCurrentMode(m coredomain.WorkspaceTarget) {
 }
 
 // EffectiveModel derives the model for target exclusively from Runtime
-// Authority (I5).
-func (a *App) EffectiveModel(target coredomain.WorkspaceTarget) coredomain.ModelRef {
+// Authority. The target parameter is ignored: there is one active binding.
+func (a *App) EffectiveModel(_ runtime.WorkspaceTarget) runtime.ModelRef {
 	if a.runtime == nil {
-		return coredomain.ModelRef{}
+		return runtime.ModelRef{}
 	}
-	return a.runtime.EffectiveModel(target)
+	return a.runtime.EffectiveModel(a.currentMode)
 }
 
-// ActiveModel resolves EffectiveModel(currentMode) (I5).
-func (a *App) ActiveModel() coredomain.ModelRef {
+// ActiveModel resolves EffectiveModel(currentMode).
+func (a *App) ActiveModel() runtime.ModelRef {
 	if a.runtime == nil {
-		return coredomain.ModelRef{}
+		return runtime.ModelRef{}
 	}
 	return a.runtime.ActiveModel()
 }
@@ -162,19 +162,19 @@ type ModelAssignmentFailedMsg struct {
 //  4. a.messages = append(a.messages, renderSystemMessage(event.ToTranscriptLog()))
 //  5. Re-render viewport content derived from a.runtime.ActiveModel() and scroll to bottom
 //  6. Return model_picker.CloseModalCmd()
-func (a *App) HandleModelAssignmentRequestedMsg(msg model_picker.ModelAssignmentRequestedMsg) (coredomain.ModelTransitionEvent, tea.Cmd, error) {
-	modelRef := coredomain.ModelRef{ID: msg.ModelID, Provider: msg.Provider}
+func (a *App) HandleModelAssignmentRequestedMsg(msg model_picker.ModelAssignmentRequestedMsg) (runtime.ModelTransitionEvent, tea.Cmd, error) {
+	modelRef := runtime.ModelRef{ID: msg.ModelID, Provider: msg.Provider}
 	// 1. Validate without mutating.
-	prep, err := a.runtime.PrepareTransition(coredomain.WorkspaceTarget(string(msg.Target)), modelRef)
+	prep, err := a.runtime.PrepareTransition(runtime.WorkspaceTarget(string(msg.Target)), modelRef)
 	if err != nil {
-		return coredomain.ModelTransitionEvent{}, nil, err
+		return runtime.ModelTransitionEvent{}, nil, err
 	}
 	// 2. Persist before committing runtime state (I3). Abort on failure.
 	if a.configRepo == nil {
 		a.configRepo = defaultConfigRepo{}
 	}
 	if err := a.configRepo.PersistAssignment(string(msg.Target), msg.ModelID); err != nil {
-		return coredomain.ModelTransitionEvent{}, nil, err
+		return runtime.ModelTransitionEvent{}, nil, err
 	}
 	// 3. Deterministic commit (I4): cannot fail on business validation.
 	event := a.runtime.CommitTransition(prep)
@@ -210,6 +210,8 @@ func (a *App) HandleModelAssignment(msg model_picker.ModelAssignmentRequestedMsg
 
 func (a *App) RuntimeAuthorityRevertOnFailure(target model_picker.WorkspaceTarget) error {
 	cfg := config.GetGlobalConfig()
+	// Clear the active binding's persisted state for the given target.
+	// Under the unified binding model, this resets the relevant assignment.
 	switch target {
 	case model_picker.TargetAsk:
 		cfg.Assignments.Ask = ""
@@ -225,4 +227,20 @@ func (a *App) RuntimeAuthorityRevertOnFailure(target model_picker.WorkspaceTarge
 		return fmt.Errorf("unknown workspace target: %s", target)
 	}
 	return config.Save(cfg)
+}
+
+// ActivateModel is the new single-binding activation path. It persists the
+// binding and commits it to runtime atomically.
+func (a *App) ActivateModel(binding authority.ModelBinding) error {
+	// Validate binding.
+	if err := authority.ValidateBinding(binding); err != nil {
+		return err
+	}
+	// Persist before committing (I3).
+	if err := config.PersistActiveBinding(string(binding.ProviderID), string(binding.ModelID), string(binding.VariantParams)); err != nil {
+		return err
+	}
+	// Commit to runtime (I4).
+	a.runtime.Activate(binding)
+	return nil
 }

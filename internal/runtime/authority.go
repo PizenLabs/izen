@@ -1,16 +1,16 @@
 package runtime
 
-// Runtime Authority: the single source of truth for the effective model (I5).
+// Runtime Authority: the single source of truth for the effective model.
 //
-//   I1: Model Picker never owns runtime or persistence authority.
-//   I2: Assignment and activation are distinct state transitions.
-//   I3: Persistent assignment succeeds before runtime state is committed.
-//   I4: Runtime commit is deterministic after successful preparation/persistence.
-//   I8: Workspace targets are semantic policies, not independent runtimes.
+// The runtime authority owns ONE active executable binding (ProviderID +
+// ModelID + VariantParams). Per-workspace assignment matrices are removed.
+// The currentMode field is retained purely for UI display and does NOT
+// participate in model resolution.
 //
-// Assignment (persist) and activation (effective for current mode) are kept
-// distinct: CommitTransition records Previous/Current plus Activated
-// (Target == currentMode) without any business validation so it cannot fail.
+// Invariants:
+//   - The active binding is the sole source of runtime model state.
+//   - Persistence must succeed before runtime commit (callers enforce I3).
+//   - ResolveForIntent is the single model-resolution entry point.
 
 import (
 	"fmt"
@@ -18,54 +18,128 @@ import (
 	"sync"
 	"time"
 
-	coredomain "github.com/PizenLabs/izen/internal/core/domain"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 )
 
-// WorkspaceTarget aliases the core-domain semantic policy target so the
-// runtime and the picker share one closed target schema (I8).
-type WorkspaceTarget = coredomain.WorkspaceTarget
+// WorkspaceTarget is a semantic mode label retained for transcript logging
+// and UI mode display. It is NOT a model assignment slot.
+type WorkspaceTarget string
 
-// Target aliases for call sites that prefer runtime-scoped names.
 const (
-	TargetAsk         = coredomain.WorkspaceAsk
-	TargetInvestigate = coredomain.WorkspaceInvestigate
-	TargetPlan        = coredomain.WorkspacePlan
-	TargetBuild       = coredomain.WorkspaceBuild
-	TargetReview      = coredomain.WorkspaceReview
-	TargetNone        = coredomain.WorkspaceNone
+	TargetAsk         WorkspaceTarget = "ask"
+	TargetInvestigate WorkspaceTarget = "investigate"
+	TargetPlan        WorkspaceTarget = "plan"
+	TargetBuild       WorkspaceTarget = "build"
+	TargetReview      WorkspaceTarget = "review"
+	TargetNone        WorkspaceTarget = "none"
 )
 
-// ModelRef aliases the core-domain model reference (I7: no wire semantics).
-type ModelRef = coredomain.ModelRef
-
-// ModelTransitionEvent aliases the core-domain transition event.
-type ModelTransitionEvent = coredomain.ModelTransitionEvent
-
-// PreparedTransition is the validated, committable assignment. It carries
-// everything CommitTransition needs so the commit stays deterministic.
-type PreparedTransition struct {
-	Target   WorkspaceTarget
-	Previous ModelRef
-	Next     ModelRef
+// ModelRef is a lightweight model reference for transcript events.
+type ModelRef struct {
+	ID       string
+	Provider string
 }
 
-// RuntimeAuthority is the single source of truth for workspace model state.
-// It owns no persistence: callers must persist before committing (I3).
+// ModelTransitionEvent records one model activation for transcript logging.
+type ModelTransitionEvent struct {
+	Target    WorkspaceTarget
+	Previous  ModelRef
+	Current   ModelRef
+	Activated bool
+	Timestamp time.Time
+}
+
+// ToTranscriptLog renders the system feedback log line for the transcript.
+func (e ModelTransitionEvent) ToTranscriptLog() string {
+	prev := e.Previous.ID
+	if prev == "" {
+		prev = "(unset)"
+	}
+	curr := e.Current.ID
+	if curr == "" {
+		curr = "(unset)"
+	}
+	if e.Activated {
+		return fmt.Sprintf("[System] Active mode '%s' switched: %s -> %s", string(e.Target), prev, curr)
+	}
+	return fmt.Sprintf("[System] %s binding updated: %s (Inactive)", string(e.Target), curr)
+}
+
+// RuntimeAuthority is the single source of truth for the active model binding.
 type RuntimeAuthority struct {
 	mu          sync.RWMutex
-	assignments map[WorkspaceTarget]ModelRef
+	active      authority.ModelBinding
+	policy      authority.ModelPolicy
 	currentMode WorkspaceTarget
 }
 
-// NewRuntimeAuthority builds an empty authority defaulting to ask mode.
+// NewRuntimeAuthority builds an empty authority.
 func NewRuntimeAuthority() *RuntimeAuthority {
 	return &RuntimeAuthority{
-		assignments: make(map[WorkspaceTarget]ModelRef),
 		currentMode: TargetAsk,
 	}
 }
 
-// SetCurrentMode sets the active workspace mode (semantic policy, I8).
+// Activate atomically sets the active model binding.
+func (a *RuntimeAuthority) Activate(binding authority.ModelBinding) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.active = binding
+}
+
+// ActiveBinding returns the current active model binding.
+func (a *RuntimeAuthority) ActiveBinding() authority.ModelBinding {
+	if a == nil {
+		return authority.ModelBinding{}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.active
+}
+
+// SetPolicy sets the role-based model policy (read-only configuration).
+func (a *RuntimeAuthority) SetPolicy(policy authority.ModelPolicy) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.policy = policy
+}
+
+// Policy returns the current role-based model policy.
+func (a *RuntimeAuthority) Policy() authority.ModelPolicy {
+	if a == nil {
+		return authority.ModelPolicy{}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.policy
+}
+
+// ResolveForIntent resolves the model binding for a semantic intent using
+// the stateless Policy Resolver. This is the single model-resolution entry
+// point for all execution paths.
+func (a *RuntimeAuthority) ResolveForIntent(intent string) (authority.ModelBinding, error) {
+	if a == nil {
+		return authority.ModelBinding{}, fmt.Errorf("authority: not initialized")
+	}
+	a.mu.RLock()
+	runtime := authority.ModelState{
+		ActiveProvider: a.active.ProviderID,
+		ActiveModel:    a.active.ModelID,
+		ActiveVariant:  a.active.VariantParams,
+		IsConfigured:   a.active.ModelID != "",
+	}
+	policy := a.policy
+	a.mu.RUnlock()
+	return authority.ResolveModel(intent, runtime, policy)
+}
+
+// SetCurrentMode sets the active workspace mode (for UI display only).
 func (a *RuntimeAuthority) SetCurrentMode(m WorkspaceTarget) {
 	if a == nil {
 		return
@@ -91,17 +165,33 @@ func (a *RuntimeAuthority) CurrentMode() WorkspaceTarget {
 	return a.currentMode
 }
 
-// EffectiveModel derives the model for target exclusively from runtime state (I5).
-func (a *RuntimeAuthority) EffectiveModel(target WorkspaceTarget) ModelRef {
+// SeedBootstrap installs the active binding without validation (bootstrap only).
+func (a *RuntimeAuthority) SeedBootstrap(binding authority.ModelBinding) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.active = binding
+}
+
+// --- Backward-compatible API (deprecated, used by callers not yet migrated) ---
+
+// EffectiveModel returns the active model for any target. The target parameter
+// is ignored: there is only one active binding.
+func (a *RuntimeAuthority) EffectiveModel(_ WorkspaceTarget) ModelRef {
 	if a == nil {
 		return ModelRef{}
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.assignments[target]
+	return ModelRef{
+		ID:       string(a.active.ModelID),
+		Provider: string(a.active.ProviderID),
+	}
 }
 
-// ActiveModel resolves EffectiveModel(currentMode) (I5).
+// ActiveModel returns the active model (convenience alias for EffectiveModel).
 func (a *RuntimeAuthority) ActiveModel() ModelRef {
 	if a == nil {
 		return ModelRef{}
@@ -109,41 +199,50 @@ func (a *RuntimeAuthority) ActiveModel() ModelRef {
 	return a.EffectiveModel(a.CurrentMode())
 }
 
-// SeedAssignment installs an assignment without validation (bootstrap only).
-func (a *RuntimeAuthority) SeedAssignment(target WorkspaceTarget, ref ModelRef) {
+// SeedAssignment installs an assignment for the given target. The target is
+// ignored for model resolution; the binding becomes the active binding.
+func (a *RuntimeAuthority) SeedAssignment(_ WorkspaceTarget, ref ModelRef) {
 	if a == nil {
 		return
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.assignments == nil {
-		a.assignments = make(map[WorkspaceTarget]ModelRef)
+	a.active = authority.ModelBinding{
+		ProviderID: authority.ProviderID(ref.Provider),
+		ModelID:    authority.ModelID(ref.ID),
 	}
-	a.assignments[target] = ref
+}
+
+// PreparedTransition is retained for backward compatibility with callers
+// that have not yet migrated to Activate(). It validates the model ID
+// without mutating runtime state.
+type PreparedTransition struct {
+	Target   WorkspaceTarget
+	Previous ModelRef
+	Next     ModelRef
 }
 
 // PrepareTransition validates an assignment without mutating runtime state.
-// Errors: unknown target (TargetNone/empty/unknown) or empty model ID.
 func (a *RuntimeAuthority) PrepareTransition(target WorkspaceTarget, next ModelRef) (PreparedTransition, error) {
 	if a == nil {
 		return PreparedTransition{}, fmt.Errorf("runtime: authority not initialized")
-	}
-	if !WorkspaceTarget(target).IsValid() {
-		return PreparedTransition{}, fmt.Errorf("runtime: unknown workspace target: %q", string(target))
 	}
 	if strings.TrimSpace(next.ID) == "" {
 		return PreparedTransition{}, fmt.Errorf("runtime: empty model id for target %q", string(target))
 	}
 	a.mu.RLock()
-	prev := a.assignments[target]
+	prev := ModelRef{
+		ID:       string(a.active.ModelID),
+		Provider: string(a.active.ProviderID),
+	}
 	a.mu.RUnlock()
 	return PreparedTransition{Target: target, Previous: prev, Next: next}, nil
 }
 
-// CommitTransition applies a prepared transition deterministically. It
-// performs no business validation and never fails: preparation and
-// persistence must already have succeeded (I3, I4). Activated is derived
-// from Target == currentMode so assignment vs activation stay distinct (I2).
+// CommitTransition applies a prepared transition deterministically.
+// Under the single-binding model, the active binding is only updated when
+// the target matches the current mode. Assignments to inactive targets are
+// persisted but do not change the active binding.
 func (a *RuntimeAuthority) CommitTransition(prep PreparedTransition) ModelTransitionEvent {
 	if a == nil {
 		return ModelTransitionEvent{
@@ -152,20 +251,27 @@ func (a *RuntimeAuthority) CommitTransition(prep PreparedTransition) ModelTransi
 		}
 	}
 	a.mu.Lock()
-	if a.assignments == nil {
-		a.assignments = make(map[WorkspaceTarget]ModelRef)
+	prev := ModelRef{
+		ID:       string(a.active.ModelID),
+		Provider: string(a.active.ProviderID),
 	}
-	a.assignments[prep.Target] = prep.Next
 	mode := a.currentMode
 	if mode == "" {
 		mode = TargetAsk
 	}
+	activated := prep.Target == mode
+	if activated {
+		a.active = authority.ModelBinding{
+			ProviderID: authority.ProviderID(prep.Next.Provider),
+			ModelID:    authority.ModelID(prep.Next.ID),
+		}
+	}
 	a.mu.Unlock()
 	return ModelTransitionEvent{
 		Target:    prep.Target,
-		Previous:  prep.Previous,
+		Previous:  prev,
 		Current:   prep.Next,
-		Activated: prep.Target == mode,
+		Activated: activated,
 		Timestamp: time.Now(),
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"errors"
 	"testing"
 
-	coredomain "github.com/PizenLabs/izen/internal/core/domain"
+	"github.com/PizenLabs/izen/internal/runtime"
 	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
 )
 
@@ -30,7 +30,7 @@ func TestHandleAssignmentPersistsExactPayloadModel(t *testing.T) {
 	repo := &stubConfigRepo{}
 	a := NewApp()
 	a.SetConfigRepo(repo)
-	a.SetCurrentMode(coredomain.WorkspaceAsk)
+	a.SetCurrentMode(runtime.TargetAsk)
 
 	msg := model_picker.ModelAssignmentRequestedMsg{
 		ModelID:  "inclusionai/ling-3.0-flash-fin:free",
@@ -57,7 +57,7 @@ func TestHandleAssignmentPersistsExactPayloadModel(t *testing.T) {
 	if repo.calls[0].target != "ask" {
 		t.Errorf("persist target = %q, want ask", repo.calls[0].target)
 	}
-	got := a.EffectiveModel(coredomain.WorkspaceAsk)
+	got := a.EffectiveModel(runtime.TargetAsk)
 	if got.ID != "inclusionai/ling-3.0-flash-fin:free" {
 		t.Errorf("EffectiveModel(ask) = %q, want inclusionai", got.ID)
 	}
@@ -72,7 +72,7 @@ func TestHandleAssignmentAbortsRuntimeOnPersistFailure(t *testing.T) {
 	repo := &stubConfigRepo{err: errors.New("disk full")}
 	a := NewApp()
 	a.SetConfigRepo(repo)
-	a.SetCurrentMode(coredomain.WorkspaceAsk)
+	a.SetCurrentMode(runtime.TargetAsk)
 
 	msg := model_picker.ModelAssignmentRequestedMsg{
 		ModelID:  "inclusionai/ling-3.0-flash-fin:free",
@@ -82,18 +82,19 @@ func TestHandleAssignmentAbortsRuntimeOnPersistFailure(t *testing.T) {
 	if _, _, err := a.HandleModelAssignmentRequestedMsg(msg); err == nil {
 		t.Fatal("must surface the persistence failure")
 	}
-	if got := a.EffectiveModel(coredomain.WorkspaceAsk); got.ID != "" {
+	if got := a.EffectiveModel(runtime.TargetAsk); got.ID != "" {
 		t.Errorf("EffectiveModel(ask) = %q after failed persist, want empty (no mutation)", got.ID)
 	}
 }
 
-// Assignment to an inactive target persists + commits to that target only;
-// the active model's status truth is untouched (I2).
+// Assignment to an inactive target persists the binding but does NOT
+// activate it. Under the single-binding model, only assignments to the
+// current mode change the active binding.
 func TestHandleAssignmentInactiveTargetLeavesActiveModel(t *testing.T) {
 	repo := &stubConfigRepo{}
 	a := NewApp()
 	a.SetConfigRepo(repo)
-	a.SetCurrentMode(coredomain.WorkspaceAsk)
+	a.SetCurrentMode(runtime.TargetAsk)
 
 	msg := model_picker.ModelAssignmentRequestedMsg{
 		ModelID:  "google/gemini-2.5-flash",
@@ -107,9 +108,8 @@ func TestHandleAssignmentInactiveTargetLeavesActiveModel(t *testing.T) {
 	if event.Activated {
 		t.Error("assignment to an inactive target must not be Activated")
 	}
-	if got := a.EffectiveModel(coredomain.WorkspacePlan); got.ID != "google/gemini-2.5-flash" {
-		t.Errorf("EffectiveModel(plan) = %q, want gemini", got.ID)
-	}
+	// Under the single-binding model, ActiveModel returns the active binding.
+	// Since target=plan != currentMode=ask, the active binding is unchanged.
 	if got := a.ActiveModel(); got.ID != "" {
 		t.Errorf("ActiveModel = %q, want empty (ask untouched)", got.ID)
 	}

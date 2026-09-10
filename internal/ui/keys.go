@@ -1265,6 +1265,16 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 	userInput := m.ExpandPasteTokens(m.ti.Value())
 	m.dismissSuggestions()
 
+	// Block prompt submission when no active model is configured (Phase 3).
+	if m.unconfigured {
+		m.push(roleStatus, "⚠ No active model set for provider. Please select a model to begin.")
+		m.refreshViewportContent()
+		m.ti.Focus()
+		m.showModelPicker = true
+		m.modelPicker = newModelPickerFromCache(m)
+		return m, m.modelPicker.Init()
+	}
+
 	// ── Proposed shell command checkpoint ──────────────────────────────
 	if m.proposedShellCmd != "" {
 		cmd := m.proposedShellCmd

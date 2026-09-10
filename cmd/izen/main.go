@@ -167,10 +167,19 @@ func main() {
 		cfg = config.Default()
 	}
 
+	// Non-fatal bootup on unconfigured model state: launch TUI directly
+	// into /models picker instead of terminating.
+	unconfigured := false
 	if err := cfg.Validate(); err != nil {
-		fmt.Fprintf(os.Stderr, "izen: config error: %v\n", err)
-		os.Exit(1)
+		// Only fatal for real infrastructure errors; empty model allows graceful boot
+		if strings.Contains(err.Error(), "no model configured") || strings.Contains(err.Error(), "unassigned model") {
+			unconfigured = true
+		} else {
+			fmt.Fprintf(os.Stderr, "izen: config error: %v\n", err)
+			os.Exit(1)
+		}
 	}
+	_ = unconfigured // Graceful boot handled by TUI model state check in NewProgramWithApp
 
 	// Inject the configured response style policy into every composed system
 	// prompt for the lifetime of this process.

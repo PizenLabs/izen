@@ -7,44 +7,16 @@ package domain
 //   I5: Effective model is derived exclusively from Runtime Authority.
 //   I6: Model capabilities are truthful; unknown capabilities are never inferred.
 //   I7: Provider wire semantics never leak into the core domain model.
-//   I8: Workspace targets are semantic policies, not independent runtimes.
 
 import (
 	"fmt"
 	"time"
 )
 
-// WorkspaceTarget is the semantic policy scope for a model assignment.
-// It is NOT an independent runtime; the Runtime Authority owns execution.
+// WorkspaceTarget is a semantic mode label (e.g. "ask", "build").
+// It is NOT a model assignment slot — model state is owned by the
+// Runtime Authority's single active binding.
 type WorkspaceTarget string
-
-const (
-	WorkspaceAsk         WorkspaceTarget = "ask"
-	WorkspaceInvestigate WorkspaceTarget = "investigate"
-	WorkspacePlan        WorkspaceTarget = "plan"
-	WorkspaceBuild       WorkspaceTarget = "build"
-	WorkspaceReview      WorkspaceTarget = "review"
-	WorkspaceNone        WorkspaceTarget = "none"
-)
-
-// AllWorkspaceTargets is the ordered assignable set (excludes none).
-var AllWorkspaceTargets = []WorkspaceTarget{
-	WorkspaceAsk,
-	WorkspaceInvestigate,
-	WorkspacePlan,
-	WorkspaceBuild,
-	WorkspaceReview,
-}
-
-// IsValid reports whether t is a known assignable target (excludes none).
-func (t WorkspaceTarget) IsValid() bool {
-	switch t {
-	case WorkspaceAsk, WorkspaceInvestigate, WorkspacePlan, WorkspaceBuild, WorkspaceReview:
-		return true
-	default:
-		return false
-	}
-}
 
 // ModelRef is the core-domain model reference. Provider is an opaque label;
 // no provider wire semantics (tiers, effort keys, budgets) live here (I7).
@@ -53,9 +25,7 @@ type ModelRef struct {
 	Provider string
 }
 
-// ModelTransitionEvent records one assignment/activation transition.
-// Assignment and activation are distinct state transitions (I2):
-// Activated reports whether Target == current mode at commit time.
+// ModelTransitionEvent records one model activation for transcript logging.
 type ModelTransitionEvent struct {
 	Target    WorkspaceTarget
 	Previous  ModelRef
@@ -65,9 +35,6 @@ type ModelTransitionEvent struct {
 }
 
 // ToTranscriptLog renders the system feedback log line for the transcript.
-// Activated transitions log the active-mode switch; inactive ones log the
-// binding update explicitly marked (Inactive) so the status bar contract
-// (unchanged when target != active mode) stays truthful.
 func (e ModelTransitionEvent) ToTranscriptLog() string {
 	prev := e.Previous.ID
 	if prev == "" {

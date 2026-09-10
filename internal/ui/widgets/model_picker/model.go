@@ -167,9 +167,6 @@ type Model struct {
 	// activeWorkspace is the contextual workspace target for fast-path assignment.
 	activeWorkspace WorkspaceTarget
 
-	// targetCursor is the assignment drawer cursor in StateDetail.
-	targetCursor int
-
 	// reasoningPolicy is the workspace reasoning policy for assignment.
 	reasoningPolicy string
 
@@ -235,7 +232,6 @@ func New(snap *registry.ModelSnapshot) Model {
 		searchInput:     searchInputModel{Width: searchInputWidth, focused: false},
 		state:           StateBrowsing,
 		activeWorkspace: TargetNone,
-		targetCursor:    0,
 		reasoningPolicy: "default",
 	}
 	m.refilter()
@@ -437,12 +433,6 @@ func (m Model) ActiveWorkspace() WorkspaceTarget { return m.activeWorkspace }
 // SetActiveWorkspace sets the active workspace context.
 func (m Model) SetActiveWorkspace(t WorkspaceTarget) Model { m.activeWorkspace = t; return m }
 
-// TargetCursor returns the detail view target cursor index.
-func (m Model) TargetCursor() int { return m.targetCursor }
-
-// SetTargetCursor sets the detail view target cursor.
-func (m Model) SetTargetCursor(i int) Model { m.targetCursor = i; return m }
-
 // ReasoningPolicy returns the reasoning policy string.
 func (m Model) ReasoningPolicy() string { return m.reasoningPolicy }
 
@@ -488,27 +478,6 @@ func (m *Model) pinDetail() {
 
 // clearDetail releases the pinned selection on exit back to browsing.
 func (m *Model) clearDetail() { m.detailModel = nil }
-
-// getInitialTargetIndex returns the cursor init position for the assignment drawer.
-func (m Model) getInitialTargetIndex() int {
-	for i, t := range AllWorkspaceTargets {
-		if t == m.activeWorkspace {
-			return i
-		}
-	}
-	return 0
-}
-
-// isModelAssignedToTarget reports whether modelID is bound to target.
-func (m Model) isModelAssignedToTarget(modelID string, target WorkspaceTarget) bool {
-	if modelID == "" {
-		return false
-	}
-	if bound, ok := m.roles[string(target)]; ok && bound != "" {
-		return bound == modelID
-	}
-	return false
-}
 
 // cycleReasoningPolicy cycles strictly through the highlighted model's real
 // ReasoningCapability.Options via selectedReasoningOptIdx.
@@ -556,10 +525,10 @@ func (m Model) emitAssignmentCmd(model *registry.ModelDescriptor, target Workspa
 	}
 	return func() tea.Msg {
 		return ModelAssignmentRequestedMsg{
-			ModelID:  model.ID,
-			Provider: model.Provider,
-			Target:   target,
-			Policy:   InvocationPolicy{Reasoning: policy},
+			ModelID:   model.ID,
+			Provider:  model.Provider,
+			Target:    WorkspaceTarget(""), // Deprecated workspace target
+			Policy:    InvocationPolicy{Reasoning: policy},
 		}
 	}
 }

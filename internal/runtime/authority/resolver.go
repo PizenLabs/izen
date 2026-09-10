@@ -52,6 +52,7 @@ type ModelState struct {
 	ActiveProvider ProviderID
 	ActiveModel    ModelID
 	ActiveVariant  VariantOption
+	IsConfigured   bool // Non-fatal bootup when false
 }
 
 // ModelPolicy is the read-only policy configuration loaded from settings.
@@ -68,6 +69,10 @@ var ErrUnassignedModel = errors.New("authority: unassigned model")
 // ErrProviderModelMismatch signals a model that does not belong to the
 // provider that will serve it.
 var ErrProviderModelMismatch = errors.New("authority: provider/model mismatch")
+
+// ErrProviderDisabled signals that the provider is not configured or
+// not reachable.
+var ErrProviderDisabled = errors.New("authority: provider disabled")
 
 // ResolveModel implements the pure, stateless Policy Resolver.
 // Rules:
@@ -148,4 +153,20 @@ func containsSlashVendorPrefix(s string) bool {
 		}
 	}
 	return false
+}
+
+// ValidateBinding checks that a ModelBinding has a non-empty ModelID and
+// that the provider/model pair is compatible. Returns nil on success.
+func ValidateBinding(binding ModelBinding) error {
+	if binding.ModelID == "" {
+		return fmt.Errorf("%w: empty model ID", ErrUnassignedModel)
+	}
+	if binding.ProviderID == "" {
+		return fmt.Errorf("%w: empty provider ID", ErrProviderDisabled)
+	}
+	if !modelCompatible(string(binding.ProviderID), string(binding.ModelID)) {
+		return fmt.Errorf("%w: model %q does not belong to provider %q",
+			ErrProviderModelMismatch, binding.ModelID, binding.ProviderID)
+	}
+	return nil
 }

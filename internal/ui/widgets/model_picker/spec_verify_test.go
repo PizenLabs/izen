@@ -157,11 +157,7 @@ func TestFocusScopeStateMachine(t *testing.T) {
 		t.Error("Enter to detail must not emit assignment command")
 	}
 
-	// In detail, up/down navigate targets, Esc returns to browsing
-	mUp, _ := mDetail.UpdateModel(tea.KeyMsg{Type: tea.KeyUp})
-	if mUp.TargetCursor() != 0 {
-		t.Errorf("up at top should stay 0, got %d", mUp.TargetCursor())
-	}
+	// In detail, Esc returns to browsing
 	mDown, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
 	if mDown.Cursor() != 1 {
 		t.Errorf("down must move cursor in browsing, got %d want 1", mDown.Cursor())

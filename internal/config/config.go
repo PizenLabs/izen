@@ -85,6 +85,22 @@ type AIConfig struct {
 	Providers        map[string]AIProviderConfig `yaml:"providers"`
 }
 
+// ActiveBindingConfig is the atomic provider/model/variant binding.
+type ActiveBindingConfig struct {
+	Provider string `yaml:"provider"`
+	Model    string `yaml:"model"`
+	Variant  string `yaml:"variant,omitempty"`
+}
+
+// BindingsConfig is the unified model binding. Active is the single source
+// of truth for the runtime model. Policy maps semantic roles to overrides.
+type BindingsConfig struct {
+	Active ActiveBindingConfig            `yaml:"active"`
+	Policy map[string]ActiveBindingConfig `yaml:"policy,omitempty"`
+}
+
+// AssignmentsConfig is the legacy per-workspace assignment matrix.
+// Retained for backward compatibility and migration; prefer BindingsConfig.
 type AssignmentsConfig struct {
 	Ask         string `yaml:"ask,omitempty"`
 	Investigate string `yaml:"investigate,omitempty"`
@@ -98,7 +114,10 @@ type Config struct {
 	DefaultModel string `yaml:"default_model,omitempty"`
 	PlanModel    string `yaml:"plan_model,omitempty"`
 
-	// New structured assignments
+	// Unified model binding (single source of truth)
+	Bindings BindingsConfig `yaml:"bindings"`
+
+	// Legacy per-workspace assignments (migrated to Bindings.Active)
 	Assignments AssignmentsConfig `yaml:"assignments"`
 
 	AI        AIConfig        `yaml:"ai"`
@@ -212,6 +231,12 @@ type LynxConfig struct {
 }
 
 func (c *Config) ActiveProviderName() string {
+	// Unified binding is the primary authority.
+	if c.Bindings.Active.Provider != "" {
+		if _, ok := c.AI.Providers[c.Bindings.Active.Provider]; ok {
+			return c.Bindings.Active.Provider
+		}
+	}
 	if c.AI.DefaultProvider != "" {
 		if _, ok := c.AI.Providers[c.AI.DefaultProvider]; ok {
 			return c.AI.DefaultProvider
@@ -229,6 +254,10 @@ func (c *Config) ActiveProviderName() string {
 }
 
 func (c *Config) ActiveModelName() string {
+	// Unified binding is the primary authority.
+	if c.Bindings.Active.Model != "" {
+		return c.Bindings.Active.Model
+	}
 	if c.Models.SessionModel != "" {
 		return c.Models.SessionModel
 	}
@@ -371,11 +400,11 @@ func Default() *Config {
 			FallbackProvider: "openai",
 			MaxTokens:        4096,
 			Providers: map[string]AIProviderConfig{
-			"ollama": {
-				BaseURL:      "http://localhost:11434/v1",
-				APIKey:       "ollama",
-				DefaultModel: "",
-			},
+		"ollama": {
+			BaseURL:      "http://localhost:11434/v1",
+			APIKey:       "ollama",
+			DefaultModel: "qwen2.5-coder:7b",
+		},
 				"anthropic": {
 					BaseURL:      "https://api.anthropic.com/v1",
 					APIKey:       "${ANTHROPIC_API_KEY}",
@@ -399,9 +428,8 @@ func Default() *Config {
 			},
 		},
 		Models: ModelConfig{
-			Default:   "",
-			Provider:  "",
-			MaxTokens: 4096,
+			Default:   "qwen2.5-coder:7b",
+			Provider:  "ollama",			MaxTokens: 4096,
 			Modes: map[string]ModeSpec{
 				"ask":         {Provider: "", Model: ""},
 				"plan":        {Provider: "", Model: ""},
@@ -476,7 +504,38 @@ func (c *Config) MigrateLegacyConfig() bool {
 		c.Assignments.Plan = c.PlanModel
 		migrated = true
 	}
+	// Migrate 5-slot assignments → unified active binding.
+	if migratedSlot := c.MigrateLegacyAssignments(); migratedSlot {
+		migrated = true
+	}
 	return migrated
+}
+
+// MigrateLegacyAssignments migrates the 5-slot per-workspace assignment
+// matrix to the unified active binding. The first non-empty assignment
+// becomes the active binding. Returns true if migration occurred.
+func (c *Config) MigrateLegacyAssignments() bool {
+	// Already have an active binding — no migration needed.
+	if c.Bindings.Active.Model != "" {
+		return false
+	}
+	// Find the first non-empty legacy assignment.
+	legacy := map[string]string{
+		"ask":         c.Assignments.Ask,
+		"investigate": c.Assignments.Investigate,
+		"plan":        c.Assignments.Plan,
+		"build":       c.Assignments.Build,
+		"review":      c.Assignments.Review,
+	}
+	for _, modelID := range legacy {
+		if modelID != "" {
+			c.Bindings.Active.Model = modelID
+			// Infer provider from the active provider config.
+			c.Bindings.Active.Provider = c.ActiveProviderName()
+			return true
+		}
+	}
+	return false
 }
 
 func PersistAssignment(target string, modelID string) error {
@@ -497,6 +556,17 @@ func PersistAssignment(target string, modelID string) error {
 		return fmt.Errorf("unknown workspace target: %s", target)
 	}
 
+	return Save(cfg)
+}
+
+// PersistActiveBinding persists the unified active model binding.
+func PersistActiveBinding(provider, model, variant string) error {
+	cfg := GetGlobalConfig()
+	cfg.Bindings.Active = ActiveBindingConfig{
+		Provider: provider,
+		Model:    model,
+		Variant:  variant,
+	}
 	return Save(cfg)
 }
 
