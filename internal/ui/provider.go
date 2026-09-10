@@ -9,8 +9,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/llm"
-	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 )
 
 var validProviders = map[string]string{
@@ -147,63 +148,26 @@ func (m *model) switchProvider(name string) tea.Cmd {
 	// request (OpenRouter rejects e.g. local-id:7b with HTTP 400).
 	m.syncPipelineTiers()
 
-	// Provider switch state invalidation: clear stale target assignments that
-	// do not belong to the newly active provider. Without this, an Ollama
-	// assignment (local-id:7b) leaks into an OpenRouter worker context
-	// and is correctly rejected by the OpenRouter regex validator, but the
-	// root cause is stale authority state. Switching must re-resolve.
-	if rt := m.ensureModelRuntime(); rt != nil {
-		newDefault := ""
-		if provCfg, ok := m.cfg.AI.Providers[name]; ok {
-			newDefault = provCfg.DefaultModel
-		}
-		for _, tgtStr := range []string{"ask", "investigate", "plan", "build", "review"} {
-			tgt := appruntime.WorkspaceTarget(tgtStr)
-			ref := rt.EffectiveModel(tgt)
-			if ref.ID != "" && !modelBelongsToProvider(name, ref.ID) {
-				// Clear stale assignment
-				rt.SeedAssignment(tgt, appruntime.ModelRef{})
-				switch tgtStr {
-				case "ask":
-					m.cfg.Assignments.Ask = ""
-				case "investigate":
-					m.cfg.Assignments.Investigate = ""
-				case "plan":
-					m.cfg.Assignments.Plan = ""
-				case "build":
-					m.cfg.Assignments.Build = ""
-				case "review":
-					m.cfg.Assignments.Review = ""
-				}
-				// Re-resolve with new provider's default to keep harnesses functional
-				if newDefault != "" && modelBelongsToProvider(name, newDefault) {
-					rt.SeedAssignment(tgt, appruntime.ModelRef{ID: newDefault, Provider: name})
-					switch tgtStr {
-					case "ask":
-						m.cfg.Assignments.Ask = newDefault
-					case "investigate":
-						m.cfg.Assignments.Investigate = newDefault
-					case "plan":
-						m.cfg.Assignments.Plan = newDefault
-					case "build":
-						m.cfg.Assignments.Build = newDefault
-					case "review":
-						m.cfg.Assignments.Review = newDefault
-					}
-				}
+	// Provider switch state invalidation: clear the active binding if it does
+	// not belong to the newly active provider. Without this, an Ollama model
+	// leaks into an OpenRouter context and is rejected by the validator.
+	if auth := m.modelAuthority; auth != nil {
+		binding := auth.ActiveBinding()
+		if binding.ModelID != "" && !modelBelongsToProvider(name, string(binding.ModelID)) {
+			// Clear stale binding and re-seed with new provider's default.
+			newDefault := ""
+			if provCfg, ok := m.cfg.AI.Providers[name]; ok {
+				newDefault = provCfg.DefaultModel
 			}
-		}
-		if m.sessionModel != "" && !modelBelongsToProvider(name, m.sessionModel) {
-			m.sessionModel = ""
-			m.cfg.Models.SessionModel = ""
 			if newDefault != "" && modelBelongsToProvider(name, newDefault) {
-				m.sessionModel = newDefault
-				m.cfg.Models.SessionModel = newDefault
+				auth.Activate(authority.ModelBinding{
+					ProviderID: authority.ProviderID(name),
+					ModelID:    authority.ModelID(newDefault),
+				})
+				_ = config.PersistActiveBinding(name, newDefault, "")
+			} else {
+				auth.Activate(authority.ModelBinding{})
 			}
-		}
-		// Also clear the active target's session override if stale
-		if m.cfg != nil && m.cfg.Models.SessionModel != "" && !modelBelongsToProvider(name, m.cfg.Models.SessionModel) {
-			m.cfg.Models.SessionModel = ""
 		}
 	}
 

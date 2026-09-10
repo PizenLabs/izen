@@ -1403,12 +1403,10 @@ type model struct {
 	// Lazily created on /models from the local JSON cache (zero network);
 	// background sync is owned by the app layer.
 	modelRegistry *registry.Registry
-	sessionModel  string // user-selected model override via /models (legacy mirror; authority owns truth)
-
-	// modelRuntime is the Runtime Authority single source of truth for the
-	// effective model (I5). The picker never owns runtime state (I1); the
-	// status bar derives exclusively from here via ActiveModel.
-	modelRuntime *appruntime.RuntimeAuthority
+	// modelAuthority is the single source of truth for the active model binding.
+	// The UI reads ActiveBinding() to derive the current model/provider; it
+	// never stores a separate model reference. Nil in harnesses/tests.
+	modelAuthority *appruntime.RuntimeAuthority
 
 	// modelAppSvc is the domain application boundary for model role
 	// bindings (pure-view picker emits BindModelToRoleCommand; this service
@@ -1762,7 +1760,24 @@ func (m *model) syncPipelineTiers() {
 	if eng == nil {
 		return
 	}
+	activeProvider := m.cfg.ActiveProviderName()
+	activeDefault := ""
+	if provCfg, ok := m.cfg.AI.Providers[activeProvider]; ok {
+		activeDefault = provCfg.DefaultModel
+	}
 	eng.Router().SyncTiers(func(i pipeline.Intent) (string, string) {
+		// Resolve through authority when available.
+		if m.modelAuthority != nil {
+			b, err := m.modelAuthority.ResolveForIntent(string(i))
+			if err == nil && b.ModelID != "" {
+				return string(b.ModelID), string(b.ProviderID)
+			}
+		}
+		// Fallback: re-pin stale models to the active provider's default.
+		// Empty string leaves the current pin in place.
+		if activeDefault != "" {
+			return activeDefault, activeProvider
+		}
 		return "", ""
 	})
 }

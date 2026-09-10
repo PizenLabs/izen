@@ -11,62 +11,55 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/provider/discovery"
 	"github.com/PizenLabs/izen/internal/provider/registry"
-	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
 )
 
 // commitModelAssignment runs the atomic control-plane transaction pipeline
-// for a ModelAssignmentRequestedMsg (I2/I3/I4). It is shared by the
-// modal-open fast path (internal/ui/update.go picker routing) and the
-// modal-closed fallback path (main switch), so an assignment can never be
-// silently dropped regardless of delivery order:
+// for a ModelAssignmentRequestedMsg. It is shared by the modal-open fast path
+// (internal/ui/update.go picker routing) and the modal-closed fallback path
+// (main switch), so an assignment can never be silently dropped regardless of
+// delivery order:
 //
-//  1. Prepare validates without mutating runtime.
+//  1. Validate binding via authority.ValidateBinding.
 //  2. Persist must succeed before runtime commit (abort w/o mutate).
 //  3. Commit is deterministic (no validation failures).
 //  4. Transcript logs event.ToTranscriptLog() as a system message.
-//  5. Viewport re-renders from ActiveModel() and scrolls to bottom.
+//  5. Viewport re-renders from ActiveBinding() and scrolls to bottom.
 //  6. Modal tears down deterministically via CloseModalCmd.
 //
 // msg.ModelID/Provider flow straight from the event payload into
-// PrepareTransition and PersistAssignment: no fallback layer overrides the
+// ValidateBinding and PersistActiveBinding: no fallback layer overrides the
 // assigned model with a default.
 func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedMsg) tea.Cmd {
-	rt := m.ensureModelRuntime()
-	prep, prepErr := rt.PrepareTransition(appruntime.WorkspaceTarget(string(msg.Target)), appruntime.ModelRef{ID: msg.ModelID, Provider: msg.Provider})
-	if prepErr != nil {
-		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", prepErr.Error()))
+	auth := m.ensureModelAuthority()
+	binding := authority.ModelBinding{
+		ProviderID: authority.ProviderID(msg.Provider),
+		ModelID:    authority.ModelID(msg.ModelID),
+	}
+	if err := authority.ValidateBinding(binding); err != nil {
+		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
 		return nil
 	}
-	if err := config.PersistAssignment(string(msg.Target), msg.ModelID); err != nil {
-		// Abort without mutating runtime (I3).
+	if err := config.PersistActiveBinding(msg.Provider, msg.ModelID, string(msg.Policy.Reasoning)); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
 		return nil
 	}
-	event := rt.CommitTransition(prep)
-	// Assignment vs activation stay distinct (I2): only the active
-	// workspace disturbs the live session; inactive bindings persist
-	// to config while the status bar (ActiveModel) stays intact.
+	auth.Activate(binding)
+	// Sync pipeline intent tiers to the new binding.
+	m.syncPipelineTiers()
+	// Provider switch if needed.
 	var followCmd tea.Cmd
-	if event.Activated {
-		m.sessionModel = event.Current.ID
-		if m.cfg != nil {
-			m.cfg.Models.SessionModel = event.Current.ID
-		}
-		m.syncPipelineTiers()
-		if event.Current.Provider != "" {
-			followCmd = m.switchProviderIfNeeded(event.Current.Provider)
-		}
+	if msg.Provider != "" {
+		followCmd = m.switchProviderIfNeeded(msg.Provider)
 	}
-	m.push(roleSystem, event.ToTranscriptLog())
+	m.push(roleSystem, fmt.Sprintf("✓ Model set to %s/%s", msg.Provider, msg.ModelID))
 	m.refreshViewportContent()
 	m.gotoBottomIfAllowed()
-	// Deterministic teardown: close synchronously to avoid races,
-	// then emit CloseModalCmd for the routing layer (idempotent).
 	m.showModelPicker = false
 	m.ti.Focus()
 	if followCmd != nil {
@@ -82,18 +75,12 @@ func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedM
 func newModelPickerFromCache(m *model) model_picker.Model {
 	if m.modelRegistry == nil {
 		m.modelRegistry = registry.NewRegistry()
-		// Synchronous local-cache read only; missing file = empty picker.
-		// Never blocks on network; never spawns sync here.
 		_ = m.modelRegistry.LoadCache()
 	}
 	mp := model_picker.NewFromRegistry(m.modelRegistry)
-	// Contextual workspace: the picker's activeWorkspace mirrors the current
-	// mode so Enter fast-path assigns for /ask, /plan, etc. Global callers
-	// may override to TargetNone to force inspect-via-StateDetail (I2, I8).
 	if m != nil && m.resolver != nil {
 		mp = mp.SetActiveWorkspace(model_picker.WorkspaceTarget(m.resolver.Current().String()))
-		// Keep Runtime Authority tracking the active mode (I5).
-		m.ensureModelRuntime()
+		m.ensureModelAuthority()
 	}
 	if m.width > 0 || m.height > 0 {
 		var cmd tea.Cmd
@@ -107,7 +94,7 @@ func newModelPickerFromCache(m *model) model_picker.Model {
 }
 
 // applyPickerActivation applies an ACTIVATE (Enter) selection from the widget
-// picker: closes over the highlighted model, sets the session override,
+// picker: closes over the highlighted model, sets the active binding,
 // switches providers when needed, and toasts. Idempotent: empty IDs are a
 // no-op so duplicate Activate commands are safe.
 func (m *model) applyPickerActivation(um model_picker.Model) tea.Cmd {
@@ -126,10 +113,21 @@ func (m *model) applyPickerActivation(um model_picker.Model) tea.Cmd {
 			provider = hl.Provider
 		}
 	}
-	m.sessionModel = id
-	if m.cfg != nil {
-		m.cfg.Models.SessionModel = id
+
+	auth := m.ensureModelAuthority()
+	binding := authority.ModelBinding{
+		ProviderID: authority.ProviderID(provider),
+		ModelID:    authority.ModelID(id),
 	}
+	if err := authority.ValidateBinding(binding); err != nil {
+		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
+		return nil
+	}
+	if err := config.PersistActiveBinding(provider, id, ""); err != nil {
+		m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
+		return nil
+	}
+	auth.Activate(binding)
 	m.syncPipelineTiers()
 
 	var cmds []tea.Cmd
@@ -181,10 +179,7 @@ func (m *model) refreshModelRegistryCmd() tea.Cmd {
 		return func() tea.Msg {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			// Failure preserves cache; the header shows stale via providers.
 			_ = svc.RefreshRegistry(ctx)
-			// Re-read the shared cache file so the UI snapshot reflects the
-			// service refresh even when registries are distinct instances.
 			_ = reg.LoadCache()
 			return model_picker.SnapshotMsg{Snap: reg.Load()}
 		}
@@ -192,10 +187,6 @@ func (m *model) refreshModelRegistryCmd() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		// Live discovery without a service: concurrent fetch across active
-		// API keys (OpenRouter/OpenAI/Anthropic/Gemini/DeepSeek) plus the
-		// Ollama local runtime when reachable. Sync merges into RAM and
-		// persists per-provider; the fresh snapshot emits directly.
 		_ = reg.Sync(ctx, discovery.DiscoverProviders(ctx))
 		return model_picker.SnapshotMsg{Snap: reg.Load()}
 	}
@@ -223,15 +214,23 @@ func (m *model) pickerActivateCmd(cmd modelapp.ActivateModelCommand) tea.Cmd {
 		m.ti.Focus()
 		return nil
 	}
-	// Synthesize the widget state the activation helper reads from.
 	um := m.modelPicker
 	m.ti.Focus()
-	// Prefer the command payload directly when the picker highlight moved.
 	if um.ActivatedModelID() == "" {
-		m.sessionModel = cmd.ModelID
-		if m.cfg != nil {
-			m.cfg.Models.SessionModel = cmd.ModelID
+		auth := m.ensureModelAuthority()
+		binding := authority.ModelBinding{
+			ProviderID: authority.ProviderID(cmd.Provider),
+			ModelID:    authority.ModelID(cmd.ModelID),
 		}
+		if err := authority.ValidateBinding(binding); err != nil {
+			m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
+			return nil
+		}
+		if err := config.PersistActiveBinding(cmd.Provider, cmd.ModelID, ""); err != nil {
+			m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
+			return nil
+		}
+		auth.Activate(binding)
 		m.syncPipelineTiers()
 		m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s", cmd.ModelID)))
 		m.refreshViewportContent()

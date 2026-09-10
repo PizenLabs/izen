@@ -525,10 +525,10 @@ func (m Model) emitAssignmentCmd(model *registry.ModelDescriptor, target Workspa
 	}
 	return func() tea.Msg {
 		return ModelAssignmentRequestedMsg{
-			ModelID:   model.ID,
-			Provider:  model.Provider,
-			Target:    WorkspaceTarget(""), // Deprecated workspace target
-			Policy:    InvocationPolicy{Reasoning: policy},
+			ModelID:  model.ID,
+			Provider: model.Provider,
+			Target:   WorkspaceTarget(""), // Deprecated workspace target
+			Policy:   InvocationPolicy{Reasoning: policy},
 		}
 	}
 }

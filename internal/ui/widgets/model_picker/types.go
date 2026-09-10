@@ -31,17 +31,8 @@ const (
 	TargetPlan        WorkspaceTarget = "plan"
 	TargetBuild       WorkspaceTarget = "build"
 	TargetReview      WorkspaceTarget = "review"
-	TargetNone WorkspaceTarget = "none"
+	TargetNone        WorkspaceTarget = "none"
 )
-
-// AllWorkspaceTargets — DEPRECATED: removed from control surface.
-var AllWorkspaceTargets = []WorkspaceTarget{
-	TargetAsk,
-	TargetInvestigate,
-	TargetPlan,
-	TargetBuild,
-	TargetReview,
-}
 
 // PaneFocus selects the control surface focus scope.
 type PaneFocus int
@@ -53,10 +44,10 @@ const (
 
 // ProviderState tracks activation status for the provider-centric surface.
 type ProviderState struct {
-	Name         string `json:"name"`
-	Active       bool   `json:"active"`
-	Configured   bool   `json:"configured"`
-	ModelCount   int    `json:"model_count"`
+	Name       string `json:"name"`
+	Active     bool   `json:"active"`
+	Configured bool   `json:"configured"`
+	ModelCount int    `json:"model_count"`
 }
 
 // InvocationPolicy carries the reasoning policy for activation.
