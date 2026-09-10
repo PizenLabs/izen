@@ -988,6 +988,9 @@ type model struct {
 	// Unconfigured boot: when no active model is configured for the provider,
 	// the TUI opens directly into the model picker overlay instead of exiting.
 	unconfigured bool
+	// bootErr carries any non-fatal config validation error from startup so
+	// the TUI can surface it and route directly to the model picker.
+	bootErr error
 
 	investigateInvocationCount int
 

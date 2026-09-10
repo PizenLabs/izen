@@ -68,6 +68,14 @@ func (m *model) Init() tea.Cmd {
 		m.initSessionStartCheckpoint,
 		m.configLoadedCmd(),
 	}
+	// When bootErr is set, the app launched with an invalid/unconfigured
+	// provider. Open the model picker immediately so the user can select
+	// a model instead of staring at a blank input bar.
+	if m.bootErr != nil {
+		m.showModelPicker = true
+		m.modelPicker = newModelPickerFromCache(m)
+		cmds = append(cmds, m.modelPicker.Init())
+	}
 	// Arm the fact-only control telemetry bridge so control.iteration /
 	// control.node_observed facts stream into the loop as controlFactMsg.
 	if cmd := m.listenControlEventsCmd(); cmd != nil {

@@ -311,6 +311,31 @@ func SanitizeForSession(text string) string {
 	return result
 }
 
+// wellKnownBaseURLs maps known provider names to their canonical base URLs.
+// When a user's config file defines a provider without a base_url, the
+// loader backfills the default so the provider is immediately usable.
+var wellKnownBaseURLs = map[string]string{
+	"ollama":     "http://localhost:11434/v1",
+	"anthropic":  "https://api.anthropic.com/v1",
+	"openai":     "https://api.openai.com/v1",
+	"openrouter": "https://openrouter.ai/api/v1",
+	"groq":       "https://api.groq.com/openai/v1",
+}
+
+// SetDefaults fills in missing well-known fields (BaseURL) for providers
+// that appear in the config but lack them. This prevents cold-boot crashes
+// when a user adds a provider block without setting base_url.
+func (c *Config) SetDefaults() {
+	for name, prov := range c.AI.Providers {
+		if prov.BaseURL == "" {
+			if defURL, ok := wellKnownBaseURLs[name]; ok {
+				prov.BaseURL = defURL
+				c.AI.Providers[name] = prov
+			}
+		}
+	}
+}
+
 func ExpandEnvVar(val string) string {
 	return envVarPattern.ReplaceAllStringFunc(val, func(match string) string {
 		name := match[2 : len(match)-1]
@@ -372,6 +397,8 @@ func Load() (*Config, error) {
 		if data, err = os.ReadFile(legacy); err == nil {
 			var cfg Config
 			if err := yaml.Unmarshal(data, &cfg); err == nil {
+				cfg.AI.ExpandEnvVars()
+				cfg.SetDefaults()
 				if saveErr := Save(&cfg); saveErr == nil {
 					_ = os.Remove(legacy)
 					fmt.Fprintf(os.Stderr, "izen: migrated config from %s to %s\n", legacy, path)
@@ -389,6 +416,7 @@ func Load() (*Config, error) {
 	}
 
 	cfg.AI.ExpandEnvVars()
+	cfg.SetDefaults()
 
 	return &cfg, nil
 }
@@ -400,11 +428,11 @@ func Default() *Config {
 			FallbackProvider: "openai",
 			MaxTokens:        4096,
 			Providers: map[string]AIProviderConfig{
-		"ollama": {
-			BaseURL:      "http://localhost:11434/v1",
-			APIKey:       "ollama",
-			DefaultModel: "qwen2.5-coder:7b",
-		},
+				"ollama": {
+					BaseURL:      "http://localhost:11434/v1",
+					APIKey:       "ollama",
+					DefaultModel: "qwen2.5-coder:7b",
+				},
 				"anthropic": {
 					BaseURL:      "https://api.anthropic.com/v1",
 					APIKey:       "${ANTHROPIC_API_KEY}",
@@ -428,8 +456,8 @@ func Default() *Config {
 			},
 		},
 		Models: ModelConfig{
-			Default:   "qwen2.5-coder:7b",
-			Provider:  "ollama",			MaxTokens: 4096,
+			Default:  "qwen2.5-coder:7b",
+			Provider: "ollama", MaxTokens: 4096,
 			Modes: map[string]ModeSpec{
 				"ask":         {Provider: "", Model: ""},
 				"plan":        {Provider: "", Model: ""},
@@ -438,12 +466,12 @@ func Default() *Config {
 				"investigate": {Provider: "", Model: ""},
 			},
 			Tiers: map[string]IntentTierConfig{
-				"low_intent":        {Provider: "", Model: ""},
-				"medium_intent":     {Provider: "", Model: ""},
-				"high_intent":       {Provider: "", Model: ""},
-				"reasoning":         {Provider: "", Model: ""},
-				"execution":        {Provider: "", Model: ""},
-				"informational":     {Provider: "", Model: ""},
+				"low_intent":    {Provider: "", Model: ""},
+				"medium_intent": {Provider: "", Model: ""},
+				"high_intent":   {Provider: "", Model: ""},
+				"reasoning":     {Provider: "", Model: ""},
+				"execution":     {Provider: "", Model: ""},
+				"informational": {Provider: "", Model: ""},
 			},
 		},
 		Execution: ExecutionConfig{
