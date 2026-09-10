@@ -62,8 +62,8 @@ func TestTabularModelColumns(t *testing.T) {
 	if !strings.Contains(view, "$3.00/$15.00") {
 		t.Errorf("models pane must render $3.00/$15.00 pricing column, got:\n%s", view)
 	}
-	if !strings.Contains(view, "[Thinking]") || !strings.Contains(view, "[Tools]") {
-		t.Errorf("models pane must render [Thinking] [Tools] capability badges, got:\n%s", view)
+	if !strings.Contains(view, "[Thinking]") || !strings.Contains(view, "…") {
+		t.Errorf("models pane must render truncated capability badges at 16-cell width ([Thinking] …), got:\n%s", view)
 	}
 	if !strings.Contains(view, "1M") || !strings.Contains(view, "[Vision]") {
 		t.Errorf("models pane must render 1M context and [Vision] badge, got:\n%s", view)

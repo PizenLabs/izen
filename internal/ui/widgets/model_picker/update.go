@@ -235,7 +235,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			}
 		}
 		return m, nil
-	case "i":
+	case "alt+i", "alt+I":
 		// Inspect: pin the highlighted model into StateDetail. Enables
 		// detail view + reasoning policy cycling without committing.
 		// Any browsing focus enters detail for the highlighted model.

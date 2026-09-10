@@ -363,6 +363,7 @@ func (m Model) LastSeq() uint64 { return m.seq }
 // SetQuery replaces the search query and re-filters against RAM.
 func (m Model) SetQuery(q string) Model {
 	m.query = q
+	m.searchInput.SetValue(q)
 	m.refilter()
 	m.resetReasoning()
 	return m

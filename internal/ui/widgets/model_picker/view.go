@@ -216,7 +216,7 @@ func (m Model) renderBrowsingFooter() string {
 		keyStyle.Render("↑/↓"), descStyle.Render("navigate"),
 		keyStyle.Render("Enter"), descStyle.Render("activate / save key"),
 		keyStyle.Render("Alt+A"), descStyle.Render("set API key"),
-		keyStyle.Render("i"), descStyle.Render("details"),
+		keyStyle.Render("Alt+i"), descStyle.Render("details"),
 		keyStyle.Render("Esc"), descStyle.Render("close"),
 	)
 	if m.innerWidth <= 0 && m.width <= 0 {
@@ -509,7 +509,7 @@ const (
 const (
 	tableCtxColW   = 6
 	tablePriceColW = 12
-	tableFlagsMaxW = 24
+	tableFlagsMaxW = 16
 	tableIDMinW    = 10
 )
 
@@ -666,8 +666,8 @@ func (m Model) renderModelsPane() string {
 	header := "MODELS"
 	if m.showingRoles {
 		header = fmt.Sprintf("MODELS — assign %s", m.HighlightedRole())
-	} else if m.query != "" {
-		header += "  /" + m.query
+	} else if m.searchInput.Value() != "" {
+		header += "  /" + m.searchInput.Value()
 	}
 	lines = append(lines, mutedStyle.Render(header))
 	lines = append(lines, "")
@@ -741,7 +741,7 @@ func (m Model) renderModelRow(item registry.ModelDescriptor, rightPaneW int) str
 	// 2. Format remaining columns with exact fixed widths.
 	paddedCtx := padLeftExact(formatContextWindow(item.ContextWindow), ctxW)
 	paddedPrice := padLeftExact(formatPricing(item.InputCostPerM, item.OutputCostPerM), priceW)
-	paddedFlags := padRightExact(capabilityFlags(item), flagsW)
+	paddedFlags := padRightExact(runewidth.Truncate(capabilityFlags(item), flagsW, "…"), flagsW)
 
 	// 3. Assemble single plain string.
 	plainRow := paddedID + " " + paddedCtx + " " + paddedPrice + " " + paddedFlags
@@ -904,7 +904,11 @@ func (m Model) renderHeader() string {
 	m.searchInput.Width = 16
 	total := len(m.snapshotModels())
 	status, style := m.syncIndicator()
-	leftTitle := headerStyle.Render("IZEN MODEL REGISTRY (Provider-Centric)")
+	leftTitleBase := "IZEN MODEL REGISTRY (Provider-Centric)"
+	if m.searchInput.Value() != "" {
+		leftTitleBase += " /" + m.searchInput.Value()
+	}
+	leftTitle := headerStyle.Render(leftTitleBase)
 	countText := fmt.Sprintf("%d models loaded", total)
 	// Active focus indicator for the 3-pane layout: PROVIDERS, MODELS or ROLES.
 	focusLabel, focusHint := "PROVIDERS", "Tab to Models"

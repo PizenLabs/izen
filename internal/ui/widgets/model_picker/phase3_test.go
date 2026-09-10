@@ -39,7 +39,7 @@ func TestPhase3ContextualRender(t *testing.T) {
 	// Detail view shows MODEL DETAILS with specs
 	openai := registry.ModelDescriptor{ID: "openai/o1", Provider: "openai", Name: "o1"}
 	mStd := New(seedSnapshot([]registry.ModelDescriptor{openai}))
-	mStd, _ = mStd.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	mStd, _ = mStd.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i"), Alt: true})
 	vDetail := mStd.View()
 	if !strings.Contains(vDetail, "MODEL DETAILS") {
 		t.Errorf("detail view must contain MODEL DETAILS, got:\n%s", vDetail)

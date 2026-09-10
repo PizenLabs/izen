@@ -90,7 +90,7 @@ func TestAssignmentEmissionIsUnbatched(t *testing.T) {
 func TestDetailPinSurvivesBackgroundResort(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
 	m = m.SetPaneFocus(PaneModels).SetCursor(1) // inclusionai
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i"), Alt: true})
 	if m.State() != StateDetail {
 		t.Fatalf("state = %v, want StateDetail", m.State())
 	}
@@ -124,7 +124,7 @@ func TestDetailPinSurvivesBackgroundResort(t *testing.T) {
 func TestEscClearsDetailPin(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
 	m = m.SetPaneFocus(PaneModels).SetCursor(1)
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i"), Alt: true})
 	if m.DetailModel() == nil {
 		t.Fatal("detail pin must be set after inspect")
 	}
@@ -144,7 +144,7 @@ func TestEscClearsDetailPin(t *testing.T) {
 func TestDetailReasoningTruthfulForNonReasoningModel(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
 	m = m.SetPaneFocus(PaneModels).SetCursor(1)
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i"), Alt: true})
 
 	view := m.View()
 	if !strings.Contains(view, "Not supported by model") {
