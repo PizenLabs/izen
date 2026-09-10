@@ -20,18 +20,6 @@ var syncBaseURLs = map[string]string{
 	"ollama":   discovery.OllamaBase,
 }
 
-// staticAnthropicModels is the fallback registry for the Anthropic provider,
-// which exposes no public OpenAI-compatible /models endpoint. Returned when
-// the live fetch fails so a configured ANTHROPIC_API_KEY still yields a
-// usable catalog instead of an error.
-func staticAnthropicModels() []ModelDescriptor {
-	return []ModelDescriptor{
-		{ID: "claude-3-7-sonnet-latest", Name: "Claude 3.7 Sonnet", Provider: "anthropic", ContextWindow: 200000},
-		{ID: "claude-3-5-sonnet-latest", Name: "Claude 3.5 Sonnet", Provider: "anthropic", ContextWindow: 200000},
-		{ID: "claude-3-5-haiku-latest", Name: "Claude 3.5 Haiku", Provider: "anthropic", ContextWindow: 200000},
-	}
-}
-
 // normalizeSyncProviders copies providers, fills empty BaseURLs from known
 // endpoints, and auto-appends the Ollama local runtime when reachable and
 // not already listed. Ollama needs no API key: an empty key is backfilled
@@ -100,10 +88,10 @@ func (r *Registry) fetchForSync(ctx context.Context, p detector.ProviderConfig) 
 		return r.fetchHTTPModels(ctx, p)
 	}
 	got, err := r.fetchHTTPModels(ctx, p)
-	if err != nil && p.Name == "anthropic" {
-		return staticAnthropicModels(), nil
+	if err != nil {
+		return nil, fmt.Errorf("provider %s: live fetch failed (no static fallback): %w", p.Name, err)
 	}
-	return got, err
+	return got, nil
 }
 
 // Sync fetches every provider concurrently (errgroup) with per-provider

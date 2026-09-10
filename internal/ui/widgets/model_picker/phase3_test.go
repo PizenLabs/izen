@@ -7,7 +7,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
@@ -15,106 +14,79 @@ func TestPhase3ContextualRender(t *testing.T) {
 	none := registry.ModelDescriptor{ID: "z", Provider: "nope", Name: "z"}
 	mNone := New(seedSnapshot([]registry.ModelDescriptor{none}))
 	vNone := mNone.View()
-	if !strings.Contains(vNone, "REASONING") {
-		t.Errorf("none view must contain REASONING, got:\n%s", vNone)
+	// Browsing state is clean: no BINDINGS, no Alt bindings in footer
+	if strings.Contains(vNone, "BINDINGS") {
+		t.Errorf("browsing view must not contain BINDINGS, got:\n%s", vNone)
 	}
-	if strings.Contains(vNone, "low") {
-		t.Errorf("none view must not contain reasoning options, got:\n%s", vNone)
+	if strings.Contains(vNone, "Alt+d") {
+		t.Errorf("browsing view must not contain Alt bindings, got:\n%s", vNone)
 	}
+	if !strings.Contains(vNone, "IZEN MODEL REGISTRY") || !strings.Contains(vNone, "models") {
+		t.Errorf("header must show registry + count:\n%s", vNone)
+	}
+	// Dual-pane layout shows PROVIDERS and MODELS panes
+	if !strings.Contains(vNone, "PROVIDERS") || !strings.Contains(vNone, "MODELS") {
+		t.Errorf("browsing view must show PROVIDERS and MODELS panes:\n%s", vNone)
+	}
+	// Footer shows new 3-pane keybindings
+	if !strings.Contains(vNone, "Tab") || !strings.Contains(vNone, "API key") {
+		t.Errorf("browsing footer must show Tab and API key hints, got:\n%s", vNone)
+	}
+	// Active line shows provider/model
+	if !strings.Contains(vNone, "Active:") {
+		t.Errorf("browsing view must show Active line, got:\n%s", vNone)
+	}
+	// Detail view shows MODEL DETAILS with specs
 	openai := registry.ModelDescriptor{ID: "openai/o1", Provider: "openai", Name: "o1"}
 	mStd := New(seedSnapshot([]registry.ModelDescriptor{openai}))
-	vStd := mStd.View()
-	if !strings.Contains(vStd, "low") || !strings.Contains(vStd, "high") {
-		t.Errorf("standard view must contain low/high, got:\n%s", vStd)
+	mStd, _ = mStd.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i"), Alt: true})
+	vDetail := mStd.View()
+	if !strings.Contains(vDetail, "MODEL DETAILS") {
+		t.Errorf("detail view must contain MODEL DETAILS, got:\n%s", vDetail)
 	}
-	// Content collapses: none shows minimal dash, standard shows options.
-	if !strings.Contains(vNone, "—") {
-		t.Errorf("none view must collapse to minimal dash, got:\n%s", vNone)
+	if !strings.Contains(vDetail, "Context Window") || !strings.Contains(vDetail, "Pricing") {
+		t.Errorf("detail view must contain Context Window and Pricing, got:\n%s", vDetail)
 	}
-	if !strings.Contains(vStd, "IZEN MODEL REGISTRY") || !strings.Contains(vStd, "models") {
-		t.Errorf("header must show registry + count:\n%s", vStd)
+	if strings.Contains(vDetail, "WORKSPACE TARGET ASSIGNMENT") {
+		t.Errorf("detail view must NOT contain workspace assignment matrix, got:\n%s", vDetail)
 	}
-	if !strings.Contains(vStd, "BINDINGS") {
-		t.Errorf("view must contain BINDINGS line:\n%s", vStd)
-	}
-	if !strings.Contains(vStd, "Enter: activate") {
-		t.Errorf("footer must contain Enter: activate:\n%s", vStd)
+	if !strings.Contains(vDetail, "REASONING POLICY") {
+		t.Errorf("detail view must contain REASONING POLICY control, got:\n%s", vDetail)
 	}
 }
 
 func TestPhase3ExecutionTruth(t *testing.T) {
+	// Enter in PaneModels emits assignment directly
 	m := New(seedSnapshot(testModels()))
-	m = m.FocusList()
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	if _, ok := m.Roles()["plan"]; ok {
-		t.Fatal("must not optimistically mutate on BIND")
+	m = m.SetPaneFocus(PaneModels)
+	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter in PaneModels must emit ModelAssignmentRequestedMsg")
 	}
-	if !strings.Contains(m.Status(), "saving...") {
-		t.Fatalf("status must show saving..., got %q", m.Status())
+	assign := unwrapAssignmentMsg(t, cmd())
+	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
+		t.Errorf("assign model = %q, want highlighted", assign.ModelID)
 	}
-	seq := m.LastSeq()
-	if seq == 0 {
-		t.Fatal("Seq must be stamped on BIND")
-	}
-	// Failure reverts without corrupting local state.
-	m, _ = m.UpdateModel(BindingFailedMsg{Role: "plan", Err: errors.New("disk full"), Seq: seq})
-	if _, ok := m.Roles()["plan"]; ok {
-		t.Error("failed bind must not mutate roles")
-	}
-	if !strings.Contains(m.View(), "✕") && !strings.Contains(m.Status(), "✕") {
-		t.Errorf("failure must render ✕, status=%q", m.Status())
-	}
-	// Success confirms with check.
-	m2 := New(seedSnapshot(testModels()))
-	m2 = m2.FocusList()
-	m2, cmd := m2.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	bind := cmd().(modelapp.BindModelToRoleCommand)
-	if bind.Seq == 0 {
-		t.Error("emitted command must carry Seq")
-	}
-	m2, _ = m2.UpdateModel(modelapp.BindingResultMsg{Role: "plan", ModelID: bind.ModelID, Seq: bind.Seq})
-	if got := m2.Roles()["plan"]; got != bind.ModelID {
-		t.Errorf("success must commit roles, got %q", got)
-	}
-	if !strings.Contains(m2.Status(), "✓") {
-		t.Errorf("success must render ✓, got %q", m2.Status())
-	}
-	// Stale confirmation ignored (same role, older Seq).
+	// Binding failure still recorded correctly
 	m3 := New(seedSnapshot(testModels()))
-	m3 = m3.FocusList()
-	m3, _ = m3.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	firstSeq := m3.LastSeq()
-	m3, _ = m3.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
-	secondSeq := m3.LastSeq()
-	if secondSeq <= firstSeq {
-		t.Fatal("second bind must bump Seq")
-	}
-	m3, _ = m3.UpdateModel(modelapp.BindingResultMsg{Role: "plan", ModelID: "stale-model", Seq: firstSeq})
-	if got := m3.Roles()["plan"]; got == "stale-model" {
-		t.Error("stale Seq must be ignored")
+	m3 = m3.SetPaneFocus(PaneModels)
+	m3, _ = m3.UpdateModel(BindingFailedMsg{Role: "plan", Err: errors.New("disk full"), Seq: 1})
+	if _, ok := m3.Roles()["plan"]; ok {
+		t.Error("failed bind must not mutate roles")
 	}
 }
 
 func TestPhase3Activate(t *testing.T) {
+	// Enter in PaneModels commits directly (no intermediate detail step)
 	m := New(seedSnapshot(testModels()))
-	m = m.FocusList()
-	var cmd tea.Cmd
-	m, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
-	if !m.Done() {
-		t.Error("Enter must mark done")
-	}
+	m = m.SetPaneFocus(PaneModels)
+	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
-		t.Fatal("Enter must dispatch ActivateModelCommand")
+		t.Fatal("Enter in PaneModels must dispatch ModelAssignmentRequestedMsg")
 	}
-	act, ok := cmd().(modelapp.ActivateModelCommand)
-	if !ok {
-		t.Fatalf("Enter cmd = %T, want ActivateModelCommand", cmd())
-	}
+	act := unwrapAssignmentMsg(t, cmd())
 	if act.ModelID == "" {
-		t.Error("activate must carry ModelID")
-	}
-	if m.ActivatedModelID() != act.ModelID {
-		t.Errorf("activated = %q, want %q", m.ActivatedModelID(), act.ModelID)
+		t.Error("assignment must carry ModelID")
 	}
 }
 
@@ -135,9 +107,8 @@ func TestPhase3MultiField(t *testing.T) {
 	}
 }
 
-// Header MUST show total snapshot models in RAM while the search line shows
-// filter-scoped matches; a nonsense query keeps the total and renders the
-// empty-query message with the query echoed.
+// Header MUST show total snapshot models. A nonsense query filters the
+// models pane but the header count remains.
 func TestPhase3HeaderTotalVsMatches(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	m = m.SetQuery("xyz123")
@@ -145,11 +116,9 @@ func TestPhase3HeaderTotalVsMatches(t *testing.T) {
 	if !strings.Contains(view, "3 models") {
 		t.Errorf("header must still show total cached models, got:\n%s", view)
 	}
-	if !strings.Contains(view, "0/3 matches") {
-		t.Errorf("search line must show 0/3 matches, got:\n%s", view)
-	}
-	if !strings.Contains(view, "No models matching query: 'xyz123'") {
-		t.Errorf("empty state must echo query, got:\n%s", view)
+	// Models pane shows empty when no matches
+	if !strings.Contains(view, "(no models)") {
+		t.Errorf("empty models pane must show placeholder, got:\n%s", view)
 	}
 }
 
@@ -160,21 +129,18 @@ func TestPhase3HeaderTotalOnMatch(t *testing.T) {
 	if !strings.Contains(view, "3 models loaded") {
 		t.Errorf("header must show total loaded, got:\n%s", view)
 	}
-	if !strings.Contains(view, "3/3 matches") {
-		t.Errorf("search line must show 3/3 matches, got:\n%s", view)
-	}
 }
 
-// Cold start renders the zero-state inline (never a modal) and Init requests
-// background sync.
+// Cold start renders empty panes and Init requests background sync.
 func TestPhase3ColdStartZeroState(t *testing.T) {
 	m := New(seedSnapshot(nil))
 	view := m.View()
 	if !strings.Contains(view, "0 models") {
 		t.Errorf("cold start must show 0 models, got:\n%s", view)
 	}
-	if !strings.Contains(view, "no models loaded") {
-		t.Errorf("cold start must render zero-state inline, got:\n%s", view)
+	// Empty models pane shows placeholder
+	if !strings.Contains(view, "(no models)") {
+		t.Errorf("cold start must render empty models pane, got:\n%s", view)
 	}
 	if cmd := m.Init(); cmd == nil {
 		t.Fatal("cold start must request background sync")

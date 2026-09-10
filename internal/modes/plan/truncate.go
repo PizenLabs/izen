@@ -54,9 +54,9 @@ func IsLocalModel(modelName string) bool {
 			return true
 		}
 	}
-	// Default ollama model without explicit prefix still indicates a local SLM.
-	if name == "qwen2.5-coder:7b" {
-		return true
+	// Default local model indicator (no hardcoded execution default).
+	if name == "" {
+		return false
 	}
 	return false
 }

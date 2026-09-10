@@ -64,7 +64,7 @@ func buildProjectConfig(providers []string, apiKeys map[string]string) *localPro
 		"ollama": {
 			BaseURL:      "http://localhost:11434/v1",
 			APIKey:       "ollama",
-			DefaultModel: "qwen2.5-coder:7b",
+			DefaultModel: "",
 		},
 		"openrouter": {
 			BaseURL:      "https://openrouter.ai/api/v1",

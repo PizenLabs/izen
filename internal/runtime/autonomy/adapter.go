@@ -25,6 +25,8 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
+	"github.com/PizenLabs/izen/internal/runtime"
+	runtimeAuth "github.com/PizenLabs/izen/internal/runtime/authority"
 )
 
 // Resolved is the deterministic target resolution of one objective. Target
@@ -51,15 +53,26 @@ type Resolved struct {
 // ExecuteRequest, maps the canonical ExecutionResult onto a bounded
 // Observation, and forwards approvals through RuntimeExecutor.Approve/Reject.
 type ExecutorAdapter struct {
-	root     string
-	gateway  *execution.IntentGateway
-	executor *execution.RuntimeExecutor
+	root      string
+	gateway   *execution.IntentGateway
+	executor  *execution.RuntimeExecutor
+	authority *runtime.RuntimeAuthority
 }
 
 // NewExecutorAdapter wires the adapter over the unified IntentGateway and the
 // RuntimeExecutor authority. Both MUST be non-nil.
 func NewExecutorAdapter(root string, gateway *execution.IntentGateway, executor *execution.RuntimeExecutor) *ExecutorAdapter {
 	return &ExecutorAdapter{root: root, gateway: gateway, executor: executor}
+}
+
+// SetAuthority wires the Workspace model authority so every ExecuteRequest
+// carries an explicit TargetModel resolved at execution time. When not wired
+// the adapter falls back to the executor's legacy resolution.
+func (a *ExecutorAdapter) SetAuthority(auth *runtime.RuntimeAuthority) {
+	if a == nil {
+		return
+	}
+	a.authority = auth
 }
 
 // Root returns the workspace root the adapter resolves targets against. It is
@@ -223,6 +236,30 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		Scope:            req.Scope,
 		Evidence:         req.Evidence,
 		StreamCallback:   req.StreamCallback,
+		// Explicit TargetModel: resolved from the active Workspace Target at
+		// execution time. The executor enforces verbatim pass-through and
+		// rejects empty models locally with ErrUnassignedTargetModel.
+		// Explicit TargetModel: resolved through the stateless Policy Resolver
+		// (ResolveModel). Zero independent model fallbacks allowed.
+		Model: func() string {
+			intent := req.Intent
+			if intent == "" {
+				intent = req.Prompt
+			}
+			var runtimeState runtimeAuth.ModelState
+			if a.authority != nil {
+				ref := a.authority.ActiveModel()
+				runtimeState = runtimeAuth.ModelState{
+					ActiveProvider: runtimeAuth.ProviderID(ref.ID),
+					ActiveModel:    runtimeAuth.ModelID(ref.ID),
+				}
+			}
+			binding, err := runtimeAuth.ResolveModel(intent, runtimeState, runtimeAuth.ModelPolicy{})
+			if err != nil {
+				return ""
+			}
+			return string(binding.ModelID)
+		}(),
 		// The recovery decision travels with the request so the executor can
 		// change the ACTUAL execution protocol (bounded-patch windowed
 		// context + strict SEARCH/REPLACE contract), not just annotations.

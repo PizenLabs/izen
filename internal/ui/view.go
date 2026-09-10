@@ -762,8 +762,10 @@ func (m *model) renderRuntimeStatus(width int) string {
 	// Model name — dropped after language when the pane is too narrow.
 	if width >= minimalStatusThreshold {
 		modelName := m.getActiveModelName()
-		if m.sessionModel != "" {
-			modelName = accentStyle.Render("✓") + " " + modelName
+		if m.modelAuthority != nil {
+			if b := m.modelAuthority.ActiveBinding(); b.ModelID != "" {
+				modelName = accentStyle.Render("✓") + " " + modelName
+			}
 		}
 		meta = append(meta, dimmedStyle.Render(modelName))
 	}
@@ -936,8 +938,10 @@ func (m *model) renderStartupBanner(termWidth int) string {
 		metaParts = append(metaParts, langBadgeStyle.Render(m.projectContext.Name))
 	}
 	modelLabel := provider + " " + modelName
-	if m.sessionModel != "" {
-		modelLabel = accentStyle.Render("✓") + " " + modelLabel
+	if m.modelAuthority != nil {
+		if b := m.modelAuthority.ActiveBinding(); b.ModelID != "" {
+			modelLabel = accentStyle.Render("✓") + " " + modelLabel
+		}
 	}
 	metaParts = append(metaParts, mutedStyle.Render(modelLabel))
 	if m.gitEng != nil && m.gitEng.IsRepo() {
@@ -1002,8 +1006,10 @@ func (m *model) renderStartupBannerCompact(termWidth int) string {
 		provider := m.cfg.ActiveProviderName()
 		modelName := m.getActiveModelName()
 		modelLabel := provider + " " + modelName
-		if m.sessionModel != "" {
-			modelLabel = accentStyle.Render("✓") + " " + modelLabel
+		if m.modelAuthority != nil {
+			if b := m.modelAuthority.ActiveBinding(); b.ModelID != "" {
+				modelLabel = accentStyle.Render("✓") + " " + modelLabel
+			}
 		}
 		metaParts = append(metaParts, mutedStyle.Render(modelLabel))
 		if m.gitEng != nil && m.gitEng.IsRepo() {

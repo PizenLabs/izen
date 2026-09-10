@@ -985,6 +985,13 @@ type model struct {
 	// completes immediately (Explicit Over Implicit).
 	fastTrackTargets map[string]bool
 
+	// Unconfigured boot: when no active model is configured for the provider,
+	// the TUI opens directly into the model picker overlay instead of exiting.
+	unconfigured bool
+	// bootErr carries any non-fatal config validation error from startup so
+	// the TUI can surface it and route directly to the model picker.
+	bootErr error
+
 	investigateInvocationCount int
 
 	// Command history
@@ -1399,7 +1406,10 @@ type model struct {
 	// Lazily created on /models from the local JSON cache (zero network);
 	// background sync is owned by the app layer.
 	modelRegistry *registry.Registry
-	sessionModel  string // user-selected model override via /models
+	// modelAuthority is the single source of truth for the active model binding.
+	// The UI reads ActiveBinding() to derive the current model/provider; it
+	// never stores a separate model reference. Nil in harnesses/tests.
+	modelAuthority *appruntime.RuntimeAuthority
 
 	// modelAppSvc is the domain application boundary for model role
 	// bindings (pure-view picker emits BindModelToRoleCommand; this service
@@ -1754,8 +1764,14 @@ func (m *model) syncPipelineTiers() {
 		return
 	}
 	eng.Router().SyncTiers(func(i pipeline.Intent) (string, string) {
-		tier := i.String()
-		return m.cfg.ResolveTierModel(tier), m.cfg.ResolveTierProvider(tier)
+		// Resolve through authority — the single source of truth.
+		if m.modelAuthority != nil {
+			b, err := m.modelAuthority.ResolveForIntent(string(i))
+			if err == nil && b.ModelID != "" {
+				return string(b.ModelID), string(b.ProviderID)
+			}
+		}
+		return "", ""
 	})
 }
 

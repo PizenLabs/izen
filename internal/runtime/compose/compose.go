@@ -54,6 +54,7 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 	runtimeAutonomy "github.com/PizenLabs/izen/internal/runtime/autonomy"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	"github.com/PizenLabs/izen/internal/session"
@@ -113,6 +114,10 @@ type Application struct {
 	// auditDir is the workspace-relative audit log directory wired via
 	// WithAuditDir. Empty disables auditing.
 	auditDir string
+
+	// Authority is the single source of truth for workspace model state (I5).
+	// It owns the per-target model assignments and the active mode.
+	Authority *runtime.RuntimeAuthority
 
 	// Approver resolves patch approvals for the approval command handlers.
 	// Defaults to handlers.NewInMemoryApprover when not supplied.
@@ -545,6 +550,26 @@ func Wire(opts ...Option) (*Application, error) {
 	wf := workflow.NewWorkflowRuntime()
 	a.Workflow = wf
 
+	// ── WORKSPACE MODEL AUTHORITY (I5) ────────────────────────────────
+	// The RuntimeAuthority is the single source of truth for workspace model
+	// state. It is seeded from the persisted active binding at wire time so
+	// every invocation request carries an explicit TargetModel resolved at
+	// admission, never a hardcoded fallback.
+	a.Authority = runtime.NewRuntimeAuthority()
+	if a.Inputs.Config != nil {
+		if active := a.Inputs.Config.Bindings.Active; active.Model != "" {
+			a.Authority.SeedBootstrap(authority.ModelBinding{
+				ProviderID: authority.ProviderID(active.Provider),
+				ModelID:    authority.ModelID(active.Model),
+			})
+		} else if active := a.Inputs.Config.ActiveModelName(); active != "" {
+			a.Authority.SeedBootstrap(authority.ModelBinding{
+				ProviderID: authority.ProviderID(a.Inputs.Config.ActiveProviderName()),
+				ModelID:    authority.ModelID(active),
+			})
+		}
+	}
+
 	// ── RUNTIME EXECUTOR (authority boundary) ───────────────────────────
 	// The RuntimeExecutor is the execution authority the presentation layer
 	// submits requests to on the migrated paths ($prompt targeted mutation,
@@ -586,6 +611,8 @@ func Wire(opts ...Option) (*Application, error) {
 		Executor:        a.Executor,
 		PreflightWorker: preflightWorker,
 		Root:            a.Inputs.Root,
+		Authority:       a.Authority,
+		Config:          a.Inputs.Config,
 		Telemetry:       izentelemetry.Default(),
 	})
 	if err := hs.Register(dispatcher); err != nil {
@@ -619,13 +646,12 @@ func Wire(opts ...Option) (*Application, error) {
 	// route to reasoning models under strict budgets; /build routes to fast
 	// coding models; /ask routes to a minimal read-only policy).
 	pipeRouter := pipeline.NewRouter(
-		pipeline.WithModel(pipeline.IntentReasoning, cfg.ResolveTierModel("reasoning")),
-		pipeline.WithModel(pipeline.IntentExecution, cfg.ResolveTierModel("execution")),
-		pipeline.WithModel(pipeline.IntentInformational, cfg.ResolveTierModel("informational")),
-		pipeline.WithProvider(pipeline.IntentReasoning, cfg.ResolveTierProvider("reasoning")),
-		pipeline.WithProvider(pipeline.IntentExecution, cfg.ResolveTierProvider("execution")),
-		pipeline.WithProvider(pipeline.IntentInformational, cfg.ResolveTierProvider("informational")),
-		pipeline.WithFallbackModel(cfg.ResolveTierModel("execution")),
+		pipeline.WithModel(pipeline.IntentReasoning, ""),
+		pipeline.WithModel(pipeline.IntentExecution, ""),
+		pipeline.WithModel(pipeline.IntentInformational, ""),
+		pipeline.WithProvider(pipeline.IntentReasoning, ""),
+		pipeline.WithProvider(pipeline.IntentExecution, ""),
+		pipeline.WithProvider(pipeline.IntentInformational, ""),
 	)
 	// Layer 5 telemetry is observed on a dedicated telemetry EventBus; a
 	// TelemetryAdapter bridges every event onto the unified domain event bus
@@ -757,8 +783,10 @@ func Wire(opts ...Option) (*Application, error) {
 	// through the RuntimeExecutor, forwards approvals via Approve/Reject, and
 	// publishes loop.transition transitions on the shared bus. The presentation
 	// layer only projects those events.
+	adapter := runtimeAutonomy.NewExecutorAdapter(root, a.Gateway, a.Executor)
+	adapter.SetAuthority(a.Authority)
 	a.Autonomous = runtimeAutonomy.NewDriver(
-		runtimeAutonomy.NewExecutorAdapter(root, a.Gateway, a.Executor),
+		adapter,
 		a.Bus,
 		runtimeAutonomy.WithPreflightBarrier(loopBarrier),
 		runtimeAutonomy.WithPreflightState(preflightState),

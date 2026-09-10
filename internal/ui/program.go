@@ -35,7 +35,7 @@ import (
 // point the presentation layer drives. Every engine, orchestrator, capability
 // set and adapter is consumed read-only from app — this package never
 // instantiates engines.
-func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalConfig, app *compose.Application, det ...project.Detection) *tea.Program {
+func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalConfig, app *compose.Application, bootErr error, det ...project.Detection) *tea.Program {
 	detection := project.Detection{}
 	if len(det) > 0 {
 		detection = det[0]
@@ -167,6 +167,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		microkernel:         app.Microkernel,
 		intentCompiler:      app.IntentCompiler,
 		ledger:              NewContextLedger(),
+		modelAuthority:      app.Authority,
 		ti:                  ti,
 		showBanner:          true,
 		IsCloudModel:        cfg.ActiveProviderName() != "ollama",
@@ -179,6 +180,8 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		initStage:           initStage,
 		initProviderIdx:     0,
 		initProviderFilter:  "",
+		unconfigured:        (bootErr != nil) || (cfg.ActiveProviderName() != "" && cfg.ActiveModelName() == ""),
+		bootErr:             bootErr,
 		initPrefillUsername: globalUsername,
 		initPrefillProvider: globalProvider,
 		viewRegistry:        reg,
@@ -484,7 +487,7 @@ func runProgram(p *tea.Program, root string, initStage initStage) {
 // builds app once via compose.Wire and injects it here, satisfying the RFC
 // single-entry-point invariant — no engine is ever instantiated in this
 // package.
-func RunMainDashboardWithApp(cfg *config.Config, root string, localCfg *config.LocalConfig, app *compose.Application, det ...project.Detection) {
+func RunMainDashboardWithApp(cfg *config.Config, root string, localCfg *config.LocalConfig, app *compose.Application, bootErr error, det ...project.Detection) {
 	detection := project.Detection{}
 	if len(det) > 0 {
 		detection = det[0]
@@ -500,7 +503,7 @@ func RunMainDashboardWithApp(cfg *config.Config, root string, localCfg *config.L
 		initStage = initNone
 	}
 
-	p := NewProgramWithApp(root, cfg, localCfg, app, detection)
+	p := NewProgramWithApp(root, cfg, localCfg, app, bootErr, detection)
 	runProgram(p, root, initStage)
 }
 
@@ -537,7 +540,7 @@ func RunRollbackEngine(cfg *config.Config, root string, localCfg *config.LocalCo
 		initStage = initNone
 	}
 
-	p := NewProgramWithApp(root, cfg, localCfg, app, detection)
+	p := NewProgramWithApp(root, cfg, localCfg, app, nil, detection)
 	runProgram(p, root, initStage)
 }
 

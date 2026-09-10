@@ -17,6 +17,8 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/llm"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 	"github.com/PizenLabs/izen/internal/state"
 )
 
@@ -431,14 +433,43 @@ func mapContains(slice []string, target string) bool {
 }
 
 func (m *model) getActiveProviderName() string {
+	if m.modelAuthority != nil {
+		if b := m.modelAuthority.ActiveBinding(); b.ProviderID != "" {
+			return string(b.ProviderID)
+		}
+	}
 	return m.cfg.ActiveProviderName()
 }
 
 func (m *model) getActiveModelName() string {
-	if m.sessionModel != "" {
-		return m.sessionModel
+	if m.modelAuthority != nil {
+		if b := m.modelAuthority.ActiveBinding(); b.ModelID != "" {
+			return string(b.ModelID)
+		}
 	}
 	return m.cfg.ActiveModelName()
+}
+
+// ensureModelAuthority lazily creates the RuntimeAuthority, seeds it from the
+// persisted config binding, and returns it. The authority is the single source
+// of truth for the active model binding (I5).
+func (m *model) ensureModelAuthority() *appruntime.RuntimeAuthority {
+	if m.modelAuthority == nil {
+		m.modelAuthority = appruntime.NewRuntimeAuthority()
+		// Bootstrap from persisted config (single active binding).
+		if m.cfg != nil && m.cfg.Bindings.Active.Model != "" {
+			m.modelAuthority.Activate(authority.ModelBinding{
+				ProviderID:    authority.ProviderID(m.cfg.Bindings.Active.Provider),
+				ModelID:       authority.ModelID(m.cfg.Bindings.Active.Model),
+				VariantParams: authority.VariantOption(m.cfg.Bindings.Active.Variant),
+			})
+		}
+	}
+	// Track the active workspace target from the mode resolver (I8).
+	if m.resolver != nil {
+		m.modelAuthority.SetCurrentMode(appruntime.WorkspaceTarget(m.resolver.Current().String()))
+	}
+	return m.modelAuthority
 }
 
 // activeContextLimit returns the maximum context window for the currently

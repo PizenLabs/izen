@@ -55,7 +55,7 @@ func TestOpenAIReasoningEffortInjected(t *testing.T) {
 	client, body := captureClient(t)
 	p := NewOpenAIProvider("key", "o3")
 	p.client = client
-	_, err := p.Execute(context.Background(), ai.Request{Reasoning: &ai.ReasoningConfig{Level: "xhigh"}})
+	_, err := p.Execute(context.Background(), ai.Request{Model: "o3", Reasoning: &ai.ReasoningConfig{Level: "xhigh"}})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestOpenAIReasoningEffortOmittedWhenNil(t *testing.T) {
 	client, body := captureClient(t)
 	p := NewOpenAIProvider("key", "gpt-4o")
 	p.client = client
-	_, err := p.Execute(context.Background(), ai.Request{})
+	_, err := p.Execute(context.Background(), ai.Request{Model: "gpt-4o"})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestClaudeThinkingBudgetInjected(t *testing.T) {
 	client, body := captureClient(t)
 	p := NewClaudeProvider("key", "claude-3.7-sonnet")
 	p.client = client
-	_, err := p.Execute(context.Background(), ai.Request{Reasoning: &ai.ReasoningConfig{BudgetTokens: 8192}})
+	_, err := p.Execute(context.Background(), ai.Request{Model: "claude-3.7-sonnet", Reasoning: &ai.ReasoningConfig{BudgetTokens: 8192}})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestClaudeThinkingOmittedWhenNil(t *testing.T) {
 	client, body := captureClient(t)
 	p := NewClaudeProvider("key", "claude-3.7-sonnet")
 	p.client = client
-	_, err := p.Execute(context.Background(), ai.Request{})
+	_, err := p.Execute(context.Background(), ai.Request{Model: "claude-3.7-sonnet"})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestOpenRouterReasoningEffortInjected(t *testing.T) {
 	client, body := captureClient(t)
 	p := NewOpenRouterProvider("key", "openai/o3", "https://openrouter.example.com/api/v1")
 	p.client = client
-	_, err := p.Execute(context.Background(), ai.Request{Reasoning: &ai.ReasoningConfig{Level: "high"}})
+	_, err := p.Execute(context.Background(), ai.Request{Model: "openai/o3", Reasoning: &ai.ReasoningConfig{Level: "high"}})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestOpenRouterReasoningCoTLimitInjected(t *testing.T) {
 	client, body := captureClient(t)
 	p := NewOpenRouterProvider("key", "deepseek/deepseek-r1", "https://openrouter.example.com/api/v1")
 	p.client = client
-	_, err := p.Execute(context.Background(), ai.Request{Reasoning: &ai.ReasoningConfig{CoTLimit: 512}})
+	_, err := p.Execute(context.Background(), ai.Request{Model: "deepseek/deepseek-r1", Reasoning: &ai.ReasoningConfig{CoTLimit: 512}})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestOpenRouterReasoningOmittedWhenNil(t *testing.T) {
 	client, body := captureClient(t)
 	p := NewOpenRouterProvider("key", "openai/o3", "https://openrouter.example.com/api/v1")
 	p.client = client
-	_, err := p.Execute(context.Background(), ai.Request{})
+	_, err := p.Execute(context.Background(), ai.Request{Model: "openai/o3"})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}

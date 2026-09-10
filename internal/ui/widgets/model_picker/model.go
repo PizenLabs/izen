@@ -17,21 +17,16 @@ package model_picker
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	"github.com/PizenLabs/izen/internal/domain/role"
 	"github.com/PizenLabs/izen/internal/provider/registry"
-)
-
-// FocusScope distinguishes Search input vs List navigation key routing.
-type FocusScope int
-
-const (
-	FocusSearch FocusScope = iota // 0: Search input active
-	FocusList                     // 1: Navigation & bindings active
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 )
 
 // searchInputModel mirrors the task spec's TextInput lock: width is forced
@@ -39,6 +34,7 @@ const (
 type searchInputModel struct {
 	Width   int
 	focused bool
+	value   string
 }
 
 // Focus marks the search input as focused.
@@ -49,6 +45,28 @@ func (s *searchInputModel) Blur() { s.focused = false }
 
 // Focused reports whether the search input is focused.
 func (s searchInputModel) Focused() bool { return s.focused }
+
+// Value returns the current input value.
+func (s searchInputModel) Value() string { return s.value }
+
+// SetValue sets the input value.
+func (s *searchInputModel) SetValue(v string) { s.value = v }
+
+// Update handles a key message for the search input (bubbles compatible shim).
+func (s searchInputModel) Update(msg tea.KeyMsg) (searchInputModel, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyBackspace:
+		if len(s.value) > 0 {
+			r := []rune(s.value)
+			s.value = string(r[:len(r)-1])
+		}
+	case tea.KeyRunes:
+		s.value += string(msg.Runes)
+	case tea.KeySpace:
+		s.value += " "
+	}
+	return s, nil
+}
 
 // Role hotkeys.
 const (
@@ -137,9 +155,66 @@ type Model struct {
 	focus         FocusScope
 	searchFocused bool
 
+	// paneFocus selects which pane has keyboard focus in the dual-pane
+	// browsing layout: PaneProviders (left) or PaneModels (right).
+	// Replaces FocusScope for browsing navigation.
+	paneFocus PaneFocus
+
+	// providerCursor is the highlight index within the DERIVED provider list:
+	// index 0 is the synthetic "[All models]" entry (filter ""), indexes
+	// 1..N are the snapshot providers. Drives the left-pane selection and
+	// determines which provider's models appear in the right pane.
+	providerCursor int
+
+	// recentBindings is the most-recently-used model list, newest first.
+	// It is a non-mutating view model seeded by the parent (SetRecentBindings)
+	// and rendered as a pinned RECENTLY USED section; the parent persists it
+	// to .izen/state.json. This widget never performs that I/O itself.
+	recentBindings []authority.ModelBinding
+
+	// showingRoles selects the top-level Roles policy pane on the left side
+	// (Plan/Thinking and Commit/Fast overrides) instead of the providers list.
+	showingRoles bool
+	// roleCursor selects within the Roles list while displaying the roles pane.
+	roleCursor int
+
+	// apiKeyInput is non-nil while the secure inline API-key overlay is open.
+	// When set, all browsing keys route to the textinput (EchoPassword) and
+	// submission emits SaveProviderKeyMsg for the parent to persist.
+	apiKeyInput    *textinput.Model
+	apiKeyProvider string
+
+	// policyOverrides is the picker-local read model of role policy overrides
+	// (seeded by the parent from persisted config via SetRoleOverrides). It
+	// powers the Roles pane summaries; mutations go out as RolePolicyOverrideMsg.
+	policyOverrides map[string]OverrideBinding
+
+	// state is the two-step picker state machine (browsing vs detail).
+	state PickerState
+
+	// detailModel is the immutable selection pinned on the
+	// StateBrowsing -> StateDetail transition (Enter). StateDetail binds
+	// exclusively to this copy — never to m.filtered[m.cursor] — so
+	// background SnapshotMsg refilters (relevance re-sort) or cursor
+	// clamps can never retarget the inspected model mid-detail. Cleared
+	// on Esc back to browsing. Nil outside StateDetail.
+	detailModel *registry.ModelDescriptor
+
+	// activeWorkspace is the contextual workspace target for fast-path assignment.
+	activeWorkspace string
+
+	// reasoningPolicy is the workspace reasoning policy for assignment.
+	reasoningPolicy string
+
 	// reasoningIdx selects within the highlighted model's permitted options
 	// (adapter.OptionsForMode). Fixed/None modes ignore it.
+	// Deprecated alias of selectedReasoningOptIdx: both are kept in sync.
 	reasoningIdx int
+	// selectedReasoningOptIdx is the canonical index into the model's real
+	// ReasoningCapability.Options (see CapabilityResolver). The r key cycles
+	// strictly through valid model options; assignment payloads derive the
+	// concrete ReasoningOption.ID from this index.
+	selectedReasoningOptIdx int
 	// isGlobal selects the BindModelToRoleCommand target scope.
 	isGlobal bool
 
@@ -185,13 +260,23 @@ func New(snap *registry.ModelSnapshot) Model {
 		snap = &registry.ModelSnapshot{}
 	}
 	m := Model{
-		snap:          snap,
-		roles:         make(map[string]string),
-		pending:       make(map[string]PendingBind),
-		focus:         FocusList,
-		searchFocused: false,
-		searchInput:   searchInputModel{Width: searchInputWidth, focused: false},
+		snap:            snap,
+		roles:           make(map[string]string),
+		pending:         make(map[string]PendingBind),
+		focus:           FocusList,
+		searchFocused:   false,
+		paneFocus:       PaneProviders,
+		providerCursor:  0,
+		showingRoles:    false,
+		roleCursor:      0,
+		searchInput:     searchInputModel{Width: searchInputWidth, focused: false},
+		state:           StateBrowsing,
+		activeWorkspace: "",
+		reasoningPolicy: "default",
 	}
+	// providerCursor 0 is the synthetic "[All models]" entry: the right pane
+	// starts in global scope across every provider.
+	m.syncProviderFromCursor()
 	m.refilter()
 	m.resetReasoning()
 	return m
@@ -278,6 +363,7 @@ func (m Model) LastSeq() uint64 { return m.seq }
 // SetQuery replaces the search query and re-filters against RAM.
 func (m Model) SetQuery(q string) Model {
 	m.query = q
+	m.searchInput.SetValue(q)
 	m.refilter()
 	m.resetReasoning()
 	return m
@@ -379,6 +465,358 @@ func (m Model) FocusList() Model {
 // SearchFocused reports the current focus.
 func (m Model) SearchFocused() bool { return m.focus == FocusSearch }
 
+// PaneFocus returns the active pane focus (PaneProviders or PaneModels).
+func (m Model) PaneFocus() PaneFocus { return m.paneFocus }
+
+// SetPaneFocus sets the active pane focus.
+func (m Model) SetPaneFocus(p PaneFocus) Model {
+	m.paneFocus = p
+	return m
+}
+
+// ProviderCursor returns the highlight index within the provider list.
+func (m Model) ProviderCursor() int { return m.providerCursor }
+
+// providerEntryCount returns the size of the derived provider list shown in
+// the left pane: the synthetic "[All models]" entry plus one row per
+// snapshot provider.
+func (m Model) providerEntryCount() int {
+	return len(m.providerNames()) + 1
+}
+
+// isAllModelsSelected reports whether the provider cursor is on the
+// synthetic "[All models]" entry (global scope).
+func (m Model) isAllModelsSelected() bool {
+	return m.providerCursor <= 0
+}
+
+// syncProviderFromCursor derives the provider filter from providerCursor:
+// index 0 (All models) yields the empty filter (global scope); indexes 1..N
+// map onto snapshot providers.
+func (m *Model) syncProviderFromCursor() {
+	names := m.providerNames()
+	if m.providerCursor <= 0 || len(names) == 0 || m.providerCursor-1 >= len(names) {
+		m.provider = ""
+		return
+	}
+	m.provider = names[m.providerCursor-1]
+}
+
+// SetProviderCursor jumps to a provider-list index (0 = [All models]),
+// clamped to bounds, and syncs the provider filter for the models pane.
+func (m Model) SetProviderCursor(i int) Model {
+	count := m.providerEntryCount()
+	if count == 0 {
+		m.providerCursor = 0
+		m.provider = ""
+		return m
+	}
+	if i < 0 {
+		i = 0
+	}
+	if i >= count {
+		i = count - 1
+	}
+	m.providerCursor = i
+	m.syncProviderFromCursor()
+	m.cursor = 0
+	m.refilter()
+	m.resetReasoning()
+	return m
+}
+
+// providerNames returns the ordered provider name list from the snapshot.
+func (m Model) providerNames() []string {
+	if m.snap == nil {
+		return nil
+	}
+	names := make([]string, 0, len(m.snap.Providers))
+	for _, ps := range m.snap.Providers {
+		names = append(names, ps.Name)
+	}
+	return names
+}
+
+// highlightedProvider returns the actual provider name at providerCursor
+// (without the [All models] entry), or "" when the All models entry or no
+// provider is highlighted.
+func (m Model) highlightedProvider() string {
+	if m.isAllModelsSelected() {
+		return ""
+	}
+	names := m.providerNames()
+	idx := m.providerCursor - 1
+	if len(names) == 0 || idx < 0 || idx >= len(names) {
+		return ""
+	}
+	return names[idx]
+}
+
+// highlightedProviderLabel returns the display label for the left-pane
+// highlight: "[All models]" for the synthetic entry, else the provider name.
+func (m Model) highlightedProviderLabel() string {
+	if m.isAllModelsSelected() {
+		return "All models"
+	}
+	if name := m.highlightedProvider(); name != "" {
+		return name
+	}
+	return "—"
+}
+
+// isProviderConfigured reports whether a provider has successfully loaded
+// models (Status ok or non-zero ModelCount).
+func (m Model) isProviderConfigured(name string) bool {
+	if m.snap == nil {
+		return false
+	}
+	for _, ps := range m.snap.Providers {
+		if strings.EqualFold(ps.Name, name) {
+			return ps.Status == "" || ps.Status == "ok" || ps.ModelCount > 0
+		}
+	}
+	return false
+}
+
+// moveProviderCursor shifts the provider highlight and syncs the filter.
+func (m *Model) moveProviderCursor(delta int) {
+	count := m.providerEntryCount()
+	if count <= 0 {
+		return
+	}
+	m.providerCursor += delta
+	if m.providerCursor < 0 {
+		m.providerCursor = 0
+	}
+	if m.providerCursor >= count {
+		m.providerCursor = count - 1
+	}
+	m.syncProviderFromCursor()
+	m.cursor = 0
+	m.refilter()
+	m.resetReasoning()
+}
+
+// SetRecentBindings seeds the MRU list (newest first). The widget treats it
+// as an immutable view model; persistence to .izen/state.json is owned by the
+// parent.
+func (m Model) SetRecentBindings(recent []authority.ModelBinding) Model {
+	m.recentBindings = make([]authority.ModelBinding, len(recent))
+	copy(m.recentBindings, recent)
+	return m
+}
+
+// RecentBindings returns a copy of the MRU list (newest first).
+func (m Model) RecentBindings() []authority.ModelBinding {
+	return append([]authority.ModelBinding(nil), m.recentBindings...)
+}
+
+// AddRecentModel records a model activation at the front of the MRU list,
+// deduplicating against the full backing list. The parent persists the
+// resulting list; the picker renders it pinned at the top of the models pane.
+func (m Model) AddRecentModel(id, provider string) Model {
+	if id == "" {
+		return m
+	}
+	var out []authority.ModelBinding
+	out = append(out, authority.ModelBinding{ProviderID: authority.ProviderID(provider), ModelID: authority.ModelID(id)})
+	for _, b := range m.recentBindings {
+		if string(b.ModelID) == id {
+			continue
+		}
+		out = append(out, b)
+	}
+	const maxRecent = 12
+	if len(out) > maxRecent {
+		out = out[:maxRecent]
+	}
+	m.recentBindings = out
+	return m
+}
+
+// ShowingRoles reports whether the Roles policy pane is displayed on the left.
+func (m Model) ShowingRoles() bool { return m.showingRoles }
+
+// SetShowingRoles toggles the Roles pane (Plan/Thinking, Commit/Fast).
+func (m Model) SetShowingRoles(v bool) Model {
+	m.showingRoles = v
+	return m
+}
+
+// ApiKeyInputActive reports whether the secure inline API-key capture overlay
+// is open. The parent uses it to keep Esc local to the overlay instead of
+// tearing down the whole modal.
+func (m Model) ApiKeyInputActive() bool { return m.apiKeyInput != nil }
+
+// RoleCursor returns the highlight index within the Roles list.
+func (m Model) RoleCursor() int { return m.roleCursor }
+
+// SetRoleCursor jumps to a Roles-list index, clamped to bounds.
+func (m Model) SetRoleCursor(i int) Model {
+	if i < 0 {
+		i = 0
+	}
+	if i >= roleOverrideCount {
+		i = roleOverrideCount - 1
+	}
+	m.roleCursor = i
+	return m
+}
+
+// moveRoleCursor shifts the Roles highlight, clamped to bounds.
+func (m *Model) moveRoleCursor(delta int) {
+	m.roleCursor += delta
+	if m.roleCursor < 0 {
+		m.roleCursor = 0
+	}
+	if m.roleCursor >= roleOverrideCount {
+		m.roleCursor = roleOverrideCount - 1
+	}
+}
+
+// HighlightedRole returns the role override key at the Roles cursor
+// (RoleOverridePlan | RoleOverrideCommit).
+func (m Model) HighlightedRole() string {
+	if m.roleCursor <= 0 {
+		return RoleOverridePlan
+	}
+	return RoleOverrideCommit
+}
+
+// RoleOverrideCount is the number of top-level role policy entries.
+const roleOverrideCount = 2
+
+// SetRoleOverrides seeds the picker-local read model of role policy
+// overrides from the parent's persisted config. Keys are the role override
+// constants (RoleOverridePlan | RoleOverrideCommit).
+func (m Model) SetRoleOverrides(overrides map[string]OverrideBinding) Model {
+	m.policyOverrides = make(map[string]OverrideBinding, len(overrides))
+	for k, v := range overrides {
+		if k == "" {
+			continue
+		}
+		m.policyOverrides[k] = v
+	}
+	return m
+}
+
+// RoleOverrideFor returns the seeded override binding for a role key.
+func (m Model) RoleOverrideFor(key string) (OverrideBinding, bool) {
+	ob, ok := m.policyOverrides[key]
+	return ob, ok
+}
+
+// State returns the current PickerState.
+func (m Model) State() PickerState { return m.state }
+
+// SetState sets the picker state.
+func (m Model) SetState(s PickerState) Model { m.state = s; return m }
+
+// ActiveWorkspace returns the active workspace context.
+func (m Model) ActiveWorkspace() string { return m.activeWorkspace }
+
+// SetActiveWorkspace sets the active workspace context.
+func (m Model) SetActiveWorkspace(t string) Model { m.activeWorkspace = t; return m }
+
+// ReasoningPolicy returns the reasoning policy string.
+func (m Model) ReasoningPolicy() string { return m.reasoningPolicy }
+
+// ReasoningPolicyValue is an alias for ReasoningPolicy.
+func (m Model) ReasoningPolicyValue() string { return m.reasoningPolicy }
+
+// SetReasoningPolicy sets the reasoning policy.
+func (m Model) SetReasoningPolicy(p string) Model { m.reasoningPolicy = p; return m }
+
+// SelectedModel returns the model the picker acts on: the immutable pinned
+// detail selection while in StateDetail, the live highlight otherwise.
+// Detail binding must never recalculate against the mutable filtered list
+// (a background refilter re-sort would silently retarget the assignment).
+func (m Model) SelectedModel() *registry.ModelDescriptor {
+	if m.state == StateDetail && m.detailModel != nil {
+		return m.detailModel
+	}
+	return m.Highlighted()
+}
+
+// DetailModel reports the pinned StateDetail selection, or nil when not in
+// detail (or when detail was entered with no highlight, which cannot happen
+// via the Enter transition — it requires a non-nil highlight to pin).
+func (m Model) DetailModel() *registry.ModelDescriptor {
+	if m.state == StateDetail && m.detailModel != nil {
+		return m.detailModel
+	}
+	return nil
+}
+
+// pinDetail captures an immutable copy of the highlighted model for the
+// StateDetail session. The copy (not a slice alias) survives refilter
+// reallocations and re-sorts.
+func (m *Model) pinDetail() {
+	hl := m.Highlighted()
+	if hl == nil {
+		m.detailModel = nil
+		return
+	}
+	cp := *hl
+	m.detailModel = &cp
+}
+
+// clearDetail releases the pinned selection on exit back to browsing.
+func (m *Model) clearDetail() { m.detailModel = nil }
+
+// cycleReasoningPolicy cycles strictly through the highlighted model's real
+// ReasoningCapability.Options via selectedReasoningOptIdx.
+// Truthful guard (I6): no-op when the highlighted model is unsupported,
+// provider-managed (not configurable), or declares zero options, so pressing
+// r never fabricates state.
+func (m *Model) cycleReasoningPolicy() {
+	rcap := m.CapabilityForHighlighted()
+	if !rcap.Supported || !rcap.Configurable || len(rcap.Options) == 0 {
+		return
+	}
+	m.selectedReasoningOptIdx = (m.selectedReasoningOptIdx + 1) % len(rcap.Options)
+	m.reasoningIdx = m.selectedReasoningOptIdx
+	m.syncReasoningPolicy()
+}
+
+// moveCursor shifts cursor clamped to filtered list (lowercase alias for MoveCursor).
+func (m *Model) moveCursor(delta int) {
+	*m = m.MoveCursor(delta)
+}
+
+// emitAssignmentCmd builds a ModelAssignmentRequestedMsg command carrying the
+// concrete semantic intent: the selected ReasoningOption.ID derived from
+// caps.Options[selectedReasoningOptIdx] (e.g. "low", "high", "budget_8k"),
+// not a generic "default". Non-configurable models fall back to "default".
+func (m Model) emitAssignmentCmd(model *registry.ModelDescriptor, _ string) tea.Cmd {
+	if model == nil {
+		return nil
+	}
+	policy := "default"
+	if caps := model.GetReasoningCapability(); caps.Supported && caps.Configurable && len(caps.Options) > 0 {
+		idx := m.selectedReasoningOptIdx
+		if idx < 0 || idx >= len(caps.Options) {
+			idx = 0
+		}
+		if id := caps.Options[idx].ID; id != "" {
+			policy = id
+		}
+	} else if m.reasoningPolicy != "" {
+		// Preserve legacy explicit policy for non-configurable paths.
+		policy = m.reasoningPolicy
+		if policy == "" {
+			policy = "default"
+		}
+	}
+	return func() tea.Msg {
+		return ModelAssignmentRequestedMsg{
+			ModelID:  model.ID,
+			Provider: model.Provider,
+			Policy:   InvocationPolicy{Reasoning: policy},
+		}
+	}
+}
+
 // IsGlobal reports the binding target scope.
 func (m Model) IsGlobal() bool { return m.isGlobal }
 
@@ -388,8 +826,13 @@ func (m Model) SetScope(global bool) Model { m.isGlobal = global; return m }
 // ToggleScope flips local vs global.
 func (m Model) ToggleScope() Model { m.isGlobal = !m.isGlobal; return m }
 
-// ReasoningIndex reports the raw reasoning option index.
-func (m Model) ReasoningIndex() int { return m.reasoningIdx }
+// ReasoningIndex reports the raw reasoning option index (canonical
+// selectedReasoningOptIdx).
+func (m Model) ReasoningIndex() int { return m.selectedReasoningOptIdx }
+
+// SelectedReasoningOptIdx reports the canonical index into the model's real
+// ReasoningCapability.Options.
+func (m Model) SelectedReasoningOptIdx() int { return m.selectedReasoningOptIdx }
 
 // Models returns the full snapshot list (defensive copy; snapshot untouched).
 func (m Model) Models() []registry.ModelDescriptor {
@@ -490,6 +933,7 @@ func (m Model) Select() Model {
 	m.done = true
 	m.activatedModelID = hl.ID
 	m.activatedProvider = hl.Provider
+	m = m.AddRecentModel(hl.ID, hl.Provider)
 	return m
 }
 
@@ -641,6 +1085,14 @@ func (m *Model) refilter() {
 		src = m.snap.Models
 	}
 	m.filtered = filterLocal(src, m.query, m.provider)
+	// Sort by workspace-relevance score (highest first), then preserve original
+	// insertion order for equal scores (stable sort) so unfiltered lists stay
+	// deterministic.
+	sort.SliceStable(m.filtered, func(i, j int) bool {
+		si := m.calculateRelevanceScore(&m.filtered[i])
+		sj := m.calculateRelevanceScore(&m.filtered[j])
+		return si > sj // higher score first; stable preserves insertion on tie
+	})
 	if m.cursor >= len(m.filtered) {
 		m.cursor = len(m.filtered) - 1
 	}
@@ -661,6 +1113,43 @@ func (m *Model) applyFilter() {
 // classifier in View, so no cached state needs rebuilding. It exists to make
 // the badge-update dataflow explicit at binding-confirmation time.
 func (m *Model) refreshBadges() {}
+
+// filterLocal mirrors Registry.Filter for snapshot slices via the shared
+// MatchesQuery matcher (multi-field tokens) plus exact provider match.
+// Zero I/O.
+func (m Model) calculateRelevanceScore(desc *registry.ModelDescriptor) int {
+	score := 0
+	if desc == nil {
+		return score
+	}
+	switch m.activeWorkspace {
+	case "plan", "investigate":
+		if desc.IsThinking || hasCapability(desc.Capabilities, registry.CapThinking) {
+			score += 50
+		}
+		if desc.ContextWindow >= 100000 {
+			score += 30
+		}
+	case "build":
+		if hasCapability(desc.Capabilities, registry.CapTools) {
+			score += 40
+		}
+	case "ask":
+		if desc.InputCostPerM == 0 {
+			score += 20
+		}
+	}
+	return score
+}
+
+func hasCapability(caps []registry.ModelCapability, cap registry.ModelCapability) bool {
+	for _, c := range caps {
+		if c == cap {
+			return true
+		}
+	}
+	return false
+}
 
 // filterLocal mirrors Registry.Filter for snapshot slices via the shared
 // MatchesQuery matcher (multi-field tokens) plus exact provider match.

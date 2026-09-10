@@ -85,7 +85,24 @@ type AIConfig struct {
 	Providers        map[string]AIProviderConfig `yaml:"providers"`
 }
 
+// ActiveBindingConfig is the atomic provider/model/variant binding.
+type ActiveBindingConfig struct {
+	Provider string `yaml:"provider"`
+	Model    string `yaml:"model"`
+	Variant  string `yaml:"variant,omitempty"`
+}
+
+// BindingsConfig is the unified model binding. Active is the single source
+// of truth for the runtime model. Policy maps semantic roles to overrides.
+type BindingsConfig struct {
+	Active ActiveBindingConfig            `yaml:"active"`
+	Policy map[string]ActiveBindingConfig `yaml:"policy,omitempty"`
+}
+
 type Config struct {
+	// Unified model binding (single source of truth)
+	Bindings BindingsConfig `yaml:"bindings"`
+
 	AI        AIConfig        `yaml:"ai"`
 	Models    ModelConfig     `yaml:"models"`
 	Execution ExecutionConfig `yaml:"execution"`
@@ -123,38 +140,9 @@ func (c *Config) ActiveStylePolicy() prompt.StylePolicy {
 	return p
 }
 
-// ResolveTierModel returns the effective model for the given intent tier,
-// scoped to the currently active provider. It first checks for an
-// active_override (set via /model), then falls back to the tier's model, then
-// to the global ModelConfig.Default. A tier entry whose pinned provider differs
-// from the active provider is treated as stale (e.g. an Ollama model pinned to
-// the "informational" tier while OpenRouter is active) and is skipped, so a
-// request can never be routed to the wrong provider with an invalid model ID.
-func (c *Config) ResolveTierModel(tier string) string {
-	if c.Models.Tiers != nil {
-		if tc, ok := c.Models.Tiers[tier]; ok {
-			if tc.ActiveOverride != "" {
-				return tc.ActiveOverride
-			}
-			if tc.Model != "" && (tc.Provider == "" || tc.Provider == c.ActiveProviderName()) {
-				return tc.Model
-			}
-		}
-	}
-	return c.ActiveModelName()
-}
-
-// ResolveTierProvider returns the provider that owns the model resolved for an
-// intent tier. It returns the tier's pinned provider only when that provider is
-// the currently active one; otherwise the active provider owns the route.
-func (c *Config) ResolveTierProvider(tier string) string {
-	if c.Models.Tiers != nil {
-		if tc, ok := c.Models.Tiers[tier]; ok && tc.Provider != "" && tc.Provider == c.ActiveProviderName() {
-			return tc.Provider
-		}
-	}
-	return c.ActiveProviderName()
-}
+// ResolveTier functions removed: model resolution is now the exclusive
+// authority of the stateless Policy Resolver (internal/runtime/authority).
+// Legacy tier mappings are purged per Phase 1 authority migration.
 
 // SetTierOverride sets the active_override for the given intent tier,
 // persisting the model selection as the session-level override.
@@ -226,6 +214,12 @@ type LynxConfig struct {
 }
 
 func (c *Config) ActiveProviderName() string {
+	// Unified binding is the primary authority.
+	if c.Bindings.Active.Provider != "" {
+		if _, ok := c.AI.Providers[c.Bindings.Active.Provider]; ok {
+			return c.Bindings.Active.Provider
+		}
+	}
 	if c.AI.DefaultProvider != "" {
 		if _, ok := c.AI.Providers[c.AI.DefaultProvider]; ok {
 			return c.AI.DefaultProvider
@@ -243,6 +237,10 @@ func (c *Config) ActiveProviderName() string {
 }
 
 func (c *Config) ActiveModelName() string {
+	// Unified binding is the primary authority.
+	if c.Bindings.Active.Model != "" {
+		return c.Bindings.Active.Model
+	}
 	if c.Models.SessionModel != "" {
 		return c.Models.SessionModel
 	}
@@ -253,7 +251,8 @@ func (c *Config) ActiveModelName() string {
 	if c.Models.Default != "" {
 		return c.Models.Default
 	}
-	return "qwen2.5-coder:7b"
+	// Zero fallback allowed — no hardcoded default model.
+	return ""
 }
 
 func (c *Config) Validate() error {
@@ -293,6 +292,31 @@ func SanitizeForSession(text string) string {
 	result = strings.ReplaceAll(result, "Handoff context injected.", "")
 	result = strings.TrimSpace(result)
 	return result
+}
+
+// wellKnownBaseURLs maps known provider names to their canonical base URLs.
+// When a user's config file defines a provider without a base_url, the
+// loader backfills the default so the provider is immediately usable.
+var wellKnownBaseURLs = map[string]string{
+	"ollama":     "http://localhost:11434/v1",
+	"anthropic":  "https://api.anthropic.com/v1",
+	"openai":     "https://api.openai.com/v1",
+	"openrouter": "https://openrouter.ai/api/v1",
+	"groq":       "https://api.groq.com/openai/v1",
+}
+
+// SetDefaults fills in missing well-known fields (BaseURL) for providers
+// that appear in the config but lack them. This prevents cold-boot crashes
+// when a user adds a provider block without setting base_url.
+func (c *Config) SetDefaults() {
+	for name, prov := range c.AI.Providers {
+		if prov.BaseURL == "" {
+			if defURL, ok := wellKnownBaseURLs[name]; ok {
+				prov.BaseURL = defURL
+				c.AI.Providers[name] = prov
+			}
+		}
+	}
 }
 
 func ExpandEnvVar(val string) string {
@@ -356,6 +380,8 @@ func Load() (*Config, error) {
 		if data, err = os.ReadFile(legacy); err == nil {
 			var cfg Config
 			if err := yaml.Unmarshal(data, &cfg); err == nil {
+				cfg.AI.ExpandEnvVars()
+				cfg.SetDefaults()
 				if saveErr := Save(&cfg); saveErr == nil {
 					_ = os.Remove(legacy)
 					fmt.Fprintf(os.Stderr, "izen: migrated config from %s to %s\n", legacy, path)
@@ -373,6 +399,7 @@ func Load() (*Config, error) {
 	}
 
 	cfg.AI.ExpandEnvVars()
+	cfg.SetDefaults()
 
 	return &cfg, nil
 }
@@ -412,9 +439,8 @@ func Default() *Config {
 			},
 		},
 		Models: ModelConfig{
-			Default:   "qwen2.5-coder:7b",
-			Provider:  "ollama",
-			MaxTokens: 4096,
+			Default:  "qwen2.5-coder:7b",
+			Provider: "ollama", MaxTokens: 4096,
 			Modes: map[string]ModeSpec{
 				"ask":         {Provider: "", Model: ""},
 				"plan":        {Provider: "", Model: ""},
@@ -423,30 +449,12 @@ func Default() *Config {
 				"investigate": {Provider: "", Model: ""},
 			},
 			Tiers: map[string]IntentTierConfig{
-				"low_intent": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
-				"medium_intent": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
-				"high_intent": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
-				"reasoning": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
-				"execution": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
-				"informational": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
+				"low_intent":    {Provider: "", Model: ""},
+				"medium_intent": {Provider: "", Model: ""},
+				"high_intent":   {Provider: "", Model: ""},
+				"reasoning":     {Provider: "", Model: ""},
+				"execution":     {Provider: "", Model: ""},
+				"informational": {Provider: "", Model: ""},
 			},
 		},
 		Execution: ExecutionConfig{
@@ -496,6 +504,77 @@ func Save(cfg *Config) error {
 }
 
 type ConfigChangeMsg struct{}
+
+func (c *Config) MigrateLegacyConfig() bool {
+	// Migrate from Models.Default to Bindings.Active if the active binding is empty.
+	if c.Bindings.Active.Model == "" && c.Models.Default != "" {
+		c.Bindings.Active.Model = c.Models.Default
+		c.Bindings.Active.Provider = c.ActiveProviderName()
+		return true
+	}
+	return false
+}
+
+// PersistActiveBinding persists the unified active model binding.
+func PersistActiveBinding(provider, model, variant string) error {
+	cfg := GetGlobalConfig()
+	cfg.Bindings.Active = ActiveBindingConfig{
+		Provider: provider,
+		Model:    model,
+		Variant:  variant,
+	}
+	return Save(cfg)
+}
+
+var globalConfig *Config
+
+func GetGlobalConfig() *Config {
+	if globalConfig != nil {
+		return globalConfig
+	}
+	cfg, err := Load()
+	if err != nil {
+		cfg = Default()
+	}
+	cfg.MigrateLegacyConfig()
+	globalConfig = cfg
+	return globalConfig
+}
+
+// WellKnownBaseURL returns the canonical base URL for a known provider name,
+// or the empty string when the provider has no well-known endpoint.
+func WellKnownBaseURL(provider string) string {
+	lower := strings.ToLower(strings.TrimSpace(provider))
+	return wellKnownBaseURLs[lower]
+}
+
+// SaveProviderAPIKey persists a provider API key into the unified config
+// store (~/.izen/config.yml) and immediately refreshes the in-memory global
+// config so the running session sees it without a restart. The provider block
+// is created on demand with its well-known base URL when absent. This is the
+// ONLY persistence path for the model picker's inline API-key overlay.
+func SaveProviderAPIKey(provider, apiKey string) error {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return fmt.Errorf("provider name required")
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		return fmt.Errorf("api key required for %q", provider)
+	}
+	cfg := GetGlobalConfig()
+	if cfg.AI.Providers == nil {
+		cfg.AI.Providers = make(map[string]AIProviderConfig)
+	}
+	prov, ok := cfg.AI.Providers[provider]
+	if !ok || prov.BaseURL == "" {
+		if defURL := WellKnownBaseURL(provider); defURL != "" {
+			prov.BaseURL = defURL
+		}
+	}
+	prov.APIKey = apiKey
+	cfg.AI.Providers[provider] = prov
+	return Save(cfg)
+}
 
 func StartConfigWatcher(ch chan<- bool) {
 	path := configPath()

@@ -167,10 +167,15 @@ func main() {
 		cfg = config.Default()
 	}
 
+	// Non-fatal bootup on unconfigured model state: launch TUI directly
+	// into /models picker instead of terminating.
+	unconfigured := false
+	var bootErr error
 	if err := cfg.Validate(); err != nil {
-		fmt.Fprintf(os.Stderr, "izen: config error: %v\n", err)
-		os.Exit(1)
+		bootErr = err
+		unconfigured = true
 	}
+	_ = unconfigured // Graceful boot handled by TUI model state check in NewProgramWithApp
 
 	// Inject the configured response style policy into every composed system
 	// prompt for the lifetime of this process.
@@ -270,7 +275,7 @@ func main() {
 	// detection, git init, identity setup, and provider selection — and only
 	// writes .izen/config.json when the user confirms the setup wizard.
 	if _, err := os.Stat(filepath.Join(root, ".izen", "config.json")); os.IsNotExist(err) {
-		ui.RunMainDashboardWithApp(cfg, root, localCfg, app)
+		ui.RunMainDashboardWithApp(cfg, root, localCfg, app, bootErr)
 		return
 	}
 
@@ -297,7 +302,7 @@ func main() {
 	if isRollbackMode {
 		ui.RunRollbackEngine(cfg, root, localCfg, app, detection)
 	} else {
-		ui.RunMainDashboardWithApp(cfg, root, localCfg, app, detection)
+		ui.RunMainDashboardWithApp(cfg, root, localCfg, app, bootErr, detection)
 	}
 }
 

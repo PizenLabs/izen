@@ -15,13 +15,9 @@ import (
 var (
 	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	accentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f5a623")).Bold(true)
-	defaultBadge  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1"))
-	planBadge     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa"))
-	thinkBadge    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
-	visionBadge   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89dceb"))
 	otherBadge    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f5a623"))
-	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))
-	okStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1"))
+	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))            //nolint:unused // retained for legacy bindings rendering
+	okStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1")) //nolint:unused // retained for legacy badge rendering
 	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89b4fa"))
 	syncOkStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
 	syncBusyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))
@@ -41,18 +37,14 @@ var (
 				Foreground(lipgloss.Color("#cdd6f4")).
 				Background(lipgloss.Color("#313244"))
 
-	// normalRowStyle is the unselected row: default background, Text.
-	normalRowStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#cdd6f4"))
+	// allModelsStyle distinguishes the synthetic [All models] global-scope
+	// entry in the providers pane. Sky (#89dceb) keeps it visually distinct
+	// from provider rows while staying quieter than the active highlight.
+	allModelsStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#89dceb"))
 
 	// inactiveProviderStyle renders unselected provider pills in Surface2.
 	//nolint:unused // retained for spec compatibility
 	inactiveProviderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
-
-	// providerFilterActive is the highlighted provider pill: Yellow bold.
-	providerFilterActive = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af")).Bold(true)
-	// providerFilterInactive is the muted provider pill: Subtext0.
-	providerFilterInactive = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 
 	// Per-provider badges (Catppuccin Mocha accents – legacy identifiers kept for
 	// backward compat; palette updated to spec's explicit Mocha mapping).

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -37,49 +36,32 @@ func TestSanitizeModelForOpenRouter(t *testing.T) {
 	}
 }
 
-// TestOpenRouterExecute_MapsInvalidModelID pins the reported HTTP 400 failure
-// mode: an Ollama-style model ID ("qwen2.5-coder:7b") leaked into an OpenRouter
-// request must be remapped to the provider default model before dispatch, so
-// the API never rejects the payload with "not a valid model ID".
+// TestOpenRouterExecute_MapsInvalidModelID pins the strict verbatim guard:
+// an Ollama-style model ID ("qwen2.5-coder:7b") leaked into an OpenRouter
+// request MUST be rejected locally before any HTTP dispatch — workers MUST
+// NOT silently remap it to a fallback. The request is rejected with a
+// deterministic invalid-model error and no HTTP request is sent.
 func TestOpenRouterExecute_MapsInvalidModelID(t *testing.T) {
-	var (
-		mu    sync.Mutex
-		sent  string
-		ready = make(chan struct{})
-	)
+	var sent bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Model string `json:"model"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		mu.Lock()
-		sent = body.Model
-		mu.Unlock()
-		close(ready)
+		sent = true
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"id": "1", "object": "chat.completion", "model": body.Model,
+			"id": "1", "object": "chat.completion", "model": "anthropic/claude-3.5-sonnet",
 			"choices": []map[string]interface{}{
 				{"index": 0, "message": map[string]interface{}{"role": "assistant", "content": "ok"}, "finish_reason": "stop"},
 			},
-			"usage": map[string]interface{}{"prompt_tokens": 5, "completion_tokens": 5},
 		})
 	}))
 	defer srv.Close()
 
 	p := NewOpenRouterProvider("test-key", "anthropic/claude-3.5-sonnet", srv.URL)
-	resp, err := p.Execute(context.Background(), ai.Request{Model: "qwen2.5-coder:7b"})
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
+	_, err := p.Execute(context.Background(), ai.Request{Model: "qwen2.5-coder:7b"})
+	if err == nil {
+		t.Fatal("Execute with invalid Ollama model ID should fail before dispatch")
 	}
-	<-ready
-	if resp.Content != "ok" {
-		t.Fatalf("Content = %q, want ok", resp.Content)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if sent != "anthropic/claude-3.5-sonnet" {
-		t.Fatalf("dispatched model = %q, want provider default anthropic/claude-3.5-sonnet", sent)
+	if sent {
+		t.Fatal("provider should not have dispatched HTTP request for invalid model ID")
 	}
 }
 

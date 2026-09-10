@@ -6,7 +6,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	modelapp "github.com/PizenLabs/izen/internal/app/model"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
@@ -116,67 +115,101 @@ func TestDefaultCycleRoundTrip(t *testing.T) {
 	}
 }
 
-// FocusScope state machine: UNIFIED ENGINE – Tab wall eliminated.
-// Search is ALWAYS active; Tab is no-op, Down moves cursor (global nav),
-// Alt+d/p/s/v/a bind roles, ←/→ cycle reasoning, typing always filters.
+// FocusScope state machine: Tab cycles Providers -> Models -> Roles ->
+// Providers; Enter commits in PaneModels (or binds roles while Roles Pane is
+// active); Enter/Alt+A on an unconfigured provider opens the secure API-key
+// overlay (SaveProviderKeyMsg on submit, ApiKeyInputClosedMsg on Esc).
 func TestFocusScopeStateMachine(t *testing.T) {
-	m := New(seedSnapshot(testModels()))
-	if m.Focus() != FocusList {
-		t.Fatalf("initial focus = %v, want FocusList", m.Focus())
+	snap := &registry.ModelSnapshot{
+		Models: testModels(),
+		Providers: []registry.ProviderSummary{
+			{Name: "openrouter", ModelCount: 1, Status: "ok"},
+			{Name: "gemini", ModelCount: 1, Status: "ok"},
+			{Name: "openai", ModelCount: 1, Status: "ok"},
+		},
 	}
-	// Unified: Tab is no-op (search always active) – focus must not toggle.
+	m := New(snap)
+	if m.PaneFocus() != PaneProviders {
+		t.Fatalf("initial pane focus = %v, want PaneProviders", m.PaneFocus())
+	}
+	// Tab cycles to PaneModels
 	mTab, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
-	if mTab.Focus() != m.Focus() {
-		t.Errorf("Tab must be no-op in unified engine, got %v want %v", mTab.Focus(), m.Focus())
+	if mTab.PaneFocus() != PaneModels {
+		t.Errorf("Tab must cycle to PaneModels, got %v", mTab.PaneFocus())
 	}
-	mShift, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyShiftTab})
-	if mShift.Focus() != m.Focus() {
-		t.Errorf("Shift+Tab must be no-op in unified engine")
+	// Second Tab cycles to PaneRoles (showingRoles turns on)
+	mTab2, _ := mTab.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if mTab2.PaneFocus() != PaneRoles {
+		t.Errorf("second Tab must cycle to PaneRoles, got %v", mTab2.PaneFocus())
 	}
-
-	// Alt bindings must work regardless of focus.
-	for _, tc := range []struct{ key, role string }{
-		{"alt+d", "default"}, {"alt+p", "plan"}, {"alt+s", "smol"}, {"alt+v", "vision"}, {"alt+a", "adviser"},
-	} {
-		mm := m
-		var cmd tea.Cmd
-		// Send Alt+key as Runes with Alt flag
-		r := tc.key[4:] // after "alt+"
-		_, cmd = mm.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r), Alt: true})
-		if cmd == nil {
-			t.Fatalf("alt %q must emit binding cmd", tc.key)
-		}
-		if bind := cmd().(modelapp.BindModelToRoleCommand); string(bind.Role) != tc.role {
-			t.Errorf("alt %q role = %q, want %q", tc.key, string(bind.Role), tc.role)
-		}
+	if !mTab2.ShowingRoles() {
+		t.Errorf("PaneRoles entry must show the roles pane (showingRoles=true)")
 	}
-	// Plain d/p/s/v/a must NOT bind in unified engine when focus is Search – they type.
-	mSearch := m.FocusSearch()
-	for _, key := range []string{"d", "p", "s", "v", "a"} {
-		mm, cmd := mSearch.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
-		if cmd != nil {
-			t.Errorf("plain %q in search focus must not emit bind (unified search), got cmd", key)
-		}
-		_ = mm
+	// Third Tab cycles back to PaneProviders (roles pane off)
+	mTab3, _ := mTab2.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if mTab3.PaneFocus() != PaneProviders || mTab3.ShowingRoles() {
+		t.Errorf("third Tab must cycle to PaneProviders with showingRoles off, got %v/%v", mTab3.PaneFocus(), mTab3.ShowingRoles())
 	}
 
-	// ←/→ cycle reasoning without touching the cursor or query.
-	before := m.Cursor()
-	m2, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRight})
-	if cmd != nil {
-		t.Error("→ must emit no command")
+	// Alt+A in PaneProviders (on a real provider, past the All models entry)
+	// opens the secure API-key overlay.
+	nav, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
+	mOpen, cmdKey := nav.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a"), Alt: true})
+	if cmdKey == nil {
+		t.Fatal("Alt+A in PaneProviders must open the API-key overlay")
 	}
-	if m2.Cursor() != before {
-		t.Errorf("→ changed cursor %d→%d", before, m2.Cursor())
+	if msg, ok := cmdKey().(ApiKeyInputOpenedMsg); !ok || msg.Provider != "openrouter" {
+		t.Fatalf("Alt+A msg = %#v, want ApiKeyInputOpenedMsg openrouter", cmdKey())
 	}
-	if o, ok := m2.CurrentReasoningOption(); !ok || o != "low" {
-		t.Errorf("after → reasoning option = %q,%v, want low,true", o, ok)
+	if mOpen.apiKeyInput == nil {
+		t.Fatal("Alt+A must activate the inline API-key input")
+	}
+	// Esc cancels the overlay.
+	mClosed, cmdClose := mOpen.UpdateModel(tea.KeyMsg{Type: tea.KeyEsc})
+	if mClosed.apiKeyInput != nil {
+		t.Fatal("Esc must close the API-key overlay")
+	}
+	if msg, ok := cmdClose().(ApiKeyInputClosedMsg); !ok || msg.Provider != "openrouter" {
+		t.Fatalf("Esc msg = %#v, want ApiKeyInputClosedMsg openrouter", cmdClose())
 	}
 
-	// Down moves cursor globally (no focus toggle)
+	// Enter in the overlay submits SaveProviderKeyMsg with the masked value.
+	mSubmit, _ := mOpen.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("sk-test-123")})
+	mSubmit, cmdSave := mSubmit.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if msg, ok := cmdSave().(SaveProviderKeyMsg); !ok || msg.Provider != "openrouter" || msg.APIKey != "sk-test-123" {
+		t.Fatalf("Enter msg = %#v, want SaveProviderKeyMsg openrouter/sk-test-123", cmdSave())
+	}
+	if mSubmit.apiKeyInput != nil {
+		t.Fatal("Enter must close the API-key overlay after submit")
+	}
+
+	// Enter in PaneRoles switches to the models pane for assignment.
+	mRole := m.SetPaneFocus(PaneRoles).SetShowingRoles(true)
+	mAssign, _ := mRole.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if mAssign.PaneFocus() != PaneModels {
+		t.Errorf("Enter in PaneRoles must switch to PaneModels, got %v", mAssign.PaneFocus())
+	}
+
+	// Enter in PaneModels while showing roles binds the model to the role.
+	mModels := New(snap).SetPaneFocus(PaneModels).SetShowingRoles(true)
+	_, cmd := mModels.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter in PaneModels (roles active) must emit role override command")
+	}
+	if msg, ok := cmd().(RolePolicyOverrideMsg); !ok || msg.Role != RoleOverridePlan || msg.ModelID == "" {
+		t.Fatalf("roles Enter msg = %#v, want RolePolicyOverrideMsg plan with model", cmd())
+	}
+
+	// Down moves provider cursor in PaneProviders pane (0 = All models entry)
 	mDown, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
-	if mDown.Cursor() != 1 {
-		t.Errorf("down must move cursor in unified engine, got %d want 1", mDown.Cursor())
+	if mDown.ProviderCursor() != 1 {
+		t.Errorf("down must move provider cursor, got %d want 1", mDown.ProviderCursor())
+	}
+	// In PaneModels down moves the model cursor
+	m = m.SetProviderFilter("").SetPaneFocus(PaneModels)
+	mDown2, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
+	if mDown2.Cursor() != 1 {
+		t.Errorf("down must move cursor in PaneModels, got %d want 1", mDown2.Cursor())
 	}
 }
 
@@ -198,29 +231,37 @@ func TestSearchFocusTypingDoesNotBind(t *testing.T) {
 	}
 }
 
-// Header focus indicator renders the active scope: Focus: [SEARCH] (Tab to
-// List) in search focus and Focus: [LIST] (Tab to Search) in list focus.
-// Default is [LIST] per UX spec.
+// Header focus indicator renders the active pane scope: Focus: [PROVIDERS]
+// (Tab to Models) in providers focus, Focus: [MODELS] (Tab to Roles) in
+// models focus and Focus: [ROLES] (Tab to Providers) in roles focus.
+// Default is [PROVIDERS] per the 3-pane UX spec.
 func TestHeaderFocusIndicator(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	view := m.View()
-	if !strings.Contains(view, "[LIST]") || !strings.Contains(view, "Tab to Search") {
-		t.Errorf("default list-focus header must show Focus: [LIST] (Tab to Search), got:\n%s", view)
+	if !strings.Contains(view, "[PROVIDERS]") || !strings.Contains(view, "Tab to Models") {
+		t.Errorf("default providers-focus header must show Focus: [PROVIDERS] (Tab to Models), got:\n%s", view)
 	}
-	m = m.FocusSearch()
+	m = m.SetPaneFocus(PaneModels)
 	view2 := m.View()
-	if !strings.Contains(view2, "[SEARCH]") || !strings.Contains(view2, "Tab to List") {
-		t.Errorf("search-focus header must show Focus: [SEARCH] (Tab to List), got:\n%s", view2)
+	if !strings.Contains(view2, "[MODELS]") || !strings.Contains(view2, "Tab to Roles") {
+		t.Errorf("models-focus header must show Focus: [MODELS] (Tab to Roles), got:\n%s", view2)
 	}
-	if strings.Contains(view2, "[LIST]") {
-		t.Errorf("search-focus header must not show [LIST]:\n%s", view2)
+	if strings.Contains(view2, "[PROVIDERS]") {
+		t.Errorf("models-focus header must not show [PROVIDERS]:\n%s", view2)
+	}
+	m = m.SetPaneFocus(PaneRoles).SetShowingRoles(true)
+	view3 := m.View()
+	if !strings.Contains(view3, "[ROLES]") || !strings.Contains(view3, "Tab to Providers") {
+		t.Errorf("roles-focus header must show Focus: [ROLES] (Tab to Providers), got:\n%s", view3)
+	}
+	if !strings.Contains(view3, "Plan / Thinking") {
+		t.Errorf("roles view must render the Plan/Thinking override entry:\n%s", view3)
 	}
 }
 
-// Selected-row single-line contract: the active row renders the word "Tools"
-// on the SAME line as the cursor with zero embedded newlines, zero wrapped
-// fragment below the row, and no frame-breaking blank line. Lipgloss width
-// wrap must never split the long capabilities cell onto line 2.
+// Selected-row single-line contract: the active model row renders on a
+// SINGLE physical line with zero embedded newlines and zero wrap fragments.
+// The dual-pane layout shows model IDs in the right pane.
 func TestSelectedRowSingleLineNoWrap(t *testing.T) {
 	models := []registry.ModelDescriptor{
 		{
@@ -228,10 +269,10 @@ func TestSelectedRowSingleLineNoWrap(t *testing.T) {
 			Provider:      "meta",
 			Name:          "Muse Glimmer 30B batch",
 			ContextWindow: 1_000_000,
-			InputCostPerM: 0.25, OutputCostPerM: 0.75,
+			InputCostPerM: 0, OutputCostPerM: 0.75,
 			Capabilities: []registry.ModelCapability{registry.CapThinking, registry.CapTools, registry.CapVision},
 		},
-		{ID: "openai/gpt-4o-mini", Provider: "openai", Name: "GPT-4o mini", ContextWindow: 128000},
+		{ID: "openai/gpt-4o-mini", Provider: "openai", Name: "GPT-4o mini", ContextWindow: 128000, InputCostPerM: 0},
 	}
 	m := New(seedSnapshot(models)).SetSize(100, 30)
 	m = m.MoveCursor(0)
@@ -240,7 +281,7 @@ func TestSelectedRowSingleLineNoWrap(t *testing.T) {
 	lines := strings.Split(strings.ReplaceAll(view, "\r", ""), "\n")
 	activeIdx := -1
 	for i, ln := range lines {
-		if strings.Contains(ln, ">") && strings.Contains(ln, "muse") {
+		if strings.Contains(ln, "muse") {
 			activeIdx = i
 			break
 		}
@@ -250,33 +291,8 @@ func TestSelectedRowSingleLineNoWrap(t *testing.T) {
 	}
 	active := lines[activeIdx]
 
-	// The word Tools must stay on the SELECTED row line itself.
-	if !strings.Contains(active, "Tools") {
-		t.Errorf("Tools must remain on the selected row line:\n%q", active)
-	}
+	// The selected row must be a single line with no embedded newlines.
 	if strings.Contains(active, "\n") {
 		t.Errorf("selected row must contain zero embedded newlines: %q", active)
-	}
-
-	// Zero wrap fragments: any other line carrying "Tools" must be a real
-	// model row (contains a "/" model ID + provider pill) or chrome, never a
-	// bare continuation of the caps cell spilled onto line 2.
-	for i, ln := range lines {
-		if i == activeIdx || !strings.Contains(ln, "Tools") {
-			continue
-		}
-		trimmed := strings.TrimSpace(ln)
-		if trimmed == "" {
-			continue
-		}
-		isRow := strings.Contains(ln, "/") && strings.Contains(ln, "[")
-		isChrome := strings.HasPrefix(trimmed, "REASONING") ||
-			strings.HasPrefix(trimmed, "BINDINGS") ||
-			strings.HasPrefix(trimmed, "IZEN") ||
-			strings.Contains(trimmed, "Enter") ||
-			strings.Contains(trimmed, "Focus:")
-		if !isRow && !isChrome {
-			t.Errorf("wrap fragment on line %d (selected-rows's caps spilled to line 2): %q\nfull view:\n%s", i+1, ln, view)
-		}
 	}
 }

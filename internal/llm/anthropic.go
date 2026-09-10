@@ -327,10 +327,7 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 }
 
 func (c *AnthropicClient) resolveModel(override string) string {
-	if override != "" {
-		return override
-	}
-	return c.model
+	return override
 }
 
 type anthropicStreamReader struct {

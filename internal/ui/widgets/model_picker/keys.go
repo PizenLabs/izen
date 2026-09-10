@@ -15,7 +15,7 @@ package model_picker
 //   pgup               → MoveCursor(-listRowBudget)
 //   pgdown             → MoveCursor(+listRowBudget)
 //   enter              → Select + EmitActivateCommand
-//   esc               → clearSearch if query != "" else CloseModal
+//   esc               → CloseModal (always exits picker)
 //
 // Role bindings (Alt to avoid typing collision):
 //   alt+d → bind default, alt+p → plan, alt+s → smol, alt+v → vision, alt+a → adviser

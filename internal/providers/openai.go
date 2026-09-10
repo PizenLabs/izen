@@ -118,9 +118,9 @@ func (p *OpenAIProvider) buildMessages(req ai.Request) []openaiMessage {
 }
 
 func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
-	model := p.model
-	if req.Model != "" {
-		model = req.Model
+	model := req.Model
+	if model == "" {
+		return nil, fmt.Errorf("openai: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
 
 	msgs := p.buildMessages(req)
@@ -208,9 +208,9 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 }
 
 func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
-	model := p.model
-	if req.Model != "" {
-		model = req.Model
+	model := req.Model
+	if model == "" {
+		return nil, fmt.Errorf("openai: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
 
 	msgs := p.buildMessages(req)

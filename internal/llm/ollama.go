@@ -53,10 +53,7 @@ func (c *OllamaClient) buildMessages(req PromptRequest) []openAIMessage {
 }
 
 func (c *OllamaClient) resolveModel(override string) string {
-	if override != "" {
-		return override
-	}
-	return c.model
+	return override
 }
 
 func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) (LLMResponse, error) {

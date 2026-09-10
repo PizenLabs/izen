@@ -67,6 +67,9 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	m.hotfixBranding = "PROMPT"
 	// Mode is a presentation label only — never an execution-path decision.
 	req.Mode = m.resolver.Current().String()
+	// Explicit TargetModel: resolved from the active Workspace Target at
+	// admission. The executor validates verbatim and rejects empty locally.
+	req.Model = m.getActiveModelName()
 
 	// ── CONVERSATION FLOW (UX_ENGINE #4) ─────────────────────────────
 	// A direct-response request (casual greeting / simple question) is a single

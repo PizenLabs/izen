@@ -66,7 +66,6 @@ type Router struct {
 	models    map[Intent]string
 	providers map[Intent]string
 	policies  map[Intent]layer2.ContextPolicy
-	fallback  string
 }
 
 // RouterOption configures a Router at construction time.
@@ -101,37 +100,19 @@ func WithPolicy(i Intent, p layer2.ContextPolicy) RouterOption {
 	}
 }
 
-// WithFallbackModel sets the model used for intents with no explicit pin.
-func WithFallbackModel(model string) RouterOption {
-	return func(r *Router) {
-		if model != "" {
-			r.fallback = model
-		}
-	}
-}
-
 // NewRouter returns a router with the default per-intent context policies.
-// The fallback model defaults to "qwen2.5-coder:7b"; callers that resolve
-// models from configuration must inject them via WithModel.
+// No hardcoded model fallback: callers must supply explicit bindings via
+// WithModel or the stateless Policy Resolver (ResolveModel).
 func NewRouter(opts ...RouterOption) *Router {
 	r := &Router{
 		models:    make(map[Intent]string, len(allIntents)),
 		providers: make(map[Intent]string, len(allIntents)),
 		policies:  make(map[Intent]layer2.ContextPolicy, len(allIntents)),
-		fallback:  "qwen2.5-coder:7b",
 	}
 	for _, o := range opts {
 		o(r)
 	}
 	return r
-}
-
-// FallbackModel returns the fallback model name.
-func (r *Router) FallbackModel() string {
-	if r == nil {
-		return ""
-	}
-	return r.fallback
 }
 
 // SyncTiers re-pins the per-intent model and provider selections from a
@@ -152,9 +133,6 @@ func (r *Router) SyncTiers(resolve func(Intent) (model, provider string)) {
 		model, provider := resolve(i)
 		if model != "" {
 			r.models[i] = model
-			if i == IntentExecution {
-				r.fallback = model
-			}
 		}
 		if provider != "" {
 			r.providers[i] = provider
@@ -192,12 +170,8 @@ func (r *Router) RouteFor(i Intent) RouteProfile {
 	model := r.models[i]
 	provider := r.providers[i]
 	policy := r.policies[i]
-	fallback := r.fallback
 	r.mu.RUnlock()
 
-	if model == "" {
-		model = fallback
-	}
 	if !policy.Valid() {
 		policy = DefaultPolicies[i]
 	}

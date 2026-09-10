@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +18,11 @@ import (
 	"github.com/PizenLabs/izen/internal/planner/scope"
 	"github.com/PizenLabs/izen/internal/telemetry"
 )
+
+// ErrUnassignedTargetModel is returned when a background worker is dispatched
+// without an explicit model binding for its target node. The worker MUST
+// reject locally before any provider call.
+var ErrUnassignedTargetModel = errors.New("preflight: no model assigned to target node")
 
 // Worker is the BackgroundPreflight async worker. Upon PromptAdmitted it is
 // dispatched as a goroutine and performs — off the UI critical path — the
@@ -127,17 +134,48 @@ func (w *Worker) SetCache(c *cache.TopologyCache) {
 
 // Start dispatches the background preflight as an async goroutine upon
 // PromptAdmitted. It returns immediately (<10ms) and never performs file IO
-// on the caller goroutine.
-func (w *Worker) Start(ctx context.Context, prompt string, targets []string) {
+// on the caller goroutine. When modelID is provided it is the explicit
+// TargetModel resolved dynamically from the active Workspace Target at
+// admission. An empty modelID is rejected locally with
+// ErrUnassignedTargetModel before any provider call. Callers that omit
+// modelID (legacy harnesses) run without the guard.
+func (w *Worker) Start(ctx context.Context, prompt string, targets []string, modelID ...string) {
 	w.mu.Lock()
 	w.runs++
 	w.mu.Unlock()
-	// Log spec sequence via bus activity (never stdout — TUI invariant).
+	if len(modelID) > 0 {
+		model := strings.TrimSpace(modelID[0])
+		if model == "" {
+			err := fmt.Errorf("%w [%s]", ErrUnassignedTargetModel, firstTargetOrAsk(targets))
+			if w.bus != nil {
+				w.bus.Publish(events.NewActivity(fmt.Sprintf("[preflight] bg worker rejected prompt=%q err=%v", prompt, err)))
+			}
+			if w.barrier != nil {
+				w.barrier.Notify(nil, err)
+			}
+			return
+		}
+		if w.bus != nil {
+			w.bus.Publish(events.NewActivity(fmt.Sprintf("[preflight] bg worker started prompt=%q model=%q targets=%v", prompt, model, targets)))
+			w.bus.Publish(events.NewStageCompleted("preflight_start", 0, fmt.Sprintf("bg worker started for prompt %q", prompt)))
+		}
+		go w.run(ctx, prompt, targets)
+		return
+	}
+	// Legacy path (no model binding): preserve existing logging.
 	if w.bus != nil {
 		w.bus.Publish(events.NewActivity(fmt.Sprintf("[preflight] bg worker started prompt=%q targets=%v", prompt, targets)))
 		w.bus.Publish(events.NewStageCompleted("preflight_start", 0, fmt.Sprintf("bg worker started for prompt %q", prompt)))
 	}
 	go w.run(ctx, prompt, targets)
+}
+
+// firstTargetOrAsk returns the first target or "ask" for error messages.
+func firstTargetOrAsk(targets []string) string {
+	if t := firstTarget(targets); t != "" {
+		return t
+	}
+	return "ask"
 }
 
 // StartSync is the synchronous test seam: it runs the preflight on the caller

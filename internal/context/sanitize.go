@@ -341,7 +341,7 @@ func SanitizeBuildHandoff(task *plan.Task, symbolContext string) string {
 	b.WriteString("Return ONLY the raw diff, search/replace block, or code block.\n\n")
 
 	// ── Temporal context ─────────────────────────────────────────────
-	// Local LLMs (e.g. qwen2.5-coder:7b) hallucinate default/fallback dates
+	// Local LLMs (e.g. local-model-id) hallucinate default/fallback dates
 	// like "Copyright (c) 2023" when no system time is provided. Injecting
 	// the current year prevents stale-copyright regressions without requiring
 	// the user to explicitly specify the year in every $hot request.

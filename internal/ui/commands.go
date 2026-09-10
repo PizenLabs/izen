@@ -39,6 +39,7 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	riview "github.com/PizenLabs/izen/internal/review"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 	"github.com/PizenLabs/izen/internal/session"
 	verification "github.com/PizenLabs/izen/internal/verification"
 )
@@ -2152,7 +2153,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 // switchModelDirect handles /model <model_name> for direct, non-interactive
 // model switching. It resolves the model name against the configured providers
-// and sets it as the session-level override (m.sessionModel).
+// and sets it as the active binding via the authority.
 func (m *model) switchModelDirect(modelName string) tea.Cmd {
 	modelName = strings.TrimSpace(modelName)
 	if modelName == "" {
@@ -2161,8 +2162,6 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 	}
 
 	// Check model tier configuration for active_override or tier-default resolution.
-	// If the model name matches an active_override in any tier, use that tier's
-	// provider association for routing.
 	resolvedProvider := ""
 	if m.cfg.Models.Tiers != nil {
 		for _, tc := range m.cfg.Models.Tiers {
@@ -2175,19 +2174,21 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 		}
 	}
 
-	// Set the session model override immediately so the status bar reflects
-	// the change before the provider switch completes.
-	m.sessionModel = modelName
-	m.cfg.Models.SessionModel = modelName
-	// Re-pin the pipeline router intent tiers to the newly active model so
-	// mode commands never route a stale local model into a cloud request.
-	m.syncPipelineTiers()
-
 	// Determine the provider for this model. If we couldn't resolve it from
 	// tier config, try to infer from the model name format.
 	if resolvedProvider == "" {
 		resolvedProvider = m.inferProviderFromModel(modelName)
 	}
+
+	// Activate via authority and persist.
+	auth := m.ensureModelAuthority()
+	binding := authority.ModelBinding{
+		ProviderID: authority.ProviderID(resolvedProvider),
+		ModelID:    authority.ModelID(modelName),
+	}
+	auth.Activate(binding)
+	_ = config.PersistActiveBinding(resolvedProvider, modelName, "")
+	m.syncPipelineTiers()
 
 	// If the provider changed, switch providers.
 	if resolvedProvider != "" {
@@ -2196,7 +2197,6 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 			currentProvider = m.provider.Name()
 		}
 		if resolvedProvider != currentProvider {
-			// Validate the provider exists in config.
 			if _, ok := m.cfg.AI.Providers[resolvedProvider]; ok || resolvedProvider == "ollama" {
 				m.push(roleSystem, infoStyle.Render(fmt.Sprintf("switching to provider %q for model %q...", resolvedProvider, modelName)))
 				m.refreshViewportContent()
@@ -2220,7 +2220,7 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 
 // inferProviderFromModel tries to infer the provider from the model name format.
 // Model names with "/" are treated as openrouter-style (provider/model).
-// Ollama models (e.g. qwen2.5-coder:7b, llama3:8b) default to ollama.
+// Ollama models (e.g. local-model-id, llama3:8b) default to ollama.
 func (m *model) inferProviderFromModel(modelName string) string {
 	if strings.Contains(modelName, "/") {
 		return "openrouter"

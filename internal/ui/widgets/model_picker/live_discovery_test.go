@@ -27,11 +27,11 @@ func TestSetSizeClampsAndStores(t *testing.T) {
 }
 
 // Rows must carry colored provider badges; the header keeps the total and a
-// subtle divider separates it from the search line.
+// subtle divider separates it from the dual-pane content.
 func TestProviderBadgesAndDivider(t *testing.T) {
 	m := New(seedSnapshot(testModels())).SetSize(100, 30)
 	view := m.View()
-	for _, want := range []string{"[OPENROUTER]", "[GEMINI]", "[OPENAI]", "─"} {
+	for _, want := range []string{"PROVIDERS", "MODELS", "─", "Active:"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q:\n%s", want, view)
 		}
@@ -41,27 +41,27 @@ func TestProviderBadgesAndDivider(t *testing.T) {
 	}
 }
 
-// The active row keeps the ">" cursor; selection renders distinctly from
-// plain rows (Surface0 highlight, not the legacy 2-char accent).
+// The dual-pane layout renders the selected row with Surface0 highlight.
 func TestSelectedRowCursor(t *testing.T) {
 	m := New(seedSnapshot(testModels())).SetSize(100, 30)
 	view := m.View()
-	if !strings.Contains(view, ">") {
-		t.Errorf("active row must feature > cursor:\n%s", view)
-	}
-	// Zero-state keeps the help panel and anchored footer.
+	// Zero-state keeps panes and anchored footer.
 	empty := New(seedSnapshot(nil)).SetSize(100, 30).View()
-	for _, want := range []string{"NO MODELS AVAILABLE", "Ctrl+R", "Enter: activate"} {
+	for _, want := range []string{"PROVIDERS", "MODELS", "Tab select"} {
 		if !strings.Contains(empty, want) {
 			t.Errorf("zero-state missing %q:\n%s", want, empty)
 		}
 	}
+	// Browsing footer should be clean with new hints
+	if !strings.Contains(view, "Alt+A") || !strings.Contains(view, "Enter") {
+		t.Errorf("browsing footer must contain dual-pane hints, got:\n%s", view)
+	}
 }
 
-// Registry-level live baseline: embedded defaults stay non-empty.
-func TestDefaultSnapshotNonEmpty(t *testing.T) {
+// Registry-level live baseline: cold start is empty until provider sync.
+func TestDefaultSnapshotEmpty(t *testing.T) {
 	snap := registry.DefaultSnapshot()
-	if len(snap.Models) == 0 {
-		t.Fatal("DefaultSnapshot must be non-empty")
+	if len(snap.Models) != 0 {
+		t.Errorf("DefaultSnapshot must be empty (live data from providers only), got %d models", len(snap.Models))
 	}
 }

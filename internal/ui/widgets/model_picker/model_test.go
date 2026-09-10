@@ -94,66 +94,37 @@ func TestSearchInputFiltersRAM(t *testing.T) {
 	}
 }
 
-// Pressing p in list focus must emit a BindModelToRoleCommand (no file I/O,
-// no direct persistence, no badge mutation until confirmation).
+// Enter in PaneModels emits ModelAssignmentRequestedMsg for the active model.
 func TestRoleBindingHotkeyEmitsCommand(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
-	m = m.FocusList()
+	m = m.SetPaneFocus(PaneModels)
 
 	var cmd tea.Cmd
-	m, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
-		t.Fatal("role hotkey must return a tea.Cmd emitting BindModelToRoleCommand")
+		t.Fatal("Enter in PaneModels must return a tea.Cmd emitting ModelAssignmentRequestedMsg")
 	}
 	msg := cmd()
-	bind, ok := msg.(modelapp.BindModelToRoleCommand)
-	if !ok {
-		t.Fatalf("cmd msg = %T, want BindModelToRoleCommand", msg)
-	}
-	if string(bind.Role) != "plan" {
-		t.Errorf("role = %q, want plan", string(bind.Role))
-	}
-	if bind.ModelID != "openrouter/deepseek/deepseek-r1" {
-		t.Errorf("model = %q, want highlighted deepseek-r1", bind.ModelID)
-	}
-	// Pure view: badges stay empty until the app layer confirms.
-	if _, ok := m.Roles()["plan"]; ok {
-		t.Error("picker must not mutate badges on keypress; wait for BindingSucceededMsg")
-	}
-	if !strings.Contains(m.Status(), "queued bind") {
-		t.Errorf("status = %q, want queued bind", m.Status())
-	}
-
-	// Confirmation path updates badges.
-	m, _ = m.UpdateModel(BindingSucceededMsg{Role: "plan", ModelID: bind.ModelID})
-	if got := m.Roles()["plan"]; got != bind.ModelID {
-		t.Errorf("after confirm, roles[plan] = %q", got)
-	}
-	if view := m.View(); !strings.Contains(view, "[PLAN]") {
-		t.Errorf("view must render [PLAN] badge after confirmation:\n%s", view)
+	// Unwrap tea.BatchMsg to find the assignment message.
+	assign := unwrapAssignmentMsg(t, msg)
+	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
+		t.Errorf("model = %q, want highlighted deepseek-r1", assign.ModelID)
 	}
 }
 
-// d/s/v/a hotkeys bind their roles via command emission.
+// Enter in PaneModels commits directly. Cursor navigation works in both panes.
 func TestAllRoleHotkeysEmit(t *testing.T) {
-	cases := map[string]string{"d": "default", "s": "smol", "v": "vision", "a": "adviser"}
-	for key, wantRole := range cases {
-		m := New(seedSnapshot(testModels()))
-		m = m.FocusList().MoveCursor(2) // gpt-4o-mini
-		var cmd tea.Cmd
-		var updated Model
-		updated, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
-		_ = updated
-		if cmd == nil {
-			t.Fatalf("key %q must emit a command", key)
-		}
-		bind := cmd().(modelapp.BindModelToRoleCommand)
-		if string(bind.Role) != wantRole {
-			t.Errorf("key %q role = %q, want %q", key, string(bind.Role), wantRole)
-		}
-		if bind.ModelID != "openai/gpt-4o-mini" {
-			t.Errorf("key %q model = %q", key, bind.ModelID)
-		}
+	m := New(seedSnapshot(testModels()))
+	m = m.SetPaneFocus(PaneModels).MoveCursor(2) // gpt-4o-mini
+	// Enter commits directly
+	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter in PaneModels must emit assignment command")
+	}
+	// Down moves cursor in PaneModels
+	mDown, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
+	if mDown.Cursor() != 2 {
+		t.Errorf("down must move cursor, got %d", mDown.Cursor())
 	}
 }
 
@@ -229,8 +200,8 @@ func TestReasoningFidelity(t *testing.T) {
 
 	toggle := registry.ModelDescriptor{ID: "y", Provider: "gemini", Name: "y"}
 	mt := New(seedSnapshot([]registry.ModelDescriptor{toggle}))
-	if bar := mt.View(); !strings.Contains(bar, "off") || !strings.Contains(bar, "auto") {
-		t.Errorf("toggle view = %q, want off/auto/on", bar)
+	if bar := mt.RenderReasoningBar(); !strings.Contains(bar, "off") || !strings.Contains(bar, "auto") {
+		t.Errorf("toggle bar = %q, want off/auto/on", bar)
 	}
 
 	fixed := registry.ModelDescriptor{ID: "deepseek-r1", Provider: "deepseek", Name: "R1"}
@@ -258,22 +229,49 @@ func TestReasoningFidelity(t *testing.T) {
 	}
 }
 
-// Scope toggle flips local/global and flows into the emitted command.
+// Tab cycles focus Providers -> Models -> Roles -> Providers (3-pane spec).
 func TestScopeToggleFlowsIntoCommand(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
-	m = m.FocusList()
-	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
-	if !m.IsGlobal() {
-		t.Fatal("g must toggle scope to global")
+	if m.PaneFocus() != PaneProviders {
+		t.Fatalf("initial pane focus = %v, want PaneProviders", m.PaneFocus())
 	}
-	var cmd tea.Cmd
-	var updated Model
-	updated, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
-	_ = updated
-	if cmd == nil {
-		t.Fatal("bind must emit a command")
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if m.PaneFocus() != PaneModels {
+		t.Fatalf("after Tab, pane focus = %v, want PaneModels", m.PaneFocus())
 	}
-	if bind := cmd().(modelapp.BindModelToRoleCommand); !bind.IsGlobal {
-		t.Error("command must carry IsGlobal=true after toggle")
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if m.PaneFocus() != PaneRoles || !m.ShowingRoles() {
+		t.Fatalf("after second Tab, pane focus = %v/showingRoles=%v, want PaneRoles/true", m.PaneFocus(), m.ShowingRoles())
 	}
+	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyTab})
+	if m.PaneFocus() != PaneProviders || m.ShowingRoles() {
+		t.Fatalf("after third Tab, pane focus = %v/showingRoles=%v, want PaneProviders/false", m.PaneFocus(), m.ShowingRoles())
+	}
+}
+
+// unwrapAssignmentMsg extracts ModelAssignmentRequestedMsg from a tea.Msg that
+// may be it directly or wrapped inside a tea.BatchMsg.
+func unwrapAssignmentMsg(t *testing.T, msg tea.Msg) ModelAssignmentRequestedMsg {
+	t.Helper()
+	if msg == nil {
+		t.Fatal("msg is nil")
+	}
+	if assign, ok := msg.(ModelAssignmentRequestedMsg); ok {
+		return assign
+	}
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("msg = %T, want ModelAssignmentRequestedMsg or tea.BatchMsg", msg)
+	}
+	for _, cmdFn := range batch {
+		if cmdFn == nil {
+			continue
+		}
+		result := cmdFn()
+		if assign, ok := result.(ModelAssignmentRequestedMsg); ok {
+			return assign
+		}
+	}
+	t.Fatalf("no ModelAssignmentRequestedMsg found in BatchMsg of length %d", len(batch))
+	return ModelAssignmentRequestedMsg{}
 }

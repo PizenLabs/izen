@@ -137,7 +137,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// the authoritative stage — a provider round-trip before the first byte
 	// renders as "Model ● waiting", never as "Thinking...".
 	m.startShimmer("Waiting for model...", "analyze")
-	m.setStage("model", m.cfg.ActiveModelName(), stageWaiting)
+	m.setStage("model", m.getActiveModelName(), stageWaiting)
 	m.responseBuffer.Reset()
 	m.reasoningBuffer.Reset()
 	m.traceBuffer.Reset()
@@ -293,7 +293,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	streamCh := m.streamCh
 
 	req := ai.Request{
-		Model:     m.cfg.ActiveModelName(),
+		Model:     m.getActiveModelName(),
 		Messages:  msgs,
 		Stream:    true,
 		System:    systemPrompt,

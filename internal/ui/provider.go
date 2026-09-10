@@ -3,11 +3,15 @@ package ui
 import (
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/llm"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 )
 
 var validProviders = map[string]string{
@@ -141,8 +145,31 @@ func (m *model) switchProvider(name string) tea.Cmd {
 
 	// Re-pin the layered pipeline router's intent tiers to the new active
 	// provider so mode commands never route a stale local model into a cloud
-	// request (OpenRouter rejects e.g. "qwen2.5-coder:7b" with HTTP 400).
+	// request (OpenRouter rejects e.g. local-id:7b with HTTP 400).
 	m.syncPipelineTiers()
+
+	// Provider switch state invalidation: clear the active binding if it does
+	// not belong to the newly active provider. Without this, an Ollama model
+	// leaks into an OpenRouter context and is rejected by the validator.
+	if auth := m.modelAuthority; auth != nil {
+		binding := auth.ActiveBinding()
+		if binding.ModelID != "" && !modelBelongsToProvider(name, string(binding.ModelID)) {
+			// Clear stale binding and re-seed with new provider's default.
+			newDefault := ""
+			if provCfg, ok := m.cfg.AI.Providers[name]; ok {
+				newDefault = provCfg.DefaultModel
+			}
+			if newDefault != "" && modelBelongsToProvider(name, newDefault) {
+				auth.Activate(authority.ModelBinding{
+					ProviderID: authority.ProviderID(name),
+					ModelID:    authority.ModelID(newDefault),
+				})
+				_ = config.PersistActiveBinding(name, newDefault, "")
+			} else {
+				auth.Activate(authority.ModelBinding{})
+			}
+		}
+	}
 
 	m.push(roleSystem, fmt.Sprintf("[✓] Provider switched: %s → %s", oldName, name))
 
@@ -181,6 +208,24 @@ func GetActiveProviderFromEnv() string {
 		return "groq"
 	}
 	return "ollama"
+}
+
+var openRouterModelIDRe = regexp.MustCompile(`^[^/\s]+/[^/\s]+$`)
+
+func modelBelongsToProvider(provider, model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	isOpenRouterStyle := openRouterModelIDRe.MatchString(model)
+	switch provider {
+	case "openrouter":
+		return isOpenRouterStyle
+	case "ollama":
+		return !isOpenRouterStyle
+	default:
+		return true
+	}
 }
 
 func init() {

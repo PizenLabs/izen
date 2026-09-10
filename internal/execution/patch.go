@@ -3132,7 +3132,7 @@ func tryApplySearchReplace(original, content string) (string, bool) {
 
 // ExtractRawCodeBlock extracts the raw content from a markdown code block,
 // handling nested and malformed fences commonly produced by small models
-// (e.g. qwen2.5-coder:7b which wraps ```diff inside ``` inside ```).
+// (e.g. small coding models which wrap ```diff inside ``` inside ```).
 //
 // The function applies three extraction passes:
 //  1. Strip outermost fences (``` ... ```)

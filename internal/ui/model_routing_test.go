@@ -6,6 +6,8 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/engine/pipeline"
 	"github.com/PizenLabs/izen/internal/modes"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 )
 
 func testRouterModel(t *testing.T, mode string) string {
@@ -76,6 +78,14 @@ func TestSyncPipelineTiersProviderSwitch(t *testing.T) {
 	if got := m.routeModel("ask"); got != "qwen2.5-coder:7b" {
 		t.Fatalf("routeModel(ask) before sync = %q, want stale qwen2.5-coder:7b", got)
 	}
+
+	// Set up the authority with the OpenRouter model binding so syncPipelineTiers
+	// resolves through authority (the single source of truth).
+	m.modelAuthority = appruntime.NewRuntimeAuthority()
+	m.modelAuthority.Activate(authority.ModelBinding{
+		ProviderID: authority.ProviderID("openrouter"),
+		ModelID:    authority.ModelID("anthropic/claude-3.5-sonnet"),
+	})
 
 	m.syncPipelineTiers()
 
