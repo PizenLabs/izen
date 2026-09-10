@@ -2,191 +2,255 @@ package integration
 
 import (
 	"encoding/json"
-	"os"
+	"errors"
 	"strings"
 	"testing"
 
-	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/providers/capability"
-	authority "github.com/PizenLabs/izen/internal/runtime/authority"
+	"github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 	registry "github.com/PizenLabs/izen/internal/provider/registry"
 )
 
 // ── Test A: Unified Active Model ─────────────────────────────────────────────
+// Set one binding on RuntimeAuthority; verify every intent resolves to that
+// same binding (single active binding invariant).
 func TestA_UnifiedActiveModel(t *testing.T) {
-	cfg := config.Default()
-	cfg.AI.DefaultProvider = "openrouter"
-	cfg.AI.Providers["openrouter"] = config.AIProviderConfig{
-		BaseURL:      "https://openrouter.ai/api/v1",
-		APIKey:       "test-key",
-		DefaultModel: "dots-studio/dots-3-note-preview:free",
+	auth := runtime.NewRuntimeAuthority()
+	binding := authority.ModelBinding{
+		ProviderID: authority.ProviderID("openrouter"),
+		ModelID:    authority.ModelID("anthropic/claude-3.5-sonnet"),
 	}
-	cfg.Models.Default = "dots-studio/dots-3-note-preview:free"
-	cfg.Models.SessionModel = "dots-studio/dots-3-note-preview:free"
+	auth.Activate(binding)
 
-	provider := cfg.ActiveProviderName()
-	model := cfg.ActiveModelName()
-
-	if provider != "openrouter" {
-		t.Errorf("provider = %q, want openrouter", provider)
-	}
-	if model != "dots-studio/dots-3-note-preview:free" {
-		t.Errorf("model = %q, want dots-studio/dots-3-note-preview:free", model)
-	}
-
-	// Assignment-based mode checks (config.Assignments, not cfg.Modes)
-	modes := []string{"ask", "investigate", "plan", "build", "review"}
-	for _, mode := range modes {
-		var assigned string
-		switch mode {
-		case "ask":
-			assigned = cfg.Assignments.Ask
-		case "investigate":
-			assigned = cfg.Assignments.Investigate
-		case "plan":
-			assigned = cfg.Assignments.Plan
-		case "build":
-			assigned = cfg.Assignments.Build
-		case "review":
-			assigned = cfg.Assignments.Review
+	// Every intent must resolve to the same active binding (no policy overrides set).
+	intents := []string{"ask", "investigate", "plan", "build", "review", "conversation"}
+	for _, intent := range intents {
+		got, err := auth.ResolveForIntent(intent)
+		if err != nil {
+			t.Errorf("ResolveForIntent(%q): unexpected error: %v", intent, err)
+			continue
 		}
-		if assigned != "" && assigned != model {
-			t.Errorf("assignment %s = %q, want unified %q", mode, assigned, model)
+		if got.ProviderID != binding.ProviderID || got.ModelID != binding.ModelID {
+			t.Errorf("ResolveForIntent(%q) = %+v, want provider=%q model=%q",
+				intent, got, binding.ProviderID, binding.ModelID)
 		}
 	}
 }
 
 // ── Test B: Explicit Policy Override ───────────────────────────────────────────
+// Set a policy binding for the plan role; verify that "plan" and "investigate"
+// (both RoleThinking) use the policy override, while other intents use the
+// active binding.
 func TestB_ExplicitPolicyOverride(t *testing.T) {
-	cfg := config.Default()
-	cfg.AI.DefaultProvider = "openrouter"
-	cfg.AI.Providers["openrouter"] = config.AIProviderConfig{
-		BaseURL:      "https://openrouter.ai/api/v1",
-		APIKey:       "test-key",
-		DefaultModel: "dots-studio/dots-3-note-preview:free",
-	}
-	cfg.Assignments.Plan = "qwen2.5-coder:7b"
+	auth := runtime.NewRuntimeAuthority()
 
-	planModel := cfg.Assignments.Plan
-	askModel := cfg.ActiveModelName()
+	// Active binding (default for non-policy intents).
+	auth.Activate(authority.ModelBinding{
+		ProviderID: authority.ProviderID("openrouter"),
+		ModelID:    authority.ModelID("anthropic/claude-3.5-sonnet"),
+	})
 
-	if planModel != "qwen2.5-coder:7b" {
-		t.Errorf("plan assignment = %q, want qwen2.5-coder:7b", planModel)
+	// Policy: override thinking role to a different provider/model.
+	auth.SetPolicy(authority.ModelPolicy{
+		Thinking: &authority.ModelBinding{
+			ProviderID: authority.ProviderID("anthropic"),
+			ModelID:    authority.ModelID("claude-sonnet-4-20250514"),
+		},
+	})
+
+	// "plan" → RoleThinking → should use policy override.
+	planBinding, err := auth.ResolveForIntent("plan")
+	if err != nil {
+		t.Fatalf("ResolveForIntent(plan): %v", err)
 	}
-	if askModel != "dots-studio/dots-3-note-preview:free" {
-		t.Errorf("ask remains openrouter model = %q", askModel)
+	if planBinding.ProviderID != "anthropic" || planBinding.ModelID != "claude-sonnet-4-20250514" {
+		t.Errorf("plan binding = provider=%q model=%q, want anthropic/claude-sonnet-4-20250514",
+			planBinding.ProviderID, planBinding.ModelID)
+	}
+
+	// "investigate" → also RoleThinking → same policy override.
+	invBinding, err := auth.ResolveForIntent("investigate")
+	if err != nil {
+		t.Fatalf("ResolveForIntent(investigate): %v", err)
+	}
+	if invBinding.ProviderID != "anthropic" || invBinding.ModelID != "claude-sonnet-4-20250514" {
+		t.Errorf("investigate binding = provider=%q model=%q, want anthropic/claude-sonnet-4-20250514",
+			invBinding.ProviderID, invBinding.ModelID)
+	}
+
+	// "ask" → RoleFast → no policy → should use active binding.
+	askBinding, err := auth.ResolveForIntent("ask")
+	if err != nil {
+		t.Fatalf("ResolveForIntent(ask): %v", err)
+	}
+	if askBinding.ProviderID != "openrouter" || askBinding.ModelID != "anthropic/claude-3.5-sonnet" {
+		t.Errorf("ask binding = provider=%q model=%q, want openrouter/anthropic/claude-3.5-sonnet",
+			askBinding.ProviderID, askBinding.ModelID)
 	}
 }
 
 // ── Test C: Invalid Provider Binding ───────────────────────────────────────────
+// Verify that ValidateBinding rejects mismatched provider/model pairs
+// (e.g. ollama model with openrouter provider).
 func TestC_InvalidProviderBinding(t *testing.T) {
-	binding := authority.ModelBinding{
-		ProviderID: authority.ProviderID("openrouter"),
-		ModelID:    authority.ModelID("qwen2.5-coder:7b"),
+	tests := []struct {
+		name    string
+		binding authority.ModelBinding
+		wantErr error
+	}{
+		{
+			name: "openrouter model on ollama provider",
+			binding: authority.ModelBinding{
+				ProviderID: authority.ProviderID("ollama"),
+				ModelID:    authority.ModelID("anthropic/claude-3.5-sonnet"),
+			},
+			wantErr: authority.ErrProviderModelMismatch,
+		},
+		{
+			name: "ollama model on openrouter provider",
+			binding: authority.ModelBinding{
+				ProviderID: authority.ProviderID("openrouter"),
+				ModelID:    authority.ModelID("qwen2.5-coder:7b"),
+			},
+			wantErr: authority.ErrProviderModelMismatch,
+		},
+		{
+			name: "empty model ID",
+			binding: authority.ModelBinding{
+				ProviderID: authority.ProviderID("openrouter"),
+				ModelID:    authority.ModelID(""),
+			},
+			wantErr: authority.ErrUnassignedModel,
+		},
+		{
+			name: "empty provider ID",
+			binding: authority.ModelBinding{
+				ProviderID: authority.ProviderID(""),
+				ModelID:    authority.ModelID("some-model"),
+			},
+			wantErr: authority.ErrProviderDisabled,
+		},
 	}
-	providerID, modelID, valid := adapterBindingValid(binding)
 
-	if valid {
-		t.Errorf("invalid binding (%q + %q) was accepted as valid", providerID, modelID)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := authority.ValidateBinding(tt.binding)
+			if err == nil {
+				t.Errorf("ValidateBinding(%+v): expected error, got nil", tt.binding)
+				return
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("ValidateBinding(%+v): got error %v, want errors.Is %v",
+					tt.binding, err, tt.wantErr)
+			}
+		})
 	}
-}
-
-// adapterBindingValid mimics adapter.ModelBindingAdapter contract for the audit.
-func adapterBindingValid(binding authority.ModelBinding) (string, string, bool) {
-	if binding.ModelID == "" {
-		return "", "", false
-	}
-	// OpenRouter requires vendor/model schema; ollama requires no slash prefix.
-	switch string(binding.ProviderID) {
-	case "openrouter":
-		if !strings.Contains(string(binding.ModelID), "/") {
-			return string(binding.ProviderID), string(binding.ModelID), false
-		}
-	case "ollama":
-		if strings.Contains(string(binding.ModelID), "/") {
-			return string(binding.ProviderID), string(binding.ModelID), false
-		}
-	default:
-		if binding.ModelID == "" {
-			return string(binding.ProviderID), string(binding.ModelID), false
-		}
-	}
-	return string(binding.ProviderID), string(binding.ModelID), true
 }
 
 // ── Test D: Conversation Path ─────────────────────────────────────────────────
+// Verify that ResolveForIntent("ask") (the conversation/direct-response path)
+// returns the exact active binding — same path as execution.
 func TestD_ConversationPath(t *testing.T) {
-	payload := map[string]interface{}{
-		"model": "dots-studio/dots-3-note-preview:free",
+	auth := runtime.NewRuntimeAuthority()
+	auth.Activate(authority.ModelBinding{
+		ProviderID: authority.ProviderID("openrouter"),
+		ModelID:    authority.ModelID("anthropic/claude-3.5-sonnet"),
+	})
+
+	binding, err := auth.ResolveForIntent("ask")
+	if err != nil {
+		t.Fatalf("ResolveForIntent(ask): %v", err)
+	}
+	if binding.ProviderID != "openrouter" {
+		t.Errorf("conversation provider = %q, want openrouter", binding.ProviderID)
+	}
+	if binding.ModelID != "anthropic/claude-3.5-sonnet" {
+		t.Errorf("conversation model = %q, want anthropic/claude-3.5-sonnet", binding.ModelID)
+	}
+
+	// Verify the binding survives JSON round-trip (execution payload construction).
+	payload := map[string]string{
+		"provider": string(binding.ProviderID),
+		"model":    string(binding.ModelID),
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
-		t.Fatalf("marshal payload: %v", err)
+		t.Fatalf("marshal: %v", err)
 	}
-	var result map[string]interface{}
-	if err := json.Unmarshal(b, &result); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if result["model"] != "dots-studio/dots-3-note-preview:free" {
-		t.Errorf("payload model = %v, want dots-studio/dots-3-note-preview:free", result["model"])
+	if !strings.Contains(string(b), "anthropic/claude-3.5-sonnet") {
+		t.Errorf("execution payload must contain exact model string, got: %s", b)
 	}
 }
 
 // ── Test E: Provider Switch ────────────────────────────────────────────────────
-func TestE_ProviderSwitchBlocksExecution(t *testing.T) {
-	cfg := config.Default()
-	cfg.AI.DefaultProvider = "ollama"
-	cfg.AI.Providers["ollama"] = config.AIProviderConfig{
-		BaseURL:      "http://localhost:11434/v1",
-		APIKey:       "ollama",
-		DefaultModel: "qwen2.5-coder:7b",
-	}
-	cfg.AI.Providers["openrouter"] = config.AIProviderConfig{
-		BaseURL:      "https://openrouter.ai/api/v1",
-		APIKey:       "test",
-		DefaultModel: "dots-studio/dots-3-note-preview:free",
-	}
-	cfg.Models.SessionModel = "qwen2.5-coder:7b"
+// Verify that switching the active binding to a new provider does NOT carry
+// over the old model. The new binding is the sole source of truth.
+func TestE_ProviderSwitch(t *testing.T) {
+	auth := runtime.NewRuntimeAuthority()
 
-	cfg.AI.DefaultProvider = "openrouter"
-	newModel := cfg.ActiveModelName()
-	if newModel != "dots-studio/dots-3-note-preview:free" {
-		t.Logf("provider switch: active model = %q (expected openrouter default)", newModel)
+	// Start with ollama.
+	auth.Activate(authority.ModelBinding{
+		ProviderID: authority.ProviderID("ollama"),
+		ModelID:    authority.ModelID("qwen2.5-coder:7b"),
+	})
+	b1, _ := auth.ResolveForIntent("ask")
+	if b1.ProviderID != "ollama" || b1.ModelID != "qwen2.5-coder:7b" {
+		t.Fatalf("initial binding = %+v, want ollama/qwen2.5-coder:7b", b1)
 	}
-	if cfg.Models.SessionModel == "qwen2.5-coder:7b" {
-		t.Log("execution blocked: session model does not match active provider")
+
+	// Switch to openrouter — old ollama model must not leak.
+	auth.Activate(authority.ModelBinding{
+		ProviderID: authority.ProviderID("openrouter"),
+		ModelID:    authority.ModelID("anthropic/claude-3.5-sonnet"),
+	})
+	b2, _ := auth.ResolveForIntent("ask")
+	if b2.ProviderID != "openrouter" {
+		t.Errorf("after switch: provider = %q, want openrouter", b2.ProviderID)
+	}
+	if b2.ModelID != "anthropic/claude-3.5-sonnet" {
+		t.Errorf("after switch: model = %q, want anthropic/claude-3.5-sonnet (no carryover)", b2.ModelID)
+	}
+	if b2.ModelID == "qwen2.5-coder:7b" {
+		t.Error("model carryover detected: old ollama model leaked into new provider binding")
 	}
 }
 
 // ── Test F: Credential Security ────────────────────────────────────────────────
+// Verify that RuntimeAuthority serialization does not expose API keys.
+// The config file stores API keys by design, but the runtime authority's
+// ModelBinding must carry only provider/model identifiers — never secrets.
 func TestF_CredentialSecurity(t *testing.T) {
-	cfg := config.Default()
-	cfg.AI.Providers["openrouter"] = config.AIProviderConfig{
-		APIKey: "secret-openrouter-key-12345",
-	}
+	auth := runtime.NewRuntimeAuthority()
+	auth.Activate(authority.ModelBinding{
+		ProviderID: authority.ProviderID("openrouter"),
+		ModelID:    authority.ModelID("anthropic/claude-3.5-sonnet"),
+	})
 
-	defer os.Remove(ConfigPath())
+	binding := auth.ActiveBinding()
 
-	if err := config.Save(cfg); err != nil {
-		t.Skipf("Save skipped (no home dir): %v", err)
-	}
-
-	data, err := os.ReadFile(ConfigPath())
+	// Serialize the binding to JSON — must not contain API keys.
+	data, err := json.Marshal(binding)
 	if err != nil {
-		return // no persisted file
+		t.Fatalf("json.Marshal: %v", err)
 	}
 	s := string(data)
-	if strings.Contains(s, "secret-openrouter-key-12345") {
-		t.Errorf("serialized config exposes API secret")
+	if strings.Contains(s, "api_key") || strings.Contains(s, "APIKey") || strings.Contains(s, "secret") {
+		t.Errorf("ModelBinding serialization contains credential field: %s", s)
 	}
-}
 
-func ConfigPath() string {
-	return "/tmp/test_izen_config.yml"
+	// Verify binding contains only safe fields.
+	if !strings.Contains(s, "openrouter") {
+		t.Errorf("binding JSON missing provider: %s", s)
+	}
+	if !strings.Contains(s, "anthropic/claude-3.5-sonnet") {
+		t.Errorf("binding JSON missing model: %s", s)
+	}
 }
 
 // ── Test G: Dynamic Catalog ────────────────────────────────────────────────────
-func TestG_DynamicCatalogMatchesLiveDiscovery(t *testing.T) {
+// Verify that the registry loads live provider data, not static lists.
+func TestG_DynamicCatalog(t *testing.T) {
 	reg := registry.NewRegistry()
 	snap := reg.Load()
 
@@ -204,19 +268,45 @@ func TestG_DynamicCatalogMatchesLiveDiscovery(t *testing.T) {
 }
 
 // ── Test H: Capability Truth ───────────────────────────────────────────────────
+// Verify that reasoning capability states are truthful: Supported,
+// Unsupported, and Unknown are correctly distinguished.
 func TestH_CapabilityTruth(t *testing.T) {
 	tests := []struct {
-		name         string
-		reasoning    bool
+		name              string
+		reasoning         bool
 		hasExplicitDenied bool
-		configurable  bool
-		opts         []string
-		wantState    capability.ReasoningSupportState
-		wantConfigurable bool
+		configurable      bool
+		opts              []string
+		wantState         capability.ReasoningSupportState
+		wantConfigurable  bool
 	}{
-		{"Supported reasoning model", true, false, true, []string{"auto", "low", "medium", "high"}, capability.ReasoningSupported, true},
-		{"Unsupported reasoning model", false, true, false, nil, capability.ReasoningUnsupported, false},
-		{"Unknown (absent metadata)", false, false, false, nil, capability.ReasoningUnknown, false},
+		{
+			name:              "Supported reasoning model",
+			reasoning:         true,
+			hasExplicitDenied: false,
+			configurable:      true,
+			opts:              []string{"auto", "low", "medium", "high"},
+			wantState:         capability.ReasoningSupported,
+			wantConfigurable:  true,
+		},
+		{
+			name:              "Unsupported reasoning model",
+			reasoning:         false,
+			hasExplicitDenied: true,
+			configurable:      false,
+			opts:              nil,
+			wantState:         capability.ReasoningUnsupported,
+			wantConfigurable:  false,
+		},
+		{
+			name:              "Unknown (absent metadata)",
+			reasoning:         false,
+			hasExplicitDenied: false,
+			configurable:      false,
+			opts:              nil,
+			wantState:         capability.ReasoningUnknown,
+			wantConfigurable:  false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -229,29 +319,5 @@ func TestH_CapabilityTruth(t *testing.T) {
 				t.Errorf("Configurable = %v, want %v", truth.Configurable, tt.wantConfigurable)
 			}
 		})
-	}
-}
-
-// ── Test D (Execution): Payload Matches Active Binding ────────────────────────
-func TestD_ExecutionPayloadMatchesActiveBinding(t *testing.T) {
-	binding := authority.ModelBinding{
-		ProviderID: authority.ProviderID("openrouter"),
-		ModelID:    authority.ModelID("dots-studio/dots-3-note-preview:free"),
-	}
-	providerID, modelID, valid := adapterBindingValid(binding)
-	if !valid {
-		t.Fatal("binding not valid")
-	}
-
-	payload := map[string]interface{}{
-		"provider": providerID,
-		"model":    modelID,
-	}
-	b, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatalf("marshal payload: %v", err)
-	}
-	if !strings.Contains(string(b), "dots-studio/dots-3-note-preview:free") {
-		t.Errorf("execution payload must contain exact active model string")
 	}
 }
