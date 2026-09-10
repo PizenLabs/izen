@@ -410,6 +410,8 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	switch k {
 	case "esc":
+		// Esc from detail returns to browsing (back-stack). Do NOT emit
+		// CloseModalCmd — the overlay stays open in browsing mode.
 		m.state = StateBrowsing
 		m.clearDetail()
 		return m, nil

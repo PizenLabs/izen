@@ -44,14 +44,14 @@ func TestPhase3ContextualRender(t *testing.T) {
 	if !strings.Contains(vDetail, "MODEL DETAILS") {
 		t.Errorf("detail view must contain MODEL DETAILS, got:\n%s", vDetail)
 	}
-	if !strings.Contains(vDetail, "Context:") || !strings.Contains(vDetail, "Price:") {
-		t.Errorf("detail view must contain Context and Price, got:\n%s", vDetail)
+	if !strings.Contains(vDetail, "Context Window") || !strings.Contains(vDetail, "Pricing") {
+		t.Errorf("detail view must contain Context Window and Pricing, got:\n%s", vDetail)
 	}
 	if strings.Contains(vDetail, "WORKSPACE TARGET ASSIGNMENT") {
 		t.Errorf("detail view must NOT contain workspace assignment matrix, got:\n%s", vDetail)
 	}
-	if !strings.Contains(vDetail, "Reasoning Policy") {
-		t.Errorf("detail view must contain Reasoning Policy control, got:\n%s", vDetail)
+	if !strings.Contains(vDetail, "REASONING POLICY") {
+		t.Errorf("detail view must contain REASONING POLICY control, got:\n%s", vDetail)
 	}
 }
 

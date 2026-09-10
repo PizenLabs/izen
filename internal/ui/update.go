@@ -360,11 +360,6 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 			return m, cmd
 		case tea.KeyMsg:
-			if msg.Type == tea.KeyEscape && !m.modelPicker.ApiKeyInputActive() {
-				m.showModelPicker = false
-				m.ti.Focus()
-				return m, nil
-			}
 			updated, cmd := m.modelPicker.Update(msg)
 			if um, ok := updated.(model_picker.Model); ok {
 				m.modelPicker = um

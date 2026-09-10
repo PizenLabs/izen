@@ -147,7 +147,7 @@ func TestDetailReasoningTruthfulForNonReasoningModel(t *testing.T) {
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
 
 	view := m.View()
-	if !strings.Contains(view, "Reasoning: Not supported by model") {
+	if !strings.Contains(view, "Not supported by model") {
 		t.Fatalf("detail must render 'Not supported by model':\n%s", view)
 	}
 	if strings.Contains(view, "[default]") {
