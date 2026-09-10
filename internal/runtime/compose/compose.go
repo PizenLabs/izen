@@ -54,6 +54,7 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/runtime/authority"
 	runtimeAutonomy "github.com/PizenLabs/izen/internal/runtime/autonomy"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	"github.com/PizenLabs/izen/internal/session"
@@ -551,36 +552,21 @@ func Wire(opts ...Option) (*Application, error) {
 
 	// ── WORKSPACE MODEL AUTHORITY (I5) ────────────────────────────────
 	// The RuntimeAuthority is the single source of truth for workspace model
-	// state. It is seeded from persisted config assignments at wire time so
+	// state. It is seeded from the persisted active binding at wire time so
 	// every invocation request carries an explicit TargetModel resolved at
 	// admission, never a hardcoded fallback.
 	a.Authority = runtime.NewRuntimeAuthority()
 	if a.Inputs.Config != nil {
-		seeds := map[runtime.WorkspaceTarget]string{
-			runtime.TargetAsk:         a.Inputs.Config.Assignments.Ask,
-			runtime.TargetInvestigate: a.Inputs.Config.Assignments.Investigate,
-			runtime.TargetPlan:        a.Inputs.Config.Assignments.Plan,
-			runtime.TargetBuild:       a.Inputs.Config.Assignments.Build,
-			runtime.TargetReview:      a.Inputs.Config.Assignments.Review,
-		}
-		for target, id := range seeds {
-			if id != "" {
-				a.Authority.SeedAssignment(target, runtime.ModelRef{ID: id})
-			}
-		}
-		// Ensure every target has at least the global active model so headless
-		// harnesses (which have no explicit per-target assignment) still carry
-		// an explicit TargetModel and do not trigger ErrUnassignedTargetModel.
-		// This is not a hardcoded fallback — it is the persisted config's active
-		// model, and an explicitly cleared assignment (ModelID="") still errors.
-		if active := a.Inputs.Config.ActiveModelName(); active != "" {
-			for _, tgt := range []runtime.WorkspaceTarget{
-				runtime.TargetAsk, runtime.TargetInvestigate, runtime.TargetPlan, runtime.TargetBuild, runtime.TargetReview,
-			} {
-				if a.Authority.EffectiveModel(tgt).ID == "" {
-					a.Authority.SeedAssignment(tgt, runtime.ModelRef{ID: active})
-				}
-			}
+		if active := a.Inputs.Config.Bindings.Active; active.Model != "" {
+			a.Authority.SeedBootstrap(authority.ModelBinding{
+				ProviderID: authority.ProviderID(active.Provider),
+				ModelID:    authority.ModelID(active.Model),
+			})
+		} else if active := a.Inputs.Config.ActiveModelName(); active != "" {
+			a.Authority.SeedBootstrap(authority.ModelBinding{
+				ProviderID: authority.ProviderID(a.Inputs.Config.ActiveProviderName()),
+				ModelID:    authority.ModelID(active),
+			})
 		}
 	}
 

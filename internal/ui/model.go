@@ -1763,23 +1763,13 @@ func (m *model) syncPipelineTiers() {
 	if eng == nil {
 		return
 	}
-	activeProvider := m.cfg.ActiveProviderName()
-	activeDefault := ""
-	if provCfg, ok := m.cfg.AI.Providers[activeProvider]; ok {
-		activeDefault = provCfg.DefaultModel
-	}
 	eng.Router().SyncTiers(func(i pipeline.Intent) (string, string) {
-		// Resolve through authority when available.
+		// Resolve through authority — the single source of truth.
 		if m.modelAuthority != nil {
 			b, err := m.modelAuthority.ResolveForIntent(string(i))
 			if err == nil && b.ModelID != "" {
 				return string(b.ModelID), string(b.ProviderID)
 			}
-		}
-		// Fallback: re-pin stale models to the active provider's default.
-		// Empty string leaves the current pin in place.
-		if activeDefault != "" {
-			return activeDefault, activeProvider
 		}
 		return "", ""
 	})

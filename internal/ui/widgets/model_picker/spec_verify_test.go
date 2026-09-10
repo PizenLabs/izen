@@ -134,7 +134,7 @@ func TestFocusScopeStateMachine(t *testing.T) {
 
 	// Quick assign via 'a' must emit ModelAssignmentRequestedMsg in browsing
 	// when an active workspace is set (fast-path; TargetNone never assigns).
-	m = m.SetActiveWorkspace(TargetAsk)
+	m = m.SetActiveWorkspace("ask")
 	mAssign, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
 	if cmd == nil {
 		t.Fatalf("'a' quick assign must emit assignment cmd in browsing")

@@ -199,7 +199,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		// CloseModalCmd here races the teardown ahead of the assignment;
 		// a closed modal no longer routes the message, so the commit is
 		// silently dropped and the status bar keeps the stale default.
-		if m.activeWorkspace == TargetNone {
+		if m.activeWorkspace == "" {
 			return m, nil
 		}
 		if sel := m.SelectedModel(); sel != nil {
@@ -225,7 +225,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	// Fallback: if msg.String() contains shift and enter, treat as fast path
 	if k == "shift+enter" || (msg.Type == tea.KeyEnter && strings.Contains(strings.ToLower(k), "shift")) {
 		// Ordered teardown: assignment only; the parent closes post-commit.
-		if m.activeWorkspace == TargetNone {
+		if m.activeWorkspace == "" {
 			return m, nil
 		}
 		if sel := m.SelectedModel(); sel != nil {
@@ -327,7 +327,7 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		// Strict single model activation (Phase 3): commit active binding
 		// directly to runtime ModelState without workspace sub-menu.
 		if sel := m.SelectedModel(); sel != nil {
-			assign := m.emitAssignmentCmd(sel, WorkspaceTarget(""))
+			assign := m.emitAssignmentCmd(sel, "")
 			if assign == nil {
 				return m, nil
 			}

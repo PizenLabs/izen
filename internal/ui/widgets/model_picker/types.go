@@ -21,19 +21,6 @@ const (
 // FocusScope is the legacy alias of InputFocus for backward compatibility.
 type FocusScope = InputFocus
 
-// WorkspaceTarget — DEPRECATED: the 5-workspace assignment matrix is removed.
-// Kept for compilation compatibility only.
-type WorkspaceTarget string
-
-const (
-	TargetAsk         WorkspaceTarget = "ask"
-	TargetInvestigate WorkspaceTarget = "investigate"
-	TargetPlan        WorkspaceTarget = "plan"
-	TargetBuild       WorkspaceTarget = "build"
-	TargetReview      WorkspaceTarget = "review"
-	TargetNone        WorkspaceTarget = "none"
-)
-
 // PaneFocus selects the control surface focus scope.
 type PaneFocus int
 
@@ -59,7 +46,6 @@ type InvocationPolicy struct {
 type ModelAssignmentRequestedMsg struct {
 	ModelID  string           `json:"model_id"`
 	Provider string           `json:"provider"`
-	Target   WorkspaceTarget  `json:"target,omitempty"` // Deprecated: workspace matrix removed
 	Policy   InvocationPolicy `json:"policy"`
 }
 

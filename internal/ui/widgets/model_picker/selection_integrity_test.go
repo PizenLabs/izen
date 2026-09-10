@@ -32,7 +32,7 @@ func integrityModels() []registry.ModelDescriptor {
 // never the index-0 default.
 func TestDetailAssignmentCarriesExactModelID(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetActiveWorkspace(TargetAsk)
+	m = m.FocusList().SetActiveWorkspace("ask")
 	m = m.SetCursor(1)
 	if got := m.SelectedModel().ID; got != "inclusionai/ling-3.0-flash-fin:free" {
 		t.Fatalf("highlight = %q, want inclusionai", got)
@@ -64,15 +64,12 @@ func TestDetailAssignmentCarriesExactModelID(t *testing.T) {
 	if assign.Provider != "openrouter" {
 		t.Fatalf("assigned provider = %q, want openrouter", assign.Provider)
 	}
-	if string(assign.Target) == "" {
-		t.Log("target empty (workspace matrix removed per Phase 3)")
-	}
 }
 
 // Detail key 1: workspace target matrix removed; no-op.
 func TestDetailHotkeyOneAssignsPinnedModel(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetActiveWorkspace(TargetAsk)
+	m = m.FocusList().SetActiveWorkspace("ask")
 	m = m.SetCursor(1)
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 
@@ -88,7 +85,7 @@ func TestDetailHotkeyOneAssignsPinnedModel(t *testing.T) {
 // the Runtime Authority commit lands.
 func TestAssignmentEmissionIsUnbatched(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetActiveWorkspace(TargetAsk)
+	m = m.FocusList().SetActiveWorkspace("ask")
 
 	// Browsing fast-path.
 	if _, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")}); cmd == nil {
@@ -117,7 +114,7 @@ func TestAssignmentEmissionIsUnbatched(t *testing.T) {
 // different model.
 func TestDetailPinSurvivesBackgroundResort(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetActiveWorkspace(TargetPlan)
+	m = m.FocusList().SetActiveWorkspace("plan")
 	m = m.SetCursor(1) // inclusionai
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 	if m.State() != StateDetail {
@@ -172,7 +169,7 @@ func TestEscClearsDetailPin(t *testing.T) {
 // options for explicitly non-reasoning families.
 func TestDetailReasoningTruthfulForNonReasoningModel(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
-	m = m.FocusList().SetActiveWorkspace(TargetAsk)
+	m = m.FocusList().SetActiveWorkspace("ask")
 	m = m.SetCursor(1)
 	m, _ = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
 

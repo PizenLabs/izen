@@ -37,16 +37,16 @@ func (r *RuntimeAuthorityState) GetModelForTarget(target string) (string, bool) 
 }
 
 // ConfigRepo abstracts assignment persistence. The default implementation
-// writes through config.PersistAssignment. Tests may stub it to fail.
+// writes through config.PersistActiveBinding. Tests may stub it to fail.
 type ConfigRepo interface {
-	PersistAssignment(target string, modelID string) error
+	PersistActiveBinding(provider, model, variant string) error
 }
 
 // defaultConfigRepo persists via the global config store.
 type defaultConfigRepo struct{}
 
-func (defaultConfigRepo) PersistAssignment(target string, modelID string) error {
-	return config.PersistAssignment(target, modelID)
+func (defaultConfigRepo) PersistActiveBinding(provider, model, variant string) error {
+	return config.PersistActiveBinding(provider, model, variant)
 }
 
 // Viewport is the minimal scrollable content surface owned by App. Content
@@ -144,20 +144,18 @@ func (a *App) refreshViewportContent() {
 }
 
 type ModelAssignmentSuccessMsg struct {
-	Target  model_picker.WorkspaceTarget
 	ModelID string
 }
 
 type ModelAssignmentFailedMsg struct {
-	Target model_picker.WorkspaceTarget
-	Err    error
+	Err error
 }
 
 // HandleModelAssignmentRequestedMsg runs the exact atomic control-plane
 // transaction pipeline:
 //
-//  1. prep, err := a.runtime.PrepareTransition(msg.Target, modelRef)
-//  2. err := a.configRepo.PersistAssignment(...) — abort without mutating runtime on failure
+//  1. prep, err := a.runtime.PrepareTransition(currentMode, modelRef)
+//  2. err := a.configRepo.PersistActiveBinding(...) — abort without mutating runtime on failure
 //  3. event := a.runtime.CommitTransition(prep) — deterministic, no validation failures
 //  4. a.messages = append(a.messages, renderSystemMessage(event.ToTranscriptLog()))
 //  5. Re-render viewport content derived from a.runtime.ActiveModel() and scroll to bottom
@@ -165,7 +163,7 @@ type ModelAssignmentFailedMsg struct {
 func (a *App) HandleModelAssignmentRequestedMsg(msg model_picker.ModelAssignmentRequestedMsg) (runtime.ModelTransitionEvent, tea.Cmd, error) {
 	modelRef := runtime.ModelRef{ID: msg.ModelID, Provider: msg.Provider}
 	// 1. Validate without mutating.
-	prep, err := a.runtime.PrepareTransition(runtime.WorkspaceTarget(string(msg.Target)), modelRef)
+	prep, err := a.runtime.PrepareTransition(a.currentMode, modelRef)
 	if err != nil {
 		return runtime.ModelTransitionEvent{}, nil, err
 	}
@@ -173,15 +171,11 @@ func (a *App) HandleModelAssignmentRequestedMsg(msg model_picker.ModelAssignment
 	if a.configRepo == nil {
 		a.configRepo = defaultConfigRepo{}
 	}
-	if err := a.configRepo.PersistAssignment(string(msg.Target), msg.ModelID); err != nil {
+	if err := a.configRepo.PersistActiveBinding(msg.Provider, msg.ModelID, ""); err != nil {
 		return runtime.ModelTransitionEvent{}, nil, err
 	}
 	// 3. Deterministic commit (I4): cannot fail on business validation.
 	event := a.runtime.CommitTransition(prep)
-	// Keep legacy mirror in sync (compat only, never authoritative).
-	if a.runtimeState != nil {
-		a.runtimeState.SetModelForTarget(string(msg.Target), msg.ModelID, msg.Provider)
-	}
 	// 4. System feedback log into the transcript.
 	a.messages = append(a.messages, renderSystemMessage(event.ToTranscriptLog()))
 	// 5. Re-render viewport content derived from a.runtime.ActiveModel() and scroll to bottom.
@@ -197,35 +191,19 @@ func (a *App) HandleModelAssignment(msg model_picker.ModelAssignmentRequestedMsg
 		_ = closeCmd
 		if err != nil {
 			return ModelAssignmentFailedMsg{
-				Target: msg.Target,
-				Err:    err,
+				Err: err,
 			}
 		}
 		return ModelAssignmentSuccessMsg{
-			Target:  msg.Target,
 			ModelID: msg.ModelID,
 		}
 	}
 }
 
-func (a *App) RuntimeAuthorityRevertOnFailure(target model_picker.WorkspaceTarget) error {
+func (a *App) RuntimeAuthorityRevertOnFailure() error {
 	cfg := config.GetGlobalConfig()
-	// Clear the active binding's persisted state for the given target.
-	// Under the unified binding model, this resets the relevant assignment.
-	switch target {
-	case model_picker.TargetAsk:
-		cfg.Assignments.Ask = ""
-	case model_picker.TargetInvestigate:
-		cfg.Assignments.Investigate = ""
-	case model_picker.TargetPlan:
-		cfg.Assignments.Plan = ""
-	case model_picker.TargetBuild:
-		cfg.Assignments.Build = ""
-	case model_picker.TargetReview:
-		cfg.Assignments.Review = ""
-	default:
-		return fmt.Errorf("unknown workspace target: %s", target)
-	}
+	// Under the unified binding model, clear the active binding.
+	cfg.Bindings.Active = config.ActiveBindingConfig{}
 	return config.Save(cfg)
 }
 

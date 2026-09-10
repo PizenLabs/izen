@@ -79,7 +79,7 @@ func newModelPickerFromCache(m *model) model_picker.Model {
 	}
 	mp := model_picker.NewFromRegistry(m.modelRegistry)
 	if m != nil && m.resolver != nil {
-		mp = mp.SetActiveWorkspace(model_picker.WorkspaceTarget(m.resolver.Current().String()))
+		mp = mp.SetActiveWorkspace(m.resolver.Current().String())
 		m.ensureModelAuthority()
 	}
 	if m.width > 0 || m.height > 0 {

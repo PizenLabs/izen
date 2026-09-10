@@ -165,7 +165,7 @@ type Model struct {
 	detailModel *registry.ModelDescriptor
 
 	// activeWorkspace is the contextual workspace target for fast-path assignment.
-	activeWorkspace WorkspaceTarget
+	activeWorkspace string
 
 	// reasoningPolicy is the workspace reasoning policy for assignment.
 	reasoningPolicy string
@@ -231,7 +231,7 @@ func New(snap *registry.ModelSnapshot) Model {
 		searchFocused:   false,
 		searchInput:     searchInputModel{Width: searchInputWidth, focused: false},
 		state:           StateBrowsing,
-		activeWorkspace: TargetNone,
+		activeWorkspace: "",
 		reasoningPolicy: "default",
 	}
 	m.refilter()
@@ -428,10 +428,10 @@ func (m Model) State() PickerState { return m.state }
 func (m Model) SetState(s PickerState) Model { m.state = s; return m }
 
 // ActiveWorkspace returns the active workspace context.
-func (m Model) ActiveWorkspace() WorkspaceTarget { return m.activeWorkspace }
+func (m Model) ActiveWorkspace() string { return m.activeWorkspace }
 
 // SetActiveWorkspace sets the active workspace context.
-func (m Model) SetActiveWorkspace(t WorkspaceTarget) Model { m.activeWorkspace = t; return m }
+func (m Model) SetActiveWorkspace(t string) Model { m.activeWorkspace = t; return m }
 
 // ReasoningPolicy returns the reasoning policy string.
 func (m Model) ReasoningPolicy() string { return m.reasoningPolicy }
@@ -503,7 +503,7 @@ func (m *Model) moveCursor(delta int) {
 // concrete semantic intent: the selected ReasoningOption.ID derived from
 // caps.Options[selectedReasoningOptIdx] (e.g. "low", "high", "budget_8k"),
 // not a generic "default". Non-configurable models fall back to "default".
-func (m Model) emitAssignmentCmd(model *registry.ModelDescriptor, target WorkspaceTarget) tea.Cmd {
+func (m Model) emitAssignmentCmd(model *registry.ModelDescriptor, _ string) tea.Cmd {
 	if model == nil {
 		return nil
 	}
@@ -527,7 +527,6 @@ func (m Model) emitAssignmentCmd(model *registry.ModelDescriptor, target Workspa
 		return ModelAssignmentRequestedMsg{
 			ModelID:  model.ID,
 			Provider: model.Provider,
-			Target:   WorkspaceTarget(""), // Deprecated workspace target
 			Policy:   InvocationPolicy{Reasoning: policy},
 		}
 	}
@@ -838,18 +837,18 @@ func (m Model) calculateRelevanceScore(desc *registry.ModelDescriptor) int {
 		return score
 	}
 	switch m.activeWorkspace {
-	case TargetPlan, TargetInvestigate:
+	case "plan", "investigate":
 		if desc.IsThinking || hasCapability(desc.Capabilities, registry.CapThinking) {
 			score += 50
 		}
 		if desc.ContextWindow >= 100000 {
 			score += 30
 		}
-	case TargetBuild:
+	case "build":
 		if hasCapability(desc.Capabilities, registry.CapTools) {
 			score += 40
 		}
-	case TargetAsk:
+	case "ask":
 		if desc.InputCostPerM == 0 {
 			score += 20
 		}

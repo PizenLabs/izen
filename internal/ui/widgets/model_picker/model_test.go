@@ -99,7 +99,7 @@ func TestRoleBindingHotkeyEmitsCommand(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	m = m.FocusList()
 	// Set active workspace to plan for deterministic test
-	m = m.SetActiveWorkspace(TargetPlan)
+	m = m.SetActiveWorkspace("plan")
 
 	var cmd tea.Cmd
 	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
@@ -109,9 +109,6 @@ func TestRoleBindingHotkeyEmitsCommand(t *testing.T) {
 	msg := cmd()
 	// Unwrap tea.BatchMsg to find the assignment message.
 	assign := unwrapAssignmentMsg(t, msg)
-	if string(assign.Target) == "" {
-		t.Log("target is empty (workspace matrix removed per Phase 3)")
-	}
 	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
 		t.Errorf("model = %q, want highlighted deepseek-r1", assign.ModelID)
 	}

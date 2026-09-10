@@ -50,7 +50,7 @@ func TestPhase3ContextualRender(t *testing.T) {
 
 func TestPhase3ExecutionTruth(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
-	m = m.FocusList().SetActiveWorkspace(TargetPlan)
+	m = m.FocusList().SetActiveWorkspace("plan")
 	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
 	if cmd == nil {
 		t.Fatal("quick assign 'a' must emit ModelAssignmentRequestedMsg")
@@ -58,9 +58,6 @@ func TestPhase3ExecutionTruth(t *testing.T) {
 	assign := unwrapAssignmentMsg(t, cmd())
 	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
 		t.Errorf("assign model = %q, want highlighted", assign.ModelID)
-	}
-	if string(assign.Target) == "" {
-		t.Logf("assign target is empty (workspace matrix removed per Phase 3)")
 	}
 	// Detail assignment also emits
 	m2 := New(seedSnapshot(testModels()))

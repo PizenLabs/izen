@@ -2,7 +2,7 @@ package app
 
 // Control-plane regression tests for the ModelAssignmentRequestedMsg
 // transaction pipeline: the event payload's ModelID must flow verbatim into
-// PrepareTransition, PersistAssignment, and the Runtime Authority commit —
+// PrepareTransition, PersistActiveBinding, and the Runtime Authority commit —
 // no fallback layer may override it with a default model.
 
 import (
@@ -14,12 +14,12 @@ import (
 )
 
 type stubConfigRepo struct {
-	calls []struct{ target, modelID string }
+	calls []struct{ provider, model, variant string }
 	err   error
 }
 
-func (s *stubConfigRepo) PersistAssignment(target string, modelID string) error {
-	s.calls = append(s.calls, struct{ target, modelID string }{target, modelID})
+func (s *stubConfigRepo) PersistActiveBinding(provider, model, variant string) error {
+	s.calls = append(s.calls, struct{ provider, model, variant string }{provider, model, variant})
 	return s.err
 }
 
@@ -35,7 +35,6 @@ func TestHandleAssignmentPersistsExactPayloadModel(t *testing.T) {
 	msg := model_picker.ModelAssignmentRequestedMsg{
 		ModelID:  "inclusionai/ling-3.0-flash-fin:free",
 		Provider: "openrouter",
-		Target:   model_picker.TargetAsk,
 		Policy:   model_picker.InvocationPolicy{Reasoning: "default"},
 	}
 	event, closeCmd, err := a.HandleModelAssignmentRequestedMsg(msg)
@@ -51,11 +50,11 @@ func TestHandleAssignmentPersistsExactPayloadModel(t *testing.T) {
 	if !event.Activated {
 		t.Error("assignment to the current mode must be Activated")
 	}
-	if len(repo.calls) != 1 || repo.calls[0].modelID != "inclusionai/ling-3.0-flash-fin:free" {
+	if len(repo.calls) != 1 || repo.calls[0].model != "inclusionai/ling-3.0-flash-fin:free" {
 		t.Fatalf("persist calls = %+v, want exact inclusionai model", repo.calls)
 	}
-	if repo.calls[0].target != "ask" {
-		t.Errorf("persist target = %q, want ask", repo.calls[0].target)
+	if repo.calls[0].provider != "openrouter" {
+		t.Errorf("persist provider = %q, want openrouter", repo.calls[0].provider)
 	}
 	got := a.EffectiveModel(runtime.TargetAsk)
 	if got.ID != "inclusionai/ling-3.0-flash-fin:free" {
@@ -77,7 +76,6 @@ func TestHandleAssignmentAbortsRuntimeOnPersistFailure(t *testing.T) {
 	msg := model_picker.ModelAssignmentRequestedMsg{
 		ModelID:  "inclusionai/ling-3.0-flash-fin:free",
 		Provider: "openrouter",
-		Target:   model_picker.TargetAsk,
 	}
 	if _, _, err := a.HandleModelAssignmentRequestedMsg(msg); err == nil {
 		t.Fatal("must surface the persistence failure")
@@ -87,10 +85,10 @@ func TestHandleAssignmentAbortsRuntimeOnPersistFailure(t *testing.T) {
 	}
 }
 
-// Assignment to an inactive target persists the binding but does NOT
-// activate it. Under the single-binding model, only assignments to the
-// current mode change the active binding.
-func TestHandleAssignmentInactiveTargetLeavesActiveModel(t *testing.T) {
+// Assignment activates the binding for the current mode. Under the
+// single-binding model, all assignments activate since there is only one
+// active binding.
+func TestHandleAssignmentActivatesForCurrentMode(t *testing.T) {
 	repo := &stubConfigRepo{}
 	a := NewApp()
 	a.SetConfigRepo(repo)
@@ -99,18 +97,15 @@ func TestHandleAssignmentInactiveTargetLeavesActiveModel(t *testing.T) {
 	msg := model_picker.ModelAssignmentRequestedMsg{
 		ModelID:  "google/gemini-2.5-flash",
 		Provider: "gemini",
-		Target:   model_picker.TargetPlan,
 	}
 	event, _, err := a.HandleModelAssignmentRequestedMsg(msg)
 	if err != nil {
 		t.Fatalf("HandleModelAssignmentRequestedMsg: %v", err)
 	}
-	if event.Activated {
-		t.Error("assignment to an inactive target must not be Activated")
+	if !event.Activated {
+		t.Error("assignment to the current mode must be Activated")
 	}
-	// Under the single-binding model, ActiveModel returns the active binding.
-	// Since target=plan != currentMode=ask, the active binding is unchanged.
-	if got := a.ActiveModel(); got.ID != "" {
-		t.Errorf("ActiveModel = %q, want empty (ask untouched)", got.ID)
+	if got := a.ActiveModel(); got.ID != "google/gemini-2.5-flash" {
+		t.Errorf("ActiveModel = %q, want google/gemini-2.5-flash", got.ID)
 	}
 }
