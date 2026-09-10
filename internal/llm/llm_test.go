@@ -277,8 +277,9 @@ func TestAnthropicResolveModel(t *testing.T) {
 	if model := client.resolveModel("override"); model != "override" {
 		t.Errorf("resolveModel should return override, got %q", model)
 	}
-	if model := client.resolveModel(""); model != "claude-sonnet-4-20250514" {
-		t.Errorf("resolveModel should return default, got %q", model)
+	// Empty override returns empty string — no provider-local fallback.
+	if model := client.resolveModel(""); model != "" {
+		t.Errorf("resolveModel should return empty, got %q", model)
 	}
 }
 
@@ -287,8 +288,9 @@ func TestOpenAIResolveModel(t *testing.T) {
 	if model := client.resolveModel("override"); model != "override" {
 		t.Errorf("resolveModel should return override, got %q", model)
 	}
-	if model := client.resolveModel(""); model != "gpt-4o" {
-		t.Errorf("resolveModel should return default, got %q", model)
+	// Empty override returns empty string — no provider-local fallback.
+	if model := client.resolveModel(""); model != "" {
+		t.Errorf("resolveModel should return empty, got %q", model)
 	}
 }
 

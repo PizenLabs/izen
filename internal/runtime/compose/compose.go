@@ -666,7 +666,6 @@ func Wire(opts ...Option) (*Application, error) {
 		pipeline.WithProvider(pipeline.IntentReasoning, ""),
 		pipeline.WithProvider(pipeline.IntentExecution, ""),
 		pipeline.WithProvider(pipeline.IntentInformational, ""),
-		pipeline.WithFallbackModel(""),
 	)
 	// Layer 5 telemetry is observed on a dedicated telemetry EventBus; a
 	// TelemetryAdapter bridges every event onto the unified domain event bus

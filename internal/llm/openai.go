@@ -173,10 +173,7 @@ func (c *OpenAIClient) resolveEndpoint() string {
 }
 
 func (c *OpenAIClient) resolveModel(override string) string {
-	if override != "" {
-		return override
-	}
-	return c.model
+	return override
 }
 
 func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) (LLMResponse, error) {
