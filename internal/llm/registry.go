@@ -827,7 +827,6 @@ func getUserHomeDir() (string, error) {
 // the model picker is never empty when detection fails.
 func ollamaFallbackModels() []ModelInfo {
 	fallback := []ModelInfo{
-		{ID: "qwen2.5-coder:7b", Name: "qwen2.5-coder:7b", Provider: "ollama"},
 		{ID: "llama3.2:3b", Name: "llama3.2:3b", Provider: "ollama"},
 		{ID: "llama3.1:8b", Name: "llama3.1:8b", Provider: "ollama"},
 		{ID: "mistral:7b", Name: "mistral:7b", Provider: "ollama"},

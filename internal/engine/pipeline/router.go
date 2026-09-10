@@ -111,14 +111,14 @@ func WithFallbackModel(model string) RouterOption {
 }
 
 // NewRouter returns a router with the default per-intent context policies.
-// The fallback model defaults to "qwen2.5-coder:7b"; callers that resolve
-// models from configuration must inject them via WithModel.
+// No hardcoded model fallback: callers must supply explicit bindings via
+// WithModel or the stateless Policy Resolver (ResolveModel).
 func NewRouter(opts ...RouterOption) *Router {
 	r := &Router{
 		models:    make(map[Intent]string, len(allIntents)),
 		providers: make(map[Intent]string, len(allIntents)),
 		policies:  make(map[Intent]layer2.ContextPolicy, len(allIntents)),
-		fallback:  "qwen2.5-coder:7b",
+		fallback:  "",
 	}
 	for _, o := range opts {
 		o(r)

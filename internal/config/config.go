@@ -138,38 +138,9 @@ func (c *Config) ActiveStylePolicy() prompt.StylePolicy {
 	return p
 }
 
-// ResolveTierModel returns the effective model for the given intent tier,
-// scoped to the currently active provider. It first checks for an
-// active_override (set via /model), then falls back to the tier's model, then
-// to the global ModelConfig.Default. A tier entry whose pinned provider differs
-// from the active provider is treated as stale (e.g. an Ollama model pinned to
-// the "informational" tier while OpenRouter is active) and is skipped, so a
-// request can never be routed to the wrong provider with an invalid model ID.
-func (c *Config) ResolveTierModel(tier string) string {
-	if c.Models.Tiers != nil {
-		if tc, ok := c.Models.Tiers[tier]; ok {
-			if tc.ActiveOverride != "" {
-				return tc.ActiveOverride
-			}
-			if tc.Model != "" && (tc.Provider == "" || tc.Provider == c.ActiveProviderName()) {
-				return tc.Model
-			}
-		}
-	}
-	return c.ActiveModelName()
-}
-
-// ResolveTierProvider returns the provider that owns the model resolved for an
-// intent tier. It returns the tier's pinned provider only when that provider is
-// the currently active one; otherwise the active provider owns the route.
-func (c *Config) ResolveTierProvider(tier string) string {
-	if c.Models.Tiers != nil {
-		if tc, ok := c.Models.Tiers[tier]; ok && tc.Provider != "" && tc.Provider == c.ActiveProviderName() {
-			return tc.Provider
-		}
-	}
-	return c.ActiveProviderName()
-}
+// ResolveTier functions removed: model resolution is now the exclusive
+// authority of the stateless Policy Resolver (internal/runtime/authority).
+// Legacy tier mappings are purged per Phase 1 authority migration.
 
 // SetTierOverride sets the active_override for the given intent tier,
 // persisting the model selection as the session-level override.
@@ -268,7 +239,8 @@ func (c *Config) ActiveModelName() string {
 	if c.Models.Default != "" {
 		return c.Models.Default
 	}
-	return "qwen2.5-coder:7b"
+	// Zero fallback allowed — no hardcoded default model.
+	return ""
 }
 
 func (c *Config) Validate() error {
@@ -399,11 +371,11 @@ func Default() *Config {
 			FallbackProvider: "openai",
 			MaxTokens:        4096,
 			Providers: map[string]AIProviderConfig{
-				"ollama": {
-					BaseURL:      "http://localhost:11434/v1",
-					APIKey:       "ollama",
-					DefaultModel: "qwen2.5-coder:7b",
-				},
+			"ollama": {
+				BaseURL:      "http://localhost:11434/v1",
+				APIKey:       "ollama",
+				DefaultModel: "",
+			},
 				"anthropic": {
 					BaseURL:      "https://api.anthropic.com/v1",
 					APIKey:       "${ANTHROPIC_API_KEY}",
@@ -427,8 +399,8 @@ func Default() *Config {
 			},
 		},
 		Models: ModelConfig{
-			Default:   "qwen2.5-coder:7b",
-			Provider:  "ollama",
+			Default:   "",
+			Provider:  "",
 			MaxTokens: 4096,
 			Modes: map[string]ModeSpec{
 				"ask":         {Provider: "", Model: ""},
@@ -438,30 +410,12 @@ func Default() *Config {
 				"investigate": {Provider: "", Model: ""},
 			},
 			Tiers: map[string]IntentTierConfig{
-				"low_intent": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
-				"medium_intent": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
-				"high_intent": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
-				"reasoning": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
-				"execution": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
-				"informational": {
-					Provider: "ollama",
-					Model:    "qwen2.5-coder:7b",
-				},
+				"low_intent":        {Provider: "", Model: ""},
+				"medium_intent":     {Provider: "", Model: ""},
+				"high_intent":       {Provider: "", Model: ""},
+				"reasoning":         {Provider: "", Model: ""},
+				"execution":        {Provider: "", Model: ""},
+				"informational":     {Provider: "", Model: ""},
 			},
 		},
 		Execution: ExecutionConfig{

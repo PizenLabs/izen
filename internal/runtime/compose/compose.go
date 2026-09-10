@@ -660,13 +660,13 @@ func Wire(opts ...Option) (*Application, error) {
 	// route to reasoning models under strict budgets; /build routes to fast
 	// coding models; /ask routes to a minimal read-only policy).
 	pipeRouter := pipeline.NewRouter(
-		pipeline.WithModel(pipeline.IntentReasoning, cfg.ResolveTierModel("reasoning")),
-		pipeline.WithModel(pipeline.IntentExecution, cfg.ResolveTierModel("execution")),
-		pipeline.WithModel(pipeline.IntentInformational, cfg.ResolveTierModel("informational")),
-		pipeline.WithProvider(pipeline.IntentReasoning, cfg.ResolveTierProvider("reasoning")),
-		pipeline.WithProvider(pipeline.IntentExecution, cfg.ResolveTierProvider("execution")),
-		pipeline.WithProvider(pipeline.IntentInformational, cfg.ResolveTierProvider("informational")),
-		pipeline.WithFallbackModel(cfg.ResolveTierModel("execution")),
+		pipeline.WithModel(pipeline.IntentReasoning, ""),
+		pipeline.WithModel(pipeline.IntentExecution, ""),
+		pipeline.WithModel(pipeline.IntentInformational, ""),
+		pipeline.WithProvider(pipeline.IntentReasoning, ""),
+		pipeline.WithProvider(pipeline.IntentExecution, ""),
+		pipeline.WithProvider(pipeline.IntentInformational, ""),
+		pipeline.WithFallbackModel(""),
 	)
 	// Layer 5 telemetry is observed on a dedicated telemetry EventBus; a
 	// TelemetryAdapter bridges every event onto the unified domain event bus

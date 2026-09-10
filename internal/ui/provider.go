@@ -144,12 +144,12 @@ func (m *model) switchProvider(name string) tea.Cmd {
 
 	// Re-pin the layered pipeline router's intent tiers to the new active
 	// provider so mode commands never route a stale local model into a cloud
-	// request (OpenRouter rejects e.g. "qwen2.5-coder:7b" with HTTP 400).
+	// request (OpenRouter rejects e.g. local-id:7b with HTTP 400).
 	m.syncPipelineTiers()
 
 	// Provider switch state invalidation: clear stale target assignments that
 	// do not belong to the newly active provider. Without this, an Ollama
-	// assignment (qwen2.5-coder:7b) leaks into an OpenRouter worker context
+	// assignment (local-id:7b) leaks into an OpenRouter worker context
 	// and is correctly rejected by the OpenRouter regex validator, but the
 	// root cause is stale authority state. Switching must re-resolve.
 	if rt := m.ensureModelRuntime(); rt != nil {

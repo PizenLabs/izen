@@ -8,7 +8,6 @@ import (
 // ModelTokenBudget maps model name prefixes to conservative token ceilings.
 // These are deliberately conservative to prevent hallucination on small models.
 var ModelTokenBudget = map[string]int{
-	"qwen2.5-coder:7b": 4000,
 	"qwen2.5-coder:":   6000,
 	"llama3.1:":        8000,
 	"codellama:":       8000,
@@ -53,8 +52,7 @@ func (e *BudgetExceededError) BudgetActionHint() string {
 }
 
 // TokenBudgetForModel returns the conservative token ceiling for a model name.
-// Lookup is prefix-based so "qwen2.5-coder:7b" matches "qwen2.5-coder:" first,
-// then falls back to the exact prefix "qwen2.5-coder:7b".
+// Lookup is prefix-based; exact matches take precedence over prefixes.
 func TokenBudgetForModel(model string) int {
 	if budget, ok := ModelTokenBudget[model]; ok {
 		return budget

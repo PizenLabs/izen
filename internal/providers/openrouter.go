@@ -63,7 +63,7 @@ var openRouterRateLimitBackoffBase = time.Second
 // vendor component, a single "/", and a non-empty model component. Vendors
 // carry hyphens and digits (meta-llama, gpt-4o) and models may carry
 // ":free"-style variants. An ID without a vendor prefix (e.g. Ollama's
-// "qwen2.5-coder:7b") is rejected by the API with HTTP 400 "not a valid model
+// "local-id:7b") is rejected by the API with HTTP 400 "not a valid model
 // ID" and must be mapped before dispatch.
 var openRouterModelIDRe = regexp.MustCompile(`^[^/\s]+/[^/\s]+$`)
 

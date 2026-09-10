@@ -2220,7 +2220,7 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 
 // inferProviderFromModel tries to infer the provider from the model name format.
 // Model names with "/" are treated as openrouter-style (provider/model).
-// Ollama models (e.g. qwen2.5-coder:7b, llama3:8b) default to ollama.
+// Ollama models (e.g. local-model-id, llama3:8b) default to ollama.
 func (m *model) inferProviderFromModel(modelName string) string {
 	if strings.Contains(modelName, "/") {
 		return "openrouter"

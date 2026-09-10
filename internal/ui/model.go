@@ -1759,8 +1759,7 @@ func (m *model) syncPipelineTiers() {
 		return
 	}
 	eng.Router().SyncTiers(func(i pipeline.Intent) (string, string) {
-		tier := i.String()
-		return m.cfg.ResolveTierModel(tier), m.cfg.ResolveTierProvider(tier)
+		return "", ""
 	})
 }
 

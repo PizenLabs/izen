@@ -908,28 +908,17 @@ func (x *RuntimeExecutor) resolveModel(req ExecuteRequest) (string, error) {
 	}
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
-		// Legacy fallback for direct callers / harnesses that bypass the
-		// admission handler. The handler path always carries an explicit
-		// TargetModel and never reaches this branch; this preserves backward
-		// compatibility for existing tests while maintaining the strict guard
-		// for the worker execution path.
-		if legacy, lerr := x.resolveModelLegacy(); lerr != nil {
-			return "", lerr
-		} else if strings.TrimSpace(legacy) != "" {
-			model = strings.TrimSpace(legacy)
-		} else {
-			target := strings.TrimSpace(req.Mode)
-			if target == "" {
-				target = strings.TrimSpace(req.Target)
-				if target == "" && len(req.Targets) > 0 {
-					target = strings.TrimSpace(req.Targets[0])
-				}
+		target := strings.TrimSpace(req.Mode)
+		if target == "" {
+			target = strings.TrimSpace(req.Target)
+			if target == "" && len(req.Targets) > 0 {
+				target = strings.TrimSpace(req.Targets[0])
 			}
-			if target == "" {
-				target = "ask"
-			}
-			return "", fmt.Errorf("%w [%s]", ErrUnassignedTargetModel, target)
 		}
+		if target == "" {
+			target = "ask"
+		}
+		return "", fmt.Errorf("%w [%s]", ErrUnassignedTargetModel, target)
 	}
 	name := p.Name()
 	if !modelBelongsTo(name, model) {
@@ -939,46 +928,9 @@ func (x *RuntimeExecutor) resolveModel(req ExecuteRequest) (string, error) {
 	return model, nil
 }
 
-// resolveModelLegacy is the legacy manifest-pass fallback used only by
-// InvokeManifestPass. It retains the provider-config fallback so headless
-// tests and the read-only manifest auto-hook remain functional without an
-// explicit workspace target binding. The primary execution path (invokeMutation
-// / invokeReadOnly) MUST NOT use this — it must use resolveModel(req) which
-// enforces explicit TargetModel binding.
-func (x *RuntimeExecutor) resolveModelLegacy() (string, error) {
-	x.mu.Lock()
-	p := x.provider
-	x.mu.Unlock()
-	if p == nil {
-		return "", fmt.Errorf("executor: no provider configured for model invocation")
-	}
-	if x.cfg == nil {
-		return "", fmt.Errorf("executor: no configuration to resolve the model for provider %q", p.Name())
-	}
-	name := p.Name()
-	model := ""
-	switch {
-	case x.cfg.Models.SessionModel != "":
-		model = x.cfg.Models.SessionModel
-	default:
-		if provCfg, ok := x.cfg.AI.Providers[name]; ok && provCfg.DefaultModel != "" {
-			model = provCfg.DefaultModel
-		} else if x.cfg.Models.Default != "" {
-			model = x.cfg.Models.Default
-		} else {
-			model = x.cfg.ActiveModelName()
-		}
-	}
-	model = strings.TrimSpace(model)
-	if model == "" {
-		return "", fmt.Errorf("executor: no model bound to provider %q", name)
-	}
-	if !modelBelongsTo(name, model) {
-		return "", fmt.Errorf("%w: model %q does not belong to provider %q",
-			ErrProviderModelMismatch, model, name)
-	}
-	return model, nil
-}
+// resolveModelLegacy removed: zero fallback allowed. The execution pipeline
+// must use ResolveModel (stateless Policy Resolver) and must not maintain
+// independent model state or fall back to hardcoded defaults.
 
 // Execute runs the deterministic execution flow for req, driving the
 // runtime-owned ExecutionGraph. The graph is the single lifecycle authority:
@@ -2539,6 +2491,10 @@ func (x *RuntimeExecutor) manifestSystemPromptFor() string {
 // gate signal. A finish_reason="length" truncated response likewise crosses as
 // raw bytes — ParseMutationManifest rejects the truncated JSON — so the DAG
 // strategy decision falls back silently instead of surfacing exhaustion.
+func (x *RuntimeExecutor) resolveManifestModel() (string, error) {
+	return "", fmt.Errorf("executor: manifest pass requires an explicit model binding (no fallback allowed)")
+}
+
 func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string, targetContent []byte) (string, error) {
 	if x == nil {
 		return "", fmt.Errorf("executor: nil runtime for manifest pass")
@@ -2549,7 +2505,7 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 	if p == nil {
 		return "", fmt.Errorf("executor: no provider configured for the manifest pass")
 	}
-	model, err := x.resolveModelLegacy()
+	model, err := x.resolveManifestModel()
 	if err != nil {
 		return "", err
 	}

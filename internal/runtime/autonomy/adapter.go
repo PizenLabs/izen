@@ -26,6 +26,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/runtime"
+	runtimeAuth "github.com/PizenLabs/izen/internal/runtime/authority"
 )
 
 // Resolved is the deterministic target resolution of one objective. Target
@@ -238,13 +239,26 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		// Explicit TargetModel: resolved from the active Workspace Target at
 		// execution time. The executor enforces verbatim pass-through and
 		// rejects empty models locally with ErrUnassignedTargetModel.
+		// Explicit TargetModel: resolved through the stateless Policy Resolver
+		// (ResolveModel). Zero independent model fallbacks allowed.
 		Model: func() string {
+			intent := req.Intent
+			if intent == "" {
+				intent = req.Prompt
+			}
+			var runtimeState runtimeAuth.ModelState
 			if a.authority != nil {
-				if ref := a.authority.ActiveModel(); ref.ID != "" {
-					return ref.ID
+				ref := a.authority.ActiveModel()
+				runtimeState = runtimeAuth.ModelState{
+					ActiveProvider: runtimeAuth.ProviderID(ref.ID),
+					ActiveModel:    runtimeAuth.ModelID(ref.ID),
 				}
 			}
-			return ""
+			binding, err := runtimeAuth.ResolveModel(intent, runtimeState, runtimeAuth.ModelPolicy{})
+			if err != nil {
+				return ""
+			}
+			return string(binding.ModelID)
 		}(),
 		// The recovery decision travels with the request so the executor can
 		// change the ACTUAL execution protocol (bounded-patch windowed
