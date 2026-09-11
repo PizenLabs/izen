@@ -24,8 +24,9 @@ import (
 //	   No token counters, no cost, no zero-value indicators — a brand-new
 //	   session never clutters the footer with idle telemetry.
 //	b. EXECUTING     (isExecuting)
-//	   Live stream bar: "⠋ Generating...  ·  ↓<live_tok> tok  ·  <rate> tok/s
-//	   ·  Ctrl+C interrupt". The spinner pulses cyan→amber. The instant
+//	   Live stream bar: "⠋ Generating...  ·  ↓<live_tok> tok ($<live_cost>)  ·  <rate> tok/s
+//	   ·  [model]  ·  Ctrl+C interrupt" seeded at t=0 as 0 tok ($C_in).
+//	   The spinner pulses cyan→amber. The instant
 //	   execution ends, isExecuting() flips false and the bar is replaced —
 //	   'Ctrl+C interrupt' and the '⏸' icon never survive past completion.
 //	c. ACTIVE SESSION IDLE (sessionHasRunPrompts && !isExecuting)
@@ -273,19 +274,19 @@ func (m *model) noFirstByteReceived() bool {
 //
 //	pre-TTFT (no first token yet):
 //	  ⠋ Connecting to provider... 4.2s / 15.0s · [model]  ·  Ctrl+C interrupt
-//	post-first-token:
-//	  ⠋ Generating...  ·  ↓<tok> tok  ·  <rate> tok/s  ·  [model]  ·  Ctrl+C interrupt
+//	post-first-token (live cost burn):
+//	  ⠋ Generating...  ·  ↓<tok> tok ($<cost>)  ·  <rate> tok/s  ·  [model]  ·  Ctrl+C interrupt
 //
 // The pre-TTFT stopwatch re-renders on every FrameTickMsg (30ms) while the
 // first byte is awaited and freezes the moment it arrives. The "/ 15.0s"
 // budget is the internal TTFT threshold; phase details (DNS/TLS/headers)
 // appear exclusively in the TTFTTimeout error event log.
-// The tok count is ONLY the authoritative provider-reported stage count (fed
-// via setStageMetrics from the stream's ProviderUsage) — never a character
-// estimate. The rate is derived from that authoritative count over the
-// stream's wall-clock elapsed time. This bar exists strictly while an
-// operation is in flight; on completion it is replaced wholesale, so
-// 'Ctrl+C interrupt' / '⏸' can never linger.
+// The live tok count is max(authoritative provider stage count, per-chunk
+// live estimate) so the meter advances on every StreamChunkMsg; the cost is
+// C_est = (T_in*P_in + T_out*P_out)/1M seeded at t=0 with 0 output tokens
+// (Generating... 0 tok ($C_in) 0.0 tok/s, $free when pricing is 0). This bar
+// exists strictly while an operation is in flight; on completion it is
+// replaced wholesale, so 'Ctrl+C interrupt' / '⏸' can never linger.
 // When in StateRetrying (retryInfo != nil), an explicit retry banner is shown
 // instead of hanging on "Generating...": "[Retry N/M] <error>. Retrying in Xs..."
 func (m *model) renderExecutingFooter() string {
@@ -319,9 +320,11 @@ func (m *model) renderExecutingFooter() string {
 		)
 	}
 	modelName := m.getActiveModelName()
+	liveOut := m.streamLiveOutputTokens()
+	costLabel := m.streamCostLabel()
 	return footerSep(
 		m.executingSpinner()+" "+footerExecLabelStyle.Render("Generating..."),
-		footerTokStyle.Render("↓"+status.FormatTokens(st.Tokens)+" tok"),
+		footerTokStyle.Render("↓"+status.FormatTokens(liveOut)+" tok ("+costLabel+")"),
 		footerExecMetaStyle.Render(formatTokenRate(m.streamTokenRate(st))+" tok/s"),
 		footerModelStyle.Render("["+truncateModelName(modelName, 16)+"]"),
 		interruptLabelStyle.Render(Icon.Interrupt+" Ctrl+C interrupt"),

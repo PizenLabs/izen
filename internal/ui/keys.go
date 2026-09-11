@@ -1365,6 +1365,12 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		m.streamStartTime = time.Now()
 		m.thoughtStartTime = time.Now()
 		m.thoughtEndTime = time.Time{}
+		// T=0 cost baseline (Preflight/StreamStart): capture pricing + prompt
+		// estimate immediately so the EXECUTING bar renders
+		// "Generating... 0 tok ($C_in) 0.0 tok/s" before streamCmd refines it
+		// with the full assembled request length.
+		m.streamLiveTokens = 0
+		m.initStreamCostTelemetry(len(userInput))
 		cmd := m.handleInput(userInput)
 		// ── CLEANUP: stop shimmer on non-streaming early returns ────
 		// If handleInput returned nil or a non-stream command (error,

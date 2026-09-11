@@ -50,7 +50,8 @@ func (m *model) runUsageCmd() tea.Cmd {
 	isCloud := providerName != "ollama"
 	turnCost := 0.0
 	if isCloud && totalTok > 0 {
-		turnCost = float64(inputTok)*(3.0/1_000_000) + float64(outputTok)*(15.0/1_000_000)
+		inPerM, outPerM := m.lookupStreamPricing(modelName)
+		turnCost = float64(inputTok)*(inPerM/1_000_000) + float64(outputTok)*(outPerM/1_000_000)
 	}
 	turnCost = llm.EnforceFreeModelOverride(modelName, turnCost)
 	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("  Input Tokens      %d", inputTok)))

@@ -2569,6 +2569,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if total := msg.output + msg.reasoning; total > m.streamLiveTokens {
 			m.streamLiveTokens = total
 		}
+		// Authoritative prompt count replaces the t=0 chars/4 estimate so
+		// C_est converges on billed input tokens mid-stream.
+		if msg.input > 0 {
+			m.streamBaseInputTokens = msg.input
+		}
 		if m.thinkingBuffer != nil && msg.reasoning > 0 {
 			m.thinkingBuffer.SetReasoningTokens(msg.reasoning)
 		}
@@ -2944,7 +2949,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.IsCloudModel = m.cfg.ActiveProviderName() != "ollama"
 		turnCost := 0.0
 		if m.IsCloudModel {
-			turnCost = float64(msg.tokenInput)*(3.0/1_000_000) + float64(msg.tokenOutput)*(15.0/1_000_000)
+			inPerM, outPerM := m.lookupStreamPricing(m.getActiveModelName())
+			// Prefer live baseline pricing captured at t=0 when the final
+			// provider usage matches the streaming turn; otherwise use the
+			// fresh lookup so completed turns never bill at stale rates.
+			if m.streamBaseInputTokens == msg.tokenInput || msg.tokenInput == 0 {
+				if m.streamInputPricePerM != 0 || m.streamOutputPricePerM != 0 {
+					inPerM, outPerM = m.streamInputPricePerM, m.streamOutputPricePerM
+				}
+			}
+			turnCost = float64(msg.tokenInput)*(inPerM/1_000_000) + float64(msg.tokenOutput)*(outPerM/1_000_000)
 		}
 		turnCost = llm.EnforceFreeModelOverride(m.cfg.ActiveModelName(), turnCost)
 		if turnCost > 0 {
@@ -3123,8 +3137,30 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.stopShimmer()
 
 		// User-initiated interrupt — suppress error noise, just clean up.
+		// The final cost line reflects accumulated live tokens at cancellation.
 		if m.interruptRequested {
 			m.interruptRequested = false
+			cancelOut := m.streamLiveOutputTokens()
+			cancelIn := m.streamBaseInputTokens
+			if cancelIn == 0 && msg.tokenInput > 0 {
+				cancelIn = msg.tokenInput
+			}
+			if cancelOut == 0 && msg.tokenOutput > 0 {
+				cancelOut = msg.tokenOutput
+			}
+			cancelCost := m.streamEstimatedCost()
+			// Commit the consumed turn so the idle footer stays truthful.
+			if cancelIn > 0 || cancelOut > 0 {
+				m.commitTokenUsage(cancelIn, cancelOut)
+				m.markUsageKnown()
+			}
+			if cancelCost > 0 {
+				m.AccumulatedCost += cancelCost
+			}
+			if cancelIn+cancelOut > 0 {
+				m.push(roleStatus, dimmedStyle.Render(
+					fmt.Sprintf("✕ cancelled · +%d tok · %s", cancelIn+cancelOut, llm.FormatCost(cancelCost))))
+			}
 			m.responseBuffer.Reset()
 			m.currentStreamContent = ""
 			m.streamBuffer = ""
@@ -3278,7 +3314,29 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
-		return m, tea.Batch(flush, m.tokenUsageCmd(msg.tokenInput, msg.tokenOutput))
+		// Explicit Over Implicit on failure: when the provider died before a
+		// final usage chunk, fall back to the live burn (baseline input +
+		// live output) so Ctrl+C/timeout still reports consumed tokens, and
+		// accumulate the matching cost.
+		failIn, failOut := msg.tokenInput, msg.tokenOutput
+		if failIn == 0 {
+			failIn = m.streamBaseInputTokens
+		}
+		if failOut == 0 {
+			if live := m.streamLiveOutputTokens(); live > 0 {
+				failOut = live
+			}
+		}
+		if (failIn > 0 || failOut > 0) && m.IsCloudModel {
+			inPerM, outPerM := m.lookupStreamPricing(m.getActiveModelName())
+			if failCost := float64(failIn)*(inPerM/1_000_000) + float64(failOut)*(outPerM/1_000_000); failCost > 0 {
+				failCost = llm.EnforceFreeModelOverride(m.getActiveModelName(), failCost)
+				if failCost > 0 {
+					m.AccumulatedCost += failCost
+				}
+			}
+		}
+		return m, tea.Batch(flush, m.tokenUsageCmd(failIn, failOut))
 
 	case thinkingStreamMsg:
 		// Real-time reasoning token dispatch to the TUI Thinking Panel.

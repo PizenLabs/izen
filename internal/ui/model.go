@@ -1108,6 +1108,17 @@ type model struct {
 	// any authoritative usage chunk arrives. Reset per turn in streamCmd.
 	streamLiveTokens int
 
+	// streamBaseInputTokens is the t=0 baseline prompt-token estimate for the
+	// active turn (chars/4 over the assembled request). It seeds C_in before
+	// any provider usage arrives and is replaced by the authoritative
+	// streamUsageMsg input count when the provider reports one.
+	streamBaseInputTokens int
+	// streamInputPricePerM / streamOutputPricePerM are the active model's
+	// pricing rates (USD per 1M tokens) captured at t=0 from the model
+	// registry (provider catalog) with llm catalog fallback. Zero means free.
+	streamInputPricePerM  float64
+	streamOutputPricePerM float64
+
 	// Execution heartbeat: set when any foreground operation begins so the
 	// footer can render live connection-pulse telemetry (elapsed seconds)
 	// even when no provider tokens have arrived yet.
@@ -2626,6 +2637,11 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 		m.reconcileSpinner()
 	}
 	// Reset token rate / spinner counters to 0.0 tok/s and clear stage.
+	// Capture the live burn BEFORE zeroing so the abort line reflects
+	// accumulated tokens at cancellation (Ctrl+C mid-stream).
+	abortLiveOut := m.streamLiveOutputTokens()
+	abortBaseIn := m.streamBaseInputTokens
+	abortCostLabel := m.streamCostLabel()
 	if m.stage != nil {
 		m.stage.mu.Lock()
 		m.stage.Tokens = 0
@@ -2696,7 +2712,13 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	// Clear spinners and reset token rate counters to 0.0 tok/s already done above;
 	// ensure sync.
 	m.stopShimmer()
-	m.push(roleSystem, infoStyle.Render("[ ABORT ] Execution force-cancelled by user."))
+	abortTotal := abortBaseIn + abortLiveOut
+	if abortTotal > 0 || abortCostLabel != "" {
+		m.push(roleSystem, infoStyle.Render(
+			fmt.Sprintf("[ ABORT ] Execution force-cancelled by user. +%d tok · %s", abortTotal, abortCostLabel)))
+	} else {
+		m.push(roleSystem, infoStyle.Render("[ ABORT ] Execution force-cancelled by user."))
+	}
 	m.refreshViewportContent()
 	if m.Ready {
 		m.Viewport.GotoBottom()

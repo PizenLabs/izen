@@ -7,29 +7,36 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func TestCopyMode_EnterViaCommand(t *testing.T) {
+func TestCopyMode_SlashCommandsPurged(t *testing.T) {
 	m := newViTestModel()
 	m.state = StateChat
 	m.inViMode = false
 	m.records = []record{{role: roleAI, text: "a"}, {role: roleAI, text: "b"}}
-	_ = m.handleCommand("/copy-mode")
-	// Mouse reporting is now globally enabled, so enterViMode no longer needs
-	// to return EnableMouseCellMotion. The command may be nil.
-	if !m.inViMode {
-		t.Fatal("m.inViMode should be true after /copy-mode")
-	}
-	if m.toast == "" || !strings.Contains(strings.ToLower(m.toast), "copy mode") {
-		t.Fatalf("toast should describe copy mode, got %q", m.toast)
+	for _, cmd := range []string{"/copy-mode", "/copy_mode", "/inspect"} {
+		_ = m.handleCommand(cmd)
+		if m.inViMode {
+			t.Fatalf("%s must NOT enter copy mode after purge (triple-Esc is canonical)", cmd)
+		}
 	}
 }
 
-func TestCopyMode_InspectAlias(t *testing.T) {
+func TestCopyMode_TripleEscCanonical(t *testing.T) {
 	m := newViTestModel()
 	m.state = StateChat
 	m.inViMode = false
-	m.handleCommand("/inspect")
-	if !m.inViMode {
-		t.Fatal("/inspect should enter copy mode (vi mode)")
+	m.streaming = false
+	m.agentRunning = false
+	// Simulate 3 consecutive Esc presses through Update (canonical trigger).
+	var updated tea.Model
+	updated = m
+	for i := 0; i < 3; i++ {
+		var cmd tea.Cmd
+		updated, cmd = updated.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		_ = cmd
+	}
+	mm := updated.(*model)
+	if !mm.inViMode {
+		t.Fatal("triple-Esc must enter copy mode (canonical trigger)")
 	}
 }
 
@@ -65,12 +72,10 @@ func TestCopyMode_BlockedWhileProcessing(t *testing.T) {
 	m := newViTestModel()
 	m.state = StateProcessing
 	m.inViMode = false
-	cmd := m.handleCommand("/copy-mode")
-	if cmd != nil {
-		t.Fatal("should not enter copy mode while processing")
-	}
+	// Slash entry is purged: /copy-mode is unknown and never enters vi mode.
+	_ = m.handleCommand("/copy-mode")
 	if m.inViMode {
-		t.Fatal("should remain outside vi mode while processing")
+		t.Fatal("purged /copy-mode must not enter vi mode while processing")
 	}
 }
 

@@ -124,8 +124,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 
 	// Execution heartbeat: mark when the execution lifecycle starts.
 	m.executionStartedAt = time.Now()
-	// A fresh turn resets the live tok/s estimate (content + reasoning).
+	// A fresh turn resets the live tok/s estimate (content + reasoning) and
+	// the t=0 cost baseline (pricing + prompt tokens). The full request
+	// length refines the baseline below once msgs are assembled.
 	m.streamLiveTokens = 0
+	m.streamBaseInputTokens = estimatePromptTokens(content)
+	m.streamInputPricePerM, m.streamOutputPricePerM = m.lookupStreamPricing(m.getActiveModelName())
 	m.streamCh = make(chan tea.Msg, 1024)
 	m.streaming = true
 	m.spinnerFrame = 0
@@ -284,6 +288,14 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	}
 
 	debugLogPayload(content, msgs)
+
+	// Refine the t=0 prompt baseline with the full assembled request length
+	// (system + history + current turn) so C_in covers the billed prompt.
+	totalChars := len(systemPrompt)
+	for _, msg := range msgs {
+		totalChars += len(msg.Content)
+	}
+	m.initStreamCostTelemetry(totalChars)
 
 	// Capture the channel reference locally so the goroutine (and the
 	// ReasoningHandler below, which runs on the producer goroutine during
