@@ -78,12 +78,15 @@ func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedM
 // network I/O, zero Fetching screen. The registry is lazily created from the
 // local JSON cache; background sync arrives later as SnapshotMsg.
 func newModelPickerFromCache(m *model) model_picker.Model {
+	if m == nil {
+		return model_picker.NewFromRegistry(nil)
+	}
 	if m.modelRegistry == nil {
 		m.modelRegistry = registry.NewRegistry()
 		_ = m.modelRegistry.LoadCache()
 	}
 	mp := model_picker.NewFromRegistry(m.modelRegistry)
-	if m != nil && m.resolver != nil {
+	if m.resolver != nil {
 		mp = mp.SetActiveWorkspace(m.resolver.Current().String())
 		m.ensureModelAuthority()
 	}
