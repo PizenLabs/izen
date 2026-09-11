@@ -899,6 +899,12 @@ func modelBelongsTo(providerName, model string) bool {
 // model configuration state or fallback to a hardcoded default. An empty
 // Model is rejected locally with ErrUnassignedTargetModel before any provider
 // call, and the model ID is passed verbatim to the provider.
+//
+// Direct callers (tests, headless harnesses) that bypass the IntentGateway may
+// omit Model; the executor then resolves it from the active Workspace Target
+// configuration (cfg.ActiveModelName) at admission time, preserving the
+// "explicit binding at prompt admission" invariant without requiring every
+// test helper to thread the model verbatim.
 func (x *RuntimeExecutor) resolveModel(req ExecuteRequest) (string, error) {
 	x.mu.Lock()
 	p := x.provider
@@ -907,6 +913,9 @@ func (x *RuntimeExecutor) resolveModel(req ExecuteRequest) (string, error) {
 		return "", fmt.Errorf("executor: no provider configured for model invocation")
 	}
 	model := strings.TrimSpace(req.Model)
+	if model == "" && x.cfg != nil {
+		model = strings.TrimSpace(x.cfg.ActiveModelName())
+	}
 	if model == "" {
 		target := strings.TrimSpace(req.Mode)
 		if target == "" {
@@ -2492,6 +2501,19 @@ func (x *RuntimeExecutor) manifestSystemPromptFor() string {
 // raw bytes — ParseMutationManifest rejects the truncated JSON — so the DAG
 // strategy decision falls back silently instead of surfacing exhaustion.
 func (x *RuntimeExecutor) resolveManifestModel() (string, error) { //nolint:staticcheck
+	if x.cfg != nil {
+		if m := strings.TrimSpace(x.cfg.ActiveModelName()); m != "" {
+			// Validate against the bound provider when possible.
+			x.mu.Lock()
+			p := x.provider
+			x.mu.Unlock()
+			if p != nil && !modelBelongsTo(p.Name(), m) {
+				// Mismatch is still a deterministic error before any network call.
+				return "", fmt.Errorf("%w: model %q does not belong to provider %q", ErrProviderModelMismatch, m, p.Name())
+			}
+			return m, nil
+		}
+	}
 	return "", fmt.Errorf("executor: manifest pass requires an explicit model binding (no fallback allowed)")
 }
 
