@@ -207,6 +207,57 @@ func (s *TaskStore) RecordConflict(taskID, operationID, reason string) error {
 	return nil
 }
 
+// RecordFailure appends FAILURE_CLASSIFIED. It MUST be called before any
+// Phase 2 recovery transition is attempted: no recovery without a
+// classified failure event in ledger.ndjson.
+func (s *TaskStore) RecordFailure(taskID, reason, operationID, detail string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ev := newEvent(taskID, EventFailureClassified, map[string]any{
+		"reason":      reason,
+		"operationId": operationID,
+		"detail":      detail,
+	})
+	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
+		return err
+	}
+	s.apply(ev)
+	return nil
+}
+
+// RecordHandoff appends WORKER_HANDOFF, preserving TaskID, CheckpointID and
+// event lineage: a worker/provider change never rewrites task identity.
+func (s *TaskStore) RecordHandoff(taskID, fromWorker, toWorker, checkpointID, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ev := newEvent(taskID, EventWorkerHandoff, map[string]any{
+		"fromWorker":   fromWorker,
+		"toWorker":     toWorker,
+		"checkpointId": checkpointID,
+		"reason":       reason,
+	})
+	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
+		return err
+	}
+	s.apply(ev)
+	return nil
+}
+
+// PauseTask appends TASK_PAUSED and moves the task to PAUSED, yielding
+// control to the human boundary. Used when the recovery budget is exhausted.
+func (s *TaskStore) PauseTask(taskID, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ev := newEvent(taskID, EventTaskPaused, map[string]any{
+		"reason": reason,
+	})
+	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
+		return err
+	}
+	s.apply(ev)
+	return nil
+}
+
 // State returns a copy of the materialized task state.
 func (s *TaskStore) State(taskID string) (TaskState, bool) {
 	s.mu.Lock()
@@ -475,6 +526,27 @@ func (s *TaskStore) apply(ev LedgerEvent) {
 			t.Cursor.Status = CursorConflict
 		}
 		t.Status = TaskRePlan
+		s.currentID = ev.TaskID
+	case EventFailureClassified:
+		t := ensureTask(s.tasks, ev.TaskID)
+		if t.Status == TaskRunning {
+			t.Status = TaskInterrupted
+		}
+		s.currentID = ev.TaskID
+	case EventWorkerHandoff:
+		// State-driven failover: identity is preserved. Only the
+		// checkpoint pointer advances when the payload carries one.
+		t := ensureTask(s.tasks, ev.TaskID)
+		if cp := strField(ev.Payload, "checkpointId"); cp != "" {
+			t.LastCheckpointID = cp
+		}
+		if t.Status == TaskInterrupted {
+			t.Status = TaskRunning
+		}
+		s.currentID = ev.TaskID
+	case EventTaskPaused:
+		t := ensureTask(s.tasks, ev.TaskID)
+		t.Status = TaskPaused
 		s.currentID = ev.TaskID
 	}
 }

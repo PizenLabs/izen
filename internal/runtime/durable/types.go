@@ -70,6 +70,12 @@ const (
 	EventVerificationResult EventType = "VERIFICATION_RESULT"
 	EventStaleLockReclaimed EventType = "STALE_LOCK_RECLAIMED"
 	EventTargetConflict     EventType = "TARGET_CONFLICT"
+	// Phase 2 (ephemeral worker) events: classified provider failures,
+	// worker handoffs, and human-boundary pauses. FAILURE_CLASSIFIED is
+	// always appended before any recovery transition is attempted.
+	EventFailureClassified EventType = "FAILURE_CLASSIFIED"
+	EventWorkerHandoff     EventType = "WORKER_HANDOFF"
+	EventTaskPaused        EventType = "TASK_PAUSED"
 )
 
 // IsTruthBoundary reports whether the event type requires an explicit
