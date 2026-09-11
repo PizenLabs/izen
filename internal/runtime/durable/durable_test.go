@@ -20,9 +20,9 @@ func testWorkDir(t *testing.T) string {
 	return dir
 }
 
-func writeWorkFile(t *testing.T, dir, name, content string) {
+func writeWorkFile(t *testing.T, dir, content string) {
 	t.Helper()
-	p := filepath.Join(dir, filepath.FromSlash(name))
+	p := filepath.Join(dir, filepath.FromSlash("a.txt"))
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestCrashRecoveryTornTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	writeWorkFile(t, dir, "a.txt", "patched")
+	writeWorkFile(t, dir, "patched")
 	post, err := ComputeTreeDigest(dir)
 	if err != nil {
 		t.Fatalf("digest: %v", err)
@@ -96,7 +96,7 @@ func TestCrashRecoveryTornTail(t *testing.T) {
 // Retry MUST NOT duplicate the patch.
 func TestIdempotentRetryNoDuplicate(t *testing.T) {
 	dir := testWorkDir(t)
-	writeWorkFile(t, dir, "a.txt", "v1")
+	writeWorkFile(t, dir, "v1")
 	s := NewTaskStore(dir)
 	if err := s.Open(); err != nil {
 		t.Fatal(err)
@@ -105,14 +105,14 @@ func TestIdempotentRetryNoDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 	pre, _ := ComputeTreeDigest(dir)
-	writeWorkFile(t, dir, "a.txt", "v2") // the side effect commits...
+	writeWorkFile(t, dir, "v2") // the side effect commits...
 	post, _ := ComputeTreeDigest(dir)
-	writeWorkFile(t, dir, "a.txt", "v1") // ...then the worker "crashes" before commit
+	writeWorkFile(t, dir, "v1") // ...then the worker "crashes" before commit
 
 	calls := 0
 	effect := func() error {
 		calls++
-		writeWorkFile(t, dir, "a.txt", "v2")
+		writeWorkFile(t, dir, "v2")
 		return nil
 	}
 	digestOf := func() (string, error) { return ComputeTreeDigest(dir) }
@@ -148,7 +148,7 @@ func TestIdempotentRetryNoDuplicate(t *testing.T) {
 // ReconcileAll advances WITHOUT re-execution.
 func TestReconcileAlreadyCommitted(t *testing.T) {
 	dir := testWorkDir(t)
-	writeWorkFile(t, dir, "a.txt", "v1")
+	writeWorkFile(t, dir, "v1")
 	s := NewTaskStore(dir)
 	if err := s.Open(); err != nil {
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestReconcileAlreadyCommitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	pre, _ := ComputeTreeDigest(dir)
-	writeWorkFile(t, dir, "a.txt", "v2")
+	writeWorkFile(t, dir, "v2")
 	post, _ := ComputeTreeDigest(dir)
 
 	// Worker dispatches, applies the side effect, then dies before commit.
@@ -193,7 +193,7 @@ func TestReconcileAlreadyCommitted(t *testing.T) {
 // 2c. Crash before any side effect: safe retry.
 func TestReconcileSafeRetry(t *testing.T) {
 	dir := testWorkDir(t)
-	writeWorkFile(t, dir, "a.txt", "v1")
+	writeWorkFile(t, dir, "v1")
 	s := NewTaskStore(dir)
 	if err := s.Open(); err != nil {
 		t.Fatal(err)
@@ -227,7 +227,7 @@ func TestReconcileSafeRetry(t *testing.T) {
 // 2d. Third-party mutation: conflict -> TARGET_CONFLICT + RE_PLAN.
 func TestReconcileConflict(t *testing.T) {
 	dir := testWorkDir(t)
-	writeWorkFile(t, dir, "a.txt", "v1")
+	writeWorkFile(t, dir, "v1")
 	s := NewTaskStore(dir)
 	if err := s.Open(); err != nil {
 		t.Fatal(err)

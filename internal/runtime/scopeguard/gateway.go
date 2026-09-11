@@ -152,6 +152,14 @@ func (g *IntentGateway) Authorize(_ context.Context, p Proposal, primaryScope []
 	return GatewayResult{Decision: DecisionAllow, Reason: "proposal authorized against scope, structure, policy and budget", Structural: structRes}
 }
 
+// EvaluateProposal is the master-orchestrator entry point for the
+// authority & scope check tier. It is a thin wrapper over Authorize so the
+// pipeline sequence (gateway.EvaluateProposal) has a stable name while the
+// decision logic stays in one place. It performs NO side effects.
+func (g *IntentGateway) EvaluateProposal(ctx context.Context, p Proposal, primaryScope []string) GatewayResult {
+	return g.Authorize(ctx, p, primaryScope)
+}
+
 // ── RuntimeExecutor ──
 
 // Effect is the injectable side-effect seam. Under ExecutionCursor
@@ -180,11 +188,88 @@ type ReconcileAlias = durable.ReconcileDecision
 // REQUIRE_VERIFICATION), preserving Proposal != Execution.
 type RuntimeExecutor struct {
 	store *durable.TaskStore
+	// workDir roots digest computation for ReconcilePendingCursors and
+	// ExecuteAuthorized. Empty disables those methods (they return an
+	// error); Execute itself takes explicit digests and is unaffected.
+	workDir string
 }
 
 // NewRuntimeExecutor binds an executor to the durable task substrate.
 func NewRuntimeExecutor(store *durable.TaskStore) *RuntimeExecutor {
 	return &RuntimeExecutor{store: store}
+}
+
+// NewRuntimeExecutorWithWorkDir binds an executor to the durable task
+// substrate and roots digest computation at workDir.
+func NewRuntimeExecutorWithWorkDir(store *durable.TaskStore, workDir string) *RuntimeExecutor {
+	return &RuntimeExecutor{store: store, workDir: workDir}
+}
+
+// SetWorkDir roots digest computation at workDir for
+// ReconcilePendingCursors and ExecuteAuthorized.
+func (e *RuntimeExecutor) SetWorkDir(workDir string) {
+	if e == nil {
+		return
+	}
+	e.workDir = workDir
+}
+
+// ReconcilePendingCursors resolves any pending or crash-interrupted
+// side effects before new proposals are evaluated (reconciliation
+// boundary). It folds every task holding a pending cursor through
+// durable.Reconcile against the live worktree digest computed with
+// durable.ComputeTreeDigest: ALREADY_COMMITTED advances without
+// re-execution, SAFE_RETRY resets to PENDING, CONFLICT records
+// TARGET_CONFLICT and moves the task to RE_PLAN. All transitions are
+// persisted to ledger.ndjson; nothing stays memory-only.
+func (e *RuntimeExecutor) ReconcilePendingCursors(ctx context.Context) (map[string]ReconcileAlias, error) {
+	if e == nil || e.store == nil {
+		return nil, fmt.Errorf("scopeguard: nil executor store")
+	}
+	if strings.TrimSpace(e.workDir) == "" {
+		return nil, fmt.Errorf("scopeguard: executor workDir not set")
+	}
+	_ = ctx
+	// Snapshot scopes BEFORE ReconcileAll: it holds the store lock while
+	// invoking this func, so consulting the store here would self-deadlock.
+	scopes := e.store.TaskScopes()
+	return e.store.ReconcileAll(func(taskID string) (string, error) {
+		if scope, ok := scopes[taskID]; ok && len(scope) > 0 {
+			return durable.ComputeTreeDigest(e.workDir, scope...)
+		}
+		return durable.ComputeTreeDigest(e.workDir)
+	})
+}
+
+// ExecuteAuthorized invokes Execute only for proposals carrying execution
+// authority: decision MUST be DecisionAllow. DecisionDeny is never
+// executed; DecisionRequireVerification MUST be verified by the caller
+// first (the master engine runs evidence verification and upgrades the
+// decision before calling). Digests are computed live with
+// durable.ComputeTreeDigest over the proposal targets so reconciliation
+// observes the real worktree — no mock digests.
+func (e *RuntimeExecutor) ExecuteAuthorized(ctx context.Context, p Proposal, decision GatewayResult, effect Effect, verify Verifier) (ExecutorResult, error) {
+	if e == nil || e.store == nil {
+		return ExecutorResult{}, fmt.Errorf("scopeguard: nil executor store")
+	}
+	switch decision.Decision {
+	case DecisionAllow:
+		// Proceed.
+	case DecisionDeny:
+		return ExecutorResult{}, fmt.Errorf("scopeguard: proposal denied, execution refused: %s", decision.Reason)
+	case DecisionRequireVerification:
+		return ExecutorResult{}, fmt.Errorf("scopeguard: proposal requires verification before execution")
+	default:
+		return ExecutorResult{}, fmt.Errorf("scopeguard: unknown gateway decision %q", decision.Decision)
+	}
+	if strings.TrimSpace(e.workDir) == "" {
+		return ExecutorResult{}, fmt.Errorf("scopeguard: executor workDir not set")
+	}
+	pre, err := durable.ComputeTreeDigest(e.workDir, p.TargetFiles...)
+	if err != nil {
+		return ExecutorResult{}, fmt.Errorf("scopeguard: pre-execution digest: %w", err)
+	}
+	return e.Execute(ctx, p, pre, pre, effect, verify)
 }
 
 // Execute dispatches an authorized proposal exactly once:

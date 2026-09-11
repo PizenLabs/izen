@@ -210,24 +210,25 @@ func (l *NegativeLedger) AttachToContract(taskID string, c *ephemeral.ResumeCont
 //	[IMMUTABLE NEGATIVE CONSTRAINTS]
 //	DO NOT ATTEMPT THE FOLLOWING REJECTED APPROACHES:
 //	- Approach: "..." / Reason: "..." / Evidence: [...]
+//
+// CANONICAL API: this is the canonical entry point for constraint-block
+// rendering. The block bytes are produced by the single implementation in
+// durable.RenderImmutableConstraintsBlock (ephemeral.RenderResumePrompt
+// delegates to the same renderer), so the format cannot drift between
+// packages. Only ACTIVE entries are rendered; STALE entries are withheld.
 func RenderImmutableConstraints(entries []NegativeKnowledge) string {
-	constraints := make([]ephemeral.NegativeConstraint, 0, len(entries))
+	constraints := make([]durable.ImmutableConstraint, 0, len(entries))
 	for _, n := range entries {
 		if n.Status != StatusActiveNegativeKnowledge {
 			continue
 		}
-		constraints = append(constraints, ToEphemeralConstraint(n))
+		constraints = append(constraints, durable.ImmutableConstraint{
+			Hypothesis:   n.Hypothesis,
+			WhyRejected:  n.WhyRejected,
+			EvidenceRefs: append([]string(nil), n.EvidenceRefs...),
+		})
 	}
-	c := ephemeral.ResumeContract{NegativeConstraints: constraints}
-	// RenderResumePrompt always emits the header when constraints exist.
-	// Slice the prompt to just the constraints block for ledger-friendly
-	// test assertions.
-	full := ephemeral.RenderResumePrompt(c)
-	idx := strings.Index(full, ephemeral.ImmutableConstraintsHeader)
-	if idx < 0 {
-		return ""
-	}
-	return full[idx:]
+	return durable.RenderImmutableConstraintsBlock(constraints)
 }
 
 func scopesOverlap(a, b []string) bool {

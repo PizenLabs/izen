@@ -71,6 +71,14 @@ type ProviderError struct {
 // The zero value is ready to use; all methods are pure and goroutine-safe.
 type FailureClassifier struct{}
 
+// ClassifyError maps a raw execution/verification error onto the canonical
+// taxonomy by lowering it into a ProviderError and applying the same
+// deterministic rule chain as Classify. A nil error yields FailureUnknown;
+// callers must only invoke it on failure paths.
+func ClassifyError(err error) FailureReason {
+	return FailureClassifier{}.Classify(ProviderError{Err: err})
+}
+
 // Classify applies the deterministic rule chain in priority order:
 //
 //  1. finish_reason == "length" (or max-output-token truncation) -> TOKEN_LIMIT.

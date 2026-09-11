@@ -3,12 +3,17 @@ package ephemeral
 import (
 	"fmt"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/runtime/durable"
 )
 
 // ImmutableConstraintsHeader is the system-prompt section hosting Phase 3
 // verified negative knowledge. Every replacement worker receives the
 // ACTIVE entries matching its target scope under this header.
-const ImmutableConstraintsHeader = "[IMMUTABLE NEGATIVE CONSTRAINTS]"
+//
+// Canonical block rendering lives in durable.RenderImmutableConstraintsBlock;
+// this alias is kept so existing callers keep compiling.
+const ImmutableConstraintsHeader = durable.ImmutableConstraintsHeader
 
 // RenderResumePrompt serializes a ResumeContract into the replacement
 // worker's system prompt. ACTIVE negative constraints are rendered under
@@ -35,18 +40,24 @@ func RenderResumePrompt(c ResumeContract) string {
 	if len(c.NegativeConstraints) == 0 {
 		return b.String()
 	}
-	b.WriteString(ImmutableConstraintsHeader + "\n")
-	b.WriteString("DO NOT ATTEMPT THE FOLLOWING REJECTED APPROACHES:\n")
-	for _, n := range c.NegativeConstraints {
-		b.WriteString("- Approach: \"" + strings.TrimSpace(n.Hypothesis) + "\"\n")
-		if strings.TrimSpace(n.WhyRejected) != "" {
-			b.WriteString("  Reason: \"" + strings.TrimSpace(n.WhyRejected) + "\"\n")
-		}
-		if len(n.EvidenceRefs) > 0 {
-			b.WriteString("  Evidence: [" + strings.Join(n.EvidenceRefs, ", ") + "]\n")
-		}
-	}
+	// Constraint rendering is delegated to the canonical durable renderer
+	// so the block format has a single source of truth.
+	b.WriteString(durable.RenderImmutableConstraintsBlock(toDurableConstraints(c.NegativeConstraints)))
 	return b.String()
+}
+
+// toDurableConstraints projects ephemeral constraints onto the durable
+// rendering shape.
+func toDurableConstraints(in []NegativeConstraint) []durable.ImmutableConstraint {
+	out := make([]durable.ImmutableConstraint, 0, len(in))
+	for _, n := range in {
+		out = append(out, durable.ImmutableConstraint{
+			Hypothesis:   n.Hypothesis,
+			WhyRejected:  n.WhyRejected,
+			EvidenceRefs: append([]string(nil), n.EvidenceRefs...),
+		})
+	}
+	return out
 }
 
 // ValidateProposal rejects a worker proposal that attempts a known failed

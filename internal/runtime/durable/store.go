@@ -65,6 +65,26 @@ func NewTaskStore(workDir string) *TaskStore {
 // LedgerPath returns the ledger file path (instrumentation for tests).
 func (s *TaskStore) LedgerPath() string { return s.ledgerPath }
 
+// WorkDir returns the bound working directory root used for digest
+// computation.
+func (s *TaskStore) WorkDir() string { return s.workDir }
+
+// TaskScopes returns a snapshot of per-task ActiveTargetScope keyed by task
+// ID. It exists so reconciliation can resolve digests per task without
+// re-entering the store lock from inside ReconcileAll (which already holds
+// it while invoking the digest func).
+func (s *TaskStore) TaskScopes() map[string][]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]string, len(s.tasks))
+	for id, t := range s.tasks {
+		if t != nil {
+			out[id] = append([]string(nil), t.ActiveTargetScope...)
+		}
+	}
+	return out
+}
+
 // SnapshotPath returns the snapshot file path.
 func (s *TaskStore) SnapshotPath() string { return s.snapPath }
 
