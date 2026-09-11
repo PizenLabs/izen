@@ -36,8 +36,9 @@ import (
 func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedMsg) tea.Cmd {
 	auth := m.ensureModelAuthority()
 	binding := authority.ModelBinding{
-		ProviderID: authority.ProviderID(msg.Provider),
-		ModelID:    authority.ModelID(msg.ModelID),
+		ProviderID:    authority.ProviderID(msg.Provider),
+		ModelID:       authority.ModelID(msg.ModelID),
+		VariantParams: authority.VariantOption(string(msg.Policy.Reasoning)),
 	}
 	if err := authority.ValidateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
@@ -123,15 +124,17 @@ func (m *model) applyPickerActivation(um model_picker.Model) tea.Cmd {
 	}
 
 	auth := m.ensureModelAuthority()
+	variant := um.ReasoningPolicy()
 	binding := authority.ModelBinding{
-		ProviderID: authority.ProviderID(provider),
-		ModelID:    authority.ModelID(id),
+		ProviderID:    authority.ProviderID(provider),
+		ModelID:       authority.ModelID(id),
+		VariantParams: authority.VariantOption(variant),
 	}
 	if err := authority.ValidateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
 		return nil
 	}
-	if err := config.PersistActiveBinding(provider, id, ""); err != nil {
+	if err := config.PersistActiveBinding(provider, id, variant); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
 		return nil
 	}
@@ -227,15 +230,23 @@ func (m *model) pickerActivateCmd(cmd modelapp.ActivateModelCommand) tea.Cmd {
 	m.ti.Focus()
 	if um.ActivatedModelID() == "" {
 		auth := m.ensureModelAuthority()
+		variant := ""
+		if cmd.Reasoning != nil {
+			variant = cmd.Reasoning.Option
+		}
+		if variant == "" {
+			variant = um.ReasoningPolicy()
+		}
 		binding := authority.ModelBinding{
-			ProviderID: authority.ProviderID(cmd.Provider),
-			ModelID:    authority.ModelID(cmd.ModelID),
+			ProviderID:    authority.ProviderID(cmd.Provider),
+			ModelID:       authority.ModelID(cmd.ModelID),
+			VariantParams: authority.VariantOption(variant),
 		}
 		if err := authority.ValidateBinding(binding); err != nil {
 			m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
 			return nil
 		}
-		if err := config.PersistActiveBinding(cmd.Provider, cmd.ModelID, ""); err != nil {
+		if err := config.PersistActiveBinding(cmd.Provider, cmd.ModelID, variant); err != nil {
 			m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
 			return nil
 		}

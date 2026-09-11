@@ -70,6 +70,24 @@ func NewIdleTimeoutReader(src io.ReadCloser, idle time.Duration) *IdleTimeoutRea
 // Idle returns the configured inter-token window.
 func (r *IdleTimeoutReader) Idle() time.Duration { return r.idle }
 
+// SetIdle updates the inter-token window going forward (two-phase TTFT:
+// the caller arms a dynamic first-byte deadline, then relaxes to the
+// steady inter-token window once the first chunk proves the stream alive).
+// The in-flight deadline restarts under the new window so the gap is
+// measured from the last received chunk. Non-positive values are ignored.
+func (r *IdleTimeoutReader) SetIdle(idle time.Duration) {
+	if idle <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.idle = idle
+	if r.closed || r.fired || r.timer == nil {
+		return
+	}
+	r.timer.Reset(idle)
+}
+
 // IdleFired reports whether the watchdog has fired (the stream stalled).
 func (r *IdleTimeoutReader) IdleFired() bool {
 	r.mu.Lock()

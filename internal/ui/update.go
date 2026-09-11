@@ -23,6 +23,7 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/core/classifier"
+	corestream "github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/domain/signal"
@@ -2197,9 +2198,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		// ── LIVE TTFT COUNTDOWN ──────────────────────────────────────
 		// While the first byte has not arrived, re-render on EVERY frame
-		// tick so the "Connecting to provider... 4.2s / 15.0s" stopwatch
-		// and spinner advance smoothly instead of sitting frozen. The
-		// single-flight repaint gate bounds actual renders to 30FPS.
+		// tick so the "Connecting... 14s" countdown and spinner advance
+		// smoothly instead of sitting frozen. The single-flight repaint
+		// gate bounds actual renders to 30FPS.
 		// The countdown stops the instant the first byte lands in
 		// utf8StreamBuf (firstTokenReceived flips true) and the bar
 		// transitions to token metrics.
@@ -3201,27 +3202,24 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		} else {
 			sanitized := sanitizedErr
 			// TTFT Timeout: no first byte arrived and the failure is a
-			// deadline or a phase-identifiable socket stall (DNS / TCP /
-			// TLS / response headers). Measure actual elapsed via
-			// time.Since and name the stalled phase so the log pinpoints
-			// where the connection died instead of showing a bare deadline.
+			// deadline, the first-byte idle watchdog firing, or a
+			// phase-identifiable socket stall (DNS / TCP / TLS / response
+			// headers). Measure actual elapsed via time.Since and name the
+			// stalled phase so the log pinpoints where the connection died
+			// instead of showing a bare deadline. The reported budget is
+			// the dynamic per-model deadline (m.ttftDuration) the footer
+			// countdown ticks against.
 			phaseDetail := providers.TTFTPhaseDetail(msg.err)
 			isTTFTFailure := m.noFirstByteReceived() && !hasPartialContent &&
-				(isContextDeadline(msg.err) || errors.Is(msg.err, context.DeadlineExceeded) || phaseDetail != "")
+				(isContextDeadline(msg.err) || errors.Is(msg.err, context.DeadlineExceeded) ||
+					errors.Is(msg.err, corestream.ErrStreamIdleTimeout) || phaseDetail != "")
 			if isTTFTFailure {
-				start := m.executionStartedAt
-				if start.IsZero() {
-					start = m.streamStartTime
-				}
-				elapsed := time.Since(start)
-				if elapsed < 15*time.Second {
-					elapsed = 15 * time.Second
-				}
+				ttft := m.ttftDuration()
 				if phaseDetail == "" {
 					phaseDetail = "No first byte received within TTFT budget"
 				}
 				m.push(roleError, errorStyle.Render(
-					fmt.Sprintf("✗ provider response stalled: TTFT timeout after %.1fs (%s).", elapsed.Seconds(), phaseDetail)))
+					fmt.Sprintf("✗ provider response stalled: TTFT timeout (%ds elapsed) (%s).", int(ttft.Seconds()), phaseDetail)))
 				// Context isolation: prune the uncompleted prompt from SessionHistory so it does not pollute next turn.
 				m.pruneFailedPromptFromHistory()
 			} else {

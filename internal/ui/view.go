@@ -761,7 +761,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 
 	// Model name — dropped after language when the pane is too narrow.
 	if width >= minimalStatusThreshold {
-		modelName := m.getActiveModelName()
+		modelName := m.getActiveModelDisplay()
 		if m.modelAuthority != nil {
 			if b := m.modelAuthority.ActiveBinding(); b.ModelID != "" {
 				modelName = accentStyle.Render("✓") + " " + modelName
@@ -1236,11 +1236,24 @@ func (m *model) printRecord(rec record) string {
 		}
 		return strings.Join(styledLines, "\n")
 	case roleActivity:
-		styledLines := make([]string, len(wrappedLines))
-		for i, line := range wrappedLines {
-			styledLines[i] = m.styleActivityLine(line)
+		// ── TRACE GATE (quiet mode default) ──────────────────────
+		// Internal engine trace lines (command received, intent parsed,
+		// [event] PromptAdmitted, [preflight] bg worker, [plan]/[build]/
+		// [stream] telemetry, …) render ONLY when verbose trace is on
+		// (Alt+E / Alt+V → m.traceVerbose / TraceVerbose). In quiet mode
+		// they collapse to the single per-turn "▸ Trace:" summary inside
+		// styleActivityLine; repeat summaries return "" and are dropped
+		// here so the main viewport stays clean (user messages, model
+		// text and final ✓ summaries only).
+		var kept []string
+		for _, line := range wrappedLines {
+			styled := m.styleActivityLine(line)
+			if styled == "" {
+				continue
+			}
+			kept = append(kept, styled)
 		}
-		return strings.Join(styledLines, "\n")
+		return strings.Join(kept, "\n")
 	case roleStatus:
 		styledLines := make([]string, len(wrappedLines))
 		for i, line := range wrappedLines {

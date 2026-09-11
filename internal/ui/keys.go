@@ -1265,6 +1265,22 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 	userInput := m.ExpandPasteTokens(m.ti.Value())
 	m.dismissSuggestions()
 
+	// ── EMPTY PROMPT GUARD ───────────────────────────────────────
+	// Enter on an empty/whitespace-only input is a no-op: short-circuit
+	// here so neither handleInput nor the Application-layer submit_prompt
+	// command ever sees a blank prompt. Without this, whitespace slips
+	// past the `!= ""` check below and surfaces as the red
+	// `command submit_prompt failed: handlers: empty prompt` error.
+	// The tail-lock is still performed so the viewport stays anchored
+	// (empty submit must not leave a scrolled-away offset behind).
+	if strings.TrimSpace(userInput) == "" {
+		m.ti.SetValue("")
+		m.ti.Reset()
+		m.syncInputFromTI()
+		m.lockTailToNewPrompt()
+		return m, nil
+	}
+
 	// Block prompt submission when no active model is configured (Phase 3).
 	if m.unconfigured {
 		m.push(roleStatus, "⚠ No active model set for provider. Please select a model to begin.")
@@ -1397,7 +1413,7 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		// so the loading dock AND the TTFT countdown animate immediately,
 		// regardless of what the submitted command does next (async prep,
 		// stream, engine run). The frame loop is what re-renders the live
-		// "Connecting to provider... 4.2s / 15.0s" stopwatch during the
+		// "Connecting... 14s" countdown during the
 		// first-byte wait — without it the footer would sit frozen until
 		// the first token arrives. All loops self-terminate when no
 		// background producer owns the flags, so idle submits leak nothing.

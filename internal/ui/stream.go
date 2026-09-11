@@ -35,15 +35,20 @@ const askCodingMaxTokens = 4096
 
 // Stream context lifecycle (decoupled TTFT vs active-stream deadlines).
 //
-//	pre-TTFT:  the transport ResponseHeaderTimeout (10s cloud / 15s local)
-//	          bounds the wait for the first response byte; the footer TTFT
-//	          countdown renders against ttftBudget (15s).
+//	pre-TTFT:  the dynamic TTFT deadline (m.ttftDuration: 15s fast models,
+//	          up to 90s reasoning/free-tier) bounds the wait for the first
+//	          response byte; the transport ResponseHeaderTimeout (10s cloud
+//	          / 15s local) remains the socket-level backstop. The footer
+//	          countdown renders the same dynamic deadline.
 //	post-TTFT: once the first byte arrives the stream is alive. Liveness is
 //	          governed by the inter-token idle timeout (reset on every chunk)
 //	          under a generous absolute stream-max ceiling — never by the old
 //	          fixed 15s total request deadline that expired mid-generation.
 const (
-	// streamTTFTBudget mirrors the footer countdown + transport backstop.
+	// streamTTFTBudget is the standard-tier pre-TTFT bound. It mirrors the
+	// dynamic resolver's standard tier (llm.TTFTStandardTimeout) and remains
+	// the documented default; per-turn streams resolve their own deadline
+	// via m.ttftDuration().
 	streamTTFTBudget = 15 * time.Second
 	// streamInterTokenIdle is the post-TTFT liveness bound: any chunk
 	// within this window proves the stream alive and resets the deadline.
@@ -331,9 +336,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// cancelStaleAgentOps already invoke to tear the stream down.
 	//
 	// DECOUPLED LIFECYCLE (no fixed total deadline):
-	//   pre-TTFT  — the transport ResponseHeaderTimeout (10s cloud / 15s
-	//               local) bounds the wait for the first response byte and
-	//               fails fast with a phase-identifiable error.
+	//   pre-TTFT  — the dynamic TTFT deadline (ttftTimeout below: 15s fast
+	//               models, up to 90s reasoning/free-tier) bounds the wait
+	//               for the first response byte; the transport
+	//               ResponseHeaderTimeout (10s cloud / 15s local) remains
+	//               the socket-level backstop and fails fast with a
+	//               phase-identifiable error.
 	//   post-TTFT — once bytes flow, liveness is governed by the inter-token
 	//               idle watchdog (reset on every chunk) wrapped around the
 	//               SSE body below. The context here carries only the generous
@@ -341,6 +349,10 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	//               generation (e.g. 45s of steady tokens) completes instead
 	//               of dying to a fixed 15s "context deadline exceeded".
 	// Each attempt still defers cancel() so OS sockets force-close on exit.
+	// The dynamic TTFT is captured here (synchronously, before the producer
+	// goroutine starts) so the first-byte window, the footer countdown and
+	// the stall diagnosis all share one deadline for the turn.
+	ttftTimeout := m.ttftDuration()
 	ctx, cancel := context.WithTimeout(m.operationContext(), streamMaxDuration)
 	m.streamCancel = cancel
 
@@ -380,13 +392,16 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			return
 		}
 		defer func() { _ = rawStream.Close() }()
-		// INTER-TOKEN IDLE WATCHDOG (post-TTFT liveness): every Read that
-		// carries bytes resets the idle deadline. A slow-but-continuous
-		// generation never trips it; a stalled socket is force-closed with
-		// an identifiable ErrStreamIdleTimeout instead of hanging to the
-		// stream-max ceiling. Usage/finish-reason assertions below keep
-		// reading from rawStream (the wrapper only carries the byte path).
-		idleBody := stream.NewIdleTimeoutReader(rawStream, streamInterTokenIdle)
+		// INTER-TOKEN IDLE WATCHDOG (two-phase liveness): the reader opens
+		// with the dynamic TTFT deadline as its first-byte window, then
+		// relaxes to the steady inter-token window the instant the first
+		// chunk proves the stream alive (see relaxToSteady below). A
+		// slow-but-continuous generation never trips it; a stalled socket
+		// is force-closed with an identifiable ErrStreamIdleTimeout instead
+		// of hanging to the stream-max ceiling. Usage/finish-reason
+		// assertions below keep reading from rawStream (the wrapper only
+		// carries the byte path).
+		idleBody := stream.NewIdleTimeoutReader(rawStream, ttftTimeout)
 		defer func() { _ = idleBody.Close() }()
 		// Task 2: strict context cancellation — force-close SSE body on interrupt.
 		done := make(chan struct{})
@@ -429,10 +444,22 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			streamCh <- streamUsageMsg{input: u.PromptTokens, output: u.CompletionTokens, reasoning: u.ReasoningTokens}
 		}
 
+		// Two-phase TTFT: the first chunk (content or thinking) proves the
+		// stream alive, so the dynamic first-byte window relaxes to the
+		// steady inter-token window from here on.
+		relaxedToSteady := false
+		relaxToSteady := func() {
+			if !relaxedToSteady {
+				relaxedToSteady = true
+				idleBody.SetIdle(streamInterTokenIdle)
+			}
+		}
 		full, ingestErr := ingestLLMStream(idleBody, m.bus, func(text string) {
+			relaxToSteady()
 			streamCh <- tokenMsg(text)
 			emitUsage()
 		}, func(text string) {
+			relaxToSteady()
 			streamCh <- thinkingTokenMsg(text)
 			emitUsage()
 		})

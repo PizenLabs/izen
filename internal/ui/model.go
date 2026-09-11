@@ -3332,14 +3332,25 @@ func (m *model) renderRecordForViewport(rec record) string {
 		return m.renderAIResponseBlocks(text, width)
 	case roleActivity:
 		var b strings.Builder
+		first := true
 		for _, srcLine := range strings.Split(text, "\n") {
 			wrapped := wrapIndentedLine(srcLine, wrapWidth)
 			for _, wl := range wrapped {
-				b.WriteString(renderBounded(m.styleActivityLine(wl)))
-				b.WriteByte('\n')
+				// Quiet-mode trace gate: collapsed repeat summaries return
+				// "" and are dropped so no blank trace rows enter the
+				// viewport (Alt+E restores the full logs).
+				styled := renderBounded(m.styleActivityLine(wl))
+				if styled == "" {
+					continue
+				}
+				if !first {
+					b.WriteByte('\n')
+				}
+				b.WriteString(styled)
+				first = false
 			}
 		}
-		return strings.TrimSuffix(b.String(), "\n")
+		return b.String()
 	default:
 		var b strings.Builder
 		for _, srcLine := range strings.Split(text, "\n") {

@@ -105,6 +105,44 @@ func TestIdleTimeoutReader_StallTripsIdleError(t *testing.T) {
 	}
 }
 
+// TestIdleTimeoutReader_SetIdleRelaxesToSteadyWindow pins the two-phase
+// TTFT contract: the reader opens with a dynamic first-byte deadline, and
+// SetIdle relaxes it to the steady inter-token window once the first chunk
+// proves the stream alive. A non-positive SetIdle is ignored.
+func TestIdleTimeoutReader_SetIdleRelaxesToSteadyWindow(t *testing.T) {
+	src := &stallBody{closed: make(chan struct{})}
+	r := NewIdleTimeoutReader(src, 50*time.Millisecond)
+	defer func() { _ = r.Close() }()
+
+	if got := r.Idle(); got != 50*time.Millisecond {
+		t.Fatalf("Idle() = %v, want 50ms", got)
+	}
+	r.SetIdle(200 * time.Millisecond)
+	if got := r.Idle(); got != 200*time.Millisecond {
+		t.Fatalf("Idle() after SetIdle = %v, want 200ms", got)
+	}
+	r.SetIdle(0)
+	r.SetIdle(-time.Second)
+	if got := r.Idle(); got != 200*time.Millisecond {
+		t.Fatalf("Idle() after non-positive SetIdle = %v, want unchanged 200ms", got)
+	}
+
+	// First chunk arrives inside the window; the stall that follows must be
+	// governed by the relaxed 200ms window, not the original 50ms.
+	buf := make([]byte, 64)
+	if _, err := r.Read(buf); err != nil {
+		t.Fatalf("first chunk read failed: %v", err)
+	}
+	start := time.Now()
+	_, err := r.Read(buf)
+	if !errors.Is(err, ErrStreamIdleTimeout) {
+		t.Fatalf("stall error = %v, want ErrStreamIdleTimeout", err)
+	}
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+		t.Fatalf("watchdog fired after %v, want ~200ms relaxed window (not the 50ms first-byte window)", elapsed)
+	}
+}
+
 // TestIdleTimeoutDefaults pins the decoupled lifecycle budgets: 15s TTFT
 // pre-first-byte bound, 30s inter-token idle post-TTFT, 10m generous stream
 // ceiling. A 45s continuous generation fits inside the ceiling with room.

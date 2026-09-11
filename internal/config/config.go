@@ -106,11 +106,41 @@ type Config struct {
 	AI        AIConfig        `yaml:"ai"`
 	Models    ModelConfig     `yaml:"models"`
 	Execution ExecutionConfig `yaml:"execution"`
+	Timeout   TimeoutConfig   `yaml:"timeout,omitempty"`
 	Fallback  FallbackConfig  `yaml:"fallback"`
 	Lynx      LynxConfig      `yaml:"lynx"`
 	MCP       MCPConfig       `yaml:"mcp"`
 	Style     string          `yaml:"style"`
 	Username  string          `yaml:"username"`
+}
+
+// TimeoutConfig carries user-overridable connection timeouts. Durations
+// are strings parsed with time.ParseDuration (e.g. "60s", "1m30s") so the
+// YAML stays human-readable; empty or unparseable values fall back to the
+// dynamic resolver defaults.
+type TimeoutConfig struct {
+	// TTFT overrides the dynamic Time-To-First-Token deadline for every
+	// model (see llm.ResolveTTFTTimeout). Empty means profile-based
+	// resolution.
+	TTFT string `yaml:"ttft,omitempty" json:"ttft,omitempty"`
+}
+
+// TTFTTimeoutOverride parses Timeout.TTFT for the dynamic TTFT resolver.
+// It returns 0 when unset or unparseable so the resolver falls back to the
+// model/provider profile tiers.
+func (c *Config) TTFTTimeoutOverride() time.Duration {
+	if c == nil {
+		return 0
+	}
+	s := strings.TrimSpace(c.Timeout.TTFT)
+	if s == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
 }
 
 type ModelConfig struct {

@@ -104,9 +104,19 @@ func isEngineTraceLine(s string) bool {
 		return true
 	case strings.HasPrefix(lower, "[patch"):
 		return true
+	case strings.HasPrefix(lower, "[plan]"):
+		return true
+	case strings.HasPrefix(lower, "[build]"):
+		return true
+	case strings.HasPrefix(lower, "[stream]"):
+		return true
 	case strings.HasPrefix(lower, "intent parsed:"):
 		return true
 	case strings.HasPrefix(lower, "command received:"):
+		return true
+	case strings.Contains(lower, "received command:"):
+		return true
+	case strings.Contains(lower, "bg worker"):
 		return true
 	case strings.Contains(lower, "stage completed"):
 		return true

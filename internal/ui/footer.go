@@ -20,7 +20,7 @@ import (
 // projection of the interaction lifecycle. It has exactly three states:
 //
 //	a. FRESH LAUNCH  (!sessionHasRunPrompts && !isExecuting)
-//	   Clean startup hint: "<active_model_alias>  ·  Ctrl+H help".
+//	   Clean startup hint: "<active_model_alias>  ·  ? help".
 //	   No token counters, no cost, no zero-value indicators — a brand-new
 //	   session never clutters the footer with idle telemetry.
 //	b. EXECUTING     (isExecuting)
@@ -131,6 +131,58 @@ func truncateModelName(name string, max int) string {
 	return ansi.Truncate(name, max, "…")
 }
 
+// formatModelWithVariant formats the active model string with its reasoning
+// variant badge: `model-id (variant)` when a variant is active, plain
+// `model-id` when the variant is empty or off. The comparison is
+// case-insensitive and trims whitespace; "off", "default" and "none" are all
+// treated as no-variant so the footer never shows `model (off)`.
+func formatModelWithVariant(modelName, variant string) string {
+	v := strings.TrimSpace(variant)
+	if v == "" {
+		return modelName
+	}
+	switch strings.ToLower(v) {
+	case "off", "default", "none":
+		return modelName
+	}
+	if modelName == "" {
+		return v
+	}
+	return modelName + " (" + v + ")"
+}
+
+// activeVariantLabel returns the active model variant / reasoning effort
+// label for the footer badge. Lookup order (first non-empty wins, live on
+// every render so role/variant switches reflect immediately):
+//
+//  1. RuntimeAuthority active binding VariantParams (picker ACTIVATE path).
+//  2. Persisted config Bindings.Active.Variant (survives restarts).
+//  3. Local effort selector (m.currentEffort ←/→ widget, dynamic per turn).
+func (m *model) activeVariantLabel() string {
+	if m == nil {
+		return ""
+	}
+	if m.modelAuthority != nil {
+		if b := m.modelAuthority.ActiveBinding(); b.VariantParams != "" {
+			return string(b.VariantParams)
+		}
+	}
+	if m.cfg != nil && strings.TrimSpace(m.cfg.Bindings.Active.Variant) != "" {
+		return m.cfg.Bindings.Active.Variant
+	}
+	if m.currentEffort != EffortDefault && m.currentEffort != EffortNone {
+		return m.currentEffort.Description()
+	}
+	return ""
+}
+
+// getActiveModelDisplay returns the footer-ready model label: the active
+// model id with the variant badge in parentheses when a variant is active
+// (e.g. `nex-agi/nex-n2.5-mini:free (medium)`), plain id otherwise.
+func (m *model) getActiveModelDisplay() string {
+	return formatModelWithVariant(m.getActiveModelName(), m.activeVariantLabel())
+}
+
 // renderActiveIdleFooterResponsive is the width-responsive, tiered footer
 // core specified in the task. It is a pure function that strictly respects
 // the available terminal width (termWidth):
@@ -161,12 +213,12 @@ func renderActiveIdleFooter(width int, modelName string, inTok, outTok int, ctxP
 }
 
 // renderFreshLaunchFooter renders the clean startup hint for a brand-new
-// session: "<model>  ·  Ctrl+H help". No counters, no cost, no
+// session: "<model>  ·  ? help". No counters, no cost, no
 // zero-value indicators.
 func (m *model) renderFreshLaunchFooter() string {
 	return footerSep(
-		footerModelStyle.Render(m.getActiveModelName()),
-		footerHelpStyle.Render("Ctrl+H help"),
+		footerModelStyle.Render(m.getActiveModelDisplay()),
+		footerHelpStyle.Render("? help"),
 	)
 }
 
@@ -185,7 +237,7 @@ func (m *model) renderFreshLaunchFooter() string {
 func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
 	cost := llm.EnforceFreeModelOverride(m.cfg.ActiveModelName(), m.AccumulatedCost)
 	costStr := llm.FormatCost(cost)
-	modelName := m.getActiveModelName()
+	modelName := m.getActiveModelDisplay()
 	fullUsage := status.FormatUsageContext(m.InputTokens, m.OutputTokens, m.TotalTokens, m.activeContextLimit())
 	compactTok := "↓" + status.FormatTokens(m.InputTokens) + " + ↑" + status.FormatTokens(m.OutputTokens) + " tok"
 
@@ -220,11 +272,39 @@ func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
 	return padRightOverlay(base, chip, width)
 }
 
-// ttftBudget is the Time-To-First-Token deadline the live connection
-// stopwatch counts against (rendered as "/ 15.0s"). It mirrors the 15s
-// request context bound in streamCmd and DefaultTTFTTimeout: the transport
-// header bound (10s cloud) fires first, the context fires at 15s.
-const ttftBudget = 15 * time.Second
+// ttftDuration resolves the live Time-To-First-Token deadline for the
+// active model/provider profile (llm.ResolveTTFTTimeout): reasoning, heavy
+// and free-tier models wait 45s–90s, standard/fast models fail fast at
+// 15s–20s, and config.Timeout.TTFT overrides everything. It is evaluated
+// on every render so model switches, variant changes and config overrides
+// reflect immediately in the countdown.
+func (m *model) ttftDuration() time.Duration {
+	var override time.Duration
+	if m.cfg != nil {
+		override = m.cfg.TTFTTimeoutOverride()
+	}
+	return llm.ResolveTTFTTimeout(llm.ModelSpec{
+		Provider:        m.getActiveProviderName(),
+		ModelID:         m.getActiveModelName(),
+		Variant:         m.activeVariantLabel(),
+		TimeoutOverride: override,
+	})
+}
+
+// ttftProviderModelLabel renders the [{provider/model}] badge for the
+// connecting line. Vendor-prefixed ids (OpenRouter "vendor/model") already
+// encode the path and are used as-is; bare ids are prefixed with the
+// active provider.
+func (m *model) ttftProviderModelLabel() string {
+	display := m.getActiveModelDisplay()
+	if strings.Contains(display, "/") {
+		return display
+	}
+	if prov := m.getActiveProviderName(); prov != "" {
+		return prov + "/" + display
+	}
+	return display
+}
 
 // firstTokenReceived reports whether the first stream token has arrived.
 // The UTF-8 byte buffer is primary: the instant it holds the first valid
@@ -273,14 +353,18 @@ func (m *model) noFirstByteReceived() bool {
 // renderExecutingFooter renders the live EXECUTING bar:
 //
 //	pre-TTFT (no first token yet):
-//	  ⠋ Connecting to provider... 4.2s / 15.0s · [model]  ·  Ctrl+C interrupt
+//	  ⠋ Connecting... 14s [groq/llama-3.3-70b]  ·  Ctrl+C interrupt
 //	post-first-token (live cost burn):
 //	  ⠋ Generating...  ·  ↓<tok> tok ($<cost>)  ·  <rate> tok/s  ·  [model]  ·  Ctrl+C interrupt
 //
-// The pre-TTFT stopwatch re-renders on every FrameTickMsg (30ms) while the
-// first byte is awaited and freezes the moment it arrives. The "/ 15.0s"
-// budget is the internal TTFT threshold; phase details (DNS/TLS/headers)
-// appear exclusively in the TTFTTimeout error event log.
+// The pre-TTFT countdown renders on every FrameTickMsg (30ms) while the
+// first byte is awaited and freezes the moment it arrives. It counts DOWN
+// the dynamic TTFT deadline (ttftDuration: 15s fast models, up to 90s for
+// reasoning/free-tier) as a single integer — stable width, no decimal
+// flicker. remaining = max(0, ttft - elapsed); when it reaches 0 before
+// headers arrive the stall error path reports
+// "provider response stalled: TTFT timeout (<ttft>s elapsed)". Phase
+// details (DNS/TLS/headers) appear exclusively in that error event log.
 // The live tok count is max(authoritative provider stage count, per-chunk
 // live estimate) so the meter advances on every StreamChunkMsg; the cost is
 // C_est = (T_in*P_in + T_out*P_out)/1M seeded at t=0 with 0 output tokens
@@ -299,9 +383,10 @@ func (m *model) renderExecutingFooter() string {
 		)
 	}
 	st := m.stageSnapshot()
-	// Pre-TTFT connection phase: live stopwatch against the TTFT budget.
-	// The timer stops the instant the first token arrives (see
-	// firstTokenReceived) and the bar transitions to token metrics below.
+	// Pre-TTFT connection phase: single-number countdown against the
+	// dynamic TTFT deadline. The timer stops the instant the first token
+	// arrives (see firstTokenReceived) and the bar transitions to token
+	// metrics below.
 	if !m.firstTokenReceived(st) && !m.executionStartedAt.IsZero() && m.isExecuting() {
 		start := m.executionStartedAt
 		if start.IsZero() {
@@ -311,15 +396,19 @@ func (m *model) renderExecutingFooter() string {
 		if elapsed < 0 {
 			elapsed = 0
 		}
-		modelName := m.getActiveModelName()
-		pulse := fmt.Sprintf("Connecting to provider... %.1fs / %.1fs · [%s]",
-			elapsed.Seconds(), ttftBudget.Seconds(), truncateModelName(modelName, 16))
+		ttft := m.ttftDuration()
+		remaining := int((ttft - elapsed).Seconds())
+		if remaining < 0 {
+			remaining = 0
+		}
+		pulse := fmt.Sprintf("Connecting... %ds [%s]",
+			remaining, truncateModelName(m.ttftProviderModelLabel(), 24))
 		return footerSep(
 			m.executingSpinner()+" "+footerExecLabelStyle.Render(pulse),
 			interruptLabelStyle.Render(Icon.Interrupt+" Ctrl+C interrupt"),
 		)
 	}
-	modelName := m.getActiveModelName()
+	modelName := m.getActiveModelDisplay()
 	liveOut := m.streamLiveOutputTokens()
 	costLabel := m.streamCostLabel()
 	return footerSep(
