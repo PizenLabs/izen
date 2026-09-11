@@ -76,6 +76,15 @@ const (
 	EventFailureClassified EventType = "FAILURE_CLASSIFIED"
 	EventWorkerHandoff     EventType = "WORKER_HANDOFF"
 	EventTaskPaused        EventType = "TASK_PAUSED"
+	// Phase 3 (adaptive context engine) events: evidence-pressure signals
+	// gating context-tier expansion, verified negative knowledge, and
+	// context-tier transitions. Expansion requires a recorded
+	// EVIDENCE_PRESSURE event; self-reported model confidence never
+	// expands context on its own.
+	EventEvidencePressure       EventType = "EVIDENCE_PRESSURE"
+	EventNegativeKnowledge      EventType = "NEGATIVE_KNOWLEDGE_RECORDED"
+	EventNegativeKnowledgeStale EventType = "NEGATIVE_KNOWLEDGE_STALED"
+	EventContextTierAdvanced    EventType = "CONTEXT_TIER_ADVANCED"
 )
 
 // IsTruthBoundary reports whether the event type requires an explicit
@@ -97,6 +106,26 @@ type LedgerEvent struct {
 	EventType EventType      `json:"eventType"`
 	Payload   map[string]any `json:"payload"`
 }
+
+// NegativeKnowledgeRecord is the durable projection of one verified
+// negative-knowledge entry. The full hypothesis lifecycle lives in
+// internal/runtime/adaptive; the store keeps only what replay needs:
+// identity, scope, status and evidence references.
+type NegativeKnowledgeRecord struct {
+	ID           string   `json:"id"`
+	Hypothesis   string   `json:"hypothesis"`
+	WhyRejected  string   `json:"whyRejected"`
+	EvidenceRefs []string `json:"evidenceRefs,omitempty"`
+	TargetScope  []string `json:"targetScope,omitempty"`
+	Status       string   `json:"status"`
+}
+
+// Phase 3 status constants mirror adaptive.StatusActive/Stale without
+// importing it (durable is the bottom of the dependency chain).
+const (
+	NegativeStatusActive = "ACTIVE"
+	NegativeStatusStale  = "STALE"
+)
 
 // LockMetadata is the JSON payload stored in .izen/runtime/lock.
 type LockMetadata struct {

@@ -64,6 +64,21 @@ type ResumeContract struct {
 	CheckpointID string        `json:"checkpointId"`
 	ResumeReason FailureReason `json:"resumeReason"`
 	AllowedTools []string      `json:"allowedTools,omitempty"`
+	// NegativeConstraints carries Phase 3 verified negative knowledge:
+	// disproven hypotheses serialized as immutable constraints. Only
+	// ACTIVE entries matching the capsule scope are attached; STALE
+	// entries are withheld. Omitted when empty.
+	NegativeConstraints []NegativeConstraint `json:"negativeConstraints,omitempty"`
+}
+
+// NegativeConstraint is the ephemeral projection of one ACTIVE negative
+// knowledge entry. It mirrors adaptive.NegativeKnowledge without importing
+// it (ephemeral sits below adaptive in the dependency chain).
+type NegativeConstraint struct {
+	Hypothesis   string   `json:"hypothesis"`
+	WhyRejected  string   `json:"whyRejected,omitempty"`
+	EvidenceRefs []string `json:"evidenceRefs,omitempty"`
+	TargetScope  []string `json:"targetScope,omitempty"`
 }
 
 // CapsuleSource is the task-level context the runtime supplies when

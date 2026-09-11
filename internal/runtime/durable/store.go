@@ -29,6 +29,13 @@ type TaskStore struct {
 
 	tasks     map[string]*TaskState
 	currentID string
+
+	// Phase 3 adaptive state (derived from ledger replay, like tasks):
+	// per-task context ladder tier, recorded evidence-pressure signals,
+	// and negative-knowledge entries (active + stale).
+	contextTiers map[string]int
+	pressures    map[string][]LedgerEvent
+	negatives    map[string][]NegativeKnowledgeRecord
 }
 
 // SnapshotFile is the on-disk shape of snapshot.json: purely derived,
@@ -43,12 +50,15 @@ func NewTaskStore(workDir string) *TaskStore {
 	clean := filepath.Clean(workDir)
 	rt := filepath.Join(clean, ".izen", "runtime")
 	return &TaskStore{
-		workDir:    clean,
-		runtimeDir: rt,
-		ledgerPath: filepath.Join(rt, "ledger.ndjson"),
-		snapPath:   filepath.Join(rt, "snapshot.json"),
-		lock:       NewFileLock(clean),
-		tasks:      make(map[string]*TaskState),
+		workDir:      clean,
+		runtimeDir:   rt,
+		ledgerPath:   filepath.Join(rt, "ledger.ndjson"),
+		snapPath:     filepath.Join(rt, "snapshot.json"),
+		lock:         NewFileLock(clean),
+		tasks:        make(map[string]*TaskState),
+		contextTiers: make(map[string]int),
+		pressures:    make(map[string][]LedgerEvent),
+		negatives:    make(map[string][]NegativeKnowledgeRecord),
 	}
 }
 
@@ -258,6 +268,207 @@ func (s *TaskStore) PauseTask(taskID, reason string) error {
 	return nil
 }
 
+// ── Phase 3: adaptive context engine ──
+
+// RecordEvidencePressure appends EVIDENCE_PRESSURE. Context-tier expansion
+// is valid ONLY when a matching pressure event exists in ledger.ndjson;
+// self-reported model confidence alone never expands context.
+func (s *TaskStore) RecordEvidencePressure(taskID, signal, detail string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(taskID) == "" {
+		return fmt.Errorf("durable: empty task id")
+	}
+	if strings.TrimSpace(signal) == "" {
+		return fmt.Errorf("durable: empty evidence-pressure signal")
+	}
+	ev := newEvent(taskID, EventEvidencePressure, map[string]any{
+		"signal": signal,
+		"detail": detail,
+	})
+	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
+		return err
+	}
+	s.apply(ev)
+	return nil
+}
+
+// HasEvidencePressure reports whether any EVIDENCE_PRESSURE event with the
+// given signal exists for the task. Empty signal matches any pressure.
+func (s *TaskStore) HasEvidencePressure(taskID, signal string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ev := range s.pressures[taskID] {
+		if signal == "" || strField(ev.Payload, "signal") == signal {
+			return true
+		}
+	}
+	return false
+}
+
+// RecordNegativeKnowledge appends NEGATIVE_KNOWLEDGE_RECORDED for a
+// hypothesis disproven with concrete evidence (failed build, failing test,
+// static-analysis error). Empty hypothesis/evidence is rejected: negative
+// knowledge requires evidence, never bare model assertion.
+func (s *TaskStore) RecordNegativeKnowledge(taskID string, rec NegativeKnowledgeRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(taskID) == "" {
+		return fmt.Errorf("durable: empty task id")
+	}
+	if strings.TrimSpace(rec.Hypothesis) == "" {
+		return fmt.Errorf("durable: empty negative-knowledge hypothesis")
+	}
+	if len(rec.EvidenceRefs) == 0 {
+		return fmt.Errorf("durable: negative knowledge requires evidence refs")
+	}
+	if strings.TrimSpace(rec.ID) == "" {
+		rec.ID = newID()
+	}
+	if strings.TrimSpace(rec.Status) == "" {
+		rec.Status = NegativeStatusActive
+	}
+	ev := newEvent(taskID, EventNegativeKnowledge, map[string]any{
+		"id":           rec.ID,
+		"hypothesis":   rec.Hypothesis,
+		"whyRejected":  rec.WhyRejected,
+		"evidenceRefs": rec.EvidenceRefs,
+		"targetScope":  rec.TargetScope,
+		"status":       rec.Status,
+	})
+	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
+		return err
+	}
+	s.apply(ev)
+	return nil
+}
+
+// NegativeKnowledge returns a copy of all negative-knowledge records for a task.
+func (s *TaskStore) NegativeKnowledge(taskID string) []NegativeKnowledgeRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]NegativeKnowledgeRecord(nil), s.negatives[taskID]...)
+}
+
+// ActiveNegativeKnowledge returns only ACTIVE records matching scope.
+// Empty scope matches all active records.
+func (s *TaskStore) ActiveNegativeKnowledge(taskID string, scope []string) []NegativeKnowledgeRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []NegativeKnowledgeRecord
+	for _, r := range s.negatives[taskID] {
+		if r.Status != NegativeStatusActive {
+			continue
+		}
+		if len(scope) > 0 && len(r.TargetScope) > 0 && !scopesOverlap(r.TargetScope, scope) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// MarkNegativeKnowledgeStale appends NEGATIVE_KNOWLEDGE_STALED for one entry.
+// Called on RE_PLAN / structural scope shifts that invalidate the
+// preconditions of a rejected hypothesis.
+func (s *TaskStore) MarkNegativeKnowledgeStale(taskID, id, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	found := false
+	for _, r := range s.negatives[taskID] {
+		if r.ID == id {
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("durable: negative knowledge %q not found for task %q", id, taskID)
+	}
+	ev := newEvent(taskID, EventNegativeKnowledgeStale, map[string]any{
+		"id":     id,
+		"reason": reason,
+	})
+	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
+		return err
+	}
+	s.apply(ev)
+	return nil
+}
+
+// MarkStaleOnScopeShift transitions to STALE every ACTIVE record whose
+// TargetScope no longer overlaps newScope. Records with an empty
+// TargetScope are scope-universal and are retained. Returns the count
+// transitioned. An empty newScope transitions nothing.
+func (s *TaskStore) MarkStaleOnScopeShift(taskID string, newScope []string, reason string) (int, error) {
+	if len(newScope) == 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	staleIDs := make([]string, 0)
+	for _, r := range s.negatives[taskID] {
+		if r.Status != NegativeStatusActive || len(r.TargetScope) == 0 {
+			continue
+		}
+		if !scopesOverlap(r.TargetScope, newScope) {
+			staleIDs = append(staleIDs, r.ID)
+		}
+	}
+	s.mu.Unlock()
+	count := 0
+	for _, id := range staleIDs {
+		if err := s.MarkNegativeKnowledgeStale(taskID, id, reason); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+// AdvanceContextTier appends CONTEXT_TIER_ADVANCED and records the new tier.
+// Callers MUST have recorded a matching EVIDENCE_PRESSURE event first;
+// this method does not itself verify that invariant (the adaptive planner
+// enforces it) so replay stays a pure fold.
+func (s *TaskStore) AdvanceContextTier(taskID string, tier int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if tier < 0 || tier > 4 {
+		return fmt.Errorf("durable: context tier %d out of range [0,4]", tier)
+	}
+	ev := newEvent(taskID, EventContextTierAdvanced, map[string]any{
+		"tier": tier,
+	})
+	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
+		return err
+	}
+	s.apply(ev)
+	return nil
+}
+
+// ContextTier returns the persisted ladder tier for a task (default L0).
+func (s *TaskStore) ContextTier(taskID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.contextTiers[taskID]
+}
+
+func scopesOverlap(a, b []string) bool {
+	for _, x := range a {
+		nx := strings.TrimSpace(x)
+		if nx == "" {
+			continue
+		}
+		for _, y := range b {
+			ny := strings.TrimSpace(y)
+			if ny == "" {
+				continue
+			}
+			if nx == ny || strings.HasPrefix(nx, ny) || strings.HasPrefix(ny, nx) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // State returns a copy of the materialized task state.
 func (s *TaskStore) State(taskID string) (TaskState, bool) {
 	s.mu.Lock()
@@ -417,6 +628,9 @@ func (s *TaskStore) appendLocked(ev LedgerEvent) error {
 // runtime recovers to the last coherent prefix.
 func (s *TaskStore) replayLocked() error {
 	s.tasks = make(map[string]*TaskState)
+	s.contextTiers = make(map[string]int)
+	s.pressures = make(map[string][]LedgerEvent)
+	s.negatives = make(map[string][]NegativeKnowledgeRecord)
 	s.currentID = ""
 	f, err := os.Open(s.ledgerPath)
 	if err != nil {
@@ -547,6 +761,44 @@ func (s *TaskStore) apply(ev LedgerEvent) {
 	case EventTaskPaused:
 		t := ensureTask(s.tasks, ev.TaskID)
 		t.Status = TaskPaused
+		s.currentID = ev.TaskID
+	case EventEvidencePressure:
+		s.pressures[ev.TaskID] = append(s.pressures[ev.TaskID], ev)
+		s.currentID = ev.TaskID
+	case EventNegativeKnowledge:
+		rec := NegativeKnowledgeRecord{
+			ID:           strField(ev.Payload, "id"),
+			Hypothesis:   strField(ev.Payload, "hypothesis"),
+			WhyRejected:  strField(ev.Payload, "whyRejected"),
+			EvidenceRefs: payloadStrings(ev.Payload["evidenceRefs"]),
+			TargetScope:  payloadStrings(ev.Payload["targetScope"]),
+			Status:       NegativeStatusActive,
+		}
+		if st, _ := ev.Payload["status"].(string); st != "" {
+			rec.Status = st
+		}
+		s.negatives[ev.TaskID] = append(s.negatives[ev.TaskID], rec)
+		s.currentID = ev.TaskID
+	case EventNegativeKnowledgeStale:
+		id := strField(ev.Payload, "id")
+		for i, r := range s.negatives[ev.TaskID] {
+			if r.ID == id {
+				s.negatives[ev.TaskID][i].Status = NegativeStatusStale
+			}
+		}
+		s.currentID = ev.TaskID
+	case EventContextTierAdvanced:
+		if s.contextTiers == nil {
+			s.contextTiers = make(map[string]int)
+		}
+		tier := 0
+		switch v := ev.Payload["tier"].(type) {
+		case float64:
+			tier = int(v)
+		case int:
+			tier = v
+		}
+		s.contextTiers[ev.TaskID] = tier
 		s.currentID = ev.TaskID
 	}
 }
