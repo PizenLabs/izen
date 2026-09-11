@@ -450,6 +450,32 @@ func (s *TaskStore) ContextTier(taskID string) int {
 	return s.contextTiers[taskID]
 }
 
+// RecordCustomEvent appends an audit-lineage event that carries no
+// materialized state transition (Phase 4 guard/gateway lineage:
+// SCOPE_VIOLATION_REJECTED, STRUCTURAL_AMBIGUITY, PROPOSAL_AUTHORIZED,
+// WORKSPACE_SWITCHED). The event is durable in ledger.ndjson and survives
+// snapshot rebuild; replay folds it as a currentID touch only so task
+// identity and cursor state are never rewritten by audit events.
+func (s *TaskStore) RecordCustomEvent(taskID string, typ EventType, payload map[string]any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(taskID) == "" {
+		return fmt.Errorf("durable: empty task id")
+	}
+	if typ == "" {
+		return fmt.Errorf("durable: empty event type")
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	ev := newEvent(taskID, typ, payload)
+	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
+		return err
+	}
+	s.apply(ev)
+	return nil
+}
+
 func scopesOverlap(a, b []string) bool {
 	for _, x := range a {
 		nx := strings.TrimSpace(x)
@@ -800,6 +826,13 @@ func (s *TaskStore) apply(ev LedgerEvent) {
 		}
 		s.contextTiers[ev.TaskID] = tier
 		s.currentID = ev.TaskID
+	case EventScopeViolationRejected, EventStructuralAmbiguity,
+		EventProposalAuthorized, EventWorkspaceSwitched:
+		// Phase 4 audit lineage: durable in the ledger, no materialized
+		// state transition. Task identity, cursor, checkpoint, evidence
+		// and negative knowledge are preserved verbatim.
+		s.currentID = ev.TaskID
+		ensureTask(s.tasks, ev.TaskID)
 	}
 }
 

@@ -85,6 +85,14 @@ const (
 	EventNegativeKnowledge      EventType = "NEGATIVE_KNOWLEDGE_RECORDED"
 	EventNegativeKnowledgeStale EventType = "NEGATIVE_KNOWLEDGE_STALED"
 	EventContextTierAdvanced    EventType = "CONTEXT_TIER_ADVANCED"
+	// Phase 4 (scope guard & multi-workspace continuity) events: hard
+	// scope rejections at the guard boundary, structural ambiguity
+	// routing, authorization decisions, and workspace policy switches.
+	// None of these mutate task identity; they are audit lineage only.
+	EventScopeViolationRejected EventType = "SCOPE_VIOLATION_REJECTED"
+	EventStructuralAmbiguity    EventType = "STRUCTURAL_AMBIGUITY"
+	EventProposalAuthorized     EventType = "PROPOSAL_AUTHORIZED"
+	EventWorkspaceSwitched      EventType = "WORKSPACE_SWITCHED"
 )
 
 // IsTruthBoundary reports whether the event type requires an explicit
