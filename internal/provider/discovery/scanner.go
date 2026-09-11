@@ -157,10 +157,10 @@ func ParseOllamaTags(data []byte) []OllamaModel {
 	return out
 }
 
-// DiscoverProviders merges detector results (env with precedence + file
-// credentials) with live extras: the GOOGLE_API_KEY/DEEPSEEK_API_KEY aliases
-// and the Ollama local runtime (no key required). Ollama is appended only
-// when its /api/tags probe responds. Results are deduplicated by provider
+// DiscoverProviders merges detector results (config.yml with precedence,
+// then env, then file credentials) with live extras: the
+// GOOGLE_API_KEY/DEEPSEEK_API_KEY aliases and the Ollama local runtime (no
+// key required). Ollama is appended only when its /api/tags probe responds. Results are deduplicated by provider
 // name; detector entries win on conflict except the gemini alias, which
 // backfills only when gemini is otherwise absent.
 func DiscoverProviders(ctx context.Context) []detector.ProviderConfig {

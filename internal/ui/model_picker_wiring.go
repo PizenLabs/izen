@@ -328,27 +328,47 @@ func (m *model) persistPickerState() {
 }
 
 // applySaveProviderKey persists an API key submitted by the secure inline
-// API-key overlay into the unified config store, mirrors it into the process
-// env so live discovery sees it immediately, and kicks off a background
-// catalog refresh for the newly-configured provider. The modal stays open so
-// the user can pick a model right away.
+// API-key overlay into the unified config store (~/.izen/config.yml, which
+// takes precedence over environment variables), mirrors it into the live
+// session config struct and the process env, hot-reloads the runtime HTTP
+// client bearer token immediately, and kicks off a background catalog
+// refresh for the newly-configured provider. The modal stays open so the
+// user can pick a model right away, and subsequent prompt submissions in the
+// same session use the newly saved key with no restart.
 func (m *model) applySaveProviderKey(msg model_picker.SaveProviderKeyMsg) tea.Cmd {
-	if msg.Provider == "" {
+	provider := strings.ToLower(strings.TrimSpace(msg.Provider))
+	apiKey := strings.TrimSpace(msg.APIKey)
+	if provider == "" {
 		return nil
 	}
-	if err := config.SaveProviderAPIKey(msg.Provider, msg.APIKey); err != nil {
+	if err := config.SaveProviderAPIKey(provider, apiKey); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] API key save failed: %s", err.Error()))
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
 		return nil
 	}
-	// Mirror into the process env so detector.DiscoverProviders and the live
-	// registry sync pick it up without a restart.
-	envName := strings.ToUpper(msg.Provider) + "_API_KEY"
-	if os.Getenv(envName) == "" {
-		_ = os.Setenv(envName, msg.APIKey)
+	// Mirror into the live session config struct (m.cfg may be a different
+	// pointer than the global singleton SaveProviderAPIKey refreshes).
+	if m.cfg != nil {
+		if m.cfg.AI.Providers == nil {
+			m.cfg.AI.Providers = make(map[string]config.AIProviderConfig)
+		}
+		prov := m.cfg.AI.Providers[provider]
+		prov.APIKey = apiKey
+		if strings.TrimSpace(prov.BaseURL) == "" {
+			prov.BaseURL = config.WellKnownBaseURL(provider)
+		}
+		m.cfg.AI.Providers[provider] = prov
 	}
-	m.push(roleSystem, fmt.Sprintf("✓ API key saved for %s — refreshing catalog", msg.Provider))
+	// Mirror into the process env so env-only readers (live discovery,
+	// detector fallbacks) see the new key immediately. The saved config.yml
+	// value remains authoritative under the strict precedence.
+	if envName := config.EnvVarForProvider(provider); envName != "" {
+		_ = os.Setenv(envName, apiKey)
+	}
+	// Re-initialize the live HTTP client bearer token now.
+	m.hotReloadProviderKey(provider, apiKey)
+	m.push(roleSystem, fmt.Sprintf("✓ API key saved for %s — refreshing catalog", provider))
 	m.refreshViewportContent()
 	m.gotoBottomIfAllowed()
 	return m.refreshModelRegistryCmd()

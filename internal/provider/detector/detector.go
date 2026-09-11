@@ -1,6 +1,7 @@
 // Package detector implements provider auto-detection for Phase 1.
 //
-// Precedence: environment variables always override credentials stored in
+// Precedence: explicit keys in ~/.izen/config.yml always override
+// environment variables, which in turn override credentials stored in
 // ~/.izen/credentials/providers.json. Detection performs no network I/O
 // and never writes credentials.
 package detector
@@ -9,6 +10,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // ProviderConfig describes a single detected provider credential.
@@ -16,8 +20,9 @@ type ProviderConfig struct {
 	Name    string `json:"name"`
 	APIKey  string `json:"api_key"`
 	BaseURL string `json:"base_url"`
-	// Source is "env" when the key came from the environment and "file"
-	// when it was loaded from providers.json. It is never persisted.
+	// Source is "config" when the key was explicitly saved in
+	// ~/.izen/config.yml, "env" when it came from the environment, and
+	// "file" when it was loaded from providers.json. It is never persisted.
 	Source string `json:"-"`
 }
 
@@ -63,9 +68,14 @@ type fileProvider struct {
 	BaseURL string `json:"base_url"`
 }
 
-// DetectProviders scans environment variables with absolute precedence and
-// merges credentials from ~/.izen/credentials/providers.json.
-// Environment keys MUST override file credentials for the same provider.
+// DetectProviders scans credentials with strict precedence:
+//
+//  1. Explicit keys saved in ~/.izen/config.yml (highest — user intent).
+//  2. Environment variables (e.g. OPENROUTER_API_KEY from ~/.zshrc).
+//  3. Credentials in ~/.izen/credentials/providers.json (OAuth/token file).
+//
+// Environment keys still override the legacy token file, but an explicit
+// config.yml key always wins over both.
 func DetectProviders() []ProviderConfig {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -82,7 +92,9 @@ func DetectProvidersWithHome(home string) []ProviderConfig {
 		return env
 	}
 	fileCreds := loadFileCredentials(filepath.Join(home, ".izen", "credentials", "providers.json"))
-	return mergeProviders(env, fileCreds)
+	merged := mergeProviders(env, fileCreds)
+	configCreds := loadConfigFileCredentials(filepath.Join(home, ".izen", "config.yml"))
+	return mergeProviders(configCreds, merged)
 }
 
 // detectFromEnv returns one ProviderConfig per set, non-empty env var.
@@ -191,21 +203,73 @@ func normalizeFileProviders(entries []fileProvider) []ProviderConfig {
 	return out
 }
 
-// mergeProviders overlays env providers on top of file credentials by name.
-// Env entries win; file-only entries are appended.
-func mergeProviders(env, file []ProviderConfig) []ProviderConfig {
-	seen := make(map[string]struct{}, len(env)+len(file))
-	out := make([]ProviderConfig, 0, len(env)+len(file))
-	for _, p := range env {
+// mergeProviders overlays higher-precedence providers on top of
+// lower-precedence credentials by name. Entries in high win; entries only in
+// low are appended. Callers chain it: config.yml over (env over token file).
+func mergeProviders(high, low []ProviderConfig) []ProviderConfig {
+	seen := make(map[string]struct{}, len(high)+len(low))
+	out := make([]ProviderConfig, 0, len(high)+len(low))
+	for _, p := range high {
 		seen[p.Name] = struct{}{}
 		out = append(out, p)
 	}
-	for _, p := range file {
+	for _, p := range low {
 		if _, ok := seen[p.Name]; ok {
 			continue
 		}
 		seen[p.Name] = struct{}{}
 		out = append(out, p)
+	}
+	return out
+}
+
+// configFileShape mirrors the subset of ~/.izen/config.yml this package may
+// read: the ai.providers map. Unknown keys are ignored so the full
+// application config stays compatible.
+type configFileShape struct {
+	AI struct {
+		Providers map[string]struct {
+			APIKey  string `yaml:"api_key"`
+			BaseURL string `yaml:"base_url"`
+		} `yaml:"providers"`
+	} `yaml:"ai"`
+}
+
+// loadConfigFileCredentials reads explicit provider keys from
+// ~/.izen/config.yml. Only literally-saved keys participate: values that are
+// empty or still carry a ${ENV_VAR} placeholder reference the shell
+// environment, so they are skipped here and resolve through the env layer
+// instead (which keeps their Source as "env"). Explicit keys return with
+// Source "config" and the configured (or well-known) base URL.
+func loadConfigFileCredentials(path string) []ProviderConfig {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var cf configFileShape
+	if err := yaml.Unmarshal(data, &cf); err != nil {
+		return nil
+	}
+	out := make([]ProviderConfig, 0, len(cf.AI.Providers))
+	for name, p := range cf.AI.Providers {
+		key := strings.TrimSpace(p.APIKey)
+		if key == "" || strings.Contains(key, "${") {
+			continue
+		}
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		base := strings.TrimSpace(p.BaseURL)
+		if base == "" {
+			base = defaultBaseURL(name)
+		}
+		out = append(out, ProviderConfig{
+			Name:    name,
+			APIKey:  key,
+			BaseURL: base,
+			Source:  "config",
+		})
 	}
 	return out
 }

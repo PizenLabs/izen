@@ -11,6 +11,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/llm"
+	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/runtime/authority"
 )
 
@@ -69,7 +70,7 @@ func (m *model) runUsageCmd() tea.Cmd {
 	for name, envVar := range validProviders {
 		available := m.isProviderAvailable(name, envVar)
 		status := "[×]"
-		detail := fmt.Sprintf("missing %s", envVar)
+		detail := fmt.Sprintf("missing %s (or config providers.%s.api_key)", envVar, name)
 		if available {
 			status = "[✓]"
 			detail = "configured"
@@ -93,7 +94,20 @@ func (m *model) isProviderAvailable(name, envVar string) bool {
 		_, ok := m.cfg.AI.Providers["ollama"]
 		return ok
 	}
-	return os.Getenv(envVar) != ""
+	// Strict precedence: an explicit key saved in ~/.izen/config.yml counts
+	// as configured even when the shell environment variable is unset, and
+	// it wins when both are set.
+	if m.cfg != nil {
+		if p, ok := m.cfg.AI.Providers[name]; ok {
+			if strings.TrimSpace(p.APIKey) != "" {
+				return true
+			}
+		}
+	}
+	if envVar == "" {
+		envVar = config.EnvVarForProvider(name)
+	}
+	return strings.TrimSpace(os.Getenv(envVar)) != ""
 }
 
 func (m *model) switchProvider(name string) tea.Cmd {
@@ -226,6 +240,87 @@ func modelBelongsToProvider(provider, model string) bool {
 		return !isOpenRouterStyle
 	default:
 		return true
+	}
+}
+
+// buildProviderInstance constructs a live ai.Provider for name bound to the
+// given key/baseURL/model. It mirrors the composition-root registration
+// (runtime/compose registerProviders) so a hot-reloaded key produces the
+// identical client the next prompt submission will use. Unknown providers
+// yield nil (never a fabricated client).
+func buildProviderInstance(name, apiKey, baseURL, model string) ai.Provider {
+	switch name {
+	case "ollama":
+		return providers.NewOllamaProvider(baseURL, apiKey, model)
+	case "openrouter":
+		return providers.NewOpenRouterProvider(apiKey, model, baseURL)
+	case "openai":
+		return providers.NewOpenAIProvider(apiKey, model)
+	case "anthropic":
+		return providers.NewClaudeProvider(apiKey, model)
+	case "gemini":
+		return providers.NewGeminiProvider(apiKey, model)
+	case "groq":
+		return providers.NewGroqProvider(apiKey, model, baseURL)
+	case "opencode":
+		return providers.NewOpenCodeProvider(apiKey, model, baseURL)
+	case "9router":
+		return providers.NewNineRouterProvider(apiKey, model, baseURL)
+	default:
+		return nil
+	}
+}
+
+// hotReloadProviderKey re-initializes the live runtime client for provider
+// immediately after its API key is saved: the rebuilt instance (carrying the
+// new bearer token) is re-registered on the provider manager, and when the
+// provider is the session-active one, m.provider plus the plan/stream
+// engines and the runtime executor are re-bound to it. Subsequent prompt
+// submissions in the same session therefore use the newly saved key with no
+// restart. All nil-guard branches are no-ops for test harnesses.
+func (m *model) hotReloadProviderKey(provider, apiKey string) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	apiKey = strings.TrimSpace(apiKey)
+	if provider == "" || apiKey == "" {
+		return
+	}
+	baseURL := ""
+	defModel := ""
+	if m.cfg != nil {
+		if p, ok := m.cfg.AI.Providers[provider]; ok {
+			baseURL = p.BaseURL
+			defModel = p.DefaultModel
+		}
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = config.WellKnownBaseURL(provider)
+	}
+	inst := buildProviderInstance(provider, apiKey, baseURL, defModel)
+	if inst == nil {
+		return
+	}
+	if m.mgr != nil {
+		m.mgr.Register(provider, inst)
+		if got, ok := m.mgr.Get(provider); ok {
+			inst = got
+		}
+	}
+	active := ""
+	if m.provider != nil {
+		active = m.provider.Name()
+	} else if m.cfg != nil {
+		active = m.cfg.ActiveProviderName()
+	}
+	if active != "" && active != provider {
+		return
+	}
+	m.provider = inst
+	if m.planEngine != nil {
+		m.planEngine.SetProvider(m.provider.Execute)
+		m.planEngine.SetStreamProvider(m.provider.ExecuteStream)
+	}
+	if m.executor != nil {
+		m.executor.SetProvider(inst)
 	}
 }
 
