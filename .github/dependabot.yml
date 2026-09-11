@@ -8,25 +8,18 @@ updates:
       day: "monday"
       time: "09:00"
     open-pull-requests-limit: 10
+    groups:
+      go-patch-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+          - "minor"
     labels:
       - "dependencies"
       - "go"
     commit-message:
-      prefix: "chore(deps)"
-      include: "scope"
-
-  - package-ecosystem: "cargo"
-    directory: "/lynx"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "rust"
-    commit-message:
-      prefix: "chore(deps)"
+      prefix: "chore"
       include: "scope"
 
   - package-ecosystem: "github-actions"
@@ -36,9 +29,16 @@ updates:
       day: "monday"
       time: "09:00"
     open-pull-requests-limit: 10
+    groups:
+      actions-patch-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+          - "minor"
     labels:
       - "dependencies"
       - "github-actions"
     commit-message:
-      prefix: "chore(deps)"
+      prefix: "chore"
       include: "scope"

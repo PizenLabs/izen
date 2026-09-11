@@ -859,33 +859,59 @@ func (a *Application) Close() {
 }
 
 // registerProviders registers every configured AI provider onto the manager.
+// API keys resolve with strict precedence: an explicit key saved in
+// ~/.izen/config.yml wins over the shell environment variable, which is the
+// fallback when the config block is absent or empty. A provider with neither
+// is skipped (never registered with an empty key).
 func registerProviders(cfg *config.Config, mgr *ai.Manager) {
 	if cfg == nil || mgr == nil {
 		return
 	}
-	if provCfg, ok := cfg.AI.Providers["ollama"]; ok && provCfg.APIKey != "" {
-		mgr.Register("ollama", providers.NewOllamaProvider(provCfg.BaseURL, provCfg.APIKey, provCfg.DefaultModel))
+	provCfgFor := func(name string) config.AIProviderConfig {
+		if cfg.AI.Providers != nil {
+			if p, ok := cfg.AI.Providers[name]; ok {
+				return p
+			}
+		}
+		return config.AIProviderConfig{BaseURL: config.WellKnownBaseURL(name)}
 	}
-	if provCfg, ok := cfg.AI.Providers["openrouter"]; ok && provCfg.APIKey != "" {
-		mgr.Register("openrouter", providers.NewOpenRouterProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
+	baseURLFor := func(name string, p config.AIProviderConfig) string {
+		if strings.TrimSpace(p.BaseURL) != "" {
+			return p.BaseURL
+		}
+		return config.WellKnownBaseURL(name)
 	}
-	if provCfg, ok := cfg.AI.Providers["openai"]; ok && provCfg.APIKey != "" {
-		mgr.Register("openai", providers.NewOpenAIProvider(provCfg.APIKey, provCfg.DefaultModel))
+	if key := cfg.ResolveAPIKey("ollama"); key != "" {
+		p := provCfgFor("ollama")
+		mgr.Register("ollama", providers.NewOllamaProvider(baseURLFor("ollama", p), key, p.DefaultModel))
 	}
-	if provCfg, ok := cfg.AI.Providers["anthropic"]; ok && provCfg.APIKey != "" {
-		mgr.Register("anthropic", providers.NewClaudeProvider(provCfg.APIKey, provCfg.DefaultModel))
+	if key := cfg.ResolveAPIKey("openrouter"); key != "" {
+		p := provCfgFor("openrouter")
+		mgr.Register("openrouter", providers.NewOpenRouterProvider(key, p.DefaultModel, baseURLFor("openrouter", p)))
 	}
-	if provCfg, ok := cfg.AI.Providers["gemini"]; ok && provCfg.APIKey != "" {
-		mgr.Register("gemini", providers.NewGeminiProvider(provCfg.APIKey, provCfg.DefaultModel))
+	if key := cfg.ResolveAPIKey("openai"); key != "" {
+		p := provCfgFor("openai")
+		mgr.Register("openai", providers.NewOpenAIProvider(key, p.DefaultModel))
 	}
-	if provCfg, ok := cfg.AI.Providers["groq"]; ok && provCfg.APIKey != "" {
-		mgr.Register("groq", providers.NewGroqProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
+	if key := cfg.ResolveAPIKey("anthropic"); key != "" {
+		p := provCfgFor("anthropic")
+		mgr.Register("anthropic", providers.NewClaudeProvider(key, p.DefaultModel))
 	}
-	if provCfg, ok := cfg.AI.Providers["opencode"]; ok && provCfg.APIKey != "" {
-		mgr.Register("opencode", providers.NewOpenCodeProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
+	if key := cfg.ResolveAPIKey("gemini"); key != "" {
+		p := provCfgFor("gemini")
+		mgr.Register("gemini", providers.NewGeminiProvider(key, p.DefaultModel))
 	}
-	if provCfg, ok := cfg.AI.Providers["9router"]; ok && provCfg.APIKey != "" {
-		mgr.Register("9router", providers.NewNineRouterProvider(provCfg.APIKey, provCfg.DefaultModel, provCfg.BaseURL))
+	if key := cfg.ResolveAPIKey("groq"); key != "" {
+		p := provCfgFor("groq")
+		mgr.Register("groq", providers.NewGroqProvider(key, p.DefaultModel, baseURLFor("groq", p)))
+	}
+	if key := cfg.ResolveAPIKey("opencode"); key != "" {
+		p := provCfgFor("opencode")
+		mgr.Register("opencode", providers.NewOpenCodeProvider(key, p.DefaultModel, baseURLFor("opencode", p)))
+	}
+	if key := cfg.ResolveAPIKey("9router"); key != "" {
+		p := provCfgFor("9router")
+		mgr.Register("9router", providers.NewNineRouterProvider(key, p.DefaultModel, baseURLFor("9router", p)))
 	}
 }
 

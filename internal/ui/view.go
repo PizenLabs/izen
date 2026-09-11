@@ -663,18 +663,18 @@ func (m *model) renderHelpOverlay() string {
 		"",
 		subtleStyle.Render("  ─── Commands ───"),
 		"  " + dimmedStyle.Render("/help  /?  /objective  /clear  /drop  /undo  /copy"),
-		"  " + dimmedStyle.Render("/commit  /checkpoint  /arch  /copy-mode  /quit"),
+		"  " + dimmedStyle.Render("/commit  /checkpoint  /arch  /quit"),
 		"  " + dimmedStyle.Render("!<cmd>          run a shell command"),
 		"  " + dimmedStyle.Render("@<path>         attach a file"),
 		"",
 		subtleStyle.Render("  ─── Shortcuts ───"),
-		"  " + dimmedStyle.Render("Esc (×3)        toggle vi-navigation mode (/copy-mode)"),
+		"  " + dimmedStyle.Render("Esc (×3)        toggle vi-navigation copy mode"),
 		"  " + dimmedStyle.Render("Esc (×3)        quit IZEN (normal mode)"),
 		"  " + dimmedStyle.Render("↑/↓             history navigation"),
 		"  " + dimmedStyle.Render("Tab/Enter       complete autocomplete"),
 		"  " + dimmedStyle.Render("?               toggle this help overlay"),
 		"",
-		subtleStyle.Render("  ─── Vi Navigation Mode (/copy-mode) ───"),
+		subtleStyle.Render("  ─── Vi Navigation Mode ───"),
 		"  " + dimmedStyle.Render("j/k             cursor down/up (line-wise)"),
 		"  " + dimmedStyle.Render("h/l             cursor left/right (character-wise)"),
 		"  " + dimmedStyle.Render("0/$             jump to line start/end"),
@@ -761,7 +761,7 @@ func (m *model) renderRuntimeStatus(width int) string {
 
 	// Model name — dropped after language when the pane is too narrow.
 	if width >= minimalStatusThreshold {
-		modelName := m.getActiveModelName()
+		modelName := m.getActiveModelDisplay()
 		if m.modelAuthority != nil {
 			if b := m.modelAuthority.ActiveBinding(); b.ModelID != "" {
 				modelName = accentStyle.Render("✓") + " " + modelName
@@ -1236,11 +1236,24 @@ func (m *model) printRecord(rec record) string {
 		}
 		return strings.Join(styledLines, "\n")
 	case roleActivity:
-		styledLines := make([]string, len(wrappedLines))
-		for i, line := range wrappedLines {
-			styledLines[i] = m.styleActivityLine(line)
+		// ── TRACE GATE (quiet mode default) ──────────────────────
+		// Internal engine trace lines (command received, intent parsed,
+		// [event] PromptAdmitted, [preflight] bg worker, [plan]/[build]/
+		// [stream] telemetry, …) render ONLY when verbose trace is on
+		// (Alt+E / Alt+V → m.traceVerbose / TraceVerbose). In quiet mode
+		// they collapse to the single per-turn "▸ Trace:" summary inside
+		// styleActivityLine; repeat summaries return "" and are dropped
+		// here so the main viewport stays clean (user messages, model
+		// text and final ✓ summaries only).
+		var kept []string
+		for _, line := range wrappedLines {
+			styled := m.styleActivityLine(line)
+			if styled == "" {
+				continue
+			}
+			kept = append(kept, styled)
 		}
-		return strings.Join(styledLines, "\n")
+		return strings.Join(kept, "\n")
 	case roleStatus:
 		styledLines := make([]string, len(wrappedLines))
 		for i, line := range wrappedLines {

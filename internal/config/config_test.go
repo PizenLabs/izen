@@ -287,13 +287,26 @@ func TestValidateProviderNameOpenRouter(t *testing.T) {
 	}
 }
 
-func TestResolveCredentialsEnvVar(t *testing.T) {
+func TestResolveCredentialsConfigFirst(t *testing.T) {
+	setEnv(t, "ANTHROPIC_API_KEY", "sk-env-value")
+	defer unsetEnv(t, "ANTHROPIC_API_KEY")
+
+	// An explicit config.yml key is authoritative over the shell env.
+	key := ResolveCredentials("anthropic", "sk-config-explicit")
+	if key != "sk-config-explicit" {
+		t.Errorf("ResolveCredentials = %q, want %q (config file must take priority over env)", key, "sk-config-explicit")
+	}
+}
+
+func TestResolveCredentialsEnvFallback(t *testing.T) {
 	setEnv(t, "ANTHROPIC_API_KEY", "sk-test-resolve")
 	defer unsetEnv(t, "ANTHROPIC_API_KEY")
 
-	key := ResolveCredentials("anthropic", "fallback-key")
-	if key != "sk-test-resolve" {
-		t.Errorf("ResolveCredentials = %q, want %q (env var should take priority)", key, "sk-test-resolve")
+	// Empty/whitespace config falls back to the environment variable.
+	for _, empty := range []string{"", "   "} {
+		if key := ResolveCredentials("anthropic", empty); key != "sk-test-resolve" {
+			t.Errorf("ResolveCredentials(%q) = %q, want %q (env fallback)", empty, key, "sk-test-resolve")
+		}
 	}
 }
 
@@ -301,6 +314,61 @@ func TestResolveCredentialsFallback(t *testing.T) {
 	key := ResolveCredentials("unknown-provider", "config-fallback-key")
 	if key != "config-fallback-key" {
 		t.Errorf("ResolveCredentials = %q, want %q (should fall back to config key)", key, "config-fallback-key")
+	}
+}
+
+func TestResolveProviderAPIKeyPrecedence(t *testing.T) {
+	setEnv(t, "OPENROUTER_API_KEY", "sk-env-shell")
+	defer unsetEnv(t, "OPENROUTER_API_KEY")
+
+	// 1. Explicit config.yml key wins over the environment.
+	cfg := Default()
+	prov := cfg.AI.Providers["openrouter"]
+	prov.APIKey = "sk-config-explicit"
+	cfg.AI.Providers["openrouter"] = prov
+	if got := ResolveProviderAPIKey(cfg, "openrouter", "OPENROUTER_API_KEY"); got != "sk-config-explicit" {
+		t.Errorf("ResolveProviderAPIKey = %q, want config key (config must override env)", got)
+	}
+	if got := cfg.ResolveAPIKey("openrouter"); got != "sk-config-explicit" {
+		t.Errorf("ResolveAPIKey = %q, want config key", got)
+	}
+
+	// 2. Empty config falls back to the environment variable.
+	prov.APIKey = "   "
+	cfg.AI.Providers["openrouter"] = prov
+	if got := ResolveProviderAPIKey(cfg, "openrouter", "OPENROUTER_API_KEY"); got != "sk-env-shell" {
+		t.Errorf("ResolveProviderAPIKey = %q, want env fallback", got)
+	}
+
+	// 3. Neither yields empty (caller triggers the missing-key prompt).
+	unsetEnv(t, "OPENROUTER_API_KEY")
+	if got := ResolveProviderAPIKey(cfg, "openrouter", "OPENROUTER_API_KEY"); got != "" {
+		t.Errorf("ResolveProviderAPIKey = %q, want empty", got)
+	}
+	if got := ResolveProviderAPIKey(nil, "openrouter", "OPENROUTER_API_KEY"); got != "" {
+		t.Errorf("ResolveProviderAPIKey(nil cfg) = %q, want empty", got)
+	}
+}
+
+func TestCredentialSourceForConfigFirst(t *testing.T) {
+	cfg := Default()
+	prov := cfg.AI.Providers["openai"]
+	prov.APIKey = "sk-config-explicit"
+	cfg.AI.Providers["openai"] = prov
+	setEnv(t, "OPENAI_API_KEY", "sk-env-shell")
+	defer unsetEnv(t, "OPENAI_API_KEY")
+
+	if got := CredentialSourceFor(cfg, "openai"); got != "config" {
+		t.Errorf("CredentialSourceFor = %q, want config", got)
+	}
+	if !HasCredentialsFor(cfg, "openai") {
+		t.Errorf("HasCredentialsFor = false, want true with explicit config key")
+	}
+
+	empty := Default()
+	empty.AI.Providers["openai"] = AIProviderConfig{BaseURL: "https://api.openai.com/v1"}
+	if got := CredentialSourceFor(empty, "openai"); got != "env" {
+		t.Errorf("CredentialSourceFor (empty config) = %q, want env", got)
 	}
 }
 

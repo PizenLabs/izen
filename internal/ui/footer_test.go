@@ -24,7 +24,7 @@ func TestFooterFreshLaunchState(t *testing.T) {
 
 	footer := stripANSIFooter(m.renderFixedFooter(width, nil))
 
-	for _, want := range []string{"qwen2.5-coder:7b", "Ctrl+H help"} {
+	for _, want := range []string{"qwen2.5-coder:7b", "? help"} {
 		if !strings.Contains(footer, want) {
 			t.Errorf("fresh-launch footer missing %q:\n%q", want, footer)
 		}
@@ -66,7 +66,7 @@ func TestFooterExecutingStateLiveBar(t *testing.T) {
 		}
 	}
 	// The executing bar never renders idle hints.
-	if strings.Contains(footer, "Alt+E trace") || strings.Contains(footer, "Ctrl+H help") {
+	if strings.Contains(footer, "Alt+E trace") || strings.Contains(footer, "Ctrl+H help") || strings.Contains(footer, "? help") {
 		t.Errorf("executing footer leaked idle hint:\n%q", footer)
 	}
 	// The authoritatively derived rate ≈ 128 tok / 10s = 12.8 tok/s.
@@ -175,7 +175,7 @@ func TestFooterCompletedStateRevertsToIdle(t *testing.T) {
 		}
 	}
 	// Fresh-launch (no prompts run yet): clean startup hint returns.
-	if !strings.Contains(idle, "Ctrl+H help") {
+	if !strings.Contains(idle, "? help") {
 		t.Errorf("completed footer missing fresh-launch hint:\n%q", idle)
 	}
 	if strings.Contains(idle, "\n") {

@@ -36,8 +36,9 @@ import (
 func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedMsg) tea.Cmd {
 	auth := m.ensureModelAuthority()
 	binding := authority.ModelBinding{
-		ProviderID: authority.ProviderID(msg.Provider),
-		ModelID:    authority.ModelID(msg.ModelID),
+		ProviderID:    authority.ProviderID(msg.Provider),
+		ModelID:       authority.ModelID(msg.ModelID),
+		VariantParams: authority.VariantOption(string(msg.Policy.Reasoning)),
 	}
 	if err := authority.ValidateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
@@ -54,6 +55,9 @@ func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedM
 	auth.Activate(binding)
 	// Sync pipeline intent tiers to the new binding.
 	m.syncPipelineTiers()
+	// Record the activation in the RECENTLY USED list (with variant) so the
+	// models pane pins it, then persist the MRU to ~/.izen/state.json.
+	m.modelPicker = m.modelPicker.AddRecentModel(msg.ModelID, msg.Provider)
 	// Persist the RECENTLY USED list (MRU) to ~/.izen/state.json.
 	m.persistPickerState()
 	// Provider switch if needed.
@@ -77,12 +81,15 @@ func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedM
 // network I/O, zero Fetching screen. The registry is lazily created from the
 // local JSON cache; background sync arrives later as SnapshotMsg.
 func newModelPickerFromCache(m *model) model_picker.Model {
+	if m == nil {
+		return model_picker.NewFromRegistry(nil)
+	}
 	if m.modelRegistry == nil {
 		m.modelRegistry = registry.NewRegistry()
 		_ = m.modelRegistry.LoadCache()
 	}
 	mp := model_picker.NewFromRegistry(m.modelRegistry)
-	if m != nil && m.resolver != nil {
+	if m.resolver != nil {
 		mp = mp.SetActiveWorkspace(m.resolver.Current().String())
 		m.ensureModelAuthority()
 	}
@@ -123,15 +130,17 @@ func (m *model) applyPickerActivation(um model_picker.Model) tea.Cmd {
 	}
 
 	auth := m.ensureModelAuthority()
+	variant := um.ReasoningPolicy()
 	binding := authority.ModelBinding{
-		ProviderID: authority.ProviderID(provider),
-		ModelID:    authority.ModelID(id),
+		ProviderID:    authority.ProviderID(provider),
+		ModelID:       authority.ModelID(id),
+		VariantParams: authority.VariantOption(variant),
 	}
 	if err := authority.ValidateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
 		return nil
 	}
-	if err := config.PersistActiveBinding(provider, id, ""); err != nil {
+	if err := config.PersistActiveBinding(provider, id, variant); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
 		return nil
 	}
@@ -227,15 +236,23 @@ func (m *model) pickerActivateCmd(cmd modelapp.ActivateModelCommand) tea.Cmd {
 	m.ti.Focus()
 	if um.ActivatedModelID() == "" {
 		auth := m.ensureModelAuthority()
+		variant := ""
+		if cmd.Reasoning != nil {
+			variant = cmd.Reasoning.Option
+		}
+		if variant == "" {
+			variant = um.ReasoningPolicy()
+		}
 		binding := authority.ModelBinding{
-			ProviderID: authority.ProviderID(cmd.Provider),
-			ModelID:    authority.ModelID(cmd.ModelID),
+			ProviderID:    authority.ProviderID(cmd.Provider),
+			ModelID:       authority.ModelID(cmd.ModelID),
+			VariantParams: authority.VariantOption(variant),
 		}
 		if err := authority.ValidateBinding(binding); err != nil {
 			m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
 			return nil
 		}
-		if err := config.PersistActiveBinding(cmd.Provider, cmd.ModelID, ""); err != nil {
+		if err := config.PersistActiveBinding(cmd.Provider, cmd.ModelID, variant); err != nil {
 			m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
 			return nil
 		}
@@ -317,27 +334,47 @@ func (m *model) persistPickerState() {
 }
 
 // applySaveProviderKey persists an API key submitted by the secure inline
-// API-key overlay into the unified config store, mirrors it into the process
-// env so live discovery sees it immediately, and kicks off a background
-// catalog refresh for the newly-configured provider. The modal stays open so
-// the user can pick a model right away.
+// API-key overlay into the unified config store (~/.izen/config.yml, which
+// takes precedence over environment variables), mirrors it into the live
+// session config struct and the process env, hot-reloads the runtime HTTP
+// client bearer token immediately, and kicks off a background catalog
+// refresh for the newly-configured provider. The modal stays open so the
+// user can pick a model right away, and subsequent prompt submissions in the
+// same session use the newly saved key with no restart.
 func (m *model) applySaveProviderKey(msg model_picker.SaveProviderKeyMsg) tea.Cmd {
-	if msg.Provider == "" {
+	provider := strings.ToLower(strings.TrimSpace(msg.Provider))
+	apiKey := strings.TrimSpace(msg.APIKey)
+	if provider == "" {
 		return nil
 	}
-	if err := config.SaveProviderAPIKey(msg.Provider, msg.APIKey); err != nil {
+	if err := config.SaveProviderAPIKey(provider, apiKey); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] API key save failed: %s", err.Error()))
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
 		return nil
 	}
-	// Mirror into the process env so detector.DiscoverProviders and the live
-	// registry sync pick it up without a restart.
-	envName := strings.ToUpper(msg.Provider) + "_API_KEY"
-	if os.Getenv(envName) == "" {
-		_ = os.Setenv(envName, msg.APIKey)
+	// Mirror into the live session config struct (m.cfg may be a different
+	// pointer than the global singleton SaveProviderAPIKey refreshes).
+	if m.cfg != nil {
+		if m.cfg.AI.Providers == nil {
+			m.cfg.AI.Providers = make(map[string]config.AIProviderConfig)
+		}
+		prov := m.cfg.AI.Providers[provider]
+		prov.APIKey = apiKey
+		if strings.TrimSpace(prov.BaseURL) == "" {
+			prov.BaseURL = config.WellKnownBaseURL(provider)
+		}
+		m.cfg.AI.Providers[provider] = prov
 	}
-	m.push(roleSystem, fmt.Sprintf("✓ API key saved for %s — refreshing catalog", msg.Provider))
+	// Mirror into the process env so env-only readers (live discovery,
+	// detector fallbacks) see the new key immediately. The saved config.yml
+	// value remains authoritative under the strict precedence.
+	if envName := config.EnvVarForProvider(provider); envName != "" {
+		_ = os.Setenv(envName, apiKey)
+	}
+	// Re-initialize the live HTTP client bearer token now.
+	m.hotReloadProviderKey(provider, apiKey)
+	m.push(roleSystem, fmt.Sprintf("✓ API key saved for %s — refreshing catalog", provider))
 	m.refreshViewportContent()
 	m.gotoBottomIfAllowed()
 	return m.refreshModelRegistryCmd()

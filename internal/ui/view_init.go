@@ -179,14 +179,14 @@ func (m *model) renderInitProviderSelect(width int) string {
 	b.WriteString(initDimmedStyle.Render("Choose your default AI provider. Type to filter the list."))
 	b.WriteString("\n\n")
 
-	// ── Env var detection banner ──────────────────────────────────────
+	// ── Credential detection banner ───────────────────────────────────
 	// Show a green banner when the currently selected provider has an API
-	// key set in the environment. This replaces manual key entry — the
-	// user just presses Enter to confirm.
+	// key (saved in ~/.izen/config.yml or set in the environment). This
+	// replaces manual key entry — the user just presses Enter to confirm.
 	items := m.filteredProviders()
 	if len(items) > m.initProviderIdx && m.initProviderIdx >= 0 {
 		selected := items[m.initProviderIdx]
-		if envVar := envVarForProvider(selected); envVar != "" && os.Getenv(envVar) != "" {
+		if envVar := envVarForProvider(selected); m.isProviderAvailable(selected, envVar) {
 			b.WriteString(initGreenStyle.Render("  " + Icon.Check + " " + envVar + " detected from environment. Ready!"))
 			b.WriteString("\n\n")
 		}
@@ -210,7 +210,7 @@ func (m *model) renderInitProviderSelect(width int) string {
 			status = initMutedStyle.Render(" (active)")
 		}
 		envVar := envVarForProvider(item)
-		if envVar != "" && os.Getenv(envVar) != "" {
+		if m.isProviderAvailable(item, envVar) {
 			if status == "" {
 				status = initGreenStyle.Render(" " + Icon.Success)
 			}

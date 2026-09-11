@@ -93,9 +93,6 @@ var validSystemCommands = map[string]struct{}{
 	"/explain-decision": {},
 	"/decide":           {},
 	"/copy":             {},
-	"/copy-mode":        {},
-	"/copy_mode":        {},
-	"/inspect":          {},
 	"/compact":          {},
 }
 
@@ -1898,7 +1895,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /objective  /drop  /clear  /quit  /copy  /compact"))
-		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>  /copy-mode"))
+		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("sessions"))
 		m.push(roleSystem, infoStyle.Render("  /new                       create and activate a fresh session"))
@@ -1911,7 +1908,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /session compact <A|B>     run the Generational Compactor"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, infoStyle.Render("  /copy          copy full canonical transcript to clipboard"))
-		m.push(roleSystem, infoStyle.Render("  /copy-mode     scrollable inspection mode (j/k, / search, v/y yank, wheel)"))
+		m.push(roleSystem, infoStyle.Render("  Esc (×3)       enter vi-navigation copy mode (j/k, / search, v/y yank, wheel)"))
 		m.push(roleSystem, infoStyle.Render("  /explain-decision  inspect why a tech stack was chosen"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  /usage           inspect token usage and provider status"))
@@ -2128,17 +2125,6 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	case cmd == "/copy", strings.HasPrefix(cmd, "/copy "):
 		m.handleCopy()
 		return nil
-
-	case cmd == "/copy-mode", cmd == "/copy_mode", cmd == "/inspect":
-		if m.inViMode {
-			m.setToast("Already in copy mode")
-			return nil
-		}
-		if m.state == StateProcessing || m.state == StateAwaitingApproval || m.streaming || m.agentRunning {
-			m.setToast("Cannot enter copy mode while a task is running")
-			return nil
-		}
-		return m.enterViMode()
 
 	case cmd == "/compact", strings.HasPrefix(cmd, "/compact "):
 		return m.runCompactCmd(cmd)

@@ -145,14 +145,19 @@ func (p *OpenRouterProvider) Name() string {
 	return "openrouter"
 }
 
-// resolveAPIKey returns the effective API key for a request. It checks the
-// OPENROUTER_API_KEY environment variable first (picking up runtime .env
-// changes), then falls back to the compile-time key from the provider config.
+// resolveAPIKey returns the effective API key for a request. Strict
+// precedence: the explicitly configured key (saved in ~/.izen/config.yml and
+// injected at cold-boot construction time) always wins over the shell
+// environment variable. Env is only a fallback when no configured key exists
+// (picking up runtime .env changes for unconfigured providers).
 func (p *OpenRouterProvider) resolveAPIKey() string {
-	if envKey := os.Getenv("OPENROUTER_API_KEY"); envKey != "" {
+	if key := strings.TrimSpace(p.apiKey); key != "" {
+		return key
+	}
+	if envKey := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")); envKey != "" {
 		return envKey
 	}
-	return p.apiKey
+	return ""
 }
 
 func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {

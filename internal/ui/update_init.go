@@ -271,12 +271,12 @@ func (m *model) handleInitIdentity(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.initStage = initProviderSelect
 		m.initProviderIdx = 0
 		m.initProviderItems = m.buildProviderList()
-		// Providers with env vars are sorted first by buildProviderList.
-		// Priority: 1) global profile prefill WITH env var, 2) any env var,
-		// 3) first in list (ollama or default).
+		// Providers with credentials are sorted first by buildProviderList.
+		// Priority: 1) global profile prefill WITH credentials (saved config
+		// key or env var), 2) any credentials, 3) first in list.
 		if m.initPrefillProvider != "" {
 			envVar := envVarForProvider(m.initPrefillProvider)
-			if envVar != "" && os.Getenv(envVar) != "" {
+			if m.isProviderAvailable(m.initPrefillProvider, envVar) {
 				for i, name := range m.initProviderItems {
 					if name == m.initPrefillProvider {
 						m.initProviderIdx = i
@@ -388,10 +388,11 @@ func (m *model) buildProviderList() []string {
 			unique = append(unique, n)
 		}
 	}
-	// Sort: providers with env vars set first, then ollama, then the rest
+	// Sort: providers with credentials (saved config key or env var) first,
+	// then ollama, then the rest
 	sort.SliceStable(unique, func(i, j int) bool {
-		envI := envVarForProvider(unique[i]) != "" && os.Getenv(envVarForProvider(unique[i])) != ""
-		envJ := envVarForProvider(unique[j]) != "" && os.Getenv(envVarForProvider(unique[j])) != ""
+		envI := m.isProviderAvailable(unique[i], envVarForProvider(unique[i]))
+		envJ := m.isProviderAvailable(unique[j], envVarForProvider(unique[j]))
 		if envI != envJ {
 			return envI
 		}

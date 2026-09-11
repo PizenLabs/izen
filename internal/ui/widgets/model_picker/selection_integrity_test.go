@@ -28,8 +28,8 @@ func integrityModels() []registry.ModelDescriptor {
 }
 
 // Selection integrity: navigating to a non-default model and pressing Enter
-// must carry the EXACT model ID into the assignment payload — never the
-// index-0 default.
+// must open details for the EXACT model — never the index-0 default — and
+// confirming in details must carry that ID into the assignment payload.
 func TestDetailAssignmentCarriesExactModelID(t *testing.T) {
 	m := New(seedSnapshot(integrityModels()))
 	m = m.SetPaneFocus(PaneModels).SetCursor(1)
@@ -37,13 +37,22 @@ func TestDetailAssignmentCarriesExactModelID(t *testing.T) {
 		t.Fatalf("highlight = %q, want inclusionai", got)
 	}
 
-	// Enter commits directly in PaneModels
-	var cmd tea.Cmd
-	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
-	if cmd == nil {
-		t.Fatal("Enter in PaneModels must emit an assignment command")
+	// Enter in PaneModels opens details (2-step, no direct commit)
+	updated, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("Enter in PaneModels must NOT emit directly (opens details)")
 	}
-	assign := unwrapAssignmentMsg(t, cmd())
+	if updated.State() != StateDetail {
+		t.Fatalf("Enter in PaneModels must move to StateDetail, got %v", updated.State())
+	}
+	if got := updated.SelectedModel().ID; got != "inclusionai/ling-3.0-flash-fin:free" {
+		t.Fatalf("detail model = %q, want inclusionai", got)
+	}
+	_, cmd2 := updated.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd2 == nil {
+		t.Fatal("Enter in StateDetail must emit an assignment command")
+	}
+	assign := unwrapAssignmentMsg(t, cmd2())
 	if assign.ModelID != "inclusionai/ling-3.0-flash-fin:free" {
 		t.Fatalf("assigned model = %q, want inclusionai", assign.ModelID)
 	}
@@ -74,11 +83,19 @@ func TestAssignmentEmissionIsUnbatched(t *testing.T) {
 	m = m.SetPaneFocus(PaneModels)
 	m = m.SetCursor(1)
 
-	// Enter in PaneModels commits directly.
-	if _, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter}); cmd == nil {
-		t.Fatal("Enter in PaneModels must emit an assignment command")
-	} else if _, ok := cmd().(ModelAssignmentRequestedMsg); !ok {
-		t.Fatalf("Enter cmd = %T, want bare ModelAssignmentRequestedMsg", cmd())
+	// Enter in PaneModels opens details (no command).
+	updated, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("Enter in PaneModels must NOT emit (opens details)")
+	}
+	if updated.State() != StateDetail {
+		t.Fatalf("Enter in PaneModels must move to StateDetail, got %v", updated.State())
+	}
+	// Detail Enter confirms with a bare assignment message.
+	if _, cmd2 := updated.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter}); cmd2 == nil {
+		t.Fatal("Enter in StateDetail must emit an assignment command")
+	} else if _, ok := cmd2().(ModelAssignmentRequestedMsg); !ok {
+		t.Fatalf("Enter cmd = %T, want bare ModelAssignmentRequestedMsg", cmd2())
 	}
 }
 

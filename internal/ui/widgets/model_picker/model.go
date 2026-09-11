@@ -817,6 +817,38 @@ func (m Model) emitAssignmentCmd(model *registry.ModelDescriptor, _ string) tea.
 	}
 }
 
+// activateModelWithVariantCmd confirms activation from the Model Details
+// step: emits a bare ModelAssignmentRequestedMsg carrying the selected
+// reasoning variant (default, low, medium, high, xhigh, max) chosen via the
+// r key into the runtime authority. The parent persists the binding and
+// closes the modal after the commit lands (never batched with CloseModalMsg).
+func (m Model) activateModelWithVariantCmd(model *registry.ModelDescriptor, variant string) tea.Cmd {
+	if model == nil {
+		return nil
+	}
+	policy := variant
+	if policy == "" {
+		// Derive from the canonical reasoning index when no explicit
+		// variant is passed (keeps r-key selection authoritative).
+		if opt, ok := m.CurrentReasoningOption(); ok && opt != "" {
+			policy = opt
+		} else {
+			policy = DefaultReasoningOption
+		}
+	}
+	// Fall back to the capability truth when the passed variant is empty.
+	if policy == "" {
+		return m.emitAssignmentCmd(model, "")
+	}
+	return func() tea.Msg {
+		return ModelAssignmentRequestedMsg{
+			ModelID:  model.ID,
+			Provider: model.Provider,
+			Policy:   InvocationPolicy{Reasoning: policy},
+		}
+	}
+}
+
 // IsGlobal reports the binding target scope.
 func (m Model) IsGlobal() bool { return m.isGlobal }
 

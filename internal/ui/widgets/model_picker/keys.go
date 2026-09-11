@@ -14,7 +14,8 @@ package model_picker
 //   down / ctrl+n      → MoveCursor(1)
 //   pgup               → MoveCursor(-listRowBudget)
 //   pgdown             → MoveCursor(+listRowBudget)
-//   enter              → Select + EmitActivateCommand
+//   enter (browsing)   → pin detail + StateDetail (configure & activate)
+//   enter (detail)     → activateModelWithVariantCmd + parent commit + close
 //   esc               → CloseModal (always exits picker)
 //
 // Role bindings (Alt to avoid typing collision):

@@ -267,34 +267,46 @@ func runRuntimeCommand(args []string) error {
 }
 
 // buildActiveProvider constructs the ai.Provider for the configured active
-// provider and returns it together with the effective model name.
+// provider and returns it together with the effective model name. The API key
+// resolves with strict precedence: ~/.izen/config.yml wins over the shell
+// environment variable; an empty resolution surfaces the missing-key prompt.
 func buildActiveProvider(cfg *config.Config) (ai.Provider, string, error) {
 	name := cfg.ActiveProviderName()
 	provCfg, ok := cfg.AI.Providers[name]
-	if !ok || provCfg.APIKey == "" && provCfg.BaseURL == "" {
+	if !ok {
+		provCfg = config.AIProviderConfig{BaseURL: config.WellKnownBaseURL(name)}
+	}
+	apiKey := cfg.ResolveAPIKey(name)
+	if apiKey == "" && strings.TrimSpace(provCfg.BaseURL) == "" {
 		return nil, "", fmt.Errorf(
 			"izen run: no AI provider configured (provider %q). Set one via 'izen auth login' or environment variables",
 			name,
 		)
 	}
+	if apiKey == "" {
+		return nil, "", fmt.Errorf(
+			"izen run: no API key for provider %q. Save one via 'izen auth login' or set %s",
+			name, config.EnvVarForProvider(name),
+		)
+	}
 	model := cfg.ActiveModelName()
 	switch name {
 	case "ollama":
-		return providers.NewOllamaProvider(provCfg.BaseURL, provCfg.APIKey, model), model, nil
+		return providers.NewOllamaProvider(provCfg.BaseURL, apiKey, model), model, nil
 	case "openrouter":
-		return providers.NewOpenRouterProvider(provCfg.APIKey, model, provCfg.BaseURL), model, nil
+		return providers.NewOpenRouterProvider(apiKey, model, provCfg.BaseURL), model, nil
 	case "openai":
-		return providers.NewOpenAIProvider(provCfg.APIKey, model), model, nil
+		return providers.NewOpenAIProvider(apiKey, model), model, nil
 	case "anthropic":
-		return providers.NewClaudeProvider(provCfg.APIKey, model), model, nil
+		return providers.NewClaudeProvider(apiKey, model), model, nil
 	case "gemini":
-		return providers.NewGeminiProvider(provCfg.APIKey, model), model, nil
+		return providers.NewGeminiProvider(apiKey, model), model, nil
 	case "groq":
-		return providers.NewGroqProvider(provCfg.APIKey, model, provCfg.BaseURL), model, nil
+		return providers.NewGroqProvider(apiKey, model, provCfg.BaseURL), model, nil
 	case "opencode":
-		return providers.NewOpenCodeProvider(provCfg.APIKey, model, provCfg.BaseURL), model, nil
+		return providers.NewOpenCodeProvider(apiKey, model, provCfg.BaseURL), model, nil
 	case "9router":
-		return providers.NewNineRouterProvider(provCfg.APIKey, model, provCfg.BaseURL), model, nil
+		return providers.NewNineRouterProvider(apiKey, model, provCfg.BaseURL), model, nil
 	default:
 		return nil, "", fmt.Errorf("izen run: unsupported provider %q", name)
 	}

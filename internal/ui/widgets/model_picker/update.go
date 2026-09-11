@@ -224,14 +224,15 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			if m.showingRoles {
 				return m.emitRoleOverride()
 			}
-			// Plain activation: commit highlighted model and close the overlay.
+			// 2-step activation: Enter opens Model Details / Variant
+			// configuration instead of activating directly. Confirmation
+			// happens in StateDetail via activateModelWithVariantCmd.
 			if sel := m.SelectedModel(); sel != nil {
-				m = m.Select()
-				assign := m.emitAssignmentCmd(sel, "")
-				if assign == nil {
-					return m, nil
-				}
-				return m, assign
+				m.pinDetail()
+				m.state = StateDetail
+				m.focus = FocusList
+				m.searchInput.Blur()
+				return m, nil
 			}
 		}
 		return m, nil
@@ -431,10 +432,12 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.cycleReasoningPolicy()
 		return m, nil
 	case "enter":
-		// Strict single model activation (Phase 3): commit active binding
-		// directly to runtime ModelState without workspace sub-menu.
+		// 2-step activation confirm: commit the pinned detail selection
+		// with its selected reasoning variant into the runtime authority.
+		// The parent closes the modal after the commit lands.
 		if sel := m.SelectedModel(); sel != nil {
-			assign := m.emitAssignmentCmd(sel, "")
+			variant, _ := m.CurrentReasoningOption()
+			assign := m.activateModelWithVariantCmd(sel, variant)
 			if assign == nil {
 				return m, nil
 			}

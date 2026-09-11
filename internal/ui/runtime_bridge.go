@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -32,6 +33,12 @@ func (m *model) runRuntimeCmd(cmd appruntime.RuntimeCommand) tea.Cmd {
 // translation seam mandated by the RFC; the rich engine path still runs
 // alongside for the full interactive experience.
 func (m *model) runtimeSubmitCmd(line string) tea.Cmd {
+	// Defensive empty-prompt guard (mirrors submitEnter): a blank prompt must
+	// never cross the execution boundary as submit_prompt — the handler would
+	// reject it with `handlers: empty prompt` and leak a red error into the UI.
+	if strings.TrimSpace(line) == "" {
+		return nil
+	}
 	mode := ""
 	if m.resolver != nil {
 		mode = m.resolver.Current().String()

@@ -127,8 +127,12 @@ func (m *model) resetStage(kind OperationKind) {
 	m.stage.Tokens = 0
 	m.stage.mu.Unlock()
 	// A new operation resets the live tok/s estimate alongside the
-	// authoritative stage count.
+	// authoritative stage count, plus the streaming cost baseline (t=0
+	// pricing + prompt tokens are re-captured at stream start).
 	m.streamLiveTokens = 0
+	m.streamBaseInputTokens = 0
+	m.streamInputPricePerM = 0
+	m.streamOutputPricePerM = 0
 }
 
 // setStage records a real execution-stage transition. It is safe to call from

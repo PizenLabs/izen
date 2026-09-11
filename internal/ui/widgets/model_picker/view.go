@@ -214,7 +214,7 @@ func (m Model) renderBrowsingFooter() string {
 	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s   %s %s   %s %s",
 		keyStyle.Render("Tab"), descStyle.Render("select pane"),
 		keyStyle.Render("↑/↓"), descStyle.Render("navigate"),
-		keyStyle.Render("Enter"), descStyle.Render("activate / save key"),
+		keyStyle.Render("Enter"), descStyle.Render("configure & activate"),
 		keyStyle.Render("Alt+A"), descStyle.Render("set API key"),
 		keyStyle.Render("Alt+i"), descStyle.Render("details"),
 		keyStyle.Render("Esc"), descStyle.Render("close"),

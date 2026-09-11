@@ -21,6 +21,13 @@ type storedProvider struct {
 
 // envVarForProvider returns the primary env var name for a given provider
 func envVarForProvider(provider string) string {
+	return EnvVarForProvider(provider)
+}
+
+// EnvVarForProvider returns the primary env var name for a given provider.
+// It is exported so runtime composition roots (compose, cmd/izen, ui) share
+// the single authoritative provider -> env var table with this package.
+func EnvVarForProvider(provider string) string {
 	switch provider {
 	case "ollama":
 		return ""
@@ -43,15 +50,57 @@ func envVarForProvider(provider string) string {
 	}
 }
 
+// ResolveProviderAPIKey resolves the API key for a provider with strict
+// 3-tier precedence:
+//
+//  1. Top priority: explicit key saved in ~/.izen/config.yml
+//     (cfg.AI.Providers[provider].APIKey, already env-expanded on load).
+//  2. Fallback: shell environment variable (e.g. OPENROUTER_API_KEY).
+//  3. Empty: return "" so the caller triggers the missing-key prompt.
+//
+// The config file always wins: a key the user explicitly saved via
+// SaveProviderAPIKey (or hand-edited into config.yml) is authoritative over
+// any value exported from ~/.zshrc or the process environment.
+func ResolveProviderAPIKey(cfg *Config, provider string, envVar string) string {
+	if cfg != nil {
+		if p, ok := cfg.AI.Providers[strings.ToLower(strings.TrimSpace(provider))]; ok {
+			if key := strings.TrimSpace(p.APIKey); key != "" {
+				return key
+			}
+		}
+	}
+	if strings.TrimSpace(envVar) != "" {
+		if envVal := strings.TrimSpace(os.Getenv(envVar)); envVal != "" {
+			return envVal
+		}
+	}
+	return ""
+}
+
+// ResolveAPIKey resolves the API key for a provider against this Config,
+// deriving the environment variable from the canonical provider -> env var
+// table. Precedence: config file > env var > "".
+func (c *Config) ResolveAPIKey(provider string) string {
+	return ResolveProviderAPIKey(c, provider, EnvVarForProvider(provider))
+}
+
 // ResolveCredentials resolves the best available API key for a provider.
 // Priority:
-//  1. Environment variable (e.g., ANTHROPIC_API_KEY)
-//  2. Stored OAuth/session token from ~/.izen/credentials/providers.json
-//  3. Config file api_key string (already expanded)
+//
+//  1. Config file api_key string (already expanded)
+//  2. Environment variable (e.g., ANTHROPIC_API_KEY)
+//  3. Stored OAuth/session token from ~/.izen/credentials/providers.json
+//
+// A key explicitly saved in ~/.izen/config.yml is authoritative and always
+// wins over the shell environment.
 func ResolveCredentials(provider, configKey string) string {
+	if key := strings.TrimSpace(configKey); key != "" {
+		return key
+	}
+
 	envVar := envVarForProvider(provider)
 	if envVar != "" {
-		if envVal := os.Getenv(envVar); envVal != "" {
+		if envVal := strings.TrimSpace(os.Getenv(envVar)); envVal != "" {
 			return envVal
 		}
 	}
@@ -61,14 +110,15 @@ func ResolveCredentials(provider, configKey string) string {
 		return token
 	}
 
-	return configKey
+	return ""
 }
 
 // HasCredentials returns true if the provider has credentials available
-// through any of the three sources (env var, stored token, config key).
+// through the environment or the stored token file. For the config-aware
+// check (config file > env > token) use HasCredentialsFor.
 func HasCredentials(provider string) bool {
 	envVar := envVarForProvider(provider)
-	if envVar != "" && os.Getenv(envVar) != "" {
+	if envVar != "" && strings.TrimSpace(os.Getenv(envVar)) != "" {
 		return true
 	}
 	if token := loadStoredToken(provider); token != "" {
@@ -77,17 +127,44 @@ func HasCredentials(provider string) bool {
 	return false
 }
 
+// HasCredentialsFor returns true when the provider resolves to a non-empty
+// key under the strict precedence (config file > env var > stored token).
+func HasCredentialsFor(cfg *Config, provider string) bool {
+	if cfg != nil {
+		if p, ok := cfg.AI.Providers[strings.ToLower(strings.TrimSpace(provider))]; ok {
+			if strings.TrimSpace(p.APIKey) != "" {
+				return true
+			}
+		}
+	}
+	return HasCredentials(provider)
+}
+
 // CredentialSource returns a human-readable description of where the
-// credential was found. Returns "env", "token", "config", or "".
+// credential was found. Returns "env", "token", or "".
 func CredentialSource(provider string) string {
 	envVar := envVarForProvider(provider)
-	if envVar != "" && os.Getenv(envVar) != "" {
+	if envVar != "" && strings.TrimSpace(os.Getenv(envVar)) != "" {
 		return "env"
 	}
 	if token := loadStoredToken(provider); token != "" {
 		return "token"
 	}
 	return ""
+}
+
+// CredentialSourceFor returns where the credential was found under the strict
+// precedence: "config" (explicit key in ~/.izen/config.yml), "env",
+// "token", or "" when no credential exists.
+func CredentialSourceFor(cfg *Config, provider string) string {
+	if cfg != nil {
+		if p, ok := cfg.AI.Providers[strings.ToLower(strings.TrimSpace(provider))]; ok {
+			if strings.TrimSpace(p.APIKey) != "" {
+				return "config"
+			}
+		}
+	}
+	return CredentialSource(provider)
 }
 
 func loadStoredToken(provider string) string {

@@ -118,3 +118,64 @@ func TestMalformedProvidersFileIgnored(t *testing.T) {
 		t.Errorf("got %v, want empty on malformed file", got)
 	}
 }
+
+// writeConfigFile writes a minimal ~/.izen/config.yml with provider api_keys.
+func writeConfigFile(t *testing.T, home, payload string) {
+	t.Helper()
+	dir := filepath.Join(home, ".izen")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir izen: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yml"), []byte(payload), 0600); err != nil {
+		t.Fatalf("write config.yml: %v", err)
+	}
+}
+
+// An explicit key saved in ~/.izen/config.yml takes precedence over the
+// shell environment variable for the same provider.
+func TestConfigFileOverridesEnv(t *testing.T) {
+	home := t.TempDir()
+	writeConfigFile(t, home, "ai:\n  providers:\n    openrouter:\n      api_key: sk-config-explicit\n      base_url: https://openrouter.ai/api/v1\n")
+	writeProvidersFile(t, home, `{"encrypted_providers":[{"name":"openrouter","token":"file-token"}]}`)
+	t.Setenv("OPENROUTER_API_KEY", "env-token")
+	t.Setenv("GROQ_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("GEMINI_API_KEY", "")
+
+	got := DetectProvidersWithHome(home)
+	or := findByName(got, "openrouter")
+	if or == nil {
+		t.Fatalf("openrouter missing from %v", got)
+	}
+	if or.APIKey != "sk-config-explicit" {
+		t.Errorf("APIKey = %q, want %q (config file must override env)", or.APIKey, "sk-config-explicit")
+	}
+	if or.Source != "config" {
+		t.Errorf("Source = %q, want %q", or.Source, "config")
+	}
+}
+
+// A ${ENV_VAR} placeholder in config.yml is env-derived, so the environment
+// entry (Source env) wins and no shadow "config" credential appears.
+func TestConfigPlaceholderDefersToEnv(t *testing.T) {
+	home := t.TempDir()
+	writeConfigFile(t, home, "ai:\n  providers:\n    openrouter:\n      api_key: ${OPENROUTER_API_KEY}\n      base_url: https://openrouter.ai/api/v1\n")
+	t.Setenv("OPENROUTER_API_KEY", "env-token")
+	t.Setenv("GROQ_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("GEMINI_API_KEY", "")
+
+	got := DetectProvidersWithHome(home)
+	or := findByName(got, "openrouter")
+	if or == nil {
+		t.Fatalf("openrouter missing from %v", got)
+	}
+	if or.APIKey != "env-token" {
+		t.Errorf("APIKey = %q, want %q", or.APIKey, "env-token")
+	}
+	if or.Source != "env" {
+		t.Errorf("Source = %q, want %q (placeholder must defer to env)", or.Source, "env")
+	}
+}
