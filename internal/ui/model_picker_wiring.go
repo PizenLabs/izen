@@ -55,6 +55,9 @@ func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedM
 	auth.Activate(binding)
 	// Sync pipeline intent tiers to the new binding.
 	m.syncPipelineTiers()
+	// Record the activation in the RECENTLY USED list (with variant) so the
+	// models pane pins it, then persist the MRU to ~/.izen/state.json.
+	m.modelPicker = m.modelPicker.AddRecentModel(msg.ModelID, msg.Provider)
 	// Persist the RECENTLY USED list (MRU) to ~/.izen/state.json.
 	m.persistPickerState()
 	// Provider switch if needed.

@@ -56,14 +56,21 @@ func TestPhase3ContextualRender(t *testing.T) {
 }
 
 func TestPhase3ExecutionTruth(t *testing.T) {
-	// Enter in PaneModels emits assignment directly
+	// 2-step activation: Enter in PaneModels opens details; detail Enter emits.
 	m := New(seedSnapshot(testModels()))
 	m = m.SetPaneFocus(PaneModels)
-	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
-	if cmd == nil {
-		t.Fatal("Enter in PaneModels must emit ModelAssignmentRequestedMsg")
+	updated, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("Enter in PaneModels must NOT emit directly (opens details)")
 	}
-	assign := unwrapAssignmentMsg(t, cmd())
+	if updated.State() != StateDetail {
+		t.Fatalf("Enter in PaneModels must move to StateDetail, got %v", updated.State())
+	}
+	_, cmd2 := updated.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd2 == nil {
+		t.Fatal("Enter in StateDetail must emit ModelAssignmentRequestedMsg")
+	}
+	assign := unwrapAssignmentMsg(t, cmd2())
 	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
 		t.Errorf("assign model = %q, want highlighted", assign.ModelID)
 	}
@@ -77,14 +84,22 @@ func TestPhase3ExecutionTruth(t *testing.T) {
 }
 
 func TestPhase3Activate(t *testing.T) {
-	// Enter in PaneModels commits directly (no intermediate detail step)
+	// 2-step activation: Enter in PaneModels opens details (no direct commit);
+	// detail Enter dispatches the assignment.
 	m := New(seedSnapshot(testModels()))
 	m = m.SetPaneFocus(PaneModels)
-	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
-	if cmd == nil {
-		t.Fatal("Enter in PaneModels must dispatch ModelAssignmentRequestedMsg")
+	updated, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("Enter in PaneModels must NOT dispatch directly (opens details)")
 	}
-	act := unwrapAssignmentMsg(t, cmd())
+	if updated.State() != StateDetail {
+		t.Fatalf("Enter in PaneModels must move to StateDetail, got %v", updated.State())
+	}
+	_, cmd2 := updated.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd2 == nil {
+		t.Fatal("Enter in StateDetail must dispatch ModelAssignmentRequestedMsg")
+	}
+	act := unwrapAssignmentMsg(t, cmd2())
 	if act.ModelID == "" {
 		t.Error("assignment must carry ModelID")
 	}

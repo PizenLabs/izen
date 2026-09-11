@@ -94,32 +94,35 @@ func TestSearchInputFiltersRAM(t *testing.T) {
 	}
 }
 
-// Enter in PaneModels emits ModelAssignmentRequestedMsg for the active model.
+// Enter in PaneModels opens Model Details (2-step activation): it transitions
+// to StateDetail for the highlighted model instead of activating directly.
 func TestRoleBindingHotkeyEmitsCommand(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	m = m.SetPaneFocus(PaneModels)
 
-	var cmd tea.Cmd
-	_, cmd = m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
-	if cmd == nil {
-		t.Fatal("Enter in PaneModels must return a tea.Cmd emitting ModelAssignmentRequestedMsg")
+	updated, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("Enter in PaneModels must NOT emit an assignment command (2-step: opens details)")
 	}
-	msg := cmd()
-	// Unwrap tea.BatchMsg to find the assignment message.
-	assign := unwrapAssignmentMsg(t, msg)
-	if assign.ModelID != "openrouter/deepseek/deepseek-r1" {
-		t.Errorf("model = %q, want highlighted deepseek-r1", assign.ModelID)
+	if updated.State() != StateDetail {
+		t.Fatalf("Enter in PaneModels must move picker to StateDetail, got %v", updated.State())
+	}
+	if got := updated.SelectedModel().ID; got != "openrouter/deepseek/deepseek-r1" {
+		t.Errorf("detail model = %q, want highlighted deepseek-r1", got)
 	}
 }
 
-// Enter in PaneModels commits directly. Cursor navigation works in both panes.
+// Enter in PaneModels opens details. Cursor navigation works in both panes.
 func TestAllRoleHotkeysEmit(t *testing.T) {
 	m := New(seedSnapshot(testModels()))
 	m = m.SetPaneFocus(PaneModels).MoveCursor(2) // gpt-4o-mini
-	// Enter commits directly
-	_, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
-	if cmd == nil {
-		t.Fatal("Enter in PaneModels must emit assignment command")
+	// Enter opens the details step (no direct commit)
+	updated, cmd := m.UpdateModel(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("Enter in PaneModels must NOT emit assignment command (opens details)")
+	}
+	if updated.State() != StateDetail {
+		t.Fatalf("Enter in PaneModels must move to StateDetail, got %v", updated.State())
 	}
 	// Down moves cursor in PaneModels
 	mDown, _ := m.UpdateModel(tea.KeyMsg{Type: tea.KeyDown})
