@@ -80,7 +80,7 @@ func (m *model) applyCompactedHistory(conv *compactor.Conversation) {
 	for _, k := range kept {
 		m.sess.History = append(m.sess.History, session.Message{Role: k.role, Content: k.content, Timestamp: time.Now()})
 	}
-	_ = m.sess.Save()
+	m.persistSession("compact_cmd")
 }
 
 // runCompactCmd implements /compact [now|stats|info|auto <ratio|off>].

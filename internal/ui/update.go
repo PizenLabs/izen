@@ -1502,7 +1502,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// appending to stale failed-task history.
 			if m.sess != nil {
 				m.sess.ClearHistory()
-				_ = m.sess.Save()
+				m.persistSession("update")
 			}
 
 			tasks := m.sess.CurrentTasks
@@ -1515,7 +1515,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 			if changed {
 				m.sess.StageTaskList(&tasks)
-				_ = m.sess.Save()
+				m.persistSession("update")
 			}
 			m.push(roleError, fmt.Sprintf(
 				"[BUILD HALTED] Step %d failed. Queue frozen — remaining tasks marked stalled. Use /investigate or /plan to re-generate a valid ledger.",
@@ -1794,7 +1794,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleSystem, successBannerStyle.Render("[✓] "+result))
 		}
 
-		_ = m.sess.Save()
+		m.persistSession("update")
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
@@ -1806,7 +1806,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if m.sess.ObjectiveState != nil {
 				m.sess.ObjectiveState.CurrentStatus = domain.ObjectiveIdle
 				m.sess.SetObjectiveState(m.sess.ObjectiveState)
-				_ = m.sess.Save()
+				m.persistSession("update")
 			}
 			return m, nil
 		}
@@ -1815,7 +1815,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 		m.sess.SetObjectiveState(msg.objective)
-		_ = m.sess.Save()
+		m.persistSession("update")
 		if msg.objective.TokenBudget.RequiresApproval {
 			m.setToast("Objective needs manual approval. Run /objective approve.")
 		} else {
@@ -1891,7 +1891,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					}
 				}
 				m.sess.StageTaskList(&tasks)
-				_ = m.sess.Save()
+				m.persistSession("update")
 			}
 
 			m.ti.Focus()
@@ -2678,7 +2678,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
-			_ = m.sess.Save()
+			m.persistSession("update")
 		}
 		m.TurnInputTokens = msg.tokenInput
 		m.TurnOutputTokens = msg.tokenOutput
@@ -3051,7 +3051,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				// failed previous attempt. Each plan generation is an
 				// independent lifecycle event.
 				m.sess.ClearHistory()
-				_ = m.sess.Save()
+				m.persistSession("update")
 			}
 			// Ensure the plan view shows approval actions even when the
 			// PlanEngine path (planResultMsg) was bypassed.
@@ -3192,7 +3192,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
-			_ = m.sess.Save()
+			m.persistSession("update")
 		}
 		// NON-DESTRUCTIVE SNAPSHOT: capture whether the first token was already
 		// rendered BEFORE any error bookkeeping. A mid-stream failure must

@@ -99,6 +99,13 @@ func (m *WorkflowStateMachine) SendEvent(event WorkflowEvent, ctx TransitionCont
 }
 
 func (m *WorkflowStateMachine) lookup(from WorkflowState, event WorkflowEvent, ctx TransitionContext) (WorkflowState, error) {
+	// Canonical emergency interrupt: any state returns to Idle. This is
+	// the single sanctioned path for Ctrl+C / Esc force-cancel so the UI
+	// never drifts by hand-setting presentation state while the machine
+	// remains in Building/Planning.
+	if event == EventUserInterrupt {
+		return StateIdle, nil
+	}
 	switch from {
 	case StateIdle:
 		switch event {

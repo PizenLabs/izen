@@ -393,6 +393,22 @@ func (m *model) autonomousParked() bool {
 	return m.autonomousBoundary != nil && m.autonomousDriver != nil
 }
 
+// stopAutonomousDriver schedules a driver abort for an active autonomous run
+// without finalizing the operation: the driver's terminal autonomousRunMsg
+// remains the canonical cleanup path (Phase 2 state-drift fix). It returns
+// the abort command when a driver is attached, or nil when there is nothing
+// to stop. It never hand-sets presentation state.
+func (m *model) stopAutonomousDriver(reason string) tea.Cmd {
+	if m == nil || m.autonomousDriver == nil {
+		return nil
+	}
+	driver := m.autonomousDriver
+	return func() tea.Msg {
+		term, err := driver.Abort(reason + " interrupt")
+		return autonomousRunMsg{term: term, err: err}
+	}
+}
+
 // handleAutonomousRun processes the terminal/parked outcome of a driver
 // Run/Resume/Abort. It releases the operation, renders the boundary card or the
 // terminal outcome, and keeps the driver's loop state as the single truth.

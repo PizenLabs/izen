@@ -658,7 +658,7 @@ func (m *model) runUndoCmd(raw string) tea.Cmd {
 			return nil
 		}
 		m.sess.Checkpoints = nil
-		_ = m.sess.Save()
+		m.persistSession("agents")
 		m.push(roleStatus, Icon.Success+" Reverted all working directory changes")
 		return nil
 	}
@@ -675,7 +675,7 @@ func (m *model) runUndoCmd(raw string) tea.Cmd {
 		return nil
 	}
 	m.sess.Checkpoints = checkpoints[:len(checkpoints)-1]
-	_ = m.sess.Save()
+	m.persistSession("agents")
 	m.push(roleStatus, fmt.Sprintf("undone: restored to checkpoint %s", lastID))
 	return nil
 }

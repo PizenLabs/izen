@@ -223,7 +223,7 @@ func (m *model) pruneFailedPromptFromHistory() {
 	// Prefer pruning by currentPrompt content when available.
 	if m.currentPrompt != "" {
 		if m.sess.PruneLastUserMessage(m.currentPrompt) {
-			_ = m.sess.Save()
+			m.persistSession("lifecycle")
 			m.currentPrompt = ""
 			return
 		}
@@ -235,7 +235,7 @@ func (m *model) pruneFailedPromptFromHistory() {
 		if last.Role == "user" {
 			// Check if there's no assistant after it (i.e., history tail is user)
 			m.sess.History = m.sess.History[:len(m.sess.History)-1]
-			_ = m.sess.Save()
+			m.persistSession("lifecycle")
 		}
 	}
 }
