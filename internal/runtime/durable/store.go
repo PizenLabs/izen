@@ -847,7 +847,7 @@ func (s *TaskStore) apply(ev LedgerEvent) {
 		s.contextTiers[ev.TaskID] = tier
 		s.currentID = ev.TaskID
 	case EventScopeViolationRejected, EventStructuralAmbiguity,
-		EventProposalAuthorized, EventWorkspaceSwitched:
+		EventProposalAuthorized, EventWorkspaceSwitched, EventPhaseTransition:
 		// Phase 4 audit lineage: durable in the ledger, no materialized
 		// state transition. Task identity, cursor, checkpoint, evidence
 		// and negative knowledge are preserved verbatim.

@@ -93,6 +93,11 @@ const (
 	EventStructuralAmbiguity    EventType = "STRUCTURAL_AMBIGUITY"
 	EventProposalAuthorized     EventType = "PROPOSAL_AUTHORIZED"
 	EventWorkspaceSwitched      EventType = "WORKSPACE_SWITCHED"
+	// EventPhaseTransition records a logical orchestration phase hop
+	// (domain/orchestration.Phase) against a durable task. It is audit
+	// lineage only: task identity, cursor, checkpoint, evidence and
+	// negative knowledge are preserved verbatim (STEP 2 parity).
+	EventPhaseTransition EventType = "PHASE_TRANSITION"
 )
 
 // IsTruthBoundary reports whether the event type requires an explicit
