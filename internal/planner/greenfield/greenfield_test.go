@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/ir"
-	"github.com/PizenLabs/izen/internal/kernel"
 	"github.com/PizenLabs/izen/internal/op"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
 )
 
 // prepareDirs creates the parent directories of every artifact path under
@@ -56,7 +56,7 @@ func TestGreenfieldPlannerMultiFileWorkspace(t *testing.T) {
 		t.Fatalf("expected zero roundtrips, got %q", result.Metadata["roundtrips"])
 	}
 
-	engine := kernel.NewEngine(nil)
+	engine := appruntime.NewTaskEngine(nil)
 	if _, err := result.Graph.Execute(t.Context(), engine); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}

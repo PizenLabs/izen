@@ -44,8 +44,8 @@ import (
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
-	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/workflow"
+	"github.com/PizenLabs/izen/internal/domain/capability"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/presentation"
 )

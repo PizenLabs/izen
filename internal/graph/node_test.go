@@ -8,17 +8,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/ir"
-	"github.com/PizenLabs/izen/internal/kernel"
 	"github.com/PizenLabs/izen/internal/op"
 	"github.com/PizenLabs/izen/internal/resource"
 	"github.com/PizenLabs/izen/internal/resource/file"
 	"github.com/PizenLabs/izen/internal/resource/git"
 	"github.com/PizenLabs/izen/internal/resource/terminal"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
 )
 
-// Compile-time assertion that OpNode satisfies kernel.Executable.
-var _ kernel.Executable = (*OpNode)(nil)
+// Compile-time assertion that OpNode satisfies task.Executable (canonical
+// domain contract; runtime.TaskRuntime implements the runtime side).
+var _ task.Executable = (*OpNode)(nil)
 
 // gitEnv pins an identity so commits succeed without global git config.
 var gitEnv = []string{
@@ -128,7 +130,7 @@ func TestOpNodeRequiresDefensiveCopy(t *testing.T) {
 }
 
 func TestOpNodeExecuteWriteFile(t *testing.T) {
-	engine := kernel.NewEngine(nil)
+	engine := appruntime.NewTaskEngine(nil)
 	target := newFileTarget(t, "src/a.go")
 	if err := os.MkdirAll(filepath.Dir(target.ID()), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -136,8 +138,8 @@ func TestOpNodeExecuteWriteFile(t *testing.T) {
 	node := mustNode(t, "write", op.OpWriteFile, target, ir.NewFile("src/a.go", []byte("package a\n")), nil)
 
 	res := engine.ExecuteTask(t.Context(), node)
-	if res.Status != kernel.StatusCompleted {
-		t.Fatalf("expected %s, got %s: %v", kernel.StatusCompleted, res.Status, res.Error)
+	if res.Status != task.ExecStatusCompleted {
+		t.Fatalf("expected %s, got %s: %v", task.ExecStatusCompleted, res.Status, res.Error)
 	}
 	got, err := target.Read()
 	if err != nil {
@@ -149,7 +151,7 @@ func TestOpNodeExecuteWriteFile(t *testing.T) {
 }
 
 func TestOpNodeExecuteDeleteFile(t *testing.T) {
-	engine := kernel.NewEngine(nil)
+	engine := appruntime.NewTaskEngine(nil)
 	target := newFileTarget(t, "gone.go")
 	abs := target.ID()
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
@@ -161,8 +163,8 @@ func TestOpNodeExecuteDeleteFile(t *testing.T) {
 	node := mustNode(t, "delete", op.OpDeleteFile, target, nil, nil)
 
 	res := engine.ExecuteTask(t.Context(), node)
-	if res.Status != kernel.StatusCompleted {
-		t.Fatalf("expected %s, got %s: %v", kernel.StatusCompleted, res.Status, res.Error)
+	if res.Status != task.ExecStatusCompleted {
+		t.Fatalf("expected %s, got %s: %v", task.ExecStatusCompleted, res.Status, res.Error)
 	}
 	if _, err := os.Stat(abs); !os.IsNotExist(err) {
 		t.Fatalf("expected file removed, stat err %v", err)
@@ -170,12 +172,12 @@ func TestOpNodeExecuteDeleteFile(t *testing.T) {
 }
 
 func TestOpNodeExecuteRunCommand(t *testing.T) {
-	engine := kernel.NewEngine(nil)
+	engine := appruntime.NewTaskEngine(nil)
 	node := mustNode(t, "run", op.OpRunCommand, newTerminalTarget(t), "echo hello", nil)
 
 	res := engine.ExecuteTask(t.Context(), node)
-	if res.Status != kernel.StatusCompleted {
-		t.Fatalf("expected %s, got %s: %v", kernel.StatusCompleted, res.Status, res.Error)
+	if res.Status != task.ExecStatusCompleted {
+		t.Fatalf("expected %s, got %s: %v", task.ExecStatusCompleted, res.Status, res.Error)
 	}
 	out, ok := res.Data.(string)
 	if !ok || !strings.Contains(out, "hello") {
@@ -184,12 +186,12 @@ func TestOpNodeExecuteRunCommand(t *testing.T) {
 }
 
 func TestOpNodeExecuteRunCommandFailure(t *testing.T) {
-	engine := kernel.NewEngine(nil)
+	engine := appruntime.NewTaskEngine(nil)
 	node := mustNode(t, "fail", op.OpRunCommand, newTerminalTarget(t), "exit 1", nil)
 
 	res := engine.ExecuteTask(t.Context(), node)
-	if res.Status != kernel.StatusFailed {
-		t.Fatalf("expected %s, got %s", kernel.StatusFailed, res.Status)
+	if res.Status != task.ExecStatusFailed {
+		t.Fatalf("expected %s, got %s", task.ExecStatusFailed, res.Status)
 	}
 	if res.Error == nil {
 		t.Fatal("expected a failure error")
@@ -217,8 +219,8 @@ func TestOpNodeExecuteGitCommit(t *testing.T) {
 	node := mustNode(t, "commit", op.OpGitCommit, repo, "second", nil)
 
 	res := engineExecute(t, node)
-	if res.Status != kernel.StatusCompleted {
-		t.Fatalf("expected %s, got %s: %v", kernel.StatusCompleted, res.Status, res.Error)
+	if res.Status != task.ExecStatusCompleted {
+		t.Fatalf("expected %s, got %s: %v", task.ExecStatusCompleted, res.Status, res.Error)
 	}
 	after := revParse(t, dir)
 	if after == before {
@@ -230,8 +232,8 @@ func TestOpNodeExecuteGitCommit(t *testing.T) {
 	}
 }
 
-func engineExecute(t *testing.T, node *OpNode) kernel.TaskResult {
+func engineExecute(t *testing.T, node *OpNode) task.TaskResult {
 	t.Helper()
-	engine := kernel.NewEngine(nil)
+	engine := appruntime.NewTaskEngine(nil)
 	return engine.ExecuteTask(t.Context(), node)
 }

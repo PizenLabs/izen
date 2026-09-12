@@ -10,7 +10,7 @@ import (
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
-	"github.com/PizenLabs/izen/internal/orchestrator"
+	runtimeorch "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 )
 
 // ── PREFLIGHT × DECOMPOSITION PIPELINE ──────────────────────────────────────
@@ -154,10 +154,10 @@ func TestPipeline_ApprovedDAGSatisfiesWorkflowGuardBeforeBuilding(t *testing.T) 
 	x := testExecutor(t, root, p, bus)
 	driver := NewDriver(NewExecutorAdapter(root, execution.NewIntentGateway(root), x), bus)
 
-	// The orchestrator sits at planning with an EMPTY plan context — exactly
+	// The PhaseManager sits at planning with an EMPTY plan context — exactly
 	// what a fast-path ($hot / "/build") entry leaves behind.
-	orch := orchestrator.New(workflow.NewWorkflowStateMachine(), nil)
-	if err := orch.Transition(orchestrator.PhasePlan, workflow.TransitionContext{}); err != nil {
+	orch := runtimeorch.New(workflow.NewWorkflowStateMachine(), nil)
+	if err := orch.Transition(runtimeorch.PhasePlan, workflow.TransitionContext{}); err != nil {
 		t.Fatalf("orchestrator planning setup: %v", err)
 	}
 
@@ -180,7 +180,7 @@ func TestPipeline_ApprovedDAGSatisfiesWorkflowGuardBeforeBuilding(t *testing.T) 
 	if !orch.HasAuthorizedPlan() {
 		t.Fatal("approved DECOMPOSITION_PROPOSAL must authorize the plan")
 	}
-	if err := orch.Transition(orchestrator.PhaseBuild, workflow.TransitionContext{HasCapabilities: true}); err != nil {
+	if err := orch.Transition(runtimeorch.PhaseBuild, workflow.TransitionContext{HasCapabilities: true}); err != nil {
 		t.Fatalf("TransitionToBuilding after approval: %v", err)
 	}
 
