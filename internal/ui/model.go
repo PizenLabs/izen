@@ -1738,20 +1738,22 @@ func (m *model) activeRouteModel() string {
 
 // routeModel resolves the intent-routed model for an explicit mode name. It is
 // the single seam the UI commands use for intent-based model routing.
+// Fallback hierarchy is strictly: pipeline binding → session/config model → global default.
 func (m *model) routeModel(mode string) string {
 	if m == nil {
-		return ""
+		return "qwen2.5-coder:7b"
 	}
+	var routed string
 	if m.pipelineEngine != nil {
-		return m.pipelineEngine.RouteForMode(mode).Model
+		routed = m.pipelineEngine.RouteForMode(mode).Model
+	} else if m.orch != nil && m.orch.Pipeline() != nil {
+		routed = m.orch.Pipeline().RouteForMode(mode).Model
 	}
-	if m.orch != nil && m.orch.Pipeline() != nil {
-		return m.orch.Pipeline().RouteForMode(mode).Model
+	if strings.TrimSpace(routed) != "" {
+		return routed
 	}
-	if m.cfg != nil {
-		return m.cfg.ActiveModelName()
-	}
-	return ""
+	// Fallback chain via resolveModelID (session → config → global default).
+	return m.resolveModelID("")
 }
 
 // syncPipelineTiers re-pins the layered pipeline router's per-intent models to
@@ -2578,7 +2580,9 @@ func (m *model) unwindBuildFailure() {
 	if m.workflowSM != nil {
 		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
 		// a reset back to StateIdle, from which every forward phase is reachable.
-		_ = m.workflowSM.SendEvent(workflow.EventReset, workflow.TransitionContext{})
+		if err := m.workflowSM.SendEvent(workflow.EventReset, workflow.TransitionContext{}); err != nil {
+			m.appendSystemError(fmt.Errorf("workflow reset rejected: %w", err))
+		}
 	}
 	if m.workflowRT != nil {
 		m.workflowRT.Reset()
@@ -3578,6 +3582,37 @@ func (m *model) flushRecord(rec record) tea.Cmd {
 		return nil
 	}
 	return tea.Println(rendered)
+}
+
+// appendSystemError logs a system-level transition error without swallowing it.
+// It surfaces the error in both the activity log and the error stream so the
+// operator can see the governance failure, and it preserves the failure for
+// diagnostics. This is the fail-closed error path required by Phase 1.
+func (m *model) appendSystemError(err error) {
+	if err == nil {
+		return
+	}
+	m.push(roleError, "[system] "+err.Error())
+	m.logActivity("[system] %v", err)
+}
+
+// resolveModelID implements the fail-closed model resolution hierarchy:
+// Node Binding → Session Model → Global Default ("qwen2.5-coder:7b").
+// An empty ModelID must never reach provider invocation; this helper
+// guarantees a non-empty result even when all upstream bindings are empty.
+func (m *model) resolveModelID(nodeBinding string) string {
+	if strings.TrimSpace(nodeBinding) != "" {
+		return strings.TrimSpace(nodeBinding)
+	}
+	if sessionModel := m.getActiveModelName(); strings.TrimSpace(sessionModel) != "" {
+		return strings.TrimSpace(sessionModel)
+	}
+	if m.cfg != nil {
+		if cfgDefault := m.cfg.ActiveModelName(); strings.TrimSpace(cfgDefault) != "" {
+			return strings.TrimSpace(cfgDefault)
+		}
+	}
+	return "qwen2.5-coder:7b"
 }
 
 // flushPendingRecords returns a batch cmd that flushes all records.

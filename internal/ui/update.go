@@ -1444,11 +1444,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.err != nil {
 			m.push(roleError, "build execution error: "+providers.SanitizeAPIError(msg.err))
 			if m.orch != nil {
-				_ = m.orch.Fail(classifier.FailureUnknownClass)
+				if err := m.orch.Fail(classifier.FailureUnknownClass); err != nil {
+					m.appendSystemError(fmt.Errorf("orchestrator fail transition rejected: %w", err))
+				}
 			} else if m.workflowSM != nil {
-				_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
+				if err := m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
 					FailureClass: classifier.FailureUnknownClass,
-				})
+				}); err != nil {
+					m.appendSystemError(fmt.Errorf("workflow state machine rejected failure event: %w", err))
+					m.resetStreamingState()
+				}
 			}
 			// "Human-Centered / Reversible": an execution failure must never
 			// trap the user in the build phase. Unwind back to interactive
@@ -1516,11 +1521,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				"[BUILD HALTED] Step %d failed. Queue frozen — remaining tasks marked stalled. Use /investigate or /plan to re-generate a valid ledger.",
 				m.currentBuildTaskID))
 			if m.orch != nil {
-				_ = m.orch.Fail(classifier.FailureCodeClass)
+				if err := m.orch.Fail(classifier.FailureCodeClass); err != nil {
+					m.appendSystemError(fmt.Errorf("orchestrator fail transition rejected: %w", err))
+				}
 			} else if m.workflowSM != nil {
-				_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
+				if err := m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
 					FailureClass: classifier.FailureCodeClass,
-				})
+				}); err != nil {
+					m.appendSystemError(fmt.Errorf("workflow state machine rejected failure event: %w", err))
+					m.resetStreamingState()
+				}
 			}
 			m.refreshViewportContent()
 			m.gotoBottomIfAllowed()

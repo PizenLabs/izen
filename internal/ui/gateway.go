@@ -69,9 +69,34 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	if m.resolver != nil {
 		req.Mode = m.resolver.Current().String()
 	}
-	// Explicit TargetModel: resolved from the active Workspace Target at
-	// admission. The executor validates verbatim and rejects empty locally.
-	req.Model = m.getActiveModelName()
+	// Explicit TargetModel: resolved via fail-closed hierarchy
+	// Node Binding → Session Model → Global Default ("qwen2.5-coder:7b").
+	// An empty ModelID must never reach provider invocation.
+	req.Model = m.resolveModelID(req.Model)
+	if strings.TrimSpace(req.Model) == "" {
+		m.stopShimmer()
+		m.push(roleError, "execution blocked [fail-closed]: empty ModelID; no node binding, session model, or global default configured")
+		m.refreshViewportContent()
+		return func() tea.Msg {
+			return gatedExecutionMsg{det: det, err: fmt.Errorf("execution blocked [fail-closed]: empty ModelID; no node binding, session model, or global default configured")}
+		}
+	}
+
+	// ── CONCURRENCY MUTEX: autonomousDriver vs executor ──────────────
+	// The autonomousDriver and standard executor loops are mutually exclusive;
+	// concurrent dispatch against shared workspace state is strictly forbidden.
+	activeModeForMutex := modes.ModeAsk
+	if m.resolver != nil {
+		activeModeForMutex = m.resolver.Current()
+	}
+	if m.autonomousActive && IsExecutionMode(activeModeForMutex) {
+		m.stopShimmer()
+		m.push(roleError, "execution rejected: autonomous engine loop is currently running; halt loop before initiating new workspace commands")
+		m.refreshViewportContent()
+		return func() tea.Msg {
+			return gatedExecutionMsg{det: det, err: fmt.Errorf("execution rejected: autonomous engine loop is currently running; halt loop before initiating new workspace commands")}
+		}
+	}
 
 	// ── TUI GATEWAY ROUTING HARD ENFORCEMENT ─────────────────────────
 	// Zero Direct Fallback in Execution Modes: when the active mode is any
