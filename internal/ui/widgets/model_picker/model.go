@@ -1212,11 +1212,11 @@ func BadgesFor(d registry.ModelDescriptor, roles map[string]string) []string {
 			badges = append(badges, "["+strings.ToUpper(roleName)+"]")
 		}
 	}
-	if role.EffectiveIsThinking(d) {
+	if registry.EffectiveIsThinkingOf(d) {
 		badges = append(badges, "[THINKING]")
 	}
-	caps := role.EffectiveCapabilities(d)
-	if role.HasCapability(caps, registry.CapVision) {
+	caps := registry.EffectiveCapabilitiesOf(d)
+	if role.HasCapability(caps, role.CapVision) {
 		// Avoid doubling when the vision role itself is bound: the role
 		// badge already signals assignment; the capability badge signals
 		// vision support.

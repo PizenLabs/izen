@@ -265,6 +265,16 @@ func (s *Session) ClearTasks() {
 	_ = s.Save()
 }
 
+// UnstageTaskList rolls back a staged task list, clearing the in-memory
+// ledger without persisting. Callers must follow with Save and handle its
+// error to complete the fail-closed persistence contract.
+func (s *Session) UnstageTaskList() {
+	if s == nil {
+		return
+	}
+	s.CurrentTasks = nil
+}
+
 // AddAssumption adds an assumption to the session.
 func (s *Session) AddAssumption(a string) {
 	s.Assumptions = append(s.Assumptions, a)

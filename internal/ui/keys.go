@@ -924,7 +924,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.hotfixActive = false
 				if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
 					m.sess.StageTaskList(&stashedTasks)
-					_ = m.sess.Save()
+					m.persistSession("keys")
 				}
 				m.refreshViewportContent()
 				m.followTail()
@@ -989,7 +989,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						}
 					}
 					m.sess.StageTaskList(&tasks)
-					_ = m.sess.Save()
+					m.persistSession("keys")
 				}
 				m.push(roleSystem, infoStyle.Render(
 					"  "+Icon.Error+" Rejected — shell execution aborted."))
@@ -1070,7 +1070,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case msg.String() == "alt+r" || msg.Type == tea.KeyEscape:
 			if m.sess != nil {
 				m.sess.ClearHistory()
-				_ = m.sess.Save()
+				m.persistSession("keys")
 			}
 
 			if m.currentBuildTaskID > 0 && m.sess != nil {
@@ -1082,7 +1082,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.sess.StageTaskList(&tasks)
-				_ = m.sess.Save()
+				m.persistSession("keys")
 			}
 
 			m.ti.Focus()

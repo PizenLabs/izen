@@ -561,6 +561,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// errors are surfaced; successful commands rendered their own
 		// presentation events.
 		if msg.err != nil {
+			// ── GRACEFUL PHASE TRANSITION REJECTION ───────────────
+			// A backward switch_mode hop (e.g. /investigate while in
+			// Review) is rejected by the workflow guard. Catch it at
+			// command admission, surface it as a system warning, and
+			// leave the UI predictable — never corrupt prompt
+			// dispatching with an unhandled transition error.
+			if m.handleBackwardTransitionError(msg.err) {
+				return m, nil
+			}
 			m.push(roleError, fmt.Sprintf("command %s failed: %v", msg.typ, msg.err))
 			m.refreshViewportContent()
 			if m.Ready && !m.userIsScrollingUp {
@@ -1444,11 +1453,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.err != nil {
 			m.push(roleError, "build execution error: "+providers.SanitizeAPIError(msg.err))
 			if m.orch != nil {
-				_ = m.orch.Fail(classifier.FailureUnknownClass)
+				if err := m.orch.Fail(classifier.FailureUnknownClass); err != nil {
+					m.appendSystemError(fmt.Errorf("orchestrator fail transition rejected: %w", err))
+				}
 			} else if m.workflowSM != nil {
-				_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
+				if err := m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
 					FailureClass: classifier.FailureUnknownClass,
-				})
+				}); err != nil {
+					m.appendSystemError(fmt.Errorf("workflow state machine rejected failure event: %w", err))
+					m.resetStreamingState()
+				}
 			}
 			// "Human-Centered / Reversible": an execution failure must never
 			// trap the user in the build phase. Unwind back to interactive
@@ -1497,7 +1511,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// appending to stale failed-task history.
 			if m.sess != nil {
 				m.sess.ClearHistory()
-				_ = m.sess.Save()
+				m.persistSession("update")
 			}
 
 			tasks := m.sess.CurrentTasks
@@ -1510,17 +1524,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 			if changed {
 				m.sess.StageTaskList(&tasks)
-				_ = m.sess.Save()
+				m.persistSession("update")
 			}
 			m.push(roleError, fmt.Sprintf(
 				"[BUILD HALTED] Step %d failed. Queue frozen — remaining tasks marked stalled. Use /investigate or /plan to re-generate a valid ledger.",
 				m.currentBuildTaskID))
 			if m.orch != nil {
-				_ = m.orch.Fail(classifier.FailureCodeClass)
+				if err := m.orch.Fail(classifier.FailureCodeClass); err != nil {
+					m.appendSystemError(fmt.Errorf("orchestrator fail transition rejected: %w", err))
+				}
 			} else if m.workflowSM != nil {
-				_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
+				if err := m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{
 					FailureClass: classifier.FailureCodeClass,
-				})
+				}); err != nil {
+					m.appendSystemError(fmt.Errorf("workflow state machine rejected failure event: %w", err))
+					m.resetStreamingState()
+				}
 			}
 			m.refreshViewportContent()
 			m.gotoBottomIfAllowed()
@@ -1784,7 +1803,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleSystem, successBannerStyle.Render("[✓] "+result))
 		}
 
-		_ = m.sess.Save()
+		m.persistSession("update")
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
@@ -1796,7 +1815,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if m.sess.ObjectiveState != nil {
 				m.sess.ObjectiveState.CurrentStatus = domain.ObjectiveIdle
 				m.sess.SetObjectiveState(m.sess.ObjectiveState)
-				_ = m.sess.Save()
+				m.persistSession("update")
 			}
 			return m, nil
 		}
@@ -1805,7 +1824,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 		m.sess.SetObjectiveState(msg.objective)
-		_ = m.sess.Save()
+		m.persistSession("update")
 		if msg.objective.TokenBudget.RequiresApproval {
 			m.setToast("Objective needs manual approval. Run /objective approve.")
 		} else {
@@ -1881,7 +1900,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 					}
 				}
 				m.sess.StageTaskList(&tasks)
-				_ = m.sess.Save()
+				m.persistSession("update")
 			}
 
 			m.ti.Focus()
@@ -2668,7 +2687,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
-			_ = m.sess.Save()
+			m.persistSession("update")
 		}
 		m.TurnInputTokens = msg.tokenInput
 		m.TurnOutputTokens = msg.tokenOutput
@@ -3041,7 +3060,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				// failed previous attempt. Each plan generation is an
 				// independent lifecycle event.
 				m.sess.ClearHistory()
-				_ = m.sess.Save()
+				m.persistSession("update")
 			}
 			// Ensure the plan view shows approval actions even when the
 			// PlanEngine path (planResultMsg) was bypassed.
@@ -3182,7 +3201,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
-			_ = m.sess.Save()
+			m.persistSession("update")
 		}
 		// NON-DESTRUCTIVE SNAPSHOT: capture whether the first token was already
 		// rendered BEFORE any error bookkeeping. A mid-stream failure must

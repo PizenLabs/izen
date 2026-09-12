@@ -4,9 +4,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-
-	"github.com/PizenLabs/izen/internal/config"
-	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
 // Core operational roles managed by Izen.
@@ -31,35 +28,31 @@ var smolPatterns = []string{
 	"7b", "8b", "3b", "1b", "lite", "turbo",
 }
 
-// ResolveRoleModel resolves the model for roleName:
+// ResolveRoleModel resolves the model for roleName from provider-agnostic
+// inputs:
 //
-//  1. Exact role binding in cfg.Roles[roleName] (matched against the registry
-//     by exact ID, then case-insensitive ID, then Name). A bound ID absent
-//     from the registry is an error — the engine must not silently substitute.
+//  1. Exact role binding in bindings[roleName] (matched against models by
+//     exact ID, then case-insensitive ID, then Name). A bound ID absent
+//     from models is an error — the engine must not silently substitute.
 //  2. Heuristic capability fallback when no explicit model is bound:
 //     plan → thinking model; smol → fast model; vision → vision model
 //     (required); adviser → largest context ≥128k preferred; default →
 //     tool-capable model, else first.
 //
-// A nil registry or an empty registry is always an error. A nil config is
-// treated as "no explicit bindings".
-func ResolveRoleModel(roleName string, cfg *config.CascadeConfig, reg *registry.Registry) (registry.ModelDescriptor, error) {
-	if reg == nil {
-		return registry.ModelDescriptor{}, fmt.Errorf("role %q: nil model registry", roleName)
-	}
-	models := reg.Snapshot()
+// An empty model list is always an error. A nil bindings map is treated as
+// "no explicit bindings". Callers outside internal/domain translate concrete
+// config/registry records into these primitives via the adapter layer.
+func ResolveRoleModel(roleName string, bindings map[string]string, models []ModelDescriptor) (ModelDescriptor, error) {
 	if len(models) == 0 {
-		return registry.ModelDescriptor{}, fmt.Errorf("role %q: registry is empty", roleName)
+		return ModelDescriptor{}, fmt.Errorf("role %q: model list is empty", roleName)
 	}
 
 	// Step 1: exact role binding.
-	if cfg != nil {
-		if bound, ok := cfg.Roles[roleName]; ok && strings.TrimSpace(bound) != "" {
-			if m, found := lookupModel(models, strings.TrimSpace(bound)); found {
-				return EnrichDescriptor(m), nil
-			}
-			return registry.ModelDescriptor{}, fmt.Errorf("role %q: bound model %q not found in registry", roleName, bound)
+	if bound, ok := bindings[roleName]; ok && strings.TrimSpace(bound) != "" {
+		if m, found := lookupModel(models, strings.TrimSpace(bound)); found {
+			return EnrichDescriptor(m), nil
 		}
+		return ModelDescriptor{}, fmt.Errorf("role %q: bound model %q not found in registry", roleName, bound)
 	}
 
 	// Step 2: heuristic fallback.
@@ -69,25 +62,25 @@ func ResolveRoleModel(roleName string, cfg *config.CascadeConfig, reg *registry.
 			return EnrichDescriptor(m), nil
 		}
 		// No thinking model available: fall back to a general model rather
-		// than failing — plan must always resolve when the registry is
+		// than failing — plan must always resolve when the model list is
 		// non-empty.
 		return EnrichDescriptor(models[0]), nil
 	case RoleSmol:
 		return EnrichDescriptor(firstSmol(models)), nil
 	case RoleVision:
-		if m, ok := firstWithCap(models, registry.CapVision); ok {
+		if m, ok := firstWithCap(models, CapVision); ok {
 			return EnrichDescriptor(m), nil
 		}
-		return registry.ModelDescriptor{}, fmt.Errorf("role %q: no vision-capable model in registry", roleName)
+		return ModelDescriptor{}, fmt.Errorf("role %q: no vision-capable model in registry", roleName)
 	case RoleAdviser:
 		return EnrichDescriptor(largestContext(models)), nil
 	case RoleDefault, "":
-		if m, ok := firstWithCap(models, registry.CapTools); ok {
+		if m, ok := firstWithCap(models, CapTools); ok {
 			return EnrichDescriptor(m), nil
 		}
 		return EnrichDescriptor(models[0]), nil
 	default:
-		return registry.ModelDescriptor{}, fmt.Errorf("unknown role %q (valid: %s)", roleName, strings.Join(ValidRoles, ", "))
+		return ModelDescriptor{}, fmt.Errorf("unknown role %q (valid: %s)", roleName, strings.Join(ValidRoles, ", "))
 	}
 }
 
@@ -102,7 +95,7 @@ func IsValidRole(name string) bool {
 }
 
 // lookupModel finds a descriptor by exact ID, case-insensitive ID, then Name.
-func lookupModel(models []registry.ModelDescriptor, id string) (registry.ModelDescriptor, bool) {
+func lookupModel(models []ModelDescriptor, id string) (ModelDescriptor, bool) {
 	for _, m := range models {
 		if m.ID == id {
 			return m, true
@@ -118,32 +111,32 @@ func lookupModel(models []registry.ModelDescriptor, id string) (registry.ModelDe
 			return m, true
 		}
 	}
-	return registry.ModelDescriptor{}, false
+	return ModelDescriptor{}, false
 }
 
 // firstThinking returns the first model flagged thinking by stored fields or
 // the classifier.
-func firstThinking(models []registry.ModelDescriptor) (registry.ModelDescriptor, bool) {
+func firstThinking(models []ModelDescriptor) (ModelDescriptor, bool) {
 	for _, m := range models {
-		if EffectiveIsThinking(m) || HasCapability(EffectiveCapabilities(m), registry.CapThinking) {
+		if EffectiveIsThinking(m) || HasCapability(EffectiveCapabilities(m), CapThinking) {
 			return m, true
 		}
 	}
-	return registry.ModelDescriptor{}, false
+	return ModelDescriptor{}, false
 }
 
 // firstWithCap returns the first model with the given effective capability.
-func firstWithCap(models []registry.ModelDescriptor, cap registry.ModelCapability) (registry.ModelDescriptor, bool) {
+func firstWithCap(models []ModelDescriptor, cap ModelCapability) (ModelDescriptor, bool) {
 	for _, m := range models {
 		if HasCapability(EffectiveCapabilities(m), cap) {
 			return m, true
 		}
 	}
-	return registry.ModelDescriptor{}, false
+	return ModelDescriptor{}, false
 }
 
 // firstSmol returns the first fast/low-latency model, else the first model.
-func firstSmol(models []registry.ModelDescriptor) registry.ModelDescriptor {
+func firstSmol(models []ModelDescriptor) ModelDescriptor {
 	lower := make([]string, len(models))
 	for i, m := range models {
 		lower[i] = strings.ToLower(m.ID + " " + m.Name)
@@ -160,8 +153,8 @@ func firstSmol(models []registry.ModelDescriptor) registry.ModelDescriptor {
 
 // largestContext returns the model with the largest context window,
 // preferring ≥AdviserMinContext but always resolving when non-empty.
-func largestContext(models []registry.ModelDescriptor) registry.ModelDescriptor {
-	sorted := append([]registry.ModelDescriptor(nil), models...)
+func largestContext(models []ModelDescriptor) ModelDescriptor {
+	sorted := append([]ModelDescriptor(nil), models...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return sorted[i].ContextWindow > sorted[j].ContextWindow
 	})

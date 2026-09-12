@@ -234,7 +234,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.HumanConfirmed {
 		m.sess.ObjectiveState.CurrentStatus = domain.ObjectiveExecuting
 		m.sess.SetObjectiveState(m.sess.ObjectiveState)
-		_ = m.sess.Save()
+		m.persistSession("stream")
 	}
 
 	// Context isolation: ASK single-shot prompts must not carry stale failed history.
@@ -251,7 +251,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 				newHist = append(newHist, m.sess.History[:len(m.sess.History)-2]...)
 				newHist = append(newHist, m.sess.History[len(m.sess.History)-1])
 				m.sess.History = newHist
-				_ = m.sess.Save()
+				m.persistSession("stream")
 			}
 		}
 	}

@@ -1738,20 +1738,22 @@ func (m *model) activeRouteModel() string {
 
 // routeModel resolves the intent-routed model for an explicit mode name. It is
 // the single seam the UI commands use for intent-based model routing.
+// Fallback hierarchy is strictly: pipeline binding → session/config model → global default.
 func (m *model) routeModel(mode string) string {
 	if m == nil {
-		return ""
+		return "qwen2.5-coder:7b"
 	}
+	var routed string
 	if m.pipelineEngine != nil {
-		return m.pipelineEngine.RouteForMode(mode).Model
+		routed = m.pipelineEngine.RouteForMode(mode).Model
+	} else if m.orch != nil && m.orch.Pipeline() != nil {
+		routed = m.orch.Pipeline().RouteForMode(mode).Model
 	}
-	if m.orch != nil && m.orch.Pipeline() != nil {
-		return m.orch.Pipeline().RouteForMode(mode).Model
+	if strings.TrimSpace(routed) != "" {
+		return routed
 	}
-	if m.cfg != nil {
-		return m.cfg.ActiveModelName()
-	}
-	return ""
+	// Fallback chain via resolveModelID (session → config → global default).
+	return m.resolveModelID("")
 }
 
 // syncPipelineTiers re-pins the layered pipeline router's per-intent models to
@@ -2260,6 +2262,7 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// A terminal failure event is authoritative execution truth: it must
 		// release the loading state, spinner, and pending operation.
 		m.clearExecutionLoading(OpOutcomeFailure)
+		m.syncExecutionProjection()
 	case events.SelfHealingAttemptPayload:
 		// Distinct retry badge + attempt count + failure category so the
 		// self-healing loop reads as one clean, scannable line.
@@ -2341,6 +2344,7 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			outcome = OpOutcomeCancelled
 		}
 		m.clearExecutionLoading(outcome)
+		m.syncExecutionProjection()
 	case events.ApprovalRequiredPayload:
 		m.logRuntimeDetail("[runtime] approval required: %s", p.Target)
 	case events.ApprovalRejectedPayload:
@@ -2578,7 +2582,9 @@ func (m *model) unwindBuildFailure() {
 	if m.workflowSM != nil {
 		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
 		// a reset back to StateIdle, from which every forward phase is reachable.
-		_ = m.workflowSM.SendEvent(workflow.EventReset, workflow.TransitionContext{})
+		if err := m.workflowSM.SendEvent(workflow.EventReset, workflow.TransitionContext{}); err != nil {
+			m.appendSystemError(fmt.Errorf("workflow reset rejected: %w", err))
+		}
 	}
 	if m.workflowRT != nil {
 		m.workflowRT.Reset()
@@ -2660,17 +2666,28 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.shellRunning = false
 	m.planPending = false
 	m.executionResolving = false
-	// For non-autonomous the operation is already finalized; for autonomous
-	// keep autonomousActive true until the driver terminal message but still
-	// force the presentation to IDLE.
-	_ = m.autonomousActive // referenced; no branch mutation needed
-	m.syncUIState()
-	// Force state to chat even when autonomousActive would otherwise keep
-	// it in processing — the directive requires immediate IDLE.
-	m.state = StateChat
-
+	// Canonical sync (Phase 2): never hand-set StateChat while an
+	// autonomous run is active or the workflow machine remains in a
+	// Building/Planning phase. If an autonomous driver is in flight its
+	// terminal autonomousRunMsg remains the canonical finalization path,
+	// so autonomousActive stays true here by design; the presentation is
+	// derived from the reset machine below.
 	// 3. Release any outstanding approval gate on the canonical source.
 	m.resolveApprovalState()
+	// Project the interrupt onto the canonical workflow state machine so
+	// m.state (via syncUIState) can never drift from workflowSM. The
+	// interrupt event unwinds Building/Planning/Reviewing/Repairing to
+	// Idle; failures are surfaced, never swallowed.
+	if m.workflowSM != nil {
+		if err := m.workflowSM.SendEvent(workflow.EventUserInterrupt, workflow.TransitionContext{}); err != nil {
+			m.appendSystemError(fmt.Errorf("workflow SM rejected emergency interrupt event: %w", err))
+		}
+	}
+	// syncUIState is the single source of truth for m.state: it derives
+	// the presentation exclusively from workflowSM, approval gates, and
+	// transient busy flags. No manual m.state assignment occurs on this
+	// path.
+	m.syncUIState()
 
 	// 4. Drop in-flight approval/patch state so the viewport returns to chat.
 	m.awaitingConfirmation = false
@@ -2698,20 +2715,23 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	if m.hotfixActive {
 		if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
 			m.sess.StageTaskList(&stashedTasks)
-			_ = m.sess.Save()
+			m.persistSession("model")
 		}
 		m.hotfixActive = false
 	}
 
-	// 5. Restore interactive input and force the presentation back to chat.
-	// Directive: immediately return to IDLE prompt (build > / ask >) without
-	// requiring multiple keypresses; never remain stuck in Generating...
+	// 5. Restore interactive input. The presentation state was already
+	// derived canonically via syncUIState above; no manual StateChat
+	// override occurs here so autonomousActive and workflowSM can never
+	// drift from m.state.
 	m.ti.Focus()
 	m.recalcViewportHeight()
-	m.state = StateChat
 	// Clear spinners and reset token rate counters to 0.0 tok/s already done above;
 	// ensure sync.
 	m.stopShimmer()
+	// Final canonical projection: syncUIState remains the single source of
+	// truth for m.state. No manual assignment follows.
+	m.syncUIState()
 	abortTotal := abortBaseIn + abortLiveOut
 	if abortTotal > 0 || abortCostLabel != "" {
 		m.push(roleSystem, infoStyle.Render(
@@ -2724,10 +2744,12 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 		m.Viewport.GotoBottom()
 	}
 
-	// 5b. Abort any parked autonomous run. The driver holds its own loop
-	// state (no worker is blocked); Abort terminates it as a permanent human
-	// cancellation and the terminal message projects through the normal
-	// autonomousRunMsg path.
+	// 5b. Abort any autonomous run via the canonical driver path. When a
+	// parked boundary exists the run state is cleared now and the abort
+	// projects through autonomousRunMsg; when autonomousActive is set
+	// without a parked boundary (streaming driver) stopAutonomousDriver
+	// schedules the abort while leaving finalization to the terminal
+	// message. No presentation state is hand-set here.
 	var extra []tea.Cmd
 	if m.autonomousDriver != nil && m.autonomousBoundary != nil {
 		driver := m.autonomousDriver
@@ -2736,6 +2758,10 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 			term, err := driver.Abort(reason + " interrupt")
 			return autonomousRunMsg{term: term, err: err}
 		})
+	} else if m.autonomousActive {
+		if cmd := m.stopAutonomousDriver(reason); cmd != nil {
+			extra = append(extra, cmd)
+		}
 	}
 
 	return m, tea.Batch(append(extra,
@@ -2745,7 +2771,12 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 }
 
 // syncUIState projects the canonical workflow state onto the presentation
-// state. It is the single place the approval presentation state is derived.
+// state. It is the SINGLE source of truth for deriving m.state from
+// m.workflowSM, approval gates, and transient busy flags. Emergency
+// interrupts must route through workflowSM.SendEvent(EventUserInterrupt)
+// followed by syncUIState and must never hand-set m.state to StateChat
+// while autonomousActive is true or the machine remains in
+// StateBuilding/StatePlanning.
 //
 // StateAwaitingApproval is strictly derived from the canonical pending-approval
 // gate. StateProcessing is derived from the active workflow phase only while a
@@ -2796,6 +2827,47 @@ func (m *model) syncUIState() {
 	// Resting in a mode phase must never gate the input line by itself —
 	// a persistent phase is NOT an in-flight operation.
 	m.state = StateChat
+	m.syncExecutionProjection()
+}
+
+// syncExecutionProjection deterministically mirrors the canonical
+// WorkflowStateMachine onto the presentation-layer execution projection.
+// When the engine reaches terminal/idle states (StateIdle, StateChat) or
+// recovers from interrupts (EventUserInterrupt), stale step trees and
+// progress projections are cleared immediately.
+//
+//nolint:unused // Staged contract: projection determinism (see ADR-004)
+func (m *model) syncExecutionProjection() {
+	if m.workflowSM == nil {
+		return
+	}
+	st := m.workflowSM.State()
+	if st == workflow.StateIdle || m.state == StateChat {
+		// Stale running projections must be cleared immediately when the
+		// engine returns to idle/chat or recovers from an interrupt. A
+		// terminal (completed/failed) projection is not stale — it is the
+		// visible result and survives until the next Begin. Only a running
+		// or waiting-approval projection is considered stale and is reset.
+		if m.execView != nil {
+			phase := m.execView.State().Phase
+			if phase == presentation.PhaseRunning || phase == presentation.PhaseWaitingApproval {
+				m.execView.Reset()
+				m.execVisibility = presentation.VisibilityNormal
+				m.executionResolving = false
+				return
+			}
+			if phase.Terminal() {
+				// Terminal result stays visible with its current visibility
+				// layer — the execution is no longer in-flight but the
+				// completed narrative and its expanded/debug metadata survive
+				// until the next Begin.
+				m.executionResolving = false
+				return
+			}
+		}
+		m.execVisibility = presentation.VisibilityNormal
+		m.executionResolving = false
+	}
 }
 
 // isWorkflowBusy reports whether a transient workflow operation (stream, agent,
@@ -2848,7 +2920,7 @@ func (m *model) markAllPlanTasksCompleted() {
 	}
 	if changed {
 		m.sess.StageTaskList(&tasks)
-		_ = m.sess.Save()
+		m.persistSession("model")
 	}
 }
 
@@ -3578,6 +3650,53 @@ func (m *model) flushRecord(rec record) tea.Cmd {
 		return nil
 	}
 	return tea.Println(rendered)
+}
+
+// appendSystemError logs a system-level transition error without swallowing it.
+// It surfaces the error in both the activity log and the error stream so the
+// operator can see the governance failure, and it preserves the failure for
+// diagnostics. This is the fail-closed error path required by Phase 1.
+func (m *model) appendSystemError(err error) {
+	if err == nil {
+		return
+	}
+	m.push(roleError, "[system] "+err.Error())
+	m.logActivity("[system] %v", err)
+}
+
+// persistSession saves session state to disk with fail-closed error
+// reporting (Phase 2 persistence integrity). It never swallows the Save
+// error: failures are surfaced via appendSystemError so operators see the
+// durability gap. It is deliberately fire-and-report (no error return):
+// Bubble Tea update paths have no error-propagation channel, and every
+// historical caller discarded the return — so the surface is pushed at the
+// source instead of relying on 35+ call sites to check it.
+func (m *model) persistSession(op string) {
+	if m == nil || m.sess == nil {
+		return
+	}
+	if err := m.sess.Save(); err != nil {
+		m.appendSystemError(fmt.Errorf("session persist %s failed: %w", op, err))
+	}
+}
+
+// resolveModelID implements the fail-closed model resolution hierarchy:
+// Node Binding → Session Model → Global Default ("qwen2.5-coder:7b").
+// An empty ModelID must never reach provider invocation; this helper
+// guarantees a non-empty result even when all upstream bindings are empty.
+func (m *model) resolveModelID(nodeBinding string) string {
+	if strings.TrimSpace(nodeBinding) != "" {
+		return strings.TrimSpace(nodeBinding)
+	}
+	if sessionModel := m.getActiveModelName(); strings.TrimSpace(sessionModel) != "" {
+		return strings.TrimSpace(sessionModel)
+	}
+	if m.cfg != nil {
+		if cfgDefault := m.cfg.ActiveModelName(); strings.TrimSpace(cfgDefault) != "" {
+			return strings.TrimSpace(cfgDefault)
+		}
+	}
+	return "qwen2.5-coder:7b"
 }
 
 // flushPendingRecords returns a batch cmd that flushes all records.

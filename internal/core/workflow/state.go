@@ -56,6 +56,11 @@ const (
 	EventFailureIdentified
 	EventVerificationPassed
 	EventReset
+	// EventUserInterrupt is the canonical emergency-interrupt event. It
+	// transitions any non-idle workflow state back to StateIdle so the
+	// presentation layer can derive StateChat from the state machine
+	// instead of forcing it manually (Phase 2 state-drift fix).
+	EventUserInterrupt
 )
 
 func (e WorkflowEvent) String() string {
@@ -74,6 +79,8 @@ func (e WorkflowEvent) String() string {
 		return "verification-passed"
 	case EventReset:
 		return "reset"
+	case EventUserInterrupt:
+		return "user-interrupt"
 	default:
 		return fmt.Sprintf("WorkflowEvent(%d)", int(e))
 	}

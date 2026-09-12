@@ -45,6 +45,15 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	if line == "" {
 		return nil
 	}
+	// ── CASUAL CONVERSATION AUTO-UNWIND ─────────────────────────────
+	// A casual prompt ("hi") while the WorkflowStateMachine is in any
+	// non-idle phase unwinds to StateIdle/StateChat here — before Gate(),
+	// ScopeGuard proposals, WorkerEngine dispatch, or executor submission.
+	// Zero pipeline propagation by construction: Gate() is never reached.
+	if m.handleCasualAutoUnwind(line) {
+		m.stopShimmer()
+		return nil
+	}
 	if m.gateway == nil || m.executor == nil {
 		m.push(roleError, "execution runtime not wired")
 		m.refreshViewportContent()
@@ -69,9 +78,34 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	if m.resolver != nil {
 		req.Mode = m.resolver.Current().String()
 	}
-	// Explicit TargetModel: resolved from the active Workspace Target at
-	// admission. The executor validates verbatim and rejects empty locally.
-	req.Model = m.getActiveModelName()
+	// Explicit TargetModel: resolved via fail-closed hierarchy
+	// Node Binding → Session Model → Global Default ("qwen2.5-coder:7b").
+	// An empty ModelID must never reach provider invocation.
+	req.Model = m.resolveModelID(req.Model)
+	if strings.TrimSpace(req.Model) == "" {
+		m.stopShimmer()
+		m.push(roleError, "execution blocked [fail-closed]: empty ModelID; no node binding, session model, or global default configured")
+		m.refreshViewportContent()
+		return func() tea.Msg {
+			return gatedExecutionMsg{det: det, err: fmt.Errorf("execution blocked [fail-closed]: empty ModelID; no node binding, session model, or global default configured")}
+		}
+	}
+
+	// ── CONCURRENCY MUTEX: autonomousDriver vs executor ──────────────
+	// The autonomousDriver and standard executor loops are mutually exclusive;
+	// concurrent dispatch against shared workspace state is strictly forbidden.
+	activeModeForMutex := modes.ModeAsk
+	if m.resolver != nil {
+		activeModeForMutex = m.resolver.Current()
+	}
+	if m.autonomousActive && IsExecutionMode(activeModeForMutex) {
+		m.stopShimmer()
+		m.push(roleError, "execution rejected: autonomous engine loop is currently running; halt loop before initiating new workspace commands")
+		m.refreshViewportContent()
+		return func() tea.Msg {
+			return gatedExecutionMsg{det: det, err: fmt.Errorf("execution rejected: autonomous engine loop is currently running; halt loop before initiating new workspace commands")}
+		}
+	}
 
 	// ── TUI GATEWAY ROUTING HARD ENFORCEMENT ─────────────────────────
 	// Zero Direct Fallback in Execution Modes: when the active mode is any
@@ -728,16 +762,30 @@ func (m *model) projectBuildQueueFromProof(res *execution.ExecutionResult, execE
 				stalled = true
 			}
 		}
+		prev := append([]plan.Task(nil), m.sess.CurrentTasks...)
 		m.sess.StageTaskList(&tasks)
-		_ = m.sess.Save()
+		if err := m.sess.Save(); err != nil {
+			m.sess.CurrentTasks = prev
+			m.appendSystemError(fmt.Errorf("session stage task list failed: %w", err))
+			m.push(roleError, "[BUILD HALTED] Failed to persist build proposal state to disk — queue unchanged.")
+			flush := m.flushPendingRecords()
+			return m, flush, true
+		}
 		if stalled {
 			m.push(roleError, "[BUILD HALTED] Execution failed. Queue frozen — remaining tasks marked stalled. Use /investigate or /plan to re-generate a valid ledger.")
 		}
 		flush := m.flushPendingRecords()
 		return m, flush, true
 	}
+	prev := append([]plan.Task(nil), m.sess.CurrentTasks...)
 	m.sess.StageTaskList(&tasks)
-	_ = m.sess.Save()
+	if err := m.sess.Save(); err != nil {
+		m.sess.CurrentTasks = prev
+		m.appendSystemError(fmt.Errorf("session stage task list failed: %w", err))
+		m.push(roleError, "Failed to persist build proposal state to disk — queue unchanged.")
+		flush := m.flushPendingRecords()
+		return m, flush, true
+	}
 	for _, t := range tasks {
 		if t.Status == "idle" || t.Status == "processing" {
 			flush := m.flushPendingRecords()

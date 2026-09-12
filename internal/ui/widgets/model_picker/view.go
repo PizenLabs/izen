@@ -260,7 +260,9 @@ func (m Model) renderDetailView() string {
 
 	caps := model.Capabilities
 	if len(caps) == 0 {
-		caps = role.EffectiveCapabilities(*model)
+		for _, c := range registry.EffectiveCapabilitiesOf(*model) {
+			caps = append(caps, registry.ModelCapability(string(c)))
+		}
 	}
 	capsStr := formatCapabilities(caps)
 
@@ -756,7 +758,9 @@ func (m Model) renderModelRow(item registry.ModelDescriptor, rightPaneW int) str
 func capabilityFlags(d registry.ModelDescriptor) string {
 	caps := d.Capabilities
 	if len(caps) == 0 {
-		caps = role.EffectiveCapabilities(d)
+		for _, c := range registry.EffectiveCapabilitiesOf(d) {
+			caps = append(caps, registry.ModelCapability(string(c)))
+		}
 	}
 	if len(caps) == 0 {
 		return "—"

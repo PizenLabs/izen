@@ -100,6 +100,13 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 		m.Viewport.GotoBottom()
 		return nil
 	}
+	// ── CONCURRENCY MUTEX: prevent autonomous loop while executor is active ──
+	if m.executionResolving || m.agentRunning || m.streaming || m.pipelineRunning || m.shellRunning {
+		m.push(roleError, "[autonomous] execution rejected: standard executor is currently running; wait for completion or cancel before starting autonomous loop")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
 	m.autonomousActive = true
 	m.autonomousBoundary = nil
 	m.autonomousSelect = 0
@@ -207,9 +214,16 @@ func (m *model) resumeAutonomousApprove() tea.Cmd {
 			m.clearAutonomousRun()
 			m.autonomousActive = false
 			if m.orch != nil {
-				_ = m.orch.Fail(classifier.FailureUnknownClass)
+				if ferr := m.orch.Fail(classifier.FailureUnknownClass); ferr != nil {
+					m.appendSystemError(fmt.Errorf("orchestrator fail transition rejected: %w", ferr))
+					m.logActivity("[autonomous] orch.Fail rejected: %v", ferr)
+				}
 			} else if m.workflowSM != nil {
-				_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{FailureClass: classifier.FailureUnknownClass})
+				if ferr := m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{FailureClass: classifier.FailureUnknownClass}); ferr != nil {
+					m.appendSystemError(fmt.Errorf("workflow state machine rejected failure event: %w", ferr))
+					m.logActivity("[autonomous] workflow SendEvent rejected: %v", ferr)
+					m.resetStreamingState()
+				}
 			}
 			m.push(roleError, "[autonomous] guard rejected transition — run aborted")
 			m.push(roleSystem, infoStyle.Render("Interrupted."))
@@ -302,9 +316,16 @@ func (m *model) resumeAutonomousProposalApprove() tea.Cmd {
 			m.clearAutonomousRun()
 			m.autonomousActive = false
 			if m.orch != nil {
-				_ = m.orch.Fail(classifier.FailureUnknownClass)
+				if ferr := m.orch.Fail(classifier.FailureUnknownClass); ferr != nil {
+					m.appendSystemError(fmt.Errorf("orchestrator fail transition rejected: %w", ferr))
+					m.logActivity("[autonomous] orch.Fail rejected: %v", ferr)
+				}
 			} else if m.workflowSM != nil {
-				_ = m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{FailureClass: classifier.FailureUnknownClass})
+				if ferr := m.workflowSM.SendEvent(workflow.EventFailureIdentified, workflow.TransitionContext{FailureClass: classifier.FailureUnknownClass}); ferr != nil {
+					m.appendSystemError(fmt.Errorf("workflow state machine rejected failure event: %w", ferr))
+					m.logActivity("[autonomous] workflow SendEvent rejected: %v", ferr)
+					m.resetStreamingState()
+				}
 			}
 			m.push(roleError, "[autonomous] guard rejected transition — run aborted")
 			m.push(roleSystem, infoStyle.Render("Interrupted."))
@@ -370,6 +391,22 @@ func (m *model) abortAutonomousRun(reason string) tea.Cmd {
 // autonomousParked reports whether the model holds a parked driver boundary.
 func (m *model) autonomousParked() bool {
 	return m.autonomousBoundary != nil && m.autonomousDriver != nil
+}
+
+// stopAutonomousDriver schedules a driver abort for an active autonomous run
+// without finalizing the operation: the driver's terminal autonomousRunMsg
+// remains the canonical cleanup path (Phase 2 state-drift fix). It returns
+// the abort command when a driver is attached, or nil when there is nothing
+// to stop. It never hand-sets presentation state.
+func (m *model) stopAutonomousDriver(reason string) tea.Cmd {
+	if m == nil || m.autonomousDriver == nil {
+		return nil
+	}
+	driver := m.autonomousDriver
+	return func() tea.Msg {
+		term, err := driver.Abort(reason + " interrupt")
+		return autonomousRunMsg{term: term, err: err}
+	}
 }
 
 // handleAutonomousRun processes the terminal/parked outcome of a driver

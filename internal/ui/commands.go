@@ -195,6 +195,17 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// Clear any stale error bar on new user input
 	m.lastApplyError = ""
 
+	// ── CASUAL CONVERSATION AUTO-UNWIND ─────────────────────────────
+	// A casual prompt ("hi") while the WorkflowStateMachine is in any
+	// non-idle phase unwinds to StateIdle/StateChat BEFORE the busy guard:
+	// the unwind itself clears streaming/execution state, so it must
+	// preempt the "Input blocked: task active." gate. Zero pipeline
+	// propagation — no synthesis, tools, or provider calls.
+	if m.handleCasualAutoUnwind(line) {
+		m.stopShimmer()
+		return nil
+	}
+
 	// Rigid active guards to block spamming inputs during background processes
 	if m.streaming || m.agentRunning {
 		// $inspect is a read-only observational directive: it renders the
@@ -410,7 +421,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// receives a turn that is one query behind because the current input is
 	// committed first, not retrofitted at stream completion.
 	m.sess.AddMessage("user", line, 5)
-	_ = m.sess.Save()
+	m.persistSession("commands")
 
 	// ── HYBRID INTENT GATEWAY ────────────────────────────────────────
 	// Free-form input (no explicit mode shorthand, no command, no shell) goes
@@ -454,6 +465,15 @@ func (m *model) routeFreeInput(line string) tea.Cmd {
 }
 
 func (m *model) handleMessageContent(line string) tea.Cmd {
+	// ── CASUAL CONVERSATION AUTO-UNWIND ─────────────────────────────
+	// Direct /plan-/investigate-/review-/build entry with casual chatter
+	// (e.g. "/plan hi" or a handoff landing on "hi") unwinds to
+	// StateIdle/StateChat before any engine dispatch. Zero pipeline
+	// propagation — no synthesis, tools, or provider calls.
+	if m.handleCasualAutoUnwind(line) {
+		m.stopShimmer()
+		return nil
+	}
 	var refFiles []string
 	for _, field := range strings.Fields(line) {
 		if !strings.HasPrefix(field, "@") {
@@ -1527,10 +1547,24 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 		if mode == modes.ModeBuild && !m.hasStagedBuildWork() && !m.orch.HasAuthorizedPlan() {
 			_ = m.orch.InjectEphemeralPlan("fast-path:" + mode.String())
 		}
-		_ = m.orch.Force(phaseForMode(mode), workflow.TransitionContext{
+		if err := m.orch.Force(phaseForMode(mode), workflow.TransitionContext{
 			HasPlan:         m.sess != nil && len(m.sess.CurrentTasks) > 0,
 			HasCapabilities: m.caps != nil,
-		})
+		}); err != nil {
+			// ── GRACEFUL PHASE TRANSITION REJECTION ───────────────
+			// A rejected phase hop (e.g. a backward move the graph
+			// forbids, or a guard without authorized plan evidence)
+			// is caught at command admission, surfaced as a system
+			// warning, and leaves the UI predictable — prompt
+			// dispatching is never corrupted.
+			if m.handleBackwardTransitionError(err) {
+				return nil
+			}
+			m.appendSystemError(err)
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
+			return nil
+		}
 	}
 
 	// ── RULE A: STRICT MODE TRANSITION GATEKEEPER ──────────────────────
@@ -1619,7 +1653,7 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 	// intact for genuine cross-mode handoffs.
 	m.currentResult = nil
 	m.sess.SetMode(mode)
-	_ = m.sess.Save()
+	m.persistSession("commands")
 
 	// ── SILENT MODE TRANSITION ────────────────────────────────────────
 	// Mode switches must not spam the conversation viewport. The active
@@ -2005,7 +2039,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 				m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			}
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
-			_ = m.sess.Save()
+			m.persistSession("commands")
 			m.setToast("Objective approved for outbound pipelines.")
 			return nil
 		}
@@ -2014,7 +2048,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			obj := domain.NewObjective(objArg)
 			obj.CurrentStatus = domain.ObjectiveAnalyzing
 			m.sess.SetObjectiveState(obj)
-			_ = m.sess.Save()
+			m.persistSession("commands")
 			m.setToast("Objective analysis started.")
 			return m.analyzeObjectiveCmd(obj)
 		} else {
@@ -2345,7 +2379,7 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	// truth for cross-mode handoff.
 	if m.sess != nil {
 		m.sess.ClearHistory()
-		_ = m.sess.Save()
+		m.persistSession("commands")
 	}
 }
 
@@ -2469,7 +2503,7 @@ func (m *model) amendBuildTask(stepNum int, feedback string) tea.Cmd {
 		}
 	}
 	m.sess.StageTaskList(&tasks)
-	_ = m.sess.Save()
+	m.persistSession("commands")
 	return m.handleBuildRun(stepNum)
 }
 
@@ -2584,7 +2618,7 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 			}
 		}
 		m.sess.StageTaskList(&tasks)
-		_ = m.sess.Save()
+		m.persistSession("commands")
 		return buildResultMsg{output: output, exitCode: exitCode, err: err}
 	}
 }
@@ -2606,6 +2640,9 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// when in StateIdle), handle gracefully and do not attempt
 	// authorization in an invalid state.
 	if err := m.transitionToBuilding(); err != nil {
+		if m.handleBackwardTransitionError(err) {
+			return nil
+		}
 		m.push(roleError, fmt.Sprintf("[BUILD HALTED] Workflow state transition failed: %v", err))
 		return nil
 	}
@@ -2665,7 +2702,7 @@ func (m *model) beginStagedTask(stepNum int) *plan.Task {
 	}
 	targetTask.Status = "processing"
 	m.sess.StageTaskList(&tasks)
-	_ = m.sess.Save()
+	m.persistSession("commands")
 	m.push(roleStatus, fmt.Sprintf("executing step %d: %s — %s", targetTask.StepNum, targetTask.Type, targetTask.Target))
 	// ── AUTHORITATIVE STAGE: target resolution ──────────────────────
 	// The concrete mutation target was resolved and selected — a real stage.
@@ -2710,7 +2747,7 @@ func (m *model) dispatchStagedTask(task *plan.Task) tea.Cmd {
 			}
 		}
 		m.sess.StageTaskList(&tasks)
-		_ = m.sess.Save()
+		m.persistSession("commands")
 		m.push(roleError, fmt.Sprintf("[BUILD HALTED] Task %d has unsupported type %q — no admitted execution path exists.", task.StepNum, task.Type))
 		return nil
 	}
@@ -2898,7 +2935,7 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 			ctxID := ctxpkg.GenerateContextID("go")
 			m.sess.ContextID = ctxID
 			m.sess.RunNumber++
-			_ = m.sess.Save()
+			m.persistSession("commands")
 		}
 
 		// Persist test output via file port (substrate) for auto-trace
@@ -4025,7 +4062,7 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 
 			// Store in session and persist.
 			m.sess.DiagnosticsSummary = diagnosis
-			_ = m.sess.Save()
+			m.persistSession("commands")
 
 			// Render the diagnosis on the TUI.
 			m.push(roleSystem, fmt.Sprintf("[Local SLM Diagnosis] %s", diagnosis))
@@ -4153,7 +4190,7 @@ func (m *model) resetObjectiveContextStacks() {
 	m.sess.ReviewID = ""
 	m.sess.ClearHistory()
 	m.sess.ClearTasks()
-	_ = m.sess.Save()
+	m.persistSession("commands")
 }
 
 // ── Handoff Pipeline ───────────────────────────────────────────────────────────
@@ -4332,7 +4369,7 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 			if m.sess != nil {
 				m.sess.ClearTasks()
 				m.sess.ContextLedger = nil
-				_ = m.sess.Save()
+				m.persistSession("commands")
 			}
 		}
 

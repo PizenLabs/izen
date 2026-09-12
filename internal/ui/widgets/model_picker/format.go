@@ -57,19 +57,6 @@ func formatContextWindow(tokens int) string {
 	return strings.ReplaceAll(s, "\n", " ")
 }
 
-// padVisible pads a (potentially ANSI-styled) string with trailing spaces so
-// its visible width equals exactly w cells. Uses lipgloss.Width for correct
-// measurement of styled and wide-character content.
-//
-//nolint:unused // retained for spec compatibility and potential external use
-func padVisible(s string, w int) string {
-	vw := lipgloss.Width(s)
-	if vw >= w {
-		return s
-	}
-	return s + strings.Repeat(" ", w-vw)
-}
-
 // padOrTruncateExact returns s padded or truncated to exactly w visible
 // characters. Plain-text operation: no ANSI handling. When truncating, a
 // trailing "…" replaces the last character.
