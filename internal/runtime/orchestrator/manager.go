@@ -23,7 +23,6 @@ import (
 	"github.com/PizenLabs/izen/internal/engine/pipeline"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/runtime/durable"
-	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 )
 
 // ── STEP 1 transitional bridge ────────────────────────────────────────────
@@ -81,7 +80,7 @@ func workflowStateFor(p Phase) workflow.WorkflowState {
 // state. Persistence failures are fail-closed: the hop is rejected and the
 // projection is left untouched. With no store wired the legacy in-memory
 // lifecycle runs unchanged.
-type Orchestrator struct {
+type PhaseManager struct {
 	mu       sync.RWMutex
 	sm       *workflow.WorkflowStateMachine
 	rt       *runtime.RuntimeContext
@@ -92,7 +91,7 @@ type Orchestrator struct {
 
 	// ledger is the durable phase-transition sink borrowed from the
 	// RuntimeEngine. Nil disables ledger persistence (legacy mode).
-	ledger runtimeOrchestrator.PhaseLedger
+	ledger PhaseLedger
 	// ledgerTaskID anchors phase lineage to one durable task. Empty with a
 	// wired ledger disables persistence (fail-closed needs identity).
 	ledgerTaskID string
@@ -101,7 +100,7 @@ type Orchestrator struct {
 	// execution controller. It owns the Observe → RMAH → Gate → Commit path
 	// with a single Observation-phase snapshot []byte that is passed to
 	// verification without repeating os.ReadFile.
-	runtimeLoop *runtimeOrchestrator.Loop
+	runtimeLoop *Loop
 
 	// planAuthorization carries the explicitly authorized execution plan the
 	// workflow guard consults (see plan_authorization.go): a human-approved
@@ -116,8 +115,8 @@ type Orchestrator struct {
 // New creates an Orchestrator bound to the shared WorkflowStateMachine and
 // RuntimeContext. The RuntimeContext is persistent for the lifetime of the
 // orchestrator; every phase transition shares the same instance.
-func New(sm *workflow.WorkflowStateMachine, rt *runtime.RuntimeContext) *Orchestrator {
-	return &Orchestrator{
+func New(sm *workflow.WorkflowStateMachine, rt *runtime.RuntimeContext) *PhaseManager {
+	return &PhaseManager{
 		sm:      sm,
 		rt:      rt,
 		current: PhaseIdle,
@@ -127,7 +126,7 @@ func New(sm *workflow.WorkflowStateMachine, rt *runtime.RuntimeContext) *Orchest
 
 // WithEventBus wires the event bus so PhaseChanged transitions are published.
 // Nil disables emission. Returns the orchestrator for chaining.
-func (o *Orchestrator) WithEventBus(bus *events.Bus) *Orchestrator {
+func (o *PhaseManager) WithEventBus(bus *events.Bus) *PhaseManager {
 	if o != nil {
 		o.bus = bus
 	}
@@ -146,7 +145,7 @@ type RuntimeProvider interface {
 // RuntimeEngine; the adapter never replicates its state. An empty taskID
 // disables persistence (lineage needs identity — fail-closed). Nil store
 // detaches persistence. Returns the orchestrator for chaining.
-func (o *Orchestrator) WithTaskStore(store *durable.TaskStore, taskID string) *Orchestrator {
+func (o *PhaseManager) WithTaskStore(store *durable.TaskStore, taskID string) *PhaseManager {
 	if o == nil {
 		return nil
 	}
@@ -166,7 +165,7 @@ func (o *Orchestrator) WithTaskStore(store *durable.TaskStore, taskID string) *O
 // borrowing its bound durable store, anchored to taskID. See WithTaskStore
 // for ownership and fail-closed semantics. Returns the orchestrator for
 // chaining.
-func (o *Orchestrator) WithRuntimeEngine(rt RuntimeProvider, taskID string) *Orchestrator {
+func (o *PhaseManager) WithRuntimeEngine(rt RuntimeProvider, taskID string) *PhaseManager {
 	if o == nil {
 		return nil
 	}
@@ -181,7 +180,7 @@ func (o *Orchestrator) WithRuntimeEngine(rt RuntimeProvider, taskID string) *Orc
 // detection, governed context, intent-based model routing and validation for
 // the execution phases. Nil detaches the pipeline. Returns the orchestrator
 // for chaining.
-func (o *Orchestrator) WithPipeline(pe *pipeline.Engine) *Orchestrator {
+func (o *PhaseManager) WithPipeline(pe *pipeline.Engine) *PhaseManager {
 	if o != nil {
 		o.pipeline = pe
 	}
@@ -192,7 +191,7 @@ func (o *Orchestrator) WithPipeline(pe *pipeline.Engine) *Orchestrator {
 // controller into the primary orchestrator. The loop's Observe phase is the
 // single disk-read authority; its snapshot []byte is passed to verification
 // without repeating os.ReadFile.
-func (o *Orchestrator) WithRuntimeLoop(loop *runtimeOrchestrator.Loop) *Orchestrator {
+func (o *PhaseManager) WithRuntimeLoop(loop *Loop) *PhaseManager {
 	if o != nil {
 		o.mu.Lock()
 		o.runtimeLoop = loop
@@ -202,7 +201,7 @@ func (o *Orchestrator) WithRuntimeLoop(loop *runtimeOrchestrator.Loop) *Orchestr
 }
 
 // RuntimeLoop returns the injected runtime loop, if any.
-func (o *Orchestrator) RuntimeLoop() *runtimeOrchestrator.Loop {
+func (o *PhaseManager) RuntimeLoop() *Loop {
 	if o == nil {
 		return nil
 	}
@@ -215,7 +214,7 @@ func (o *Orchestrator) RuntimeLoop() *runtimeOrchestrator.Loop {
 // snapshot (Observation phase). It is the ONLY disk read of the cycle — the
 // returned snapshot []byte is the single source for RMAH extraction and gate
 // verification.
-func (o *Orchestrator) Observe(ctx context.Context, path string) error {
+func (o *PhaseManager) Observe(ctx context.Context, path string) error {
 	if o == nil {
 		return fmt.Errorf("orchestrator: nil receiver")
 	}
@@ -231,7 +230,7 @@ func (o *Orchestrator) Observe(ctx context.Context, path string) error {
 // Snapshot returns the current memory snapshot from the runtime loop, or nil
 // before Observe. The snapshot.Content []byte is consumed by verification
 // without repeating os.ReadFile.
-func (o *Orchestrator) Snapshot() *runtimeOrchestrator.MemorySnapshot {
+func (o *PhaseManager) Snapshot() *MemorySnapshot {
 	if o == nil {
 		return nil
 	}
@@ -247,7 +246,7 @@ func (o *Orchestrator) Snapshot() *runtimeOrchestrator.MemorySnapshot {
 // SnapshotContent returns the snapshot's raw bytes for verification. It is
 // the state-machine's consumption point: verification receives this []byte
 // directly, never re-reading the file from disk.
-func (o *Orchestrator) SnapshotContent() []byte {
+func (o *PhaseManager) SnapshotContent() []byte {
 	snap := o.Snapshot()
 	if snap == nil {
 		return nil
@@ -258,7 +257,7 @@ func (o *Orchestrator) SnapshotContent() []byte {
 // ExecuteCycle runs one model-output cycle over the Observation-phase snapshot
 // via the runtime loop. The snapshot []byte from Observe is passed through
 // unchanged — no os.ReadFile occurs during extraction or verification.
-func (o *Orchestrator) ExecuteCycle(ctx context.Context, rawModelOutput []byte) (*runtimeOrchestrator.CycleOutcome, error) {
+func (o *PhaseManager) ExecuteCycle(ctx context.Context, rawModelOutput []byte) (*CycleOutcome, error) {
 	if o == nil {
 		return nil, fmt.Errorf("orchestrator: nil receiver")
 	}
@@ -272,7 +271,7 @@ func (o *Orchestrator) ExecuteCycle(ctx context.Context, rawModelOutput []byte) 
 }
 
 // Pipeline returns the wired layered Pipeline Engine, if any.
-func (o *Orchestrator) Pipeline() *pipeline.Engine {
+func (o *PhaseManager) Pipeline() *pipeline.Engine {
 	if o == nil {
 		return nil
 	}
@@ -283,7 +282,7 @@ func (o *Orchestrator) Pipeline() *pipeline.Engine {
 
 // RuntimeContext returns the shared, persistent runtime context. The returned
 // pointer is stable across all phase transitions.
-func (o *Orchestrator) RuntimeContext() *runtime.RuntimeContext {
+func (o *PhaseManager) RuntimeContext() *runtime.RuntimeContext {
 	if o == nil {
 		return nil
 	}
@@ -293,7 +292,7 @@ func (o *Orchestrator) RuntimeContext() *runtime.RuntimeContext {
 }
 
 // Current returns the current execution phase.
-func (o *Orchestrator) Current() Phase {
+func (o *PhaseManager) Current() Phase {
 	if o == nil {
 		return PhaseIdle
 	}
@@ -303,7 +302,7 @@ func (o *Orchestrator) Current() Phase {
 }
 
 // History returns the ordered phase-transition history, oldest first.
-func (o *Orchestrator) History() []Phase {
+func (o *PhaseManager) History() []Phase {
 	if o == nil {
 		return nil
 	}
@@ -316,7 +315,7 @@ func (o *Orchestrator) History() []Phase {
 
 // CurrentWorkflowState returns the underlying workflow state machine state.
 // It is read-only instrumentation for the UI's lifecycle badge.
-func (o *Orchestrator) CurrentWorkflowState() workflow.WorkflowState {
+func (o *PhaseManager) CurrentWorkflowState() workflow.WorkflowState {
 	if o == nil || o.sm == nil {
 		return workflow.StateIdle
 	}
@@ -332,7 +331,7 @@ func (o *Orchestrator) CurrentWorkflowState() workflow.WorkflowState {
 // Review -> Build), the SM is reset to idle first. Guards enforced by the SM
 // (EventBuild requires HasPlan and HasCapabilities) are evaluated through the
 // provided TransitionContext; guard violations surface as errors.
-func (o *Orchestrator) Transition(next Phase, tctx workflow.TransitionContext) error {
+func (o *PhaseManager) Transition(next Phase, tctx workflow.TransitionContext) error {
 	if o == nil {
 		return fmt.Errorf("orchestrator: nil receiver")
 	}
@@ -365,7 +364,7 @@ func (o *Orchestrator) Transition(next Phase, tctx workflow.TransitionContext) e
 	// BEFORE the in-memory projection mutates. Fail-closed: a persistence
 	// failure rejects the hop and leaves current/history untouched.
 	from := o.current
-	if err := runtimeOrchestrator.RecordPhaseTransition(o.ledger, o.ledgerTaskID, from, next); err != nil {
+	if err := RecordPhaseTransition(o.ledger, o.ledgerTaskID, from, next); err != nil {
 		return err
 	}
 	o.current = next
@@ -383,7 +382,7 @@ func (o *Orchestrator) Transition(next Phase, tctx workflow.TransitionContext) e
 // the shared RuntimeContext and emits a PhaseChanged event. It is the UI's
 // explicit user-mode-switch entry: user intent always wins over the phase
 // graph, unlike Transition which enforces validEdge.
-func (o *Orchestrator) Force(next Phase, tctx workflow.TransitionContext) error {
+func (o *PhaseManager) Force(next Phase, tctx workflow.TransitionContext) error {
 	if o == nil {
 		return fmt.Errorf("orchestrator: nil receiver")
 	}
@@ -417,7 +416,7 @@ func (o *Orchestrator) Force(next Phase, tctx workflow.TransitionContext) error 
 	// the in-memory projection mutates (forced skips edge validation but
 	// never skips lineage). Fail-closed on persistence failure.
 	from := o.current
-	if err := runtimeOrchestrator.RecordPhaseTransitionForced(o.ledger, o.ledgerTaskID, from, next); err != nil {
+	if err := RecordPhaseTransitionForced(o.ledger, o.ledgerTaskID, from, next); err != nil {
 		return err
 	}
 	o.current = next
@@ -433,7 +432,7 @@ func (o *Orchestrator) Force(next Phase, tctx workflow.TransitionContext) error 
 // Transition, it does not change the logical phase: it drives the SM to the
 // failure-relevant sub-state (Failed / Repairing / Investigating / Planning)
 // selected by the failure class. This keeps the UI decoupled from the raw SM.
-func (o *Orchestrator) Fail(class classifier.FailureClass) error {
+func (o *PhaseManager) Fail(class classifier.FailureClass) error {
 	if o == nil || o.sm == nil {
 		return fmt.Errorf("orchestrator: nil receiver or state machine")
 	}

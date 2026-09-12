@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/runtime/adaptive"
 	"github.com/PizenLabs/izen/internal/runtime/durable"
 	"github.com/PizenLabs/izen/internal/runtime/ephemeral"
@@ -41,6 +42,7 @@ type RuntimeEngine struct {
 	gateway  *scopeguard.IntentGateway
 	executor *scopeguard.RuntimeExecutor
 	policy   *scopeguard.WorkspaceSession
+	bus      *events.Bus
 
 	workDir string
 	taskID  string

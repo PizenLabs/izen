@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/PizenLabs/izen/internal/capability/policy"
+	"github.com/PizenLabs/izen/internal/domain/capability/policy"
 	"github.com/PizenLabs/izen/internal/retrieval/extractor"
 )
 

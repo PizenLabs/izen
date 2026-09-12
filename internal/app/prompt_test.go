@@ -6,13 +6,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/PizenLabs/izen/internal/capability"
+	"github.com/PizenLabs/izen/internal/domain/capability"
 	"github.com/PizenLabs/izen/internal/knowledge"
 	"github.com/PizenLabs/izen/internal/op"
 )
 
 // resolvedCaps resolves the portfolio capability set used by prompt tests.
-func resolvedCaps(t *testing.T) []capability.Capability {
+func resolvedCaps(t *testing.T) []capability.CapabilityContract {
 	t.Helper()
 	reg := capability.NewRegistry()
 	if err := capability.RegisterDefaults(reg); err != nil {

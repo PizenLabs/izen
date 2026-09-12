@@ -21,7 +21,6 @@ import (
 	"github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/ir"
-	"github.com/PizenLabs/izen/internal/kernel"
 	"github.com/PizenLabs/izen/internal/op"
 	"github.com/PizenLabs/izen/internal/planner"
 	"github.com/PizenLabs/izen/internal/resource/file"
@@ -45,9 +44,9 @@ var (
 	// ErrEmptyWorkspaceRoot is returned when the planner was built without a
 	// workspace root.
 	ErrEmptyWorkspaceRoot = errors.New("brownfield: workspace root is required")
-	// ErrNilEngine is returned by ExecuteAndRepair when no kernel engine is
+	// ErrNilEngine is returned by ExecuteAndRepair when no task executor is
 	// provided.
-	ErrNilEngine = errors.New("brownfield: nil kernel engine")
+	ErrNilEngine = errors.New("brownfield: nil task executor")
 	// ErrNilGraph is returned by ExecuteAndRepair when no graph is provided.
 	ErrNilGraph = errors.New("brownfield: nil execution graph")
 	// ErrNoRepair is returned when a failure produced no repair operations.
@@ -264,10 +263,11 @@ func (p *BrownfieldPlanner) Plan(ctx context.Context, intent string, artifacts [
 	}, nil
 }
 
-// ExecuteAndRepair drives g on engine, injecting repair operations whenever a
-// node fails, until the graph completes or the repair budget (maxRetries
-// cycles) is exhausted. A green graph returns nil.
-func (p *BrownfieldPlanner) ExecuteAndRepair(ctx context.Context, engine *kernel.Engine, g *graph.ExecutionGraph, maxRetries int) error {
+// ExecuteAndRepair drives g on a TaskExecutor (canonical:
+// *runtime.RuntimeEngine), injecting repair operations whenever a node fails,
+// until the graph completes or the repair budget (maxRetries cycles) is
+// exhausted. A green graph returns nil.
+func (p *BrownfieldPlanner) ExecuteAndRepair(ctx context.Context, engine graph.TaskExecutor, g *graph.ExecutionGraph, maxRetries int) error {
 	if p == nil {
 		return errors.New("brownfield: nil receiver")
 	}

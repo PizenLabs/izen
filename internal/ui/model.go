@@ -42,7 +42,6 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
-	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/planner"
 	"github.com/PizenLabs/izen/internal/policy"
@@ -53,6 +52,7 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/session/compaction"
 	"github.com/PizenLabs/izen/internal/state"
@@ -1564,7 +1564,7 @@ type model struct {
 	// persistent RuntimeContext. Mode switches update the active phase without
 	// resetting conversation history or workspace artifacts. Nil only in
 	// headless/test harnesses that never construct a model.
-	orch *orchestrator.Orchestrator
+	orch *runtimeOrchestrator.PhaseManager
 
 	// Autonomy decision runtime: classifies intent independently from workspace
 	// selection, evaluates the autonomy decision model (auto_continue /

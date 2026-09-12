@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/app/compiler"
-	"github.com/PizenLabs/izen/internal/capability"
+	"github.com/PizenLabs/izen/internal/domain/capability"
 	"github.com/PizenLabs/izen/internal/events"
 	txfs "github.com/PizenLabs/izen/internal/fs"
 	"github.com/PizenLabs/izen/internal/ir"
@@ -121,7 +121,7 @@ type Result struct {
 	// Intent is the original user prompt.
 	Intent string
 	// Capabilities are the capability instances resolved for the intent.
-	Capabilities []capability.Capability
+	Capabilities []capability.CapabilityContract
 	// SystemPrompt is the capability-constrained system prompt used for the
 	// final accepted generation.
 	SystemPrompt string
@@ -622,7 +622,7 @@ func (p *Pipeline) extract(ctx context.Context, raw string) extractor.Extraction
 }
 
 // validate runs every resolved capability against every artifact's content.
-func (p *Pipeline) validate(ctx context.Context, caps []capability.Capability, artifacts []ir.Artifact) []ArtifactValidation {
+func (p *Pipeline) validate(ctx context.Context, caps []capability.CapabilityContract, artifacts []ir.Artifact) []ArtifactValidation {
 	out := make([]ArtifactValidation, 0, len(artifacts))
 	for _, a := range artifacts {
 		v := ArtifactValidation{Artifact: a, Passed: true}
@@ -778,7 +778,7 @@ func (e *SemanticMismatchError) Unwrap() error { return capability.ErrSemanticMi
 // ResolveCapabilitiesForIntent maps a user intent to the active capability id
 // set, preserving request order, and resolves them through the registry. The
 // generic catch-all is only used when no specific capability matches.
-func ResolveCapabilitiesForIntent(reg *capability.Registry, intent string) ([]capability.Capability, error) {
+func ResolveCapabilitiesForIntent(reg *capability.Registry, intent string) ([]capability.CapabilityContract, error) {
 	if reg == nil {
 		return nil, errors.New("app: nil capability registry")
 	}

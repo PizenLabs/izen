@@ -10,17 +10,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/PizenLabs/izen/internal/capability"
+	"github.com/PizenLabs/izen/internal/domain/capability"
 	"github.com/PizenLabs/izen/internal/events"
 	txfs "github.com/PizenLabs/izen/internal/fs"
 	"github.com/PizenLabs/izen/internal/ir"
-	"github.com/PizenLabs/izen/internal/kernel"
 	"github.com/PizenLabs/izen/internal/knowledge"
 	"github.com/PizenLabs/izen/internal/op"
 	"github.com/PizenLabs/izen/internal/planner"
 	"github.com/PizenLabs/izen/internal/planner/brownfield"
 	"github.com/PizenLabs/izen/internal/planner/greenfield"
 	"github.com/PizenLabs/izen/internal/retrieval/extractor"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
 )
 
 // Mode selects the planning strategy for a pipeline run.
@@ -361,12 +361,13 @@ func fullOverwriteActive(policy op.ContextPolicy, intentIR *ir.IntentIR) bool {
 	return intentIR != nil && !intentIR.PreserveWorkspace
 }
 
-// execute runs the planned graph on the kernel engine, dispatching side
-// effects exclusively through the shared event bus. Before any file is
-// touched, the plan's artifact writes are sequenced through the execution DAG
-// and checked for cyclic inter-file dependencies. Brownfield graphs run
-// through the closed-loop repair loop; greenfield writes stage through the
-// pipeline's TxFS transaction and reach disk only at Commit.
+// execute runs the planned graph on the canonical RuntimeEngine task
+// executor, dispatching side effects exclusively through the shared event
+// bus. Before any file is touched, the plan's artifact writes are sequenced
+// through the execution DAG and checked for cyclic inter-file dependencies.
+// Brownfield graphs run through the closed-loop repair loop; greenfield
+// writes stage through the pipeline's TxFS transaction and reach disk only
+// at Commit.
 func (p *Pipeline) execute(ctx context.Context, planResult *planner.PlanResult, mode Mode, bf *brownfield.BrownfieldPlanner) error {
 	if planResult == nil || planResult.Graph == nil {
 		return errors.New("app: plan produced no graph")
@@ -376,7 +377,7 @@ func (p *Pipeline) execute(ctx context.Context, planResult *planner.PlanResult, 
 	if _, err := planExecutionOrder(planResult.Artifacts); err != nil {
 		return fmt.Errorf("app: execution order: %w", err)
 	}
-	engine := kernel.NewEngine(p.bus)
+	engine := appruntime.NewTaskEngine(p.bus)
 	if mode == ModeBrownfield && bf != nil {
 		return bf.ExecuteAndRepair(ctx, engine, planResult.Graph, p.maxRepairs)
 	}

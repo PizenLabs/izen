@@ -15,9 +15,16 @@ import (
 	"sync"
 
 	domaintask "github.com/PizenLabs/izen/internal/domain/task"
-	"github.com/PizenLabs/izen/internal/kernel"
 	"github.com/PizenLabs/izen/internal/op"
 )
+
+// TaskExecutor is the minimal execution contract ExecutionGraph drives.
+// Both *runtime.RuntimeEngine (canonical, STEP 3A) and the legacy
+// *kernel.Engine satisfy it, so callers program against the domain, not an
+// adapter package.
+type TaskExecutor interface {
+	ExecuteTask(context.Context, domaintask.Executable) domaintask.TaskResult
+}
 
 // Errors returned by ExecutionGraph methods.
 var (
@@ -267,15 +274,16 @@ func containsID(ids []string, id string) bool {
 	return false
 }
 
-// Execute runs the graph to a quiescent state on the kernel engine. Nodes are
-// executed in dependency order via GetPendingNodes; a completed node is marked
-// completed, while a failed or canceled node stops the run and is returned as
-// an *ExecutionFailure so the caller can InjectRepairOps and call Execute
-// again. Execute returns nil once every node is terminal. The returned map
-// holds the terminal result of every executed node keyed by node ID.
-func (g *ExecutionGraph) Execute(ctx context.Context, engine *kernel.Engine) (map[string]domaintask.TaskResult, error) {
+// Execute runs the graph to a quiescent state on a TaskExecutor (canonical:
+// *runtime.RuntimeEngine). Nodes are executed in dependency order via
+// GetPendingNodes; a completed node is marked completed, while a failed or
+// canceled node stops the run and is returned as an *ExecutionFailure so the
+// caller can InjectRepairOps and call Execute again. Execute returns nil once
+// every node is terminal. The returned map holds the terminal result of every
+// executed node keyed by node ID.
+func (g *ExecutionGraph) Execute(ctx context.Context, engine TaskExecutor) (map[string]domaintask.TaskResult, error) {
 	if engine == nil {
-		return nil, errors.New("graph: nil kernel engine")
+		return nil, errors.New("graph: nil task executor")
 	}
 	results := make(map[string]domaintask.TaskResult)
 	for {

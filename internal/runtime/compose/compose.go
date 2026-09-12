@@ -28,9 +28,9 @@ import (
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
-	"github.com/PizenLabs/izen/internal/core/capability"
 	coreRuntime "github.com/PizenLabs/izen/internal/core/runtime"
 	coreWorkflow "github.com/PizenLabs/izen/internal/core/workflow"
+	domaincap "github.com/PizenLabs/izen/internal/domain/capability"
 	"github.com/PizenLabs/izen/internal/domain/policy"
 	"github.com/PizenLabs/izen/internal/domain/ports"
 	"github.com/PizenLabs/izen/internal/domain/workflow"
@@ -48,7 +48,6 @@ import (
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/loop"
 	"github.com/PizenLabs/izen/internal/modes/plan"
-	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/providers"
@@ -57,6 +56,7 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime/authority"
 	runtimeAutonomy "github.com/PizenLabs/izen/internal/runtime/autonomy"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
+	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	"github.com/PizenLabs/izen/internal/session"
 	compaction "github.com/PizenLabs/izen/internal/session/compaction"
 	izentelemetry "github.com/PizenLabs/izen/internal/telemetry"
@@ -135,7 +135,7 @@ type Application struct {
 	// event bus (Bus). The presentation layer consumes them read-only.
 	RuntimeCtx   *coreRuntime.RuntimeContext
 	WorkflowSM   *coreWorkflow.WorkflowStateMachine
-	Orchestrator *orchestrator.Orchestrator
+	Orchestrator *runtimeOrchestrator.PhaseManager
 	Pipeline     *pipeline.Engine
 	PlanStore    *plan.PlanStore
 	PlanEngine   *plan.Engine
@@ -177,7 +177,7 @@ type Application struct {
 	IntentCompiler *plan.IntentCompilerPlanner
 	Git            *git.Engine
 	Lea            *lea.Engine
-	Caps           *capability.CapabilitySet
+	Caps           *domaincap.CapabilitySet
 	Budget         *budget.MutationBudget
 	MicroBudget    *budget.MicroBudget
 	Policy         *policy.PolicyEngine
@@ -697,14 +697,14 @@ func Wire(opts ...Option) (*Application, error) {
 	a.Execution.SetPlanStore(a.PlanStore)
 
 	// ── CONTROL PLANE: capability set, artifact store, mutation budget ──
-	a.Caps = capability.NewCapabilitySet()
-	a.Caps.Grant(capability.CapabilityRead)
-	a.Caps.Grant(capability.CapabilityWrite)
-	a.Caps.Grant(capability.CapabilityExecute)
-	a.Caps.Grant(capability.CapabilityTest)
-	a.Caps.Grant(capability.CapabilityPatch)
-	a.Caps.Grant(capability.CapabilityCheckpoint)
-	a.Caps.Grant(capability.CapabilityRollback)
+	a.Caps = domaincap.NewCapabilitySet()
+	a.Caps.Grant(domaincap.CapabilityRead)
+	a.Caps.Grant(domaincap.CapabilityWrite)
+	a.Caps.Grant(domaincap.CapabilityExecute)
+	a.Caps.Grant(domaincap.CapabilityTest)
+	a.Caps.Grant(domaincap.CapabilityPatch)
+	a.Caps.Grant(domaincap.CapabilityCheckpoint)
+	a.Caps.Grant(domaincap.CapabilityRollback)
 	a.Artifacts = artifact.NewStore(root)
 	a.Budget = budget.NewBudget(
 		100,            // max files
@@ -746,7 +746,7 @@ func Wire(opts ...Option) (*Application, error) {
 	// switches update the active phase dynamically WITHOUT resetting
 	// conversation history or workspace artifacts. Phase changes are observed
 	// via EventPhaseChanged.
-	a.Orchestrator = orchestrator.New(a.WorkflowSM, a.RuntimeCtx).WithEventBus(a.Bus).WithPipeline(a.Pipeline)
+	a.Orchestrator = runtimeOrchestrator.New(a.WorkflowSM, a.RuntimeCtx).WithEventBus(a.Bus).WithPipeline(a.Pipeline)
 
 	// ── AUTONOMY DECISION RUNTIME ────────────────────────────────────────
 	// The autonomy engine is the decision layer above the modes. Its scope is
@@ -1007,7 +1007,7 @@ func (g *gitWorkspaceGuard) DirtyFiles(_ context.Context) ([]string, error) {
 // vocabulary. The PolicyEngine derives every governance verdict from it.
 type composedCapabilityGraph struct {
 	ws   *layer1.Graph
-	caps *capability.CapabilitySet
+	caps *domaincap.CapabilitySet
 }
 
 // Supports reports whether the detected workspace exposes the named tool
@@ -1016,7 +1016,7 @@ func (g composedCapabilityGraph) Supports(cap string) bool {
 	return g.ws != nil && g.ws.Supports(layer1.Capability(cap))
 }
 
-// Resolve returns the concrete command bound to the named capability.
+// Resolve returns the concrete command bound to the named domaincap.
 func (g composedCapabilityGraph) Resolve(cap string) (string, bool) {
 	if g.ws == nil {
 		return "", false
