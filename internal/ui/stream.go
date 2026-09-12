@@ -13,7 +13,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/PizenLabs/izen/internal/agents"
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/domain"
@@ -94,6 +93,45 @@ func debugLogPayload(content string, msgs []ai.Message) {
 	_, _ = f.Write(data)
 }
 
+// injectObjectiveContext prefixes the active human-confirmed objective frame
+// onto stream content. Migrated from internal/agents.InjectObjectiveContext so
+// the ui package no longer depends on the legacy agents layer; behavior is
+// identical.
+func injectObjectiveContext(content string, objective *domain.Objective) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return trimmed
+	}
+	if objective == nil || strings.TrimSpace(objective.RawIntent) == "" {
+		return trimmed
+	}
+	if !objective.HumanConfirmed || objective.CurrentStatus == domain.ObjectiveAnalyzing {
+		return trimmed
+	}
+
+	budgetStatus := "OK"
+	if objective.TokenBudget.RequiresApproval {
+		budgetStatus = "WARNING"
+	}
+
+	frame := fmt.Sprintf(
+		"### ACTIVE OBJECTIVE\nID: %s\nIntent: %s\nStatus: %s\nScope Files: %d\nScope Symbols: %d\nBudget: %s (%d/%d)\n",
+		objective.ID,
+		objective.RawIntent,
+		objective.CurrentStatus,
+		len(objective.Scope.Files),
+		len(objective.Scope.Symbols),
+		budgetStatus,
+		objective.TokenBudget.CurrentWeight,
+		objective.TokenBudget.Threshold,
+	)
+
+	if strings.HasPrefix(trimmed, "### ACTIVE OBJECTIVE\n") {
+		return trimmed
+	}
+	return frame + "\n" + trimmed
+}
+
 func (m *model) streamCmd(content string) tea.Cmd {
 	// Guard against empty content or unintended/stray submissions
 	content = strings.TrimSpace(content)
@@ -109,7 +147,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	plannerGoverned := m.askContextGoverned && m.resolver.Current() == modes.ModeAsk
 	m.askContextGoverned = false
 
-	content = agents.InjectObjectiveContext(content, m.sess.ObjectiveState)
+	content = injectObjectiveContext(content, m.sess.ObjectiveState)
 	if m.streamCh != nil {
 		m.push(roleSystem, "Stream blocked: task active.")
 		return nil

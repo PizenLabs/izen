@@ -9,6 +9,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/presentation"
 )
 
@@ -41,6 +42,9 @@ func TestConsistencyCase1_HiAnswerOnlyNoTimeline(t *testing.T) {
 		responses: []*ai.Response{{Content: "Hello there!", TokenOutput: 3, TokenInput: 2}},
 	}, nil)
 	m.state = StateChat
+	// ASK-only contract: execution modes escalate "hi" to repository
+	// forensics via the worker-proposal hard enforcement.
+	m.resolver.Set(modes.ModeAsk)
 
 	cmd := m.runGatedLine("hi")
 	if cmd == nil {

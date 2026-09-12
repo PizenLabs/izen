@@ -24,11 +24,11 @@ import (
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
-	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	domaincap "github.com/PizenLabs/izen/internal/domain/capability"
 	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/engine/ir"
 	"github.com/PizenLabs/izen/internal/engine/pipeline"
@@ -42,7 +42,6 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
-	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/planner"
 	"github.com/PizenLabs/izen/internal/policy"
@@ -53,6 +52,7 @@ import (
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
 	riview "github.com/PizenLabs/izen/internal/review"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/session/compaction"
 	"github.com/PizenLabs/izen/internal/state"
@@ -1037,7 +1037,7 @@ type model struct {
 	authEngine     *authorization.AuthorizationEngine
 	mutationBudget *budget.MutationBudget
 	microBudget    *budget.MicroBudget
-	caps           *capability.CapabilitySet
+	caps           *domaincap.CapabilitySet
 
 	// ── Transient toast overlay (Top Bar) ─────────────────────────
 	// toast is the transient top-bar notification message. It renders as a
@@ -1564,7 +1564,7 @@ type model struct {
 	// persistent RuntimeContext. Mode switches update the active phase without
 	// resetting conversation history or workspace artifacts. Nil only in
 	// headless/test harnesses that never construct a model.
-	orch *orchestrator.Orchestrator
+	orch *runtimeOrchestrator.PhaseManager
 
 	// Autonomy decision runtime: classifies intent independently from workspace
 	// selection, evaluates the autonomy decision model (auto_continue /

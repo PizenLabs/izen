@@ -8,7 +8,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/core/budget"
-	"github.com/PizenLabs/izen/internal/core/capability"
+	"github.com/PizenLabs/izen/internal/domain/capability"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
 	"github.com/PizenLabs/izen/internal/workspace/snapshot"
 )

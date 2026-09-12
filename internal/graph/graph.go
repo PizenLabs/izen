@@ -14,9 +14,17 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/PizenLabs/izen/internal/kernel"
+	domaintask "github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/op"
 )
+
+// TaskExecutor is the minimal execution contract ExecutionGraph drives.
+// Both *runtime.RuntimeEngine (canonical, STEP 3A) and the legacy
+// *kernel.Engine satisfy it, so callers program against the domain, not an
+// adapter package.
+type TaskExecutor interface {
+	ExecuteTask(context.Context, domaintask.Executable) domaintask.TaskResult
+}
 
 // Errors returned by ExecutionGraph methods.
 var (
@@ -42,13 +50,14 @@ var (
 	ErrGraphBlocked = errors.New("graph: graph blocked on an unrepaired failure")
 )
 
-// ExecutionFailure describes the node whose execution failed and its kernel
-// result, so callers can InjectRepairOps and re-run the graph.
+// ExecutionFailure describes the node whose execution failed and its domain
+// task result, so callers can InjectRepairOps and re-run the graph. The
+// kernel Engine remains the execution bridge that produces the result.
 type ExecutionFailure struct {
 	// NodeID is the ID of the node that failed.
 	NodeID string
-	// Result is the terminal kernel result of the failed node.
-	Result kernel.TaskResult
+	// Result is the terminal domain task result of the failed node.
+	Result domaintask.TaskResult
 }
 
 // Error implements error.
@@ -65,14 +74,14 @@ func (f *ExecutionFailure) Unwrap() error { return f.Result.Error }
 type ExecutionGraph struct {
 	mu     sync.RWMutex
 	nodes  map[string]*OpNode
-	states map[string]kernel.ExecutionStatus
+	states map[string]domaintask.ExecutionStatus
 }
 
 // NewExecutionGraph constructs an empty graph.
 func NewExecutionGraph() *ExecutionGraph {
 	return &ExecutionGraph{
 		nodes:  make(map[string]*OpNode),
-		states: make(map[string]kernel.ExecutionStatus),
+		states: make(map[string]domaintask.ExecutionStatus),
 	}
 }
 
@@ -94,7 +103,7 @@ func (g *ExecutionGraph) AddNode(node *OpNode) error {
 		}
 	}
 	g.nodes[node.ID()] = node
-	g.states[node.ID()] = kernel.StatusPending
+	g.states[node.ID()] = domaintask.ExecStatusPending
 	return nil
 }
 
@@ -130,7 +139,7 @@ func (g *ExecutionGraph) GetPendingNodes() []*OpNode {
 // blocks the dependent until the graph is repaired.
 func (g *ExecutionGraph) preconditionsCompleted(requires []string) bool {
 	for _, id := range requires {
-		if g.states[id] != kernel.StatusCompleted {
+		if g.states[id] != domaintask.ExecStatusCompleted {
 			return false
 		}
 	}
@@ -144,7 +153,7 @@ func (g *ExecutionGraph) MarkCompleted(id string) error {
 	if _, ok := g.nodes[id]; !ok {
 		return ErrUnknownNode
 	}
-	g.states[id] = kernel.StatusCompleted
+	g.states[id] = domaintask.ExecStatusCompleted
 	return nil
 }
 
@@ -155,12 +164,12 @@ func (g *ExecutionGraph) MarkFailed(id string) error {
 	if _, ok := g.nodes[id]; !ok {
 		return ErrUnknownNode
 	}
-	g.states[id] = kernel.StatusFailed
+	g.states[id] = domaintask.ExecStatusFailed
 	return nil
 }
 
 // State returns the current execution status of a node.
-func (g *ExecutionGraph) State(id string) (kernel.ExecutionStatus, bool) {
+func (g *ExecutionGraph) State(id string) (domaintask.ExecutionStatus, bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	status, ok := g.states[id]
@@ -199,7 +208,7 @@ func (g *ExecutionGraph) InjectRepairOps(failedNodeID string, repairOps []op.Ope
 		return ErrUnknownNode
 	}
 	switch g.states[failedNodeID] {
-	case kernel.StatusFailed, kernel.StatusCanceled:
+	case domaintask.ExecStatusFailed, domaintask.ExecStatusCanceled:
 	default:
 		return ErrNodeNotFailed
 	}
@@ -222,7 +231,7 @@ func (g *ExecutionGraph) InjectRepairOps(failedNodeID string, repairOps []op.Ope
 			}
 		}
 		g.nodes[node.ID()] = node
-		g.states[node.ID()] = kernel.StatusPending
+		g.states[node.ID()] = domaintask.ExecStatusPending
 		repairIDs = append(repairIDs, node.ID())
 	}
 
@@ -265,17 +274,18 @@ func containsID(ids []string, id string) bool {
 	return false
 }
 
-// Execute runs the graph to a quiescent state on the kernel engine. Nodes are
-// executed in dependency order via GetPendingNodes; a completed node is marked
-// completed, while a failed or canceled node stops the run and is returned as
-// an *ExecutionFailure so the caller can InjectRepairOps and call Execute
-// again. Execute returns nil once every node is terminal. The returned map
-// holds the terminal result of every executed node keyed by node ID.
-func (g *ExecutionGraph) Execute(ctx context.Context, engine *kernel.Engine) (map[string]kernel.TaskResult, error) {
+// Execute runs the graph to a quiescent state on a TaskExecutor (canonical:
+// *runtime.RuntimeEngine). Nodes are executed in dependency order via
+// GetPendingNodes; a completed node is marked completed, while a failed or
+// canceled node stops the run and is returned as an *ExecutionFailure so the
+// caller can InjectRepairOps and call Execute again. Execute returns nil once
+// every node is terminal. The returned map holds the terminal result of every
+// executed node keyed by node ID.
+func (g *ExecutionGraph) Execute(ctx context.Context, engine TaskExecutor) (map[string]domaintask.TaskResult, error) {
 	if engine == nil {
-		return nil, errors.New("graph: nil kernel engine")
+		return nil, errors.New("graph: nil task executor")
 	}
-	results := make(map[string]kernel.TaskResult)
+	results := make(map[string]domaintask.TaskResult)
 	for {
 		pending := g.GetPendingNodes()
 		if len(pending) == 0 {
@@ -291,11 +301,11 @@ func (g *ExecutionGraph) Execute(ctx context.Context, engine *kernel.Engine) (ma
 			result := engine.ExecuteTask(ctx, node)
 			results[node.ID()] = result
 			switch result.Status {
-			case kernel.StatusCompleted:
+			case domaintask.ExecStatusCompleted:
 				if err := g.MarkCompleted(node.ID()); err != nil {
 					return results, err
 				}
-			case kernel.StatusFailed, kernel.StatusCanceled:
+			case domaintask.ExecStatusFailed, domaintask.ExecStatusCanceled:
 				if err := g.MarkFailed(node.ID()); err != nil {
 					return results, err
 				}

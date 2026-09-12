@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/PizenLabs/izen/internal/capability"
+	"github.com/PizenLabs/izen/internal/domain/capability"
 	"github.com/PizenLabs/izen/internal/knowledge"
 	"github.com/PizenLabs/izen/internal/op"
 )
@@ -129,7 +129,7 @@ func (b *PromptBuilder) CompilePolicy(semantics op.OperationSemantics) op.Contex
 //     file contents are never read into the context.
 //   - PolicyEdit / PolicyPatch: bounded baseline excerpts delimited by explicit
 //     <<<FILE / </FILE>>> boundary markers.
-func (b *PromptBuilder) BuildSystem(policy op.ContextPolicy, caps []capability.Capability, targets []string) string {
+func (b *PromptBuilder) BuildSystem(policy op.ContextPolicy, caps []capability.CapabilityContract, targets []string) string {
 	var out strings.Builder
 	out.WriteString("You are Izen, the human-centered coding engine. Route the user's intent into a coherent set of workspace files that Izen writes for you.\n")
 	if len(targets) > 0 {

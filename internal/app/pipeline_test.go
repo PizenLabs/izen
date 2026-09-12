@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/app/compiler"
-	"github.com/PizenLabs/izen/internal/capability"
+	"github.com/PizenLabs/izen/internal/domain/capability"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/ir"
 	"github.com/PizenLabs/izen/internal/op"

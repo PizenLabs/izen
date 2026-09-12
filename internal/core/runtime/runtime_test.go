@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/core/budget"
-	"github.com/PizenLabs/izen/internal/core/capability"
+	"github.com/PizenLabs/izen/internal/domain/capability"
 )
 
 func TestNew(t *testing.T) {

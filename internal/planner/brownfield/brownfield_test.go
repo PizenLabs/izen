@@ -10,11 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/ir"
-	"github.com/PizenLabs/izen/internal/kernel"
 	"github.com/PizenLabs/izen/internal/op"
 	"github.com/PizenLabs/izen/internal/resource/file"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
 )
 
 // writeRepair builds an op.OpWriteFile repair operation writing an artifact
@@ -56,7 +57,7 @@ func TestBrownfieldPlannerClosedLoopRepair(t *testing.T) {
 		t.Fatalf("Plan: %v", err)
 	}
 
-	if err := p.ExecuteAndRepair(t.Context(), kernel.NewEngine(nil), result.Graph, 3); err != nil {
+	if err := p.ExecuteAndRepair(t.Context(), appruntime.NewTaskEngine(nil), result.Graph, 3); err != nil {
 		t.Fatalf("ExecuteAndRepair: %v", err)
 	}
 	if !result.Graph.IsCompleted() {
@@ -102,7 +103,7 @@ func TestBrownfieldPlannerRepairBudgetExhausted(t *testing.T) {
 		t.Fatalf("Plan: %v", err)
 	}
 
-	err = p.ExecuteAndRepair(t.Context(), kernel.NewEngine(nil), result.Graph, 2)
+	err = p.ExecuteAndRepair(t.Context(), appruntime.NewTaskEngine(nil), result.Graph, 2)
 	if err == nil {
 		t.Fatal("expected repair budget exhaustion")
 	}
@@ -125,7 +126,7 @@ func TestBrownfieldPlannerNoRepairStrategy(t *testing.T) {
 		t.Fatalf("Plan: %v", err)
 	}
 
-	err = p.ExecuteAndRepair(t.Context(), kernel.NewEngine(nil), result.Graph, 3)
+	err = p.ExecuteAndRepair(t.Context(), appruntime.NewTaskEngine(nil), result.Graph, 3)
 	if !errors.Is(err, ErrNoRepair) {
 		t.Fatalf("expected ErrNoRepair, got %v", err)
 	}
@@ -150,7 +151,7 @@ func TestBrownfieldPlannerDefaultRepairWritesMissingArtifact(t *testing.T) {
 		t.Fatalf("Plan: %v", err)
 	}
 
-	if err := p.ExecuteAndRepair(t.Context(), kernel.NewEngine(nil), result.Graph, 2); err != nil {
+	if err := p.ExecuteAndRepair(t.Context(), appruntime.NewTaskEngine(nil), result.Graph, 2); err != nil {
 		t.Fatalf("ExecuteAndRepair: %v", err)
 	}
 	if !result.Graph.IsCompleted() {
@@ -190,7 +191,7 @@ func TestAnalyzeFailureSymptoms(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			report := AnalyzeFailure(
-				kernel.TaskResult{Status: kernel.StatusFailed, Error: tt.err, Data: tt.data},
+				task.TaskResult{Status: task.ExecStatusFailed, Error: tt.err, Data: tt.data},
 				"test -f helper.go",
 			)
 			if report.Symptom != tt.want {
@@ -219,7 +220,7 @@ func TestExecuteAndRepairValidation(t *testing.T) {
 	if err := p.ExecuteAndRepair(t.Context(), nil, result.Graph, 1); !errors.Is(err, ErrNilEngine) {
 		t.Fatalf("expected ErrNilEngine, got %v", err)
 	}
-	if err := p.ExecuteAndRepair(t.Context(), kernel.NewEngine(nil), nil, 1); !errors.Is(err, ErrNilGraph) {
+	if err := p.ExecuteAndRepair(t.Context(), appruntime.NewTaskEngine(nil), nil, 1); !errors.Is(err, ErrNilGraph) {
 		t.Fatalf("expected ErrNilGraph, got %v", err)
 	}
 }

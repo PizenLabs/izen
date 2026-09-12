@@ -30,7 +30,7 @@ var sessionForbiddenImports = []string{
 	"github.com/PizenLabs/izen/internal/engine",
 	"github.com/PizenLabs/izen/internal/runtime/autonomy",
 	"github.com/PizenLabs/izen/internal/autonomy",
-	"github.com/PizenLabs/izen/internal/orchestrator",
+	"github.com/PizenLabs/izen/internal/runtime/orchestrator",
 }
 
 // TestSessionPackageNeverImportsExecutionAuthority sweeps every file in

@@ -28,6 +28,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	cmdreg "github.com/PizenLabs/izen/internal/domain/command"
+	domainorch "github.com/PizenLabs/izen/internal/domain/orchestration"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/internal/hotfix"
@@ -35,7 +36,6 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/modes/review"
-	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	riview "github.com/PizenLabs/izen/internal/review"
@@ -521,20 +521,25 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.gotoBottomIfAllowed()
 			return nil
 		}
-		// Graceful handoff guard: if the ContextLedger's ask_handoff payload
-		// was cleared (e.g. by /clear) and no other handoff context exists,
-		// prompt for input rather than running the engine with stale or empty
-		// content. This prevents silent degradation on the local model.
+		// HARD ENFORCEMENT: every admitted prompt in INVESTIGATE mode —
+		// including target-less prompts such as "hi" — builds a
+		// scopeguard.Proposal (workspace inspection/forensics) and executes
+		// through the investigate engine. There is no conversational
+		// short-circuit and no "describe what to investigate" early return
+		// for short input: the engine owns the clarification decision and
+		// every trace originates from runtime ledger events.
 		trimmed := strings.TrimSpace(content)
-		hasHandoff := m.handoffLedgerContent != "" ||
-			m.handoffCtx.LastFailurePayload != "" ||
-			m.handoffCtx.ProposedFix != ""
-		if !hasHandoff && m.sess != nil && m.sess.ContextLedger != nil {
-			l := m.sess.ContextLedger
-			hasHandoff = l.Diagnostics != "" || len(l.Packets) > 0
-		}
-		if !hasHandoff && (trimmed == "" || len(trimmed) < 15) {
+		if trimmed == "" {
 			m.push(roleSystem, infoStyle.Render("No handoff context in ledger. Describe what to investigate (e.g. a test failure, error log, or crash report):"))
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
+			return nil
+		}
+		// ScopeGuard.EvaluateProposal + WorkerEngine.ExecuteProposal run
+		// before the investigate dispatch. A denial is terminal; the engine
+		// owns clarification from here (no chat fallback).
+		if workerErr := ExecuteWorkerProposal(context.Background(), BuildWorkerProposal(content, modes.ModeInvestigate, ""), nil); workerErr != nil {
+			m.push(roleError, "[investigate] worker proposal denied: "+workerErr.Error())
 			m.refreshViewportContent()
 			m.gotoBottomIfAllowed()
 			return nil
@@ -1487,20 +1492,20 @@ func parseModeShorthand(line string) (modes.Mode, string, bool) {
 
 // phaseForMode maps a UI mode onto its canonical orchestrator phase. The
 // orchestrator uses these to drive the shared WorkflowStateMachine.
-func phaseForMode(mode modes.Mode) orchestrator.Phase {
+func phaseForMode(mode modes.Mode) domainorch.Phase {
 	switch mode {
 	case modes.ModeAsk:
-		return orchestrator.PhaseAsk
+		return domainorch.PhaseAsk
 	case modes.ModeInvestigate:
-		return orchestrator.PhaseInvestigate
+		return domainorch.PhaseInvestigate
 	case modes.ModePlan:
-		return orchestrator.PhasePlan
+		return domainorch.PhasePlan
 	case modes.ModeBuild:
-		return orchestrator.PhaseBuild
+		return domainorch.PhaseBuild
 	case modes.ModeReview:
-		return orchestrator.PhaseReview
+		return domainorch.PhaseReview
 	default:
-		return orchestrator.PhaseIdle
+		return domainorch.PhaseIdle
 	}
 }
 
@@ -2368,7 +2373,7 @@ func (m *model) transitionToBuilding() error {
 	// sharing the persistent RuntimeContext, so conversation history and
 	// workspace artifacts survive the transition.
 	if m.orch != nil {
-		err := m.orch.Transition(orchestrator.PhaseBuild, tctx)
+		err := m.orch.Transition(domainorch.PhaseBuild, tctx)
 		if err == nil {
 			return nil
 		}
@@ -2380,9 +2385,9 @@ func (m *model) transitionToBuilding() error {
 		// workspace lands in StateBuilding cleanly — never surfacing
 		// "invalid transition idle -> build" after a valid patch apply and
 		// never triggering automated rollback of an applied hotfix.
-		var te *orchestrator.TransitionError
+		var te *domainorch.TransitionError
 		if errors.As(err, &te) {
-			return m.orch.Force(orchestrator.PhaseBuild, tctx)
+			return m.orch.Force(domainorch.PhaseBuild, tctx)
 		}
 		return err
 	}

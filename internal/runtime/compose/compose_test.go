@@ -13,8 +13,8 @@ import (
 	"github.com/PizenLabs/izen/internal/domain/signal"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/events/audit"
-	"github.com/PizenLabs/izen/internal/orchestrator"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	runtimeorch "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 )
 
 // TestWireBuildsFullyFunctionalEventWiredApplication is the Sprint 3
@@ -130,7 +130,7 @@ func TestWireBuildsFullyFunctionalEventWiredApplication(t *testing.T) {
 	// The orchestrator drives the core WorkflowStateMachine and publishes
 	// EventPhaseChanged on the SAME shared bus the Runtime facade uses — one
 	// canonical stream for every projection.
-	if err := app.Orchestrator.Transition(orchestrator.PhasePlan, workflow.TransitionContext{}); err != nil {
+	if err := app.Orchestrator.Transition(runtimeorch.PhasePlan, workflow.TransitionContext{}); err != nil {
 		t.Fatalf("orchestrator transition to plan: %v", err)
 	}
 	if app.WorkflowSM.State().String() != "planning" {

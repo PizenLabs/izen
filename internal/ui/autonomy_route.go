@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -54,16 +55,43 @@ func (m *model) dispatchAutonomyTrace(trace autonomy.Trace) tea.Cmd {
 
 	switch trace.Decision.Decision {
 	case autonomy.DecisionDirectResponse:
-		// Conversation: answer directly with no workspace switch, no timeline
-		// and no autonomous loop. In /ask the full governed chat path runs; in
-		// any other mode the generic chat stream answers without entering the
-		// mode's execution engine.
+		// Conversation in the pure ASK boundary: answer directly with no
+		// workspace switch, no timeline and no autonomous loop.
+		//
+		// HARD ENFORCEMENT: in any execution mode (INVESTIGATE, BUILD,
+		// PLAN, REVIEW) a direct_response verdict MUST NOT stream chat.
+		// Even a target-less prompt such as "hi" builds a
+		// scopeguard.Proposal (workspace inspection/forensics) and executes
+		// through the mode's engine, so every trace originates from runtime
+		// ledger events.
 		m.autonomyHotfix = false
 		m.pendingHotfixObjective = ""
-		if m.resolver.Current() == modes.ModeAsk {
+		current := modes.ModeAsk
+		if m.resolver != nil {
+			current = m.resolver.Current()
+		}
+		if !IsExecutionMode(current) {
 			return m.handleMessageContent(trace.Input)
 		}
-		return m.streamCmd(trace.Input)
+		workerProposal := BuildWorkerProposal(trace.Input, current, "")
+		// ScopeGuard.EvaluateProposal + WorkerEngine.ExecuteProposal run
+		// before any engine dispatch. A denial is terminal (no chat
+		// fallback); an engine failure surfaces as an error, never as a
+		// phantom direct_response stream.
+		if workerErr := ExecuteWorkerProposal(context.Background(), workerProposal, nil); workerErr != nil {
+			m.push(roleError, "[autonomy] worker proposal denied: "+workerErr.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+			return nil
+		}
+		switch current {
+		case modes.ModeInvestigate:
+			return m.runInvestigateCmd(trace.Input)
+		case modes.ModeBuild:
+			return m.executeAutonomyWorkspace(trace)
+		default:
+			return m.handleMessageContent(trace.Input)
+		}
 	case autonomy.DecisionAskUser:
 		// ask_user is the ONLY verdict that renders the proposal surface
 		// (authorization, risk acknowledgement, or target confirmation). The

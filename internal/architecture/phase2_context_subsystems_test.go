@@ -25,7 +25,7 @@ var subsystemForbiddenImports = map[string][]string{
 		"github.com/PizenLabs/izen/internal/execution",
 		"github.com/PizenLabs/izen/internal/engine",
 		"github.com/PizenLabs/izen/internal/autonomy",
-		"github.com/PizenLabs/izen/internal/orchestrator",
+		"github.com/PizenLabs/izen/internal/runtime/orchestrator",
 	},
 	"internal/knowledge": {
 		"github.com/PizenLabs/izen/internal/session/compaction",
@@ -33,14 +33,14 @@ var subsystemForbiddenImports = map[string][]string{
 		"github.com/PizenLabs/izen/internal/execution",
 		"github.com/PizenLabs/izen/internal/engine",
 		"github.com/PizenLabs/izen/internal/autonomy",
-		"github.com/PizenLabs/izen/internal/orchestrator",
+		"github.com/PizenLabs/izen/internal/runtime/orchestrator",
 	},
 	"internal/contextcompiler": {
 		"github.com/PizenLabs/izen/internal/session/compaction",
 		"github.com/PizenLabs/izen/internal/execution",
 		"github.com/PizenLabs/izen/internal/engine",
 		"github.com/PizenLabs/izen/internal/autonomy",
-		"github.com/PizenLabs/izen/internal/orchestrator",
+		"github.com/PizenLabs/izen/internal/runtime/orchestrator",
 	},
 }
 

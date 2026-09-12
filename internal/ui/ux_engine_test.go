@@ -8,6 +8,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
+	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/presentation"
 )
 
@@ -31,6 +32,9 @@ func TestConversationFlowDoesNotCreateExecutionNarrative(t *testing.T) {
 		responses: []*ai.Response{{Content: "Hello, how can I help?"}},
 	}, nil)
 	m.state = StateChat
+	// ASK is the single pure-conversation boundary where DirectResponse is
+	// legal. Execution modes escalate "hi" to repository forensics.
+	m.resolver.Set(modes.ModeAsk)
 
 	cmd := m.runGatedLine("hi")
 	if cmd == nil {
@@ -62,6 +66,8 @@ func TestConversationFlowRendersAnswerOnly(t *testing.T) {
 		responses: []*ai.Response{{Content: "Go is a programming language."}},
 	}, nil)
 	m.state = StateChat
+	// ASK-only contract: execution modes escalate casual chat to forensics.
+	m.resolver.Set(modes.ModeAsk)
 
 	cmd := m.runGatedLine("what is golang")
 	if cmd == nil {

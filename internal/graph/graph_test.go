@@ -10,11 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/ir"
-	"github.com/PizenLabs/izen/internal/kernel"
 	"github.com/PizenLabs/izen/internal/op"
 	"github.com/PizenLabs/izen/internal/resource/file"
 	"github.com/PizenLabs/izen/internal/resource/terminal"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
 )
 
 func nodeIDs(nodes []*OpNode) []string {
@@ -89,7 +90,7 @@ func TestExecutionGraphFailedPreconditionBlocksDependent(t *testing.T) {
 	if g.IsCompleted() {
 		t.Fatal("expected graph incomplete while B is blocked")
 	}
-	if got, ok := g.State("A"); !ok || got != kernel.StatusFailed {
+	if got, ok := g.State("A"); !ok || got != task.ExecStatusFailed {
 		t.Fatalf("expected A failed, got %s (%v)", got, ok)
 	}
 }
@@ -126,7 +127,7 @@ func TestExecutionGraphInjectRepairOps(t *testing.T) {
 	C := mustNode(t, "C", op.OpRunCommand, term, "echo downstream", []string{"B"})
 	addNodes(t, g, A, B, C)
 
-	engine := kernel.NewEngine(nil)
+	engine := appruntime.NewTaskEngine(nil)
 	_, err := g.Execute(t.Context(), engine)
 	var fail *ExecutionFailure
 	if !errors.As(err, &fail) {
@@ -135,7 +136,7 @@ func TestExecutionGraphInjectRepairOps(t *testing.T) {
 	if fail.NodeID != "A" {
 		t.Fatalf("expected node A to fail, got %s", fail.NodeID)
 	}
-	if got, ok := g.State("A"); !ok || got != kernel.StatusFailed {
+	if got, ok := g.State("A"); !ok || got != task.ExecStatusFailed {
 		t.Fatalf("expected A failed, got %s", got)
 	}
 
@@ -185,7 +186,7 @@ func TestExecutionGraphInjectRepairOpsPreservesOtherPreconditions(t *testing.T) 
 	B := mustNode(t, "B", op.OpRunCommand, term, "echo repaired", []string{"A", "E"})
 	addNodes(t, g, A, E, B)
 
-	engine := kernel.NewEngine(nil)
+	engine := appruntime.NewTaskEngine(nil)
 	_, err := g.Execute(t.Context(), engine)
 	var fail *ExecutionFailure
 	if !errors.As(err, &fail) || fail.NodeID != "A" {
@@ -279,7 +280,7 @@ func TestExecutionGraphExecuteOnKernelEngine(t *testing.T) {
 	B := mustNode(t, "B", op.OpWriteFile, bRes, ir.NewFile("b.go", []byte("package b\n")), []string{"A"})
 	addNodes(t, g, A, B)
 
-	results, err := g.Execute(t.Context(), kernel.NewEngine(nil))
+	results, err := g.Execute(t.Context(), appruntime.NewTaskEngine(nil))
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -302,7 +303,7 @@ func TestExecutionGraphExecuteOnKernelEngine(t *testing.T) {
 
 func TestExecutionGraphExecuteEmptyGraph(t *testing.T) {
 	g := NewExecutionGraph()
-	results, err := g.Execute(t.Context(), kernel.NewEngine(nil))
+	results, err := g.Execute(t.Context(), appruntime.NewTaskEngine(nil))
 	if err != nil {
 		t.Fatalf("Execute on empty graph: %v", err)
 	}
@@ -327,12 +328,12 @@ func TestExecutionGraphExecuteBlockedOnUnrepairedFailure(t *testing.T) {
 	B := mustNode(t, "B", op.OpRunCommand, newTerminalTarget(t), "true", []string{"A"})
 	addNodes(t, g, A, B)
 
-	_, err := g.Execute(t.Context(), kernel.NewEngine(nil))
+	_, err := g.Execute(t.Context(), appruntime.NewTaskEngine(nil))
 	var fail *ExecutionFailure
 	if !errors.As(err, &fail) || fail.NodeID != "A" {
 		t.Fatalf("expected A to fail, got %v", err)
 	}
-	_, err = g.Execute(t.Context(), kernel.NewEngine(nil))
+	_, err = g.Execute(t.Context(), appruntime.NewTaskEngine(nil))
 	if !errors.Is(err, ErrGraphBlocked) {
 		t.Fatalf("expected ErrGraphBlocked, got %v", err)
 	}
@@ -406,12 +407,12 @@ func TestExecutionGraphTimeoutPropagation(t *testing.T) {
 	B := mustNode(t, "B", op.OpRunCommand, term, "true", []string{"slow"})
 	addNodes(t, g, slow, B)
 
-	_, err = g.Execute(t.Context(), kernel.NewEngine(nil))
+	_, err = g.Execute(t.Context(), appruntime.NewTaskEngine(nil))
 	var fail *ExecutionFailure
 	if !errors.As(err, &fail) || fail.NodeID != "slow" {
 		t.Fatalf("expected slow to fail with timeout, got %v", err)
 	}
-	if !errors.Is(fail.Result.Error, kernel.ErrTaskTimeout) {
+	if !errors.Is(fail.Result.Error, task.ErrTaskTimeout) {
 		t.Fatalf("expected ErrTaskTimeout, got %v", fail.Result.Error)
 	}
 }

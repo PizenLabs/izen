@@ -24,12 +24,16 @@ func autonomyTestModel() *model {
 	return m
 }
 
-// TestAutonomyValidationCase1ConversationDirectResponse pins Case 1: "hi" is a
-// conversation that is answered directly — no workspace switch, no autonomous
-// loop, no timeline, no grant, no proposal.
+// TestAutonomyValidationCase1ConversationDirectResponse pins Case 1: "hi" in
+// the pure ASK boundary is answered directly — no workspace switch, no
+// autonomous loop, no timeline, no grant, no proposal.
+//
+// HARD ENFORCEMENT: in execution modes (e.g. /build) the same greeting MUST
+// NOT take the direct_response chat shortcut — it escalates to workspace
+// execution (see TestExecutionModeConversationEscalatesToEngine).
 func TestAutonomyValidationCase1ConversationDirectResponse(t *testing.T) {
 	m := autonomyTestModel()
-	m.resolver.Set(modes.ModeBuild)
+	m.resolver.Set(modes.ModeAsk)
 
 	cmd := m.runAutonomyRoutedCmd("hi")
 	// A greeting is answered locally by interceptLocalIntent (nil cmd) or via
@@ -39,8 +43,8 @@ func TestAutonomyValidationCase1ConversationDirectResponse(t *testing.T) {
 		t.Fatal("conversation must not start any execution engine")
 	}
 	// The workspace must NOT switch away from the current mode for a greeting.
-	if got := m.resolver.Current(); got != modes.ModeBuild {
-		t.Fatalf("workspace = /%s, want /build (no switch for conversation)", got)
+	if got := m.resolver.Current(); got != modes.ModeAsk {
+		t.Fatalf("workspace = /%s, want /ask (no switch for conversation)", got)
 	}
 	// No proposal and no grant for conversation.
 	if m.pendingAutonomyProposal != nil {
