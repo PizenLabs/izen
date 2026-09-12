@@ -28,6 +28,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	cmdreg "github.com/PizenLabs/izen/internal/domain/command"
+	domainorch "github.com/PizenLabs/izen/internal/domain/orchestration"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/gateway"
 	"github.com/PizenLabs/izen/internal/hotfix"
@@ -35,7 +36,6 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/modes/review"
-	"github.com/PizenLabs/izen/internal/orchestrator"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	riview "github.com/PizenLabs/izen/internal/review"
@@ -1487,20 +1487,20 @@ func parseModeShorthand(line string) (modes.Mode, string, bool) {
 
 // phaseForMode maps a UI mode onto its canonical orchestrator phase. The
 // orchestrator uses these to drive the shared WorkflowStateMachine.
-func phaseForMode(mode modes.Mode) orchestrator.Phase {
+func phaseForMode(mode modes.Mode) domainorch.Phase {
 	switch mode {
 	case modes.ModeAsk:
-		return orchestrator.PhaseAsk
+		return domainorch.PhaseAsk
 	case modes.ModeInvestigate:
-		return orchestrator.PhaseInvestigate
+		return domainorch.PhaseInvestigate
 	case modes.ModePlan:
-		return orchestrator.PhasePlan
+		return domainorch.PhasePlan
 	case modes.ModeBuild:
-		return orchestrator.PhaseBuild
+		return domainorch.PhaseBuild
 	case modes.ModeReview:
-		return orchestrator.PhaseReview
+		return domainorch.PhaseReview
 	default:
-		return orchestrator.PhaseIdle
+		return domainorch.PhaseIdle
 	}
 }
 
@@ -2368,7 +2368,7 @@ func (m *model) transitionToBuilding() error {
 	// sharing the persistent RuntimeContext, so conversation history and
 	// workspace artifacts survive the transition.
 	if m.orch != nil {
-		err := m.orch.Transition(orchestrator.PhaseBuild, tctx)
+		err := m.orch.Transition(domainorch.PhaseBuild, tctx)
 		if err == nil {
 			return nil
 		}
@@ -2380,9 +2380,9 @@ func (m *model) transitionToBuilding() error {
 		// workspace lands in StateBuilding cleanly — never surfacing
 		// "invalid transition idle -> build" after a valid patch apply and
 		// never triggering automated rollback of an applied hotfix.
-		var te *orchestrator.TransitionError
+		var te *domainorch.TransitionError
 		if errors.As(err, &te) {
-			return m.orch.Force(orchestrator.PhaseBuild, tctx)
+			return m.orch.Force(domainorch.PhaseBuild, tctx)
 		}
 		return err
 	}

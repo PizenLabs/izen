@@ -1,25 +1,9 @@
 package kernel
 
-import (
-	"context"
-	"time"
-)
+import domaintask "github.com/PizenLabs/izen/internal/domain/task"
 
-// TaskResult is the outcome of executing a task. Status is always terminal on
-// the result returned by ExecuteTask; Error carries the failure or cancellation
-// reason when applicable; Data carries an optional, type-unspecified outcome.
-type TaskResult struct {
-	Status ExecutionStatus
-	Error  error
-	Data   any
-}
-
-// Executable is the contract a runnable task satisfies. Requires lists the IDs
-// of tasks that must complete first and is reserved for the scheduler layer;
-// the kernel does not resolve dependencies itself.
-type Executable interface {
-	ID() string
-	Requires() []string
-	Timeout() time.Duration
-	Execute(ctx context.Context, rt Runtime) TaskResult
-}
+// ── STEP 1 transitional bridge ────────────────────────────────────────────
+// Canonical task DTOs live in internal/domain/task. Aliases keep the Engine
+// bridge compiling while graph/planner callers migrate to the domain.
+type TaskResult = domaintask.TaskResult
+type Executable = domaintask.Executable

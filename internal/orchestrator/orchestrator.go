@@ -19,47 +19,38 @@ import (
 	"github.com/PizenLabs/izen/internal/core/classifier"
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/workflow"
+	domainorch "github.com/PizenLabs/izen/internal/domain/orchestration"
 	"github.com/PizenLabs/izen/internal/engine/pipeline"
 	"github.com/PizenLabs/izen/internal/events"
 	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 )
 
-// Phase is a logical execution phase within the workflow.
-type Phase int
+// ── STEP 1 transitional bridge ────────────────────────────────────────────
+// Canonical phase state types live in internal/domain/orchestration. These
+// aliases keep the legacy execution bridge (Orchestrator struct, SM driving,
+// bus wiring) compiling while high-level callers migrate to the domain.
+type Phase = domainorch.Phase
+type Transition = domainorch.Transition
+type TransitionError = domainorch.TransitionError
 
 const (
-	PhaseIdle Phase = iota
-	PhaseAsk
-	PhaseInvestigate
-	PhasePlan
-	PhaseBuild
-	PhaseReview
+	PhaseIdle        = domainorch.PhaseIdle
+	PhaseAsk         = domainorch.PhaseAsk
+	PhaseInvestigate = domainorch.PhaseInvestigate
+	PhasePlan        = domainorch.PhasePlan
+	PhaseBuild       = domainorch.PhaseBuild
+	PhaseReview      = domainorch.PhaseReview
 )
 
-func (p Phase) String() string {
-	switch p {
-	case PhaseIdle:
-		return "idle"
-	case PhaseAsk:
-		return "ask"
-	case PhaseInvestigate:
-		return "investigate"
-	case PhasePlan:
-		return "plan"
-	case PhaseBuild:
-		return "build"
-	case PhaseReview:
-		return "review"
-	default:
-		return fmt.Sprintf("Phase(%d)", int(p))
-	}
-}
-
-// Valid reports whether the phase is a known logical execution phase.
-func (p Phase) Valid() bool { return p >= PhaseIdle && p <= PhaseReview }
+// validEdge is the execution-bridge wrapper over the canonical pure table in
+// the domain (domainorch.ValidTransition).
+func validEdge(from, to Phase) bool { return domainorch.ValidTransition(from, to) }
 
 // workflowStateFor maps a logical phase onto its matching workflow SM state.
-func (p Phase) workflowState() workflow.WorkflowState {
+// It is the execution-bridge form of the former (p Phase).workflowState
+// method, kept as a free function because methods cannot be defined on an
+// aliased (domain-owned) type.
+func workflowStateFor(p Phase) workflow.WorkflowState {
 	switch p {
 	case PhaseAsk, PhaseIdle:
 		return workflow.StateIdle
@@ -73,30 +64,6 @@ func (p Phase) workflowState() workflow.WorkflowState {
 		return workflow.StateReviewing
 	default:
 		return workflow.StateIdle
-	}
-}
-
-// validEdge reports whether a logical transition from `from` to `to` is
-// permitted by the orchestrator's phase table.
-func validEdge(from, to Phase) bool {
-	if to == from {
-		return true
-	}
-	switch from {
-	case PhaseIdle:
-		return to == PhaseAsk || to == PhaseInvestigate || to == PhasePlan
-	case PhaseAsk:
-		return to == PhaseInvestigate || to == PhasePlan
-	case PhaseInvestigate:
-		return to == PhasePlan || to == PhaseAsk
-	case PhasePlan:
-		return to == PhaseBuild || to == PhaseAsk || to == PhaseInvestigate
-	case PhaseBuild:
-		return to == PhaseReview || to == PhaseAsk
-	case PhaseReview:
-		return to == PhaseBuild || to == PhaseAsk
-	default:
-		return false
 	}
 }
 
@@ -408,7 +375,7 @@ func (o *Orchestrator) Fail(class classifier.FailureClass) error {
 // If the target is not reachable directly from the current state, the machine
 // is reset to idle first, then driven forward along the canonical path.
 func driveSM(sm *workflow.WorkflowStateMachine, target Phase, tctx workflow.TransitionContext) error {
-	want := target.workflowState()
+	want := workflowStateFor(target)
 
 	// Already there.
 	if sm.State() == want {
@@ -524,13 +491,5 @@ func edge(from workflow.WorkflowState, ev workflow.WorkflowEvent) (workflow.Work
 	return from, false
 }
 
-// TransitionError reports an invalid logical phase transition.
-type TransitionError struct {
-	From Phase
-	To   Phase
-	Msg  string
-}
-
-func (e *TransitionError) Error() string {
-	return fmt.Sprintf("orchestrator: invalid transition %s -> %s: %s", e.From, e.To, e.Msg)
-}
+// NOTE: TransitionError is aliased to domainorch.TransitionError at the top
+// of this file (STEP 1 bridge). Its Error method lives in the domain.

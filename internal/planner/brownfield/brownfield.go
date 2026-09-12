@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/graph"
 	"github.com/PizenLabs/izen/internal/ir"
 	"github.com/PizenLabs/izen/internal/kernel"
@@ -373,7 +374,7 @@ var (
 // FailureReport. The combined output is assembled from the error cause and
 // the result's data (the command's captured output). command is the failed
 // command string when known.
-func AnalyzeFailure(result kernel.TaskResult, command string) FailureReport {
+func AnalyzeFailure(result task.TaskResult, command string) FailureReport {
 	report := FailureReport{Command: command, Cause: result.Error}
 	if result.Error != nil {
 		report.Output = result.Error.Error()

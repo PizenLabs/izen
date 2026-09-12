@@ -6,7 +6,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/core/budget"
-	"github.com/PizenLabs/izen/internal/core/capability"
+	domaincap "github.com/PizenLabs/izen/internal/domain/capability"
 )
 
 // Style aliases — defined in styles.go as exported variables.
@@ -18,7 +18,7 @@ import (
 type approvalPromptData struct {
 	Title         string
 	TargetFiles   []string
-	Capabilities  []capability.Capability
+	Capabilities  []domaincap.Capability
 	BudgetDelta   budget.BudgetDelta
 	LifecycleFrom artifact.LifecycleState
 	LifecycleTo   artifact.LifecycleState

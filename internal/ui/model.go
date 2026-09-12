@@ -24,11 +24,11 @@ import (
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
-	"github.com/PizenLabs/izen/internal/core/capability"
 	"github.com/PizenLabs/izen/internal/core/runtime"
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
+	domaincap "github.com/PizenLabs/izen/internal/domain/capability"
 	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
 	"github.com/PizenLabs/izen/internal/engine/ir"
 	"github.com/PizenLabs/izen/internal/engine/pipeline"
@@ -1037,7 +1037,7 @@ type model struct {
 	authEngine     *authorization.AuthorizationEngine
 	mutationBudget *budget.MutationBudget
 	microBudget    *budget.MicroBudget
-	caps           *capability.CapabilitySet
+	caps           *domaincap.CapabilitySet
 
 	// ── Transient toast overlay (Top Bar) ─────────────────────────
 	// toast is the transient top-bar notification message. It renders as a

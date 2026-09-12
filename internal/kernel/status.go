@@ -7,24 +7,18 @@
 // library and internal/events.
 package kernel
 
-// ExecutionStatus describes the lifecycle state of a task.
-type ExecutionStatus string
+import domaintask "github.com/PizenLabs/izen/internal/domain/task"
+
+// ── STEP 1 transitional bridge ────────────────────────────────────────────
+// Canonical execution state types live in internal/domain/task. These aliases
+// keep the legacy execution bridge (Engine, Runtime) compiling while
+// high-level callers migrate to the domain.
+type ExecutionStatus = domaintask.ExecutionStatus
 
 const (
-	StatusPending   ExecutionStatus = "pending"
-	StatusRunning   ExecutionStatus = "running"
-	StatusCompleted ExecutionStatus = "completed"
-	StatusFailed    ExecutionStatus = "failed"
-	StatusCanceled  ExecutionStatus = "canceled"
+	StatusPending   = domaintask.ExecStatusPending
+	StatusRunning   = domaintask.ExecStatusRunning
+	StatusCompleted = domaintask.ExecStatusCompleted
+	StatusFailed    = domaintask.ExecStatusFailed
+	StatusCanceled  = domaintask.ExecStatusCanceled
 )
-
-// IsTerminal reports whether the status represents a finished task. Only
-// StatusCompleted, StatusFailed, and StatusCanceled are terminal.
-func (s ExecutionStatus) IsTerminal() bool {
-	switch s {
-	case StatusCompleted, StatusFailed, StatusCanceled:
-		return true
-	default:
-		return false
-	}
-}

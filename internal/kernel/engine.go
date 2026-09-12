@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 
+	domaintask "github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/events"
 )
 
-// ErrTaskTimeout is the cause attached to a task context when a task's Timeout
-// elapses. It is surfaced as the TaskResult error for timed-out executions.
-var ErrTaskTimeout = errors.New("task timed out")
+// ErrTaskTimeout is the canonical timeout cause (aliased from the domain so
+// both kernel.ErrTaskTimeout and task.ErrTaskTimeout observe one value).
+var ErrTaskTimeout = domaintask.ErrTaskTimeout
 
 var errNilTask = errors.New("nil task")
 

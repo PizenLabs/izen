@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	domaintask "github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/ir"
-	"github.com/PizenLabs/izen/internal/kernel"
 	"github.com/PizenLabs/izen/internal/op"
 )
 
@@ -33,14 +33,14 @@ type (
 	}
 )
 
-// OpNode wraps an op.Operation and satisfies kernel.Executable so the
-// operation runs on the Phase A kernel.Engine.
+// OpNode wraps an op.Operation and satisfies domaintask.Executable so the
+// operation runs on the Phase A kernel.Engine (execution bridge).
 type OpNode struct {
 	op op.Operation
 }
 
-// Compile-time assertion that OpNode satisfies kernel.Executable.
-var _ kernel.Executable = (*OpNode)(nil)
+// Compile-time assertion that OpNode satisfies domaintask.Executable.
+var _ domaintask.Executable = (*OpNode)(nil)
 
 // NewOpNode validates the operation and wraps it in an executable graph node.
 // The operation preconditions are copied defensively.
@@ -69,7 +69,7 @@ func (n *OpNode) Operation() op.Operation { return n.op }
 // Execute dispatches the operation onto its target resource through the
 // resource capability contracts. A canceled context short-circuits to
 // StatusCanceled; failures surface as StatusFailed with the cause.
-func (n *OpNode) Execute(ctx context.Context, _ kernel.Runtime) kernel.TaskResult {
+func (n *OpNode) Execute(ctx context.Context, _ domaintask.Runtime) domaintask.TaskResult {
 	if err := ctx.Err(); err != nil {
 		return canceledResult(err)
 	}
@@ -87,7 +87,7 @@ func (n *OpNode) Execute(ctx context.Context, _ kernel.Runtime) kernel.TaskResul
 	}
 }
 
-func (n *OpNode) executeWriteFile(ctx context.Context) kernel.TaskResult {
+func (n *OpNode) executeWriteFile(ctx context.Context) domaintask.TaskResult {
 	artifact, ok := n.artifactPayload()
 	if !ok {
 		return failedResult(errors.New("graph: write operation requires an ir.Artifact payload"))
@@ -102,10 +102,10 @@ func (n *OpNode) executeWriteFile(ctx context.Context) kernel.TaskResult {
 	if err := w.Write(artifact.Content); err != nil {
 		return failedResult(fmt.Errorf("graph: write %q: %w", artifact.Path, err))
 	}
-	return kernel.TaskResult{Status: kernel.StatusCompleted}
+	return domaintask.TaskResult{Status: domaintask.ExecStatusCompleted}
 }
 
-func (n *OpNode) executeDeleteFile(ctx context.Context) kernel.TaskResult {
+func (n *OpNode) executeDeleteFile(ctx context.Context) domaintask.TaskResult {
 	d, ok := n.op.TargetResource.(fileDeleter)
 	if !ok {
 		return failedResult(errors.New("graph: delete operation target does not support file deletion"))
@@ -116,10 +116,10 @@ func (n *OpNode) executeDeleteFile(ctx context.Context) kernel.TaskResult {
 	if err := d.Delete(); err != nil {
 		return failedResult(fmt.Errorf("graph: delete operation: %w", err))
 	}
-	return kernel.TaskResult{Status: kernel.StatusCompleted}
+	return domaintask.TaskResult{Status: domaintask.ExecStatusCompleted}
 }
 
-func (n *OpNode) executeRunCommand(ctx context.Context) kernel.TaskResult {
+func (n *OpNode) executeRunCommand(ctx context.Context) domaintask.TaskResult {
 	command, ok := n.op.Payload.(string)
 	if !ok {
 		return failedResult(errors.New("graph: command operation requires a string payload"))
@@ -130,16 +130,16 @@ func (n *OpNode) executeRunCommand(ctx context.Context) kernel.TaskResult {
 	}
 	out, err := r.Run(ctx, command)
 	if err != nil {
-		return kernel.TaskResult{
-			Status: kernel.StatusFailed,
+		return domaintask.TaskResult{
+			Status: domaintask.ExecStatusFailed,
 			Error:  fmt.Errorf("graph: command %q: %w", command, err),
 			Data:   out,
 		}
 	}
-	return kernel.TaskResult{Status: kernel.StatusCompleted, Data: out}
+	return domaintask.TaskResult{Status: domaintask.ExecStatusCompleted, Data: out}
 }
 
-func (n *OpNode) executeGitCommit(ctx context.Context) kernel.TaskResult {
+func (n *OpNode) executeGitCommit(ctx context.Context) domaintask.TaskResult {
 	message, ok := n.op.Payload.(string)
 	if !ok {
 		return failedResult(errors.New("graph: git commit operation requires a string payload"))
@@ -152,7 +152,7 @@ func (n *OpNode) executeGitCommit(ctx context.Context) kernel.TaskResult {
 	if err != nil {
 		return failedResult(fmt.Errorf("graph: git commit: %w", err))
 	}
-	return kernel.TaskResult{Status: kernel.StatusCompleted, Data: sha}
+	return domaintask.TaskResult{Status: domaintask.ExecStatusCompleted, Data: sha}
 }
 
 // artifactPayload extracts the ir.Artifact payload, accepting both a value and
@@ -169,10 +169,10 @@ func (n *OpNode) artifactPayload() (ir.Artifact, bool) {
 	return ir.Artifact{}, false
 }
 
-func failedResult(err error) kernel.TaskResult {
-	return kernel.TaskResult{Status: kernel.StatusFailed, Error: err}
+func failedResult(err error) domaintask.TaskResult {
+	return domaintask.TaskResult{Status: domaintask.ExecStatusFailed, Error: err}
 }
 
-func canceledResult(err error) kernel.TaskResult {
-	return kernel.TaskResult{Status: kernel.StatusCanceled, Error: err}
+func canceledResult(err error) domaintask.TaskResult {
+	return domaintask.TaskResult{Status: domaintask.ExecStatusCanceled, Error: err}
 }

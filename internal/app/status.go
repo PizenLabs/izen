@@ -3,9 +3,9 @@ package app
 import (
 	"fmt"
 
+	domaintask "github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/ir"
-	"github.com/PizenLabs/izen/internal/kernel"
 )
 
 // StatusLine renders one runtime event as a compact human-readable status
@@ -21,7 +21,7 @@ func StatusLine(ev events.DomainEvent) string {
 	case events.EventTaskFailed:
 		msg := ""
 		if p, ok := ev.Payload().(events.TaskFailedPayload); ok {
-			if r, ok := p.Result.(kernel.TaskResult); ok && r.Error != nil {
+			if r, ok := p.Result.(domaintask.TaskResult); ok && r.Error != nil {
 				msg = ": " + r.Error.Error()
 			}
 		}

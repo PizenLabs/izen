@@ -4,17 +4,14 @@ import (
 	"context"
 	"sync/atomic"
 
+	domaintask "github.com/PizenLabs/izen/internal/domain/task"
 	"github.com/PizenLabs/izen/internal/events"
 )
 
-// Runtime is the execution environment handed to a task. It exposes the
-// task-scoped context, the shared event bus, and explicit cancellation.
-type Runtime interface {
-	Context() context.Context
-	Emit(ev events.DomainEvent)
-	IsCanceled() bool
-	Cancel(reason error)
-}
+// ── STEP 1 transitional bridge ────────────────────────────────────────────
+// Canonical Runtime contract lives in internal/domain/task. The alias keeps
+// the Engine bridge compiling while callers migrate to the domain.
+type Runtime = domaintask.Runtime
 
 // KernelRuntime is the concrete Runtime implementation. It encapsulates the
 // task-scoped context, its cancel cause function, and the shared event bus.
