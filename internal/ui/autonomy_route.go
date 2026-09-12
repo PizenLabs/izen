@@ -55,15 +55,25 @@ func (m *model) dispatchAutonomyTrace(trace autonomy.Trace) tea.Cmd {
 
 	switch trace.Decision.Decision {
 	case autonomy.DecisionDirectResponse:
-		// Conversation in the pure ASK boundary: answer directly with no
-		// workspace switch, no timeline and no autonomous loop.
+		// CASUAL CONVERSATION AUTO-UNWIND: a conversation verdict while the
+		// WorkflowStateMachine is in any non-idle phase unwinds to
+		// StateIdle/StateChat and answers locally. Zero pipeline
+		// propagation — no ScopeGuard proposal, no engine dispatch, no
+		// provider call. Non-casual direct_responses in the pure ASK
+		// boundary answer directly as before.
 		//
-		// HARD ENFORCEMENT: in any execution mode (INVESTIGATE, BUILD,
-		// PLAN, REVIEW) a direct_response verdict MUST NOT stream chat.
-		// Even a target-less prompt such as "hi" builds a
-		// scopeguard.Proposal (workspace inspection/forensics) and executes
-		// through the mode's engine, so every trace originates from runtime
-		// ledger events.
+		// HARD ENFORCEMENT (retained for non-casual prompts): in any
+		// execution mode (INVESTIGATE, BUILD, PLAN, REVIEW) a
+		// non-conversational direct_response verdict MUST NOT stream chat.
+		// Such prompts build a scopeguard.Proposal (workspace
+		// inspection/forensics) and execute through the mode's engine, so
+		// every trace originates from runtime ledger events.
+		if m.handleCasualAutoUnwind(trace.Input) {
+			m.autonomyHotfix = false
+			m.pendingHotfixObjective = ""
+			m.stopShimmer()
+			return nil
+		}
 		m.autonomyHotfix = false
 		m.pendingHotfixObjective = ""
 		current := modes.ModeAsk

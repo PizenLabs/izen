@@ -195,6 +195,17 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// Clear any stale error bar on new user input
 	m.lastApplyError = ""
 
+	// ── CASUAL CONVERSATION AUTO-UNWIND ─────────────────────────────
+	// A casual prompt ("hi") while the WorkflowStateMachine is in any
+	// non-idle phase unwinds to StateIdle/StateChat BEFORE the busy guard:
+	// the unwind itself clears streaming/execution state, so it must
+	// preempt the "Input blocked: task active." gate. Zero pipeline
+	// propagation — no synthesis, tools, or provider calls.
+	if m.handleCasualAutoUnwind(line) {
+		m.stopShimmer()
+		return nil
+	}
+
 	// Rigid active guards to block spamming inputs during background processes
 	if m.streaming || m.agentRunning {
 		// $inspect is a read-only observational directive: it renders the
@@ -454,6 +465,15 @@ func (m *model) routeFreeInput(line string) tea.Cmd {
 }
 
 func (m *model) handleMessageContent(line string) tea.Cmd {
+	// ── CASUAL CONVERSATION AUTO-UNWIND ─────────────────────────────
+	// Direct /plan-/investigate-/review-/build entry with casual chatter
+	// (e.g. "/plan hi" or a handoff landing on "hi") unwinds to
+	// StateIdle/StateChat before any engine dispatch. Zero pipeline
+	// propagation — no synthesis, tools, or provider calls.
+	if m.handleCasualAutoUnwind(line) {
+		m.stopShimmer()
+		return nil
+	}
 	var refFiles []string
 	for _, field := range strings.Fields(line) {
 		if !strings.HasPrefix(field, "@") {
@@ -1527,10 +1547,24 @@ func (m *model) setMode(mode modes.Mode) tea.Cmd {
 		if mode == modes.ModeBuild && !m.hasStagedBuildWork() && !m.orch.HasAuthorizedPlan() {
 			_ = m.orch.InjectEphemeralPlan("fast-path:" + mode.String())
 		}
-		_ = m.orch.Force(phaseForMode(mode), workflow.TransitionContext{
+		if err := m.orch.Force(phaseForMode(mode), workflow.TransitionContext{
 			HasPlan:         m.sess != nil && len(m.sess.CurrentTasks) > 0,
 			HasCapabilities: m.caps != nil,
-		})
+		}); err != nil {
+			// ── GRACEFUL PHASE TRANSITION REJECTION ───────────────
+			// A rejected phase hop (e.g. a backward move the graph
+			// forbids, or a guard without authorized plan evidence)
+			// is caught at command admission, surfaced as a system
+			// warning, and leaves the UI predictable — prompt
+			// dispatching is never corrupted.
+			if m.handleBackwardTransitionError(err) {
+				return nil
+			}
+			m.appendSystemError(err)
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
+			return nil
+		}
 	}
 
 	// ── RULE A: STRICT MODE TRANSITION GATEKEEPER ──────────────────────
@@ -2606,6 +2640,9 @@ func (m *model) handleBuildRun(stepNum int) tea.Cmd {
 	// when in StateIdle), handle gracefully and do not attempt
 	// authorization in an invalid state.
 	if err := m.transitionToBuilding(); err != nil {
+		if m.handleBackwardTransitionError(err) {
+			return nil
+		}
 		m.push(roleError, fmt.Sprintf("[BUILD HALTED] Workflow state transition failed: %v", err))
 		return nil
 	}

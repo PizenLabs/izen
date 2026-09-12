@@ -45,6 +45,15 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	if line == "" {
 		return nil
 	}
+	// ── CASUAL CONVERSATION AUTO-UNWIND ─────────────────────────────
+	// A casual prompt ("hi") while the WorkflowStateMachine is in any
+	// non-idle phase unwinds to StateIdle/StateChat here — before Gate(),
+	// ScopeGuard proposals, WorkerEngine dispatch, or executor submission.
+	// Zero pipeline propagation by construction: Gate() is never reached.
+	if m.handleCasualAutoUnwind(line) {
+		m.stopShimmer()
+		return nil
+	}
 	if m.gateway == nil || m.executor == nil {
 		m.push(roleError, "execution runtime not wired")
 		m.refreshViewportContent()

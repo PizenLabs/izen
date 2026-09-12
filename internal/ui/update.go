@@ -561,6 +561,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// errors are surfaced; successful commands rendered their own
 		// presentation events.
 		if msg.err != nil {
+			// ── GRACEFUL PHASE TRANSITION REJECTION ───────────────
+			// A backward switch_mode hop (e.g. /investigate while in
+			// Review) is rejected by the workflow guard. Catch it at
+			// command admission, surface it as a system warning, and
+			// leave the UI predictable — never corrupt prompt
+			// dispatching with an unhandled transition error.
+			if m.handleBackwardTransitionError(msg.err) {
+				return m, nil
+			}
 			m.push(roleError, fmt.Sprintf("command %s failed: %v", msg.typ, msg.err))
 			m.refreshViewportContent()
 			if m.Ready && !m.userIsScrollingUp {
