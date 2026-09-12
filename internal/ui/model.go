@@ -2664,17 +2664,28 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.shellRunning = false
 	m.planPending = false
 	m.executionResolving = false
-	// For non-autonomous the operation is already finalized; for autonomous
-	// keep autonomousActive true until the driver terminal message but still
-	// force the presentation to IDLE.
-	_ = m.autonomousActive // referenced; no branch mutation needed
-	m.syncUIState()
-	// Force state to chat even when autonomousActive would otherwise keep
-	// it in processing — the directive requires immediate IDLE.
-	m.state = StateChat
-
+	// Canonical sync (Phase 2): never hand-set StateChat while an
+	// autonomous run is active or the workflow machine remains in a
+	// Building/Planning phase. If an autonomous driver is in flight its
+	// terminal autonomousRunMsg remains the canonical finalization path,
+	// so autonomousActive stays true here by design; the presentation is
+	// derived from the reset machine below.
 	// 3. Release any outstanding approval gate on the canonical source.
 	m.resolveApprovalState()
+	// Project the interrupt onto the canonical workflow state machine so
+	// m.state (via syncUIState) can never drift from workflowSM. The
+	// interrupt event unwinds Building/Planning/Reviewing/Repairing to
+	// Idle; failures are surfaced, never swallowed.
+	if m.workflowSM != nil {
+		if err := m.workflowSM.SendEvent(workflow.EventUserInterrupt, workflow.TransitionContext{}); err != nil {
+			m.appendSystemError(fmt.Errorf("workflow SM rejected emergency interrupt event: %w", err))
+		}
+	}
+	// syncUIState is the single source of truth for m.state: it derives
+	// the presentation exclusively from workflowSM, approval gates, and
+	// transient busy flags. No manual m.state assignment occurs on this
+	// path.
+	m.syncUIState()
 
 	// 4. Drop in-flight approval/patch state so the viewport returns to chat.
 	m.awaitingConfirmation = false
@@ -2702,20 +2713,23 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	if m.hotfixActive {
 		if stashedTasks, rerr := m.restorePlan(); rerr == nil && len(stashedTasks) > 0 {
 			m.sess.StageTaskList(&stashedTasks)
-			_ = m.sess.Save()
+			m.persistSession("model")
 		}
 		m.hotfixActive = false
 	}
 
-	// 5. Restore interactive input and force the presentation back to chat.
-	// Directive: immediately return to IDLE prompt (build > / ask >) without
-	// requiring multiple keypresses; never remain stuck in Generating...
+	// 5. Restore interactive input. The presentation state was already
+	// derived canonically via syncUIState above; no manual StateChat
+	// override occurs here so autonomousActive and workflowSM can never
+	// drift from m.state.
 	m.ti.Focus()
 	m.recalcViewportHeight()
-	m.state = StateChat
 	// Clear spinners and reset token rate counters to 0.0 tok/s already done above;
 	// ensure sync.
 	m.stopShimmer()
+	// Final canonical projection: syncUIState remains the single source of
+	// truth for m.state. No manual assignment follows.
+	m.syncUIState()
 	abortTotal := abortBaseIn + abortLiveOut
 	if abortTotal > 0 || abortCostLabel != "" {
 		m.push(roleSystem, infoStyle.Render(
@@ -2728,10 +2742,12 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 		m.Viewport.GotoBottom()
 	}
 
-	// 5b. Abort any parked autonomous run. The driver holds its own loop
-	// state (no worker is blocked); Abort terminates it as a permanent human
-	// cancellation and the terminal message projects through the normal
-	// autonomousRunMsg path.
+	// 5b. Abort any autonomous run via the canonical driver path. When a
+	// parked boundary exists the run state is cleared now and the abort
+	// projects through autonomousRunMsg; when autonomousActive is set
+	// without a parked boundary (streaming driver) stopAutonomousDriver
+	// schedules the abort while leaving finalization to the terminal
+	// message. No presentation state is hand-set here.
 	var extra []tea.Cmd
 	if m.autonomousDriver != nil && m.autonomousBoundary != nil {
 		driver := m.autonomousDriver
@@ -2740,6 +2756,10 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 			term, err := driver.Abort(reason + " interrupt")
 			return autonomousRunMsg{term: term, err: err}
 		})
+	} else if m.autonomousActive {
+		if cmd := m.stopAutonomousDriver(reason); cmd != nil {
+			extra = append(extra, cmd)
+		}
 	}
 
 	return m, tea.Batch(append(extra,
@@ -2749,7 +2769,12 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 }
 
 // syncUIState projects the canonical workflow state onto the presentation
-// state. It is the single place the approval presentation state is derived.
+// state. It is the SINGLE source of truth for deriving m.state from
+// m.workflowSM, approval gates, and transient busy flags. Emergency
+// interrupts must route through workflowSM.SendEvent(EventUserInterrupt)
+// followed by syncUIState and must never hand-set m.state to StateChat
+// while autonomousActive is true or the machine remains in
+// StateBuilding/StatePlanning.
 //
 // StateAwaitingApproval is strictly derived from the canonical pending-approval
 // gate. StateProcessing is derived from the active workflow phase only while a
@@ -2852,7 +2877,7 @@ func (m *model) markAllPlanTasksCompleted() {
 	}
 	if changed {
 		m.sess.StageTaskList(&tasks)
-		_ = m.sess.Save()
+		m.persistSession("model")
 	}
 }
 
@@ -3594,6 +3619,22 @@ func (m *model) appendSystemError(err error) {
 	}
 	m.push(roleError, "[system] "+err.Error())
 	m.logActivity("[system] %v", err)
+}
+
+// persistSession saves session state to disk with fail-closed error
+// reporting (Phase 2 persistence integrity). It never swallows the Save
+// error: failures are surfaced via appendSystemError so operators see the
+// durability gap. Callers in execution paths must check the returned error
+// and halt completion transitions until persistence is confirmed.
+func (m *model) persistSession(op string) error {
+	if m == nil || m.sess == nil {
+		return nil
+	}
+	if err := m.sess.Save(); err != nil {
+		m.appendSystemError(fmt.Errorf("session persist %s failed: %w", op, err))
+		return err
+	}
+	return nil
 }
 
 // resolveModelID implements the fail-closed model resolution hierarchy:

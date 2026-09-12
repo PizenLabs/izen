@@ -753,16 +753,30 @@ func (m *model) projectBuildQueueFromProof(res *execution.ExecutionResult, execE
 				stalled = true
 			}
 		}
+		prev := append([]plan.Task(nil), m.sess.CurrentTasks...)
 		m.sess.StageTaskList(&tasks)
-		_ = m.sess.Save()
+		if err := m.sess.Save(); err != nil {
+			m.sess.CurrentTasks = prev
+			m.appendSystemError(fmt.Errorf("session stage task list failed: %w", err))
+			m.push(roleError, "[BUILD HALTED] Failed to persist build proposal state to disk — queue unchanged.")
+			flush := m.flushPendingRecords()
+			return m, flush, true
+		}
 		if stalled {
 			m.push(roleError, "[BUILD HALTED] Execution failed. Queue frozen — remaining tasks marked stalled. Use /investigate or /plan to re-generate a valid ledger.")
 		}
 		flush := m.flushPendingRecords()
 		return m, flush, true
 	}
+	prev := append([]plan.Task(nil), m.sess.CurrentTasks...)
 	m.sess.StageTaskList(&tasks)
-	_ = m.sess.Save()
+	if err := m.sess.Save(); err != nil {
+		m.sess.CurrentTasks = prev
+		m.appendSystemError(fmt.Errorf("session stage task list failed: %w", err))
+		m.push(roleError, "Failed to persist build proposal state to disk — queue unchanged.")
+		flush := m.flushPendingRecords()
+		return m, flush, true
+	}
 	for _, t := range tasks {
 		if t.Status == "idle" || t.Status == "processing" {
 			flush := m.flushPendingRecords()
