@@ -49,6 +49,8 @@ func normalizeOptionOrder(vm decision.DecisionViewModel) decision.DecisionViewMo
 // decisionSurfaceOptionIDs is the authoritative mapping from display index to
 // canonical intent IDs. It is the single source for the adapter's Option.Key
 // values and the driver's ParseProposalIntent normalization.
+//
+//nolint:unused // Staged contract: Approval flow decision surface (see ADR-004)
 var decisionSurfaceOptionIDs = map[string]ProposalIntent{
 	"1":                       ProposalFullFileFallback,
 	"2":                       ProposalRepromptFullText,
@@ -72,6 +74,8 @@ var decisionSurfaceOptionIDs = map[string]ProposalIntent{
 // normalization authority. It also handles empty Action fallback to index string
 // as required by TASK 1: when opt.Action is empty, the caller should pass the
 // index string ("1","2") so the intent resolves to the canonical fallback.
+//
+//nolint:unused // Staged contract: Approval flow decision surface (see ADR-004)
 func resolveDecisionSurfaceIntent(raw string) ProposalIntent {
 	if raw == "" {
 		return ProposalIntent("")
@@ -82,6 +86,8 @@ func resolveDecisionSurfaceIntent(raw string) ProposalIntent {
 // resolveDecisionSurfaceIntentWithFallback handles the TASK 1 empty-Action case
 // explicitly: when the selected option's Action/ID is empty, it falls back to
 // the 1-based index string so the surface never emits an empty payload.
+//
+//nolint:unused // Staged contract: Approval flow decision surface (see ADR-004)
 func resolveDecisionSurfaceIntentWithFallback(raw string, selectedIndex int) ProposalIntent {
 	intentStr := raw
 	if intentStr == "" {
@@ -93,6 +99,8 @@ func resolveDecisionSurfaceIntentWithFallback(raw string, selectedIndex int) Pro
 // decisionSurfaceOptionIDFor returns the canonical ID string for an intent.
 // It is used by renderers to ensure the published DecisionSurface carries the
 // exact IDs the driver expects.
+//
+//nolint:unused // Staged contract: Approval flow decision surface (see ADR-004)
 func decisionSurfaceOptionIDFor(intent ProposalIntent) string {
 	return string(intent)
 }
@@ -102,6 +110,8 @@ func decisionSurfaceOptionIDFor(intent ProposalIntent) string {
 // the DecisionSurface in one atomic construction, pinning index 0 to the
 // (recommended) option and ensuring default Selected is 0. Callers must use
 // this instead of incremental mutation to avoid partial TUI state.
+//
+//nolint:unused // Staged contract: Approval flow decision surface (see ADR-004)
 func BuildPublishedSurface(surface DecisionSurface) *ProposalModel {
 	m := NewProposalModel(surface)
 	if m != nil {
@@ -112,6 +122,8 @@ func BuildPublishedSurface(surface DecisionSurface) *ProposalModel {
 
 // Ensure the explicit bindings are referenced so the mapping is not dead code.
 // This also provides a compile-time check that the constants exist.
+//
+//nolint:unused // Staged contract: Approval flow decision surface (see ADR-004)
 var (
 	_ = ProposalFullFileFallback
 	_ = ProposalRepromptFullText

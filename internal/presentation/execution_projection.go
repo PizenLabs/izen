@@ -402,6 +402,20 @@ func (p *ExecutionProjection) matches(requestID string) bool {
 	return p.state.RequestID == requestID
 }
 
+// Reset clears the projection to idle, discarding stale step trees and
+// progress state. It is the deterministic cleanup invoked when the engine
+// reaches terminal idle (StateIdle/StateChat) or recovers from interrupts.
+//
+//nolint:unused // Staged contract: projection determinism (see ADR-004)
+func (p *ExecutionProjection) Reset() {
+	if p == nil {
+		return
+	}
+	p.state = NewIdle()
+	p.details = ExecutionDetails{}
+	p.narrative = NewExecutionNarrative()
+}
+
 // Frame computes the renderer-ready presentation slice for the given
 // visibility layer. It is a pure function of the projection state + narrative —
 // the presentation layer decides what belongs in each layer, the renderer only

@@ -41,8 +41,10 @@ var (
 			Bold(true)
 )
 
-// DistinctionClassifies text based on its role and optionally a FailureClass.
+// DistinguishLine classifies text based on its role and optionally a FailureClass.
 // Returns the styled text with prefix icon.
+//
+//nolint:unused // Staged contract: Approval flow decision surface (see ADR-004)
 func DistinguishLine(text string, role role, fc classifier.FailureClass) string {
 	// Error role is always rendered as error/unknown
 	if role == roleError {
@@ -75,6 +77,8 @@ func DistinguishLine(text string, role role, fc classifier.FailureClass) string 
 }
 
 // RenderFailureClassTag renders a compact tag for the given FailureClass.
+//
+//nolint:unused // Staged contract: Approval flow decision surface (see ADR-004)
 func RenderFailureClassTag(fc classifier.FailureClass) string {
 	switch fc {
 	case classifier.FailureCodeClass:

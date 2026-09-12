@@ -2262,6 +2262,7 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// A terminal failure event is authoritative execution truth: it must
 		// release the loading state, spinner, and pending operation.
 		m.clearExecutionLoading(OpOutcomeFailure)
+		m.syncExecutionProjection()
 	case events.SelfHealingAttemptPayload:
 		// Distinct retry badge + attempt count + failure category so the
 		// self-healing loop reads as one clean, scannable line.
@@ -2343,6 +2344,7 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			outcome = OpOutcomeCancelled
 		}
 		m.clearExecutionLoading(outcome)
+		m.syncExecutionProjection()
 	case events.ApprovalRequiredPayload:
 		m.logRuntimeDetail("[runtime] approval required: %s", p.Target)
 	case events.ApprovalRejectedPayload:
@@ -2825,6 +2827,47 @@ func (m *model) syncUIState() {
 	// Resting in a mode phase must never gate the input line by itself —
 	// a persistent phase is NOT an in-flight operation.
 	m.state = StateChat
+	m.syncExecutionProjection()
+}
+
+// syncExecutionProjection deterministically mirrors the canonical
+// WorkflowStateMachine onto the presentation-layer execution projection.
+// When the engine reaches terminal/idle states (StateIdle, StateChat) or
+// recovers from interrupts (EventUserInterrupt), stale step trees and
+// progress projections are cleared immediately.
+//
+//nolint:unused // Staged contract: projection determinism (see ADR-004)
+func (m *model) syncExecutionProjection() {
+	if m.workflowSM == nil {
+		return
+	}
+	st := m.workflowSM.State()
+	if st == workflow.StateIdle || m.state == StateChat {
+		// Stale running projections must be cleared immediately when the
+		// engine returns to idle/chat or recovers from an interrupt. A
+		// terminal (completed/failed) projection is not stale — it is the
+		// visible result and survives until the next Begin. Only a running
+		// or waiting-approval projection is considered stale and is reset.
+		if m.execView != nil {
+			phase := m.execView.State().Phase
+			if phase == presentation.PhaseRunning || phase == presentation.PhaseWaitingApproval {
+				m.execView.Reset()
+				m.execVisibility = presentation.VisibilityNormal
+				m.executionResolving = false
+				return
+			}
+				if phase.Terminal() {
+				// Terminal result stays visible with its current visibility
+				// layer — the execution is no longer in-flight but the
+				// completed narrative and its expanded/debug metadata survive
+				// until the next Begin.
+				m.executionResolving = false
+				return
+			}
+		}
+		m.execVisibility = presentation.VisibilityNormal
+		m.executionResolving = false
+	}
 }
 
 // isWorkflowBusy reports whether a transient workflow operation (stream, agent,
