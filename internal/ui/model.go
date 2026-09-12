@@ -2856,7 +2856,7 @@ func (m *model) syncExecutionProjection() {
 				m.executionResolving = false
 				return
 			}
-				if phase.Terminal() {
+			if phase.Terminal() {
 				// Terminal result stays visible with its current visibility
 				// layer — the execution is no longer in-flight but the
 				// completed narrative and its expanded/debug metadata survive
@@ -3667,17 +3667,17 @@ func (m *model) appendSystemError(err error) {
 // persistSession saves session state to disk with fail-closed error
 // reporting (Phase 2 persistence integrity). It never swallows the Save
 // error: failures are surfaced via appendSystemError so operators see the
-// durability gap. Callers in execution paths must check the returned error
-// and halt completion transitions until persistence is confirmed.
-func (m *model) persistSession(op string) error {
+// durability gap. It is deliberately fire-and-report (no error return):
+// Bubble Tea update paths have no error-propagation channel, and every
+// historical caller discarded the return — so the surface is pushed at the
+// source instead of relying on 35+ call sites to check it.
+func (m *model) persistSession(op string) {
 	if m == nil || m.sess == nil {
-		return nil
+		return
 	}
 	if err := m.sess.Save(); err != nil {
 		m.appendSystemError(fmt.Errorf("session persist %s failed: %w", op, err))
-		return err
 	}
-	return nil
 }
 
 // resolveModelID implements the fail-closed model resolution hierarchy:

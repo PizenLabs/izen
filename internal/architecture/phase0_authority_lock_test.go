@@ -579,9 +579,12 @@ func TestPhase0HandleBuildRunIsPureIntentFactorySeam(t *testing.T) {
 	}
 	for name := range defaultCalls {
 		switch name {
-		case "push", "Sprintf", "StageTaskList", "Save":
+		case "push", "Sprintf", "StageTaskList", "Save", "persistSession":
 			// Bookkeeping-only: stall the task, persist the ledger, surface
-			// the halt message. Execution is forbidden here.
+			// the halt message. Execution is forbidden here. persistSession
+			// is the model-level wrapper around sess.Save plus halt
+			// surfacing (appendSystemError) — session durability, not an
+			// execution path.
 		default:
 			t.Errorf("architecture: default arm of dispatchStagedTask invoked %q — unknown task types MUST fail closed with no execution path", name)
 		}
