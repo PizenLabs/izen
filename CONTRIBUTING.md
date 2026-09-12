@@ -140,11 +140,16 @@ Follow conventional commits:
 ```
 <type>(<scope>): <description>
 
-feat(graph): add Rust language parser support
-fix(retrieval): handle empty graph cache gracefully
-docs(readme): add quick start section
-test(investigate): add evidence store edge cases
+- Summary point (max 50 chars)
+- Another summarized point
+
+feat(graph): add Rust language parser
+fix(retrieval): handle empty graph cache
 ```
+
+Subject line: `type(scope): message` — max 38 characters.
+Body: summarized points with line breaks; max 50 characters per line.
+Exclude co-authors from the subject/body formatting rules.
 
 Types: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `chore`
 

@@ -13,8 +13,8 @@ import (
 	"github.com/PizenLabs/izen/internal/domain/signal"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/events/audit"
-	runtimeorch "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	runtimeorch "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 )
 
 // TestWireBuildsFullyFunctionalEventWiredApplication is the Sprint 3
