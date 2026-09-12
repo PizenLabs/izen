@@ -521,20 +521,25 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 			m.gotoBottomIfAllowed()
 			return nil
 		}
-		// Graceful handoff guard: if the ContextLedger's ask_handoff payload
-		// was cleared (e.g. by /clear) and no other handoff context exists,
-		// prompt for input rather than running the engine with stale or empty
-		// content. This prevents silent degradation on the local model.
+		// HARD ENFORCEMENT: every admitted prompt in INVESTIGATE mode —
+		// including target-less prompts such as "hi" — builds a
+		// scopeguard.Proposal (workspace inspection/forensics) and executes
+		// through the investigate engine. There is no conversational
+		// short-circuit and no "describe what to investigate" early return
+		// for short input: the engine owns the clarification decision and
+		// every trace originates from runtime ledger events.
 		trimmed := strings.TrimSpace(content)
-		hasHandoff := m.handoffLedgerContent != "" ||
-			m.handoffCtx.LastFailurePayload != "" ||
-			m.handoffCtx.ProposedFix != ""
-		if !hasHandoff && m.sess != nil && m.sess.ContextLedger != nil {
-			l := m.sess.ContextLedger
-			hasHandoff = l.Diagnostics != "" || len(l.Packets) > 0
-		}
-		if !hasHandoff && (trimmed == "" || len(trimmed) < 15) {
+		if trimmed == "" {
 			m.push(roleSystem, infoStyle.Render("No handoff context in ledger. Describe what to investigate (e.g. a test failure, error log, or crash report):"))
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
+			return nil
+		}
+		// ScopeGuard.EvaluateProposal + WorkerEngine.ExecuteProposal run
+		// before the investigate dispatch. A denial is terminal; the engine
+		// owns clarification from here (no chat fallback).
+		if workerErr := ExecuteWorkerProposal(context.Background(), BuildWorkerProposal(content, modes.ModeInvestigate, ""), nil); workerErr != nil {
+			m.push(roleError, "[investigate] worker proposal denied: "+workerErr.Error())
 			m.refreshViewportContent()
 			m.gotoBottomIfAllowed()
 			return nil

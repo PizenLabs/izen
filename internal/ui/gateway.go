@@ -66,22 +66,75 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	m.lastExecutionStrategy = det.Profile
 	m.hotfixBranding = "PROMPT"
 	// Mode is a presentation label only — never an execution-path decision.
-	req.Mode = m.resolver.Current().String()
+	if m.resolver != nil {
+		req.Mode = m.resolver.Current().String()
+	}
 	// Explicit TargetModel: resolved from the active Workspace Target at
 	// admission. The executor validates verbatim and rejects empty locally.
 	req.Model = m.getActiveModelName()
 
-	// ── CONVERSATION FLOW (UX_ENGINE #4) ─────────────────────────────
-	// A direct-response request (casual greeting / simple question) is a single
-	// human action: Izen → understands intent → answers. It must NOT create an
-	// execution narrative, a workspace-context pipeline, or planning states.
-	// The runtime still resolves and executes it (zero repository context), but
-	// the human surface is the answer only — no narrative panel, no milestones,
-	// no execution timeline, and no loading spinner. The in-flight marker stays
-	// set so terminal cleanup releases input and a second submission is blocked
-	// while the direct answer is produced; the provider call stays cancellable
-	// (Ctrl+C) via the registered background cancel.
-	if det.Profile.Strategy == strategy.DirectResponse {
+	// ── TUI GATEWAY ROUTING HARD ENFORCEMENT ─────────────────────────
+	// Zero Direct Fallback in Execution Modes: when the active mode is any
+	// non-pure ASK mode, the gateway MUST NOT take the direct_response /
+	// zero-context shortcut — even for target-less prompts such as "hi".
+	// Every admitted prompt builds a scopeguard.Proposal (workspace
+	// inspection/forensics by default) and crosses
+	// ScopeGuard.EvaluateProposal + WorkerEngine.ExecuteProposal before the
+	// executor dispatch, so all traces originate from runtime ledger events.
+	activeMode := modes.ModeAsk
+	if m.resolver != nil {
+		activeMode = m.resolver.Current()
+	}
+	if IsExecutionMode(activeMode) {
+		// Every admitted prompt crosses ScopeGuard.EvaluateProposal +
+		// WorkerEngine.ExecuteProposal (RuntimeEngine boundary) BEFORE the
+		// executor dispatch. ExecuteWorkerProposal evaluates first
+		// (fail-closed on deny) and then invokes ActiveWorkerEngine when
+		// wired; with no engine wired it is audit-only and returns nil.
+		// A denial or engine failure is terminal — never a chat fallback.
+		workerProposal := BuildWorkerProposal(line, activeMode, "")
+		if workerErr := ExecuteWorkerProposal(context.Background(), workerProposal, nil); workerErr != nil {
+			m.stopShimmer()
+			return func() tea.Msg {
+				return gatedExecutionMsg{det: det, err: workerErr}
+			}
+		}
+		if det.Profile.Strategy == strategy.DirectResponse {
+			// Escalate casual chat to repository forensics: the prompt is
+			// investigated, never answered as zero-context chat.
+			det.Profile.Strategy = strategy.RepositoryInvestigation
+			det.Profile.StrategyReason = "execution-mode hard enforcement: direct_response escalated to repository investigation (" + activeMode.String() + ")"
+			det.Profile.ModelRequired = true
+			det.Profile.ModelDecision = "inspect the workspace and report findings for the admitted prompt"
+			det.Profile.Artifact = strategy.ArtifactContract{Kind: "investigation", Bounded: false,
+				Description: "workspace forensics for an admitted execution-mode prompt"}
+			det.Profile.ContextKinds = []strategy.ContextKind{strategy.ContextUserIntent, strategy.ContextRepositoryConstraints, strategy.ContextDependencyEvidence}
+			det.Profile.ContextPolicy = strategy.ContextPolicyRepository
+			// Keep the executor's strategy pointer in sync: req.Strategy is
+			// the single source of the execution path downstream.
+			req.Strategy = &det.Profile
+			m.lastExecutionStrategy = det.Profile
+		}
+		// Fall through to the full operation-lifecycle path below. There is
+		// deliberately NO early direct_response return on this branch.
+	}
+
+	// ── CONVERSATION FLOW (UX_ENGINE #4, ASK MODE ONLY) ───────────────
+	// A direct-response request (casual greeting / simple question) in the
+	// pure ASK boundary is a single human action: Izen → understands intent
+	// → answers. It must NOT create an execution narrative, a
+	// workspace-context pipeline, or planning states. The runtime still
+	// resolves and executes it (zero repository context), but the human
+	// surface is the answer only — no narrative panel, no milestones, no
+	// execution timeline, and no loading spinner. The in-flight marker stays
+	// set so terminal cleanup releases input and a second submission is
+	// blocked while the direct answer is produced; the provider call stays
+	// cancellable (Ctrl+C) via the registered background cancel.
+	//
+	// DEPRECATED in execution modes: the hard-enforcement block above
+	// escalates DirectResponse before this point, so reaching here with
+	// DirectResponse implies ModeAsk.
+	if det.Profile.Strategy == strategy.DirectResponse && !IsExecutionMode(activeMode) {
 		m.execView = nil
 		m.execVisibility = presentation.VisibilityNormal
 		m.executionResolving = true
