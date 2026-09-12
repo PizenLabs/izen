@@ -76,6 +76,7 @@ func (m *WorkflowStateMachine) SendEvent(event WorkflowEvent, ctx TransitionCont
 			From:  m.current,
 			Event: event,
 			Msg:   "current state is invalid",
+			Err:   ErrEventNotAllowed,
 		}
 	}
 	next, err := m.lookup(m.current, event, ctx)
@@ -127,10 +128,10 @@ func (m *WorkflowStateMachine) lookup(from WorkflowState, event WorkflowEvent, c
 		switch event {
 		case EventBuild:
 			if !ctx.HasPlan {
-				return from, &GuardError{From: from, Event: event, Msg: "no authorized plan or micro-plan"}
+				return from, &GuardError{From: from, Event: event, Msg: "no authorized plan or micro-plan", Err: ErrInvalidTransition}
 			}
 			if !ctx.HasCapabilities {
-				return from, &GuardError{From: from, Event: event, Msg: "no authorized capabilities"}
+				return from, &GuardError{From: from, Event: event, Msg: "no authorized capabilities", Err: ErrInvalidTransition}
 			}
 			return StateBuilding, nil
 		case EventReset:
@@ -158,7 +159,7 @@ func (m *WorkflowStateMachine) lookup(from WorkflowState, event WorkflowEvent, c
 		switch event {
 		case EventBuild:
 			if !ctx.HasCapabilities {
-				return from, &GuardError{From: from, Event: event, Msg: "no authorized capabilities"}
+				return from, &GuardError{From: from, Event: event, Msg: "no authorized capabilities", Err: ErrInvalidTransition}
 			}
 			return StateBuilding, nil
 		case EventFailureIdentified:
@@ -175,7 +176,7 @@ func (m *WorkflowStateMachine) lookup(from WorkflowState, event WorkflowEvent, c
 			return StateIdle, nil
 		}
 	}
-	return from, &TransitionError{From: from, Event: event, Msg: "event not allowed in current state"}
+	return from, &TransitionError{From: from, Event: event, Msg: "event not allowed in current state", Err: ErrEventNotAllowed}
 }
 
 func (m *WorkflowStateMachine) failureTarget(class classifier.FailureClass) (WorkflowState, error) {
@@ -194,5 +195,5 @@ func (m *WorkflowStateMachine) failureTarget(class classifier.FailureClass) (Wor
 	case classifier.FailureUnknownClass:
 		return StateFailed, nil
 	}
-	return m.current, &TransitionError{From: m.current, Event: EventFailureIdentified, Msg: fmt.Sprintf("unknown failure class %d", int(class))}
+	return m.current, &TransitionError{From: m.current, Event: EventFailureIdentified, Msg: fmt.Sprintf("unknown failure class %d", int(class)), Err: ErrInvalidTransition}
 }

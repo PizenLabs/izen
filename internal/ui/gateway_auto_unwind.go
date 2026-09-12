@@ -35,9 +35,17 @@ func stripCasualDirectives(line string) string {
 }
 
 // isCasualConversationPrompt reports whether the input is pure conversational
-// chatter (IntentConversation at ~95% confidence per the deterministic
+// chatter (IntentConversation at >=95% confidence per the deterministic
 // classifier). Slash inputs, shell bangs, and empty lines are never casual:
 // they belong to the command surfaces.
+//
+// COMPOSITE PROMPT GUARD: casual auto-unwind fires only when ALL hold:
+//   - classifier confidence >= 0.95 with IntentConversation,
+//   - prompt length <= 6 whitespace-separated tokens,
+//   - zero technical/intent directives (non-conversation intent rejects).
+//
+// Composite prompts such as "Hi, investigate why memory is leaking" carry a
+// task directive and MUST NOT unwind, even with a conversational opener.
 func isCasualConversationPrompt(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
@@ -46,7 +54,23 @@ func isCasualConversationPrompt(line string) bool {
 	if isSlashInput(trimmed) || strings.HasPrefix(trimmed, "!") || strings.HasPrefix(trimmed, "$inspect") {
 		return false
 	}
-	return autonomy.IsConversation(stripCasualDirectives(trimmed))
+	stripped := stripCasualDirectives(trimmed)
+	if strings.TrimSpace(stripped) == "" {
+		return false
+	}
+	// Strict token length boundary: composite prompts with technical text are
+	// never purely casual.
+	words := strings.Fields(strings.TrimSpace(stripped))
+	if len(words) > 6 {
+		return false
+	}
+	// Require high classifier confidence with an explicit conversation intent.
+	// autonomy.Classify is deterministic with a nil semantic fallback.
+	classification := autonomy.Classify(stripped, nil)
+	if classification.Intent != autonomy.IntentConversation || classification.Confidence < 0.95 {
+		return false
+	}
+	return true
 }
 
 // casualDirectResponse resolves the zero-pipeline direct answer for an
@@ -85,6 +109,11 @@ func (m *model) handleCasualAutoUnwind(line string) bool {
 		return false
 	}
 	content := stripCasualDirectives(line)
+
+	// GENERATION EPOCH ISOLATION: invalidate all pending background worker
+	// callbacks. Any async payload arriving with Epoch < generationEpoch is
+	// silently dropped so stale state can never corrupt the reset UI.
+	m.generationEpoch++
 
 	// 1. Unwind the WorkflowStateMachine to StateIdle. EventReset is valid
 	// from every non-idle workflow state.
@@ -144,14 +173,20 @@ func (m *model) handleCasualAutoUnwind(line string) bool {
 }
 
 // isBackwardTransitionError reports whether err is a phase-transition
-// rejection for moving to a previous phase (backward movement). It matches
-// both the domain WorkflowRuntime sentinel and the orchestrator/domain
-// transition error shapes, plus the legacy message substring.
+// rejection for moving to a previous phase (backward movement).
+//
+// SENTINEL ERROR ENFORCEMENT: classification uses errors.Is / errors.As
+// exclusively. Raw string matching (strings.Contains) for error
+// identification is strictly forbidden.
 func isBackwardTransitionError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, domainworkflow.ErrInvalidTransition) {
+	if errors.Is(err, workflow.ErrBackwardTransitionDisallowed) ||
+		errors.Is(err, workflow.ErrInvalidTransition) ||
+		errors.Is(err, workflow.ErrEventNotAllowed) ||
+		errors.Is(err, domainworkflow.ErrInvalidTransition) ||
+		errors.Is(err, domainworkflow.ErrInvalidPhase) {
 		return true
 	}
 	var rte *domainworkflow.TransitionError
@@ -162,10 +197,12 @@ func isBackwardTransitionError(err error) bool {
 	if errors.As(err, &ote) {
 		return true
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "moving to a previous phase") ||
-		strings.Contains(msg, "no valid transition") ||
-		strings.Contains(msg, "event not allowed in current state")
+	var wte *workflow.TransitionError
+	if errors.As(err, &wte) {
+		return true
+	}
+	var wge *workflow.GuardError
+	return errors.As(err, &wge)
 }
 
 // handleBackwardTransitionError surfaces a blocked backward phase switch as

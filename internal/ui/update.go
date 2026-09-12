@@ -438,6 +438,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case domainEventMsg:
+		// GENERATION EPOCH ISOLATION: drop stale domain events from a
+		// previous phase.
+		if msg.Epoch < m.generationEpoch {
+			return m, nil
+		}
 		// Event bus projection: engines publish domain events headlessly and
 		// the UI renders them as activity lines. Runs on the UI goroutine, so
 		// all model mutation here is safe.
@@ -557,6 +562,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, m.closeSessionPicker()
 
 	case runtimeResultMsg:
+		// GENERATION EPOCH ISOLATION: silently drop stale worker results
+		// from a previous phase (reset/unwind bumped generationEpoch).
+		if msg.Epoch < m.generationEpoch {
+			return m, nil
+		}
 		// Outcome of a RuntimeCommand executed through the facade. Only
 		// errors are surfaced; successful commands rendered their own
 		// presentation events.
@@ -774,6 +784,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case investigateResultMsg:
+		if msg.Epoch < m.generationEpoch {
+			return m, nil // Silently ignore stale worker result from previous phase
+		}
 		m.lastAgentActivity = time.Now()
 		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
 		// processing flag (including investigateRunning) so the spinner can
@@ -875,6 +888,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case planResultMsg:
+		if msg.Epoch < m.generationEpoch {
+			return m, nil // Silently ignore stale worker result from previous phase
+		}
 		// Terminal handler for the asynchronous PlanEngine synthesis. Only here
 		// do we stage tasks and clear streaming state — never while the LLM call
 		// is in flight (that would re-block the event loop).
@@ -1118,6 +1134,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case reviewResultMsg:
+		if msg.Epoch < m.generationEpoch {
+			return m, nil // Silently ignore stale worker result from previous phase
+		}
 		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
 		// processing flag so the spinner can never be orphaned on a failed or
 		// aborted review, then re-derive the presentation state so a stale
@@ -1841,6 +1860,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case mutationResultMsg:
+		if msg.Epoch < m.generationEpoch {
+			return m, nil // Silently ignore stale worker result from previous phase
+		}
 		// OPERATION LIFECYCLE: the zero-patch short-circuit returns
 		// mutationResultMsg directly from proposeBuildPatch (skipping
 		// buildProposalReadyMsg), so the build-patch operation begun in

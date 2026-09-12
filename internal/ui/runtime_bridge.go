@@ -24,10 +24,11 @@ func (m *model) runRuntimeCmd(cmd appruntime.RuntimeCommand) tea.Cmd {
 	if m.pres == nil || cmd == nil {
 		return nil
 	}
+	epoch := m.generationEpoch
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		return runtimeResultMsg{typ: cmd.Type(), err: m.pres.Execute(ctx, cmd)}
+		return runtimeResultMsg{typ: cmd.Type(), err: m.pres.Execute(ctx, cmd), Epoch: epoch}
 	}
 }
 

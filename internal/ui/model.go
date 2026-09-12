@@ -234,6 +234,7 @@ type investigateResultMsg struct {
 	escalationContent string // when Resolved=false, pipe investigation data to LLM for analysis
 	ledgerContent     string // FormatLedgerForPlan() — structured Context-Ledger data, the SSOT for handoff
 	investigateLedger *investigate.ContextLedger
+	Epoch             uint64 // dispatch generation; drop when Epoch < generationEpoch
 }
 
 type reviewResultMsg struct {
@@ -242,6 +243,7 @@ type reviewResultMsg struct {
 	saveReportFn func()
 	ledger       *riview.ReviewLedger
 	err          error
+	Epoch        uint64 // dispatch generation; drop when Epoch < generationEpoch
 }
 
 // planResultMsg carries the outcome of the asynchronous PlanEngine ledger
@@ -270,6 +272,7 @@ type planResultMsg struct {
 	// global status.Tracker so token metrics are never lost to truncation.
 	TokenInput  int
 	TokenOutput int
+	Epoch       uint64 // dispatch generation; drop when Epoch < generationEpoch
 }
 
 type agentStartMsg struct{ label string }
@@ -344,6 +347,7 @@ type mutationResultMsg struct {
 	TokenInput  int
 	TokenOutput int
 	usageKnown  bool
+	Epoch       uint64 // dispatch generation; drop when Epoch < generationEpoch
 }
 
 // outcome returns the semantic outcome of the mutation result, normalized onto
@@ -1236,6 +1240,11 @@ type model struct {
 	activeOp *operation
 	// opIDCounter issues monotonically increasing operation IDs.
 	opIDCounter uint64
+	// generationEpoch isolates asynchronous worker lifecycles across state
+	// resets and casual auto-unwinds. Every reset/unwind increments it;
+	// async payloads carrying Epoch < generationEpoch are silently dropped
+	// so stale worker results can never corrupt the current phase.
+	generationEpoch uint64
 	// activitySurfaceSealed is set by /clear (resetTransientInteraction) and
 	// cleared by the next foreground operation (beginOperation) or user
 	// submission (submitEnter). While sealed, engine-derived activity
