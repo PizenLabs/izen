@@ -2,9 +2,6 @@ package role
 
 import (
 	"testing"
-
-	"github.com/PizenLabs/izen/internal/config"
-	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
 func TestClassifyDeepseekR1AsThinking(t *testing.T) {
@@ -12,17 +9,17 @@ func TestClassifyDeepseekR1AsThinking(t *testing.T) {
 	if !isThinking {
 		t.Error("deepseek-r1: isThinking = false, want true")
 	}
-	if !HasCapability(caps, registry.CapThinking) {
+	if !HasCapability(caps, CapThinking) {
 		t.Errorf("deepseek-r1: caps = %v, want CapThinking", caps)
 	}
-	if !HasCapability(caps, registry.CapTools) {
+	if !HasCapability(caps, CapTools) {
 		t.Errorf("deepseek-r1: caps = %v, want default CapTools", caps)
 	}
 }
 
 func TestClassifyGeminiFlashAsVision(t *testing.T) {
 	_, caps := ClassifyModel("google/gemini-2.5-flash")
-	if !HasCapability(caps, registry.CapVision) {
+	if !HasCapability(caps, CapVision) {
 		t.Errorf("gemini-2.5-flash: caps = %v, want CapVision", caps)
 	}
 }
@@ -36,7 +33,7 @@ func TestClassifyVisionPatterns(t *testing.T) {
 		"flash-image-gen",
 	} {
 		_, caps := ClassifyModel(id)
-		if !HasCapability(caps, registry.CapVision) {
+		if !HasCapability(caps, CapVision) {
 			t.Errorf("%q: caps = %v, want CapVision", id, caps)
 		}
 	}
@@ -51,36 +48,34 @@ func TestClassifyThinkingPatterns(t *testing.T) {
 		if !isThinking {
 			t.Errorf("%q: isThinking = false, want true", id)
 		}
-		if !HasCapability(caps, registry.CapThinking) {
+		if !HasCapability(caps, CapThinking) {
 			t.Errorf("%q: caps = %v, want CapThinking", id, caps)
 		}
 	}
 }
 
 func TestClassifyToolsDefaultAndLegacy(t *testing.T) {
-	if _, caps := ClassifyModel("openai/gpt-4o"); !HasCapability(caps, registry.CapTools) {
+	if _, caps := ClassifyModel("openai/gpt-4o"); !HasCapability(caps, CapTools) {
 		t.Errorf("modern model caps = %v, want CapTools", caps)
 	}
-	if _, caps := ClassifyModel("text-davinci-003"); HasCapability(caps, registry.CapTools) {
+	if _, caps := ClassifyModel("text-davinci-003"); HasCapability(caps, CapTools) {
 		t.Errorf("legacy text-davinci caps = %v, want no CapTools", caps)
 	}
 }
 
-func seedRegistry(models []registry.ModelDescriptor) *registry.Registry {
-	r := registry.NewRegistryWithCachePath("")
-	r.SetSeed(models)
-	return r
+func seedModels(models []ModelDescriptor) []ModelDescriptor {
+	return models
 }
 
 func TestResolvePlanSelectsThinkingWithoutBinding(t *testing.T) {
-	reg := seedRegistry([]registry.ModelDescriptor{
+	models := seedModels([]ModelDescriptor{
 		{ID: "openai/gpt-4o-mini", Provider: "openai", Name: "GPT-4o mini", ContextWindow: 128000},
 		{ID: "openrouter/deepseek/deepseek-r1", Provider: "openrouter", Name: "DeepSeek R1", ContextWindow: 64000},
 		{ID: "google/gemini-2.5-flash", Provider: "gemini", Name: "Gemini Flash", ContextWindow: 1000000},
 	})
-	cfg := &config.CascadeConfig{Roles: map[string]string{}}
+	cfg := map[string]string{}
 
-	got, err := ResolveRoleModel("plan", cfg, reg)
+	got, err := ResolveRoleModel("plan", cfg, models)
 	if err != nil {
 		t.Fatalf("ResolveRoleModel(plan): %v", err)
 	}
@@ -93,12 +88,12 @@ func TestResolvePlanSelectsThinkingWithoutBinding(t *testing.T) {
 }
 
 func TestResolveExactBindingWins(t *testing.T) {
-	reg := seedRegistry([]registry.ModelDescriptor{
+	models := seedModels([]ModelDescriptor{
 		{ID: "model-a", Provider: "p", Name: "A"},
 		{ID: "model-b", Provider: "p", Name: "B"},
 	})
-	cfg := &config.CascadeConfig{Roles: map[string]string{"plan": "model-b"}}
-	got, err := ResolveRoleModel("plan", cfg, reg)
+	cfg := map[string]string{"plan": "model-b"}
+	got, err := ResolveRoleModel("plan", cfg, models)
 	if err != nil {
 		t.Fatalf("ResolveRoleModel: %v", err)
 	}
@@ -108,20 +103,20 @@ func TestResolveExactBindingWins(t *testing.T) {
 }
 
 func TestResolveVisionRequiresCap(t *testing.T) {
-	reg := seedRegistry([]registry.ModelDescriptor{
+	models := seedModels([]ModelDescriptor{
 		{ID: "plain-text", Provider: "p", Name: "Plain"},
 	})
-	if _, err := ResolveRoleModel("vision", &config.CascadeConfig{Roles: map[string]string{}}, reg); err == nil {
+	if _, err := ResolveRoleModel("vision", map[string]string{}, models); err == nil {
 		t.Error("vision with no capable model must error")
 	}
 }
 
 func TestResolveAdviserPrefersLargeContext(t *testing.T) {
-	reg := seedRegistry([]registry.ModelDescriptor{
+	models := seedModels([]ModelDescriptor{
 		{ID: "small", Provider: "p", Name: "Small", ContextWindow: 8000},
 		{ID: "big", Provider: "p", Name: "Big", ContextWindow: 200000},
 	})
-	got, err := ResolveRoleModel("adviser", &config.CascadeConfig{Roles: map[string]string{}}, reg)
+	got, err := ResolveRoleModel("adviser", map[string]string{}, models)
 	if err != nil {
 		t.Fatalf("ResolveRoleModel(adviser): %v", err)
 	}
@@ -131,12 +126,12 @@ func TestResolveAdviserPrefersLargeContext(t *testing.T) {
 }
 
 func TestResolveUnknownRoleAndEmptyRegistry(t *testing.T) {
-	reg := seedRegistry([]registry.ModelDescriptor{{ID: "m", Provider: "p", Name: "M"}})
-	if _, err := ResolveRoleModel("nope", &config.CascadeConfig{Roles: map[string]string{}}, reg); err == nil {
+	models := seedModels([]ModelDescriptor{{ID: "m", Provider: "p", Name: "M"}})
+	if _, err := ResolveRoleModel("nope", map[string]string{}, models); err == nil {
 		t.Error("unknown role must error")
 	}
-	empty := seedRegistry(nil)
-	if _, err := ResolveRoleModel("plan", &config.CascadeConfig{Roles: map[string]string{}}, empty); err == nil {
+	empty := seedModels(nil)
+	if _, err := ResolveRoleModel("plan", map[string]string{}, empty); err == nil {
 		t.Error("empty registry must error")
 	}
 	if _, err := ResolveRoleModel("plan", nil, nil); err == nil {
@@ -145,9 +140,9 @@ func TestResolveUnknownRoleAndEmptyRegistry(t *testing.T) {
 }
 
 func TestResolveBoundModelMissingErrors(t *testing.T) {
-	reg := seedRegistry([]registry.ModelDescriptor{{ID: "m", Provider: "p", Name: "M"}})
-	cfg := &config.CascadeConfig{Roles: map[string]string{"plan": "ghost-model"}}
-	if _, err := ResolveRoleModel("plan", cfg, reg); err == nil {
+	models := seedModels([]ModelDescriptor{{ID: "m", Provider: "p", Name: "M"}})
+	cfg := map[string]string{"plan": "ghost-model"}
+	if _, err := ResolveRoleModel("plan", cfg, models); err == nil {
 		t.Error("bound-but-absent model must error, not silently substitute")
 	}
 }

@@ -10,8 +10,6 @@ package role
 
 import (
 	"strings"
-
-	"github.com/PizenLabs/izen/internal/provider/registry"
 )
 
 // thinkingPatterns match reasoning/thinking model IDs (case-insensitive
@@ -43,30 +41,30 @@ var legacyTextOnlyPatterns = []string{
 //
 // Matching is case-insensitive. Capabilities are returned in stable order
 // (thinking, vision, tools) with no duplicates.
-func ClassifyModel(id string) (isThinking bool, caps []registry.ModelCapability) {
+func ClassifyModel(id string) (isThinking bool, caps []ModelCapability) {
 	lower := strings.ToLower(strings.TrimSpace(id))
 	if lower == "" {
-		return false, []registry.ModelCapability{registry.CapTools}
+		return false, []ModelCapability{CapTools}
 	}
-	var out []registry.ModelCapability
+	var out []ModelCapability
 	if containsAny(lower, thinkingPatterns) {
 		isThinking = true
-		out = append(out, registry.CapThinking)
+		out = append(out, CapThinking)
 	}
 	if containsAny(lower, visionPatterns) {
-		out = append(out, registry.CapVision)
+		out = append(out, CapVision)
 	}
 	if !containsAny(lower, legacyTextOnlyPatterns) {
-		out = append(out, registry.CapTools)
+		out = append(out, CapTools)
 	}
 	if out == nil {
-		out = []registry.ModelCapability{}
+		out = []ModelCapability{}
 	}
 	return isThinking, out
 }
 
 // HasCapability reports whether caps contains cap.
-func HasCapability(caps []registry.ModelCapability, cap registry.ModelCapability) bool {
+func HasCapability(caps []ModelCapability, cap ModelCapability) bool {
 	for _, c := range caps {
 		if c == cap {
 			return true
@@ -78,7 +76,7 @@ func HasCapability(caps []registry.ModelCapability, cap registry.ModelCapability
 // EnrichDescriptor returns a copy of d with classifier-derived IsThinking and
 // Capabilities filled in when the descriptor does not already carry them.
 // Explicit registry data always wins; classification only fills gaps.
-func EnrichDescriptor(d registry.ModelDescriptor) registry.ModelDescriptor {
+func EnrichDescriptor(d ModelDescriptor) ModelDescriptor {
 	isThinking, caps := ClassifyModel(d.ID)
 	if !d.IsThinking {
 		d.IsThinking = isThinking
@@ -91,7 +89,7 @@ func EnrichDescriptor(d registry.ModelDescriptor) registry.ModelDescriptor {
 
 // EffectiveCapabilities returns d.Capabilities when present, otherwise the
 // classifier-derived set for d.ID. It never returns nil.
-func EffectiveCapabilities(d registry.ModelDescriptor) []registry.ModelCapability {
+func EffectiveCapabilities(d ModelDescriptor) []ModelCapability {
 	if len(d.Capabilities) > 0 {
 		return d.Capabilities
 	}
@@ -101,7 +99,7 @@ func EffectiveCapabilities(d registry.ModelDescriptor) []registry.ModelCapabilit
 
 // EffectiveIsThinking returns d.IsThinking when true, otherwise the
 // classifier-derived flag for d.ID.
-func EffectiveIsThinking(d registry.ModelDescriptor) bool {
+func EffectiveIsThinking(d ModelDescriptor) bool {
 	if d.IsThinking {
 		return true
 	}
