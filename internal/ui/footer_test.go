@@ -48,6 +48,7 @@ func TestFooterFreshLaunchState(t *testing.T) {
 
 // TestFooterExecutingStateLiveBar pins the EXECUTING state: the dynamic live
 // execution bar with spinner, live token count, token rate and interrupt hint.
+// Minimalist glyphs: ↑<n> / ↓<n> with zero "in"/"out" suffixes.
 func TestFooterExecutingStateLiveBar(t *testing.T) {
 	m := readyChatModel(newTestModel())
 	m.state = StateProcessing
@@ -60,7 +61,7 @@ func TestFooterExecutingStateLiveBar(t *testing.T) {
 	width := 100
 	footer := stripANSIFooter(m.renderFixedFooter(width, nil))
 
-	for _, want := range []string{"Generating...", "↑0 in", "↓128 out", "tok/s", "^C stop", "⠙"} {
+	for _, want := range []string{"Generating...", "↑0", "↓128", "tok/s", "^C stop", "⠙"} {
 		if !strings.Contains(footer, want) {
 			t.Errorf("executing footer missing %q:\n%q", want, footer)
 		}
@@ -80,8 +81,9 @@ func TestFooterExecutingStateLiveBar(t *testing.T) {
 
 // TestFooterActiveIdleState pins the ACTIVE SESSION IDLE state: after prompts
 // have run the footer shows persistent refined telemetry anchored on the model
-// name (<Model> · ↑in in · ↓out out (pct%) · <Cost>) WITHOUT any
-// stale execution controls ('^C stop', '⏸') or a mode badge.
+// name (<Model:22> · ↑<in:8> · ↓<out:8> · <Cost:12>) WITHOUT any stale
+// execution controls ('^C stop', '⏸') or a mode badge. Minimalist glyphs:
+// zero "in"/"out" suffixes.
 func TestFooterActiveIdleState(t *testing.T) {
 	m := readyChatModel(newTestModel())
 	m.sessionHasRunPrompts = true
@@ -98,10 +100,10 @@ func TestFooterActiveIdleState(t *testing.T) {
 		t.Errorf("active-idle footer must start with the model name, got prefix:\n%q", footer)
 	}
 	for _, want := range []string{
-		"qwen2.5-coder:7b",     // model alias
-		"↑2.9k in · ↓2.0k out", // in + out usage split
-		"(", "%)",              // context percentage
-		"$0.0123", // accumulated cost
+		"qwen2.5-coder:7b", // model alias
+		"↑2.9k",            // minimalist input slot (no "in" suffix)
+		"↓2.0k",            // minimalist output slot (no "out" suffix)
+		"$0.0123",          // accumulated cost
 	} {
 		if !strings.Contains(footer, want) {
 			t.Errorf("active-idle footer missing %q:\n%q", want, footer)
@@ -214,9 +216,13 @@ func TestFooterIdleChipsRightAligned(t *testing.T) {
 	if !strings.Contains(stripped, "Approve Plan") {
 		t.Errorf("active-idle footer missing capability chip:\n%q", stripped)
 	}
-	// Base idle telemetry must survive alongside the chip.
-	if !strings.Contains(stripped, "in · ") {
+	// Base idle telemetry must survive alongside the chip (minimalist glyphs).
+	if !strings.Contains(stripped, "↑100") || !strings.Contains(stripped, "↓50") {
 		t.Errorf("active-idle footer lost telemetry with chips:\n%q", stripped)
+	}
+	// Minimalist invariant: zero "in"/"out" suffixes after token counts.
+	if strings.Contains(stripped, "↑100 in") || strings.Contains(stripped, "↓50 out") {
+		t.Errorf("active-idle footer leaked in/out suffix:\n%q", stripped)
 	}
 	if strings.Contains(stripped, "\n") {
 		t.Errorf("chips wrapped the footer to a second row:\n%q", stripped)

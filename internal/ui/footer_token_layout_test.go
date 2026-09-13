@@ -8,15 +8,16 @@ import (
 
 // TestFooterTokenLayout pins the acceptance contract for the footer token
 // layout:
-//   - the executing bar carries explicit ↑input / ↓output slots, a live cost,
-//     tok/s rate, a truncated [model] badge and the drop-proof ^C stop badge
-//   - the in/out slots are FIXED-WIDTH: growing counts (1 → 9.9k) never shift
-//     the metric column positions
+//   - the executing bar carries minimalist ↑input / ↓output slots (no
+//     "in"/"out" suffixes), a live cost, tok/s rate, a truncated [model]
+//     badge and the drop-proof ^C stop badge
+//   - the in/out slots are FIXED-WIDTH (8 cells each): growing counts
+//     (1 → 9.9k) never shift the metric column positions
 //   - priority-drop: at narrowing widths the model badge drops first, then the
 //     rate, then token telemetry — while ^C stop survives at every usable width
-//   - the idle bar renders ↑in in · ↓out out (pct%) anchored on the model
+//   - the idle bar renders minimalist ↑ · ↓ anchored on the model
 func TestFooterTokenLayout(t *testing.T) {
-	// ── Executing bar: full telemetry with explicit in/out arrows ──
+	// ── Executing bar: full telemetry with minimalist arrows ──
 	m := readyChatModel(newTestModel())
 	m.state = StateProcessing
 	m.streaming = true
@@ -26,10 +27,14 @@ func TestFooterTokenLayout(t *testing.T) {
 	m.setStageMetrics(0, 0, 128)
 
 	wide := stripANSIFooter(m.renderFixedFooter(100, nil))
-	for _, want := range []string{"Generating...", "↑0 in", "↓128 out", "tok/s", "^C stop", "⠙"} {
+	for _, want := range []string{"Generating...", "↑0", "↓128", "tok/s", "^C stop", "⠙"} {
 		if !strings.Contains(wide, want) {
 			t.Errorf("executing footer missing %q:\n%q", want, wide)
 		}
+	}
+	// Minimalist invariant: zero "in"/"out" suffixes.
+	if strings.Contains(wide, "↑0 in") || strings.Contains(wide, "↓128 out") {
+		t.Errorf("executing footer leaked in/out suffix:\n%q", wide)
 	}
 
 	// ── Fixed-width in/out slots: count growth must not shift columns ──
@@ -43,8 +48,8 @@ func TestFooterTokenLayout(t *testing.T) {
 
 	small := stripANSIFooter(m.renderFixedFooter(100, nil))
 	large := stripANSIFooter(m2.renderFixedFooter(100, nil))
-	smallGap := strings.Index(small, "↓128 out") - strings.Index(small, "↑0 in")
-	largeGap := strings.Index(large, "↓9.2k out") - strings.Index(large, "↑0 in")
+	smallGap := strings.Index(small, "↓128") - strings.Index(small, "↑0")
+	largeGap := strings.Index(large, "↓9.2k") - strings.Index(large, "↑0")
 	if smallGap != largeGap {
 		t.Errorf("fixed-width slots violated: in→out column gap changed %d → %d\nsmall: %q\nlarge: %q",
 			smallGap, largeGap, small, large)
@@ -71,16 +76,19 @@ func TestFooterTokenLayout(t *testing.T) {
 		t.Errorf("width 30 must keep the spinner label + stop anchor:\n%q", ultra)
 	}
 
-	// ── Idle bar: ↑in in · ↓out out (pct%) on the model anchor ──
+	// ── Idle bar: minimalist ↑ · ↓ on the model anchor ──
 	i := readyChatModel(newTestModel())
 	i.sessionHasRunPrompts = true
 	i.InputTokens = 2300
 	i.OutputTokens = 1500
 	i.TotalTokens = 3800
 	idle := stripANSIFooter(i.renderFixedFooter(120, nil))
-	for _, want := range []string{"qwen2.5-coder:7b", "↑2.3k in · ↓1.5k out", "%)"} {
+	for _, want := range []string{"qwen2.5-coder:7b", "↑2.3k", "↓1.5k"} {
 		if !strings.Contains(idle, want) {
 			t.Errorf("idle footer missing %q:\n%q", want, idle)
 		}
+	}
+	if strings.Contains(idle, "↑2.3k in") || strings.Contains(idle, "↓1.5k out") {
+		t.Errorf("idle footer leaked in/out suffix:\n%q", idle)
 	}
 }

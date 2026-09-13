@@ -24,17 +24,18 @@ import (
 //	   No token counters, no cost, no zero-value indicators — a brand-new
 //	   session never clutters the footer with idle telemetry.
 //	b. EXECUTING     (isExecuting)
-//	   Live stream bar: "⠋ Generating...  ·  ↑<in> in ↓<out> out (<cost>)  ·  <rate> tok/s
-//	   ·  [model]  ·  ^C stop" seeded at t=0 as "↑C_in in · ↓0 out". The token
-//	   slots and rate are fixed-width (no horizontal jitter), and the "^C stop"
-//	   interrupt badge is the LAST segment to ever be dropped when the pane
-//	   narrows (see footerDropToFit). The spinner pulses cyan→amber. The
-//	   instant execution ends, isExecuting() flips false and the bar is
-//	   replaced — '^C stop' never survives past completion.
+//	   Live stream bar: "⠋ Generating...  ·  ↑<sessionIn> · ↓<sessionOut> (<cost>)  ·  <rate> tok/s
+//	   ·  [model]  ·  ^C stop" seeded at t=0 as "↑C_in · ↓0" where C_in is the
+//	   session cumulative (prior turns + current prompt). The token slots (8
+//	   cells each) and rate (12 cells) are fixed-width (no horizontal jitter),
+//	   and the "^C stop" badge (10 cells, pinned right) is the LAST segment to
+//	   ever be dropped when the pane narrows (see footerDropToFit). The spinner
+//	   pulses cyan→amber. The instant execution ends, isExecuting() flips false
+//	   and the bar is replaced — '^C stop' never survives past completion.
 //	c. ACTIVE SESSION IDLE (sessionHasRunPrompts && !isExecuting)
 //	   Persistent refined telemetry anchored on the active model name:
-//	   "<Model>  ·  ↑<in> in · ↓<out> out (<ctx_pct>%)  ·  <Cost>".
-//	   ↑ = input tokens, ↓ = output tokens (explicit input/output separation).
+//	   "<Model:22>  ·  ↑<in:8> · ↓<out:8>  ·  <Cost:12>  ·  <Action:10>".
+//	   ↑ = input tokens, ↓ = output tokens (minimalist glyphs, no suffixes).
 //	   The Mode Badge belongs EXCLUSIVELY to the Top Bar right side — it never
 //	   appears in the footer.
 //
@@ -44,7 +45,6 @@ import (
 // Footer styles (Catppuccin Mocha).
 var (
 	footerHelpStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	footerSepStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtle))
 	footerModelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 	footerTokStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorTeal))
 
@@ -52,9 +52,51 @@ var (
 	footerExecMetaStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 )
 
-// footerSep joins footer segments with the canonical "  ·  " separator.
+// footerDotStyle renders the inline telemetry separator dot dimmed and
+// faint so numerical data stays visually dominant.
+var footerDotStyle = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color(colorSubtle))
+
+// footerSep joins footer segments with the tight single-space inline
+// separator: " " + dot + " ". Telemetry metrics use their natural character
+// width — trailing space padding inside individual slots is forbidden
+// (INVARIANT 1).
 func footerSep(segments ...string) string {
-	return strings.Join(segments, "  "+footerSepStyle.Render("·")+"  ")
+	return strings.Join(segments, " "+footerDotStyle.Render("·")+" ")
+}
+
+// menuBadge is the idle-state right-block affordance, pinned to the exact
+// right edge opposite the executing "^C stop" badge.
+const menuBadge = "^P menu"
+
+// flexPinRight implements the two-zone flex dispatch (INVARIANT 2): the left
+// telemetry cluster keeps its natural inline flow, the right action badge is
+// pinned to the exact right edge, and the middle gap is filled with exact
+// whitespace padding: gap = totalWidth - width(Left) - width(Right).
+// On narrow viewports the left cluster is truncated dynamically with an
+// ellipsis so the right badge never detaches. The result is always exactly
+// width cells (via fitToWidth).
+func flexPinRight(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	leftW := lipgloss.Width(left)
+	rightW := lipgloss.Width(right)
+	if rightW >= width {
+		return fitToWidth(right, width)
+	}
+	if leftW+rightW >= width {
+		budget := width - rightW - 1
+		if budget < 1 {
+			return fitToWidth(right, width)
+		}
+		left = ansi.Truncate(left, budget, "…")
+		leftW = lipgloss.Width(left)
+	}
+	spacer := width - leftW - rightW
+	if spacer < 0 {
+		spacer = 0
+	}
+	return fitToWidth(left+strings.Repeat(" ", spacer)+right, width)
 }
 
 // isExecuting reports whether a foreground operation is in flight (streaming,
@@ -89,7 +131,7 @@ func (m *model) renderFixedFooter(width int, actions []Action) string {
 	case m.isExecuting():
 		s = m.renderExecutingFooter(width)
 	case !m.sessionHasRunPrompts:
-		s = m.renderFreshLaunchFooter()
+		s = m.renderFreshLaunchFooter(width)
 	default:
 		s = m.renderActiveIdleFooter(width, actions)
 	}
@@ -186,96 +228,106 @@ func (m *model) getActiveModelDisplay() string {
 	return formatModelWithVariant(m.getActiveModelName(), m.activeVariantLabel())
 }
 
-// renderActiveIdleFooterResponsive is the width-responsive, tiered footer
-// core specified in the task. It is a pure function that strictly respects
-// the available terminal width (termWidth):
+// ── FLEX-FLOW FOOTER GEOMETRY (ZERO-GAP TELEMETRY) ──────────────────────
+// The footer is a two-zone flex dispatch: a left telemetry cluster with
+// natural inline flow (metrics joined by tight " · " separators, zero
+// trailing padding) and a right action badge (^C stop / ^P menu) pinned to
+// the exact right edge. The middle gap is dynamic whitespace:
+// gap = totalWidth - width(Left) - width(Right).
 //
-//	Tier 1: Full Width >= 100  →  model  ·  ↑in in · ↓out out (pct%)  ·  cost  ·  [mode]
-//	Tier 2: Standard 70..99     →  model  ·  ↑in in · ↓out out (pct%)  ·  cost
-//	Tier 3: Compact 45..69      →  shortModel  ·  ↑in in · ↓out out
-//	Tier 4: Minimal <45         →  ↑in in · ↓out out
+// Token counts use status.FormatTokens quantization (712, 1.2k, 14.8k) so
+// numeric updates never reflow surrounding text (INVARIANT 3).
+
+// renderActiveIdleFooter is the width-responsive, tiered footer core as a
+// pure function:
 //
-// The returned string is strictly truncated or padded to exactly width.
+//	Tier 1: Full Width >= 100  →  model · ↑in · ↓out (pct%) · cost · [mode]   + ^P menu pinned right
+//	Tier 2: Standard 70..99     →  model · ↑in · ↓out (pct%) · cost           + ^P menu pinned right
+//	Tier 3: Compact 45..69      →  shortModel · ↑in · ↓out                    + ^P menu pinned right
+//	Tier 4: Minimal <45         →  ↑in · ↓out                                + ^P menu pinned right
+//
+// Flex-flow: the left cluster uses natural widths joined by tight " · ",
+// the right badge is pinned via flexPinRight. Minimalist glyphs, zero
+// "in"/"out" suffixes. The result is always exactly width cells.
 func renderActiveIdleFooter(width int, modelName string, inTok, outTok int, ctxPct float64, cost string, mode string) string {
 	in := statusArrowIn(status.FormatTokens(inTok))
 	out := statusArrowOut(status.FormatTokens(outTok))
-	var s string
+	var left string
 	switch {
 	case width >= 100:
-		s = fmt.Sprintf("%s  ·  %s in · %s out (%d%%)  ·  %s  ·  [%s]", modelName, in, out, int(ctxPct), cost, mode)
+		left = footerSep(modelName, in+" "+out+fmt.Sprintf(" (%d%%)", int(ctxPct)), cost, "["+mode+"]")
 	case width >= 70:
-		s = fmt.Sprintf("%s  ·  %s in · %s out (%d%%)  ·  %s", modelName, in, out, int(ctxPct), cost)
+		left = footerSep(modelName, in+" "+out+fmt.Sprintf(" (%d%%)", int(ctxPct)), cost)
 	default:
-		// Compact and minimal share the shortModel helper for 45..69.
 		if width >= 45 {
 			shortModel := truncateModelName(modelName, 12)
-			s = fmt.Sprintf("%s  ·  %s in · %s out", shortModel, in, out)
+			left = footerSep(shortModel, in, out)
 		} else {
-			s = fmt.Sprintf("%s in · %s out", in, out)
+			left = footerSep(in, out)
 		}
 	}
-	return fitToWidth(s, width)
+	return flexPinRight(left, footerExecMetaStyle.Render(menuBadge), width)
 }
 
 // renderFreshLaunchFooter renders the clean startup hint for a brand-new
-// session: "<model>  ·  ? help". No counters, no cost, no
-// zero-value indicators.
-func (m *model) renderFreshLaunchFooter() string {
-	return footerSep(
+// session as a flex line: left "<model> · ? help", right "^P menu" pinned
+// via flexPinRight. No counters, no cost, no zero-value indicators.
+func (m *model) renderFreshLaunchFooter(width int) string {
+	left := footerSep(
 		footerModelStyle.Render(m.getActiveModelDisplay()),
 		footerHelpStyle.Render("? help"),
 	)
+	return flexPinRight(left, footerExecMetaStyle.Render(menuBadge), width)
 }
 
 // renderActiveIdleFooter renders the persistent Active-Session IDLE telemetry
-// with width-responsive tiers. It strictly respects the available terminal
-// width so split-pane layouts never cause wrapping:
+// as a flex-flow line: left cluster
+// "<model> · ↑<in> · ↓<out> · <cost>" with natural widths joined by tight
+// " · ", right block "^P menu" (or the capability chip when actions are
+// present) pinned via flexPinRight. Session totals are monotonic
+// (m.InputTokens/m.OutputTokens).
 //
-//	Tier 1 >=100: full model + usage (with pct) + cost
-//	Tier 2 70-99: same tier 1 + chip overlay
-//	Tier 3 45-69: short model (12 cells) + compact usage (↑in · ↓out)
-//	Tier 4 <45:   minimal usage only (↑in · ↓out)
-//
-// Both compact and full usage render via the canonical status formatters
-// (↑ = input, ↓ = output). The Mode Badge is deliberately absent — the Top
-// Bar owns it. '^C stop' and the '⏸' icon are never present here. The caller
-// (renderFixedFooter) enforces the final exact-width fit via fitToWidth.
+// Minimalist glyph syntax: ↑<count> / ↓<count>, zero "in"/"out" suffixes.
+// The Mode Badge is deliberately absent — the Top Bar owns it. '^C stop' and
+// the '⏸' icon are never present here. Narrow widths tier down (cost drops
+// first, then the model truncates) but the right badge is never dropped.
 func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
 	cost := llm.EnforceFreeModelOverride(m.cfg.ActiveModelName(), m.AccumulatedCost)
 	costStr := llm.FormatCost(cost)
 	modelName := m.getActiveModelDisplay()
-	fullUsage := status.FormatUsageContext(m.InputTokens, m.OutputTokens, m.TotalTokens, m.activeContextLimit())
-	compactTok := status.FormatUsageValues(m.InputTokens, m.OutputTokens)
 
-	var base string
+	inPlain := statusArrowIn(status.FormatTokens(m.InputTokens))
+	outPlain := statusArrowOut(status.FormatTokens(m.OutputTokens))
+
+	var left string
 	switch {
 	case width >= 70:
-		// Tiers 1 and 2: full telemetry (model + usage with pct + cost) — Session Total only
-		base = footerSep(
+		left = footerSep(
 			footerModelStyle.Render(modelName),
-			footerTokStyle.Render(fullUsage),
+			footerTokStyle.Render(inPlain),
+			footerTokStyle.Render(outPlain),
 			footerExecMetaStyle.Render(costStr),
 		)
 	case width >= 45:
 		shortModel := truncateModelName(modelName, 12)
-		base = footerSep(
+		left = footerSep(
 			footerModelStyle.Render(shortModel),
-			footerTokStyle.Render(compactTok),
+			footerTokStyle.Render(inPlain),
+			footerTokStyle.Render(outPlain),
 		)
 	default:
-		base = footerTokStyle.Render(compactTok)
+		left = footerSep(
+			footerTokStyle.Render(inPlain),
+			footerTokStyle.Render(outPlain),
+		)
 	}
 
 	chip := renderActions(actions)
-	if chip == "" {
-		return base
+	right := footerExecMetaStyle.Render(menuBadge)
+	if chip != "" && width >= 70 {
+		right = chip
 	}
-	// In minimal or compact tiers, chips would overflow; only overlay when
-	// there is enough width to show them alongside telemetry.
-	if width < 70 {
-		return base
-	}
-	return padRightOverlay(base, chip, width)
+	return flexPinRight(left, right, width)
 }
 
 // ttftDuration resolves the live Time-To-First-Token deadline for the
@@ -356,46 +408,37 @@ func (m *model) noFirstByteReceived() bool {
 	return true
 }
 
-// renderExecutingFooter renders the live EXECUTING bar, width-aware:
+// renderExecutingFooter renders the live EXECUTING bar as a flex-flow line:
+// left cluster "Generating... · ↑<sessionIn> · ↓<sessionOut> · <rate> tok/s"
+// with natural widths joined by tight " · ", right block "^C stop" pinned
+// via flexPinRight.
 //
 //	pre-TTFT (no first token yet):
-//	  ⠋ Connecting... 14s [groq/llama-3.3-70b]  ·  ^C stop
-//	post-first-token (live cost burn):
-//	  ⠋ Generating...  ·  ↑<in> in ↓<out> out ($<cost>)  ·  <rate> tok/s  ·  [model]  ·  ^C stop
+//	  left "Connecting... Ns [provider/model]", right "^C stop"
+//	post-first-token (live session burn):
+//	  left "Generating... · ↑<in> · ↓<out> · <rate> tok/s", right "^C stop"
 //
-// ↑ = input tokens, ↓ = output tokens; the in/out slots are fixed-width so
-// the metric line never jitters while counts grow. The pre-TTFT countdown
-// renders on every FrameTickMsg (30ms) while the first byte is awaited and
-// freezes the moment it arrives. It counts DOWN the dynamic TTFT deadline
-// (ttftDuration: 15s fast models, up to 90s for reasoning/free-tier) as a
-// single integer — stable width, no decimal flicker. remaining = max(0,
-// ttft - elapsed); when it reaches 0 before headers arrive the stall error
-// path reports "provider response stalled: TTFT timeout (<ttft>s elapsed)".
-// The live tok count is max(authoritative provider stage count, per-chunk
-// live estimate) so the meter advances on every chunk; the cost is
-// C_est = (T_in*P_in + T_out*P_out)/1M seeded at t=0 with 0 output tokens
-// ($free when pricing is 0). This bar exists strictly while an operation is
-// in flight; on completion it is replaced wholesale, so '^C stop' can never
-// linger. When narrow, footerDropToFit drops segments in priority order
-// (model → rate → tokens) and the '^C stop' badge is always last to drop.
-// When in StateRetrying (retryInfo != nil), an explicit retry banner is shown
-// instead of hanging on "Generating...": "[Retry N/M] <error>. Retrying in Xs..."
+// INVARIANT 2 (monotonic session accumulation): while streaming,
+// sessionInput = priorTurnsInput + currentTurnPrompt and sessionOutput =
+// priorTurnsOutput + liveStreamTokens, so multi-turn sessions grow
+// monotonically. Minimalist glyphs, zero "in"/"out" suffixes. The pre-TTFT
+// countdown renders on every FrameTickMsg while the first byte is awaited.
+// Narrow panes drop the rate first, then token telemetry — '^C stop' is
+// never dropped. When in StateRetrying, an explicit retry banner replaces
+// "Generating...".
 func (m *model) renderExecutingFooter(width int) string {
-	// The interrupt badge is drop-proof: computed once, shared by all paths.
+	// The interrupt badge is drop-proof and pinned to the exact right edge.
 	stop := interruptLabelStyle.Render(stopBadge)
 	// Retry state takes precedence: show explicit banner, not stale generating.
 	if m.retryInfo != nil {
 		banner := formatRetryBanner(m.retryInfo)
-		return footerDropToFit(width, []string{
-			m.executingSpinner() + " " + footerExecLabelStyle.Render(banner),
-			stop,
-		})
+		left := m.executingSpinner() + " " + footerExecLabelStyle.Render(banner)
+		return flexPinRight(left, stop, width)
 	}
 	st := m.stageSnapshot()
 	// Pre-TTFT connection phase: single-number countdown against the
 	// dynamic TTFT deadline. The timer stops the instant the first token
-	// arrives (see firstTokenReceived) and the bar transitions to token
-	// metrics below.
+	// arrives and the bar transitions to token metrics below.
 	if !m.firstTokenReceived(st) && !m.executionStartedAt.IsZero() && m.isExecuting() {
 		start := m.executionStartedAt
 		if start.IsZero() {
@@ -412,47 +455,59 @@ func (m *model) renderExecutingFooter(width int) string {
 		}
 		pulse := fmt.Sprintf("Connecting... %ds [%s]",
 			remaining, truncateModelName(m.ttftProviderModelLabel(), 24))
-		return footerDropToFit(width, []string{
-			m.executingSpinner() + " " + footerExecLabelStyle.Render(pulse),
-			stop,
-		})
+		left := m.executingSpinner() + " " + footerExecLabelStyle.Render(pulse)
+		return flexPinRight(left, stop, width)
 	}
-	modelName := m.getActiveModelDisplay()
-	liveOut := m.streamLiveOutputTokens()
-	costLabel := m.streamCostLabel()
-	// FIXED-WIDTH METRICS: the in/out token slots and the rate segment are
-	// padded to deterministic widths so the bar never shifts while counts
-	// grow. Cost rides inside the token segment (feature-preserving); the
-	// model badge truncates at 12 cells. footerDropToFit strips the least
-	// critical trailing segments when the pane narrows.
-	tokIn := padFixedWidth(statusArrowIn(status.FormatTokens(m.streamBaseInputTokens))+" in", execInSlotWidth)
-	tokOut := padFixedWidth(statusArrowOut(status.FormatTokens(liveOut))+" out", execOutSlotWidth)
-	tokSeg := tokIn + " " + tokOut + " (" + costLabel + ")"
-	rateSeg := padFixedWidth(formatTokenRate(m.streamTokenRate(st))+" tok/s", execRateSegmentWidth)
-	return footerDropToFit(width, []string{
-		m.executingSpinner() + " " + footerExecLabelStyle.Render("Generating..."),
-		footerTokStyle.Render(tokSeg),
-		footerExecMetaStyle.Render(rateSeg),
-		footerModelStyle.Render("[" + truncateModelName(modelName, 12) + "]"),
-		stop,
-	})
+	sess := m.snapshotSessionMetrics()
+	tokIn := footerTokStyle.Render(statusArrowIn(status.FormatTokens(sess.TotalInput())))
+	tokOut := footerTokStyle.Render(statusArrowOut(status.FormatTokens(sess.TotalOutput())))
+	rateSeg := footerExecMetaStyle.Render(formatTokenRate(m.streamTokenRate(st)) + " tok/s")
+	stateSeg := m.executingSpinner() + " " + footerExecLabelStyle.Render("Generating...")
+
+	// Priority drop: rate first, then output, then input — state + stop
+	// always survive. Each candidate left cluster is flex-pinned; the first
+	// candidate whose natural width fits wins, otherwise the minimal pair
+	// is truncated dynamically by flexPinRight.
+	candidates := [][]string{
+		{stateSeg, tokIn, tokOut, rateSeg},
+		{stateSeg, tokIn, tokOut},
+		{stateSeg, tokIn},
+		{stateSeg},
+	}
+	for _, tokens := range candidates {
+		left := footerSep(tokens...)
+		if lipgloss.Width(left)+lipgloss.Width(stop)+1 <= width {
+			return flexPinRight(left, stop, width)
+		}
+	}
+	return flexPinRight(footerSep(stateSeg), stop, width)
 }
 
 // footerDropToFit renders a footer line from ordered segments, preserving the
 // LAST segment ('^C stop') as the drop-proof anchor: whenever the joined line
-// exceeds width, the least critical segment is dropped (model badge → rate →
-// token telemetry) and the line re-measured. The return value never exceeds
-// width — fitToWidth truncates only in the extreme sub-30-cell panes where
-// even the bare spinner+badge pair overflows.
+// exceeds width, the least critical segment is dropped and the line
+// re-measured. Segments use natural widths with the tight " · " separator;
+// the surviving line is right-pinned via flexPinRight so the anchor sits on
+// the exact right edge.
+//
+//nolint:unused
 func footerDropToFit(width int, segments []string) string {
-	for len(segments) > 2 {
-		line := footerSep(segments...)
-		if lipgloss.Width(line) <= width {
-			return fitToWidth(line, width)
-		}
-		segments = append(segments[:len(segments)-2], segments[len(segments)-1])
+	if len(segments) == 0 {
+		return fitToWidth("", width)
 	}
-	return fitToWidth(footerSep(segments...), width)
+	right := segments[len(segments)-1]
+	leftTokens := segments[:len(segments)-1]
+	for len(leftTokens) > 1 {
+		left := footerSep(leftTokens...)
+		if lipgloss.Width(left)+lipgloss.Width(right)+1 <= width {
+			return flexPinRight(left, right, width)
+		}
+		leftTokens = append(leftTokens[:len(leftTokens)-2], leftTokens[len(leftTokens)-1])
+	}
+	if len(leftTokens) == 0 {
+		return flexPinRight("", right, width)
+	}
+	return flexPinRight(footerSep(leftTokens...), right, width)
 }
 
 // statusArrowIn and statusArrowOut prefix a formatted token count with the
@@ -527,37 +582,18 @@ func formatTokenRate(rate float64) string {
 	return fmt.Sprintf("%.1f", rate)
 }
 
-// ── FIXED-WIDTH STATUS METRICS (streaming-scroll decoupling) ─────────────
-// Token counts and tok/s rates are padded to deterministic cell widths so the
-// executing footer never shifts horizontally while text streams. Padding is
-// trailing (right-pad) so existing substrings ("↑128 in", "12.8", "tok/s")
-// remain intact for tests and the line never wraps mid-stream. The in/out
-// slots carry the explicit ↑/↓ input/output label (arrow + " in"/" out"); the
-// rate slot and the drop-proof "^C stop" interrupt badge complete the bar.
-const (
-	execTokCountWidth    = 10 // legacy: "↓128 tok" (8 cells) + pad; covers "↓12.3k tok"
-	execRateSegmentWidth = 11 // e.g. "12.8 tok/s" (10 cells) + pad
-	execInSlotWidth      = 11 // fixed-width "↑12.3k in" slot (10 cells) + pad
-	execOutSlotWidth     = 11 // fixed-width "↓12.3k out" slot (10 cells) + pad
-)
+// ── FLEX-FLOW STATUS METRICS (streaming-scroll decoupling) ─────────────
+// Token counts use status.FormatTokens quantization (712, 1.2k, 14.8k) with
+// fixed precision so numeric updates never reflow surrounding text
+// (INVARIANT 3). Metrics render at natural width with tight " · "
+// separators and zero trailing padding; the line never wraps mid-stream.
+// The drop-proof "^C stop" interrupt badge anchors the exact right edge.
 
 // stopBadge is the compact interrupt affordance that anchors the executing
 // footer's right edge. It replaces the legacy "⏸ Ctrl+C interrupt" pair —
 // one badge, both the hint and the escape hatch, and the LAST segment a
 // width-aware executing footer ever drops (see footerDropToFit).
 const stopBadge = "^C stop"
-
-// padFixedWidth right-pads s with spaces to exactly w cells (cell-aware).
-// Longer strings are returned unchanged (the caller fitToWidth truncates).
-func padFixedWidth(s string, w int) string {
-	if w <= 0 {
-		return s
-	}
-	if d := w - lipgloss.Width(s); d > 0 {
-		return s + strings.Repeat(" ", d)
-	}
-	return s
-}
 
 // renderModeBadge renders the current mode as a compact capability badge:
 // read-only modes → "[READ-ONLY]", build → "[WRITE]", investigate → "[EXECUTE]".
