@@ -411,10 +411,18 @@ func (m *model) renderExecutingFooter() string {
 	modelName := m.getActiveModelDisplay()
 	liveOut := m.streamLiveOutputTokens()
 	costLabel := m.streamCostLabel()
+	// FIXED-WIDTH METRICS: pre-allocate character widths for the token
+	// count and rate segments so the footer never shifts or wraps while
+	// streaming. Right-padding keeps widths deterministic as counts grow.
+	// Only the count/rate cores are padded (not the cost/model tails) so
+	// the total line still fits narrow panes; the caller fitToWidth caps it.
+	tokCount := padFixedWidth("↓"+status.FormatTokens(liveOut)+" tok", execTokCountWidth)
+	tokSeg := tokCount + " (" + costLabel + ")"
+	rateSeg := padFixedWidth(formatTokenRate(m.streamTokenRate(st))+" tok/s", execRateSegmentWidth)
 	return footerSep(
 		m.executingSpinner()+" "+footerExecLabelStyle.Render("Generating..."),
-		footerTokStyle.Render("↓"+status.FormatTokens(liveOut)+" tok ("+costLabel+")"),
-		footerExecMetaStyle.Render(formatTokenRate(m.streamTokenRate(st))+" tok/s"),
+		footerTokStyle.Render(tokSeg),
+		footerExecMetaStyle.Render(rateSeg),
 		footerModelStyle.Render("["+truncateModelName(modelName, 16)+"]"),
 		interruptLabelStyle.Render(Icon.Interrupt+" Ctrl+C interrupt"),
 	)
@@ -484,6 +492,28 @@ func formatTokenRate(rate float64) string {
 		return fmt.Sprintf("%d", int(rate))
 	}
 	return fmt.Sprintf("%.1f", rate)
+}
+
+// ── FIXED-WIDTH STATUS METRICS (streaming-scroll decoupling) ─────────────
+// Token counts and tok/s rates are padded to deterministic cell widths so the
+// executing footer never shifts horizontally while text streams. Padding is
+// trailing (right-pad) so existing substrings ("↓128 tok", "12.8", "tok/s")
+// remain intact for tests and the line never wraps mid-stream.
+const (
+	execTokCountWidth    = 10 // e.g. "↓128 tok" (8 cells) + pad; covers "↓12.3k tok"
+	execRateSegmentWidth = 11 // e.g. "12.8 tok/s" (10 cells) + pad
+)
+
+// padFixedWidth right-pads s with spaces to exactly w cells (cell-aware).
+// Longer strings are returned unchanged (the caller fitToWidth truncates).
+func padFixedWidth(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	if d := w - lipgloss.Width(s); d > 0 {
+		return s + strings.Repeat(" ", d)
+	}
+	return s
 }
 
 // renderModeBadge renders the current mode as a compact capability badge:

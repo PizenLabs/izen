@@ -334,8 +334,10 @@ func renderStageStatus(st stageView) string {
 		// count (fed via setStageMetrics from the stream's ProviderUsage).
 		// When no authoritative usage has arrived, the indicator stays plain
 		// "streaming" — it never fabricates a number from a buffer length.
+		// FIXED WIDTH: the count segment is right-padded to a deterministic
+		// width so the processing dock never shifts horizontally mid-stream.
 		if st.Tokens > 0 {
-			return fmt.Sprintf("Model ● streaming · %s tok", status.FormatTokens(st.Tokens))
+			return fmt.Sprintf("Model ● streaming · %-10s", status.FormatTokens(st.Tokens)+" tok")
 		}
 		return "Model ● streaming"
 	case stageBlocked:
