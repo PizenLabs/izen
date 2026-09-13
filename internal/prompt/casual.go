@@ -17,3 +17,16 @@ func CasualChatContract() string {
 func CasualChatSystemPrompt() string {
 	return ApplyStyle(CasualChatContract(), activeStyle)
 }
+
+// BuildMinimalSystemPrompt is the invariant 2 compressed ≤50-token prompt for
+// conversational turns (identity + concise direct answer only). It is the
+// canonical minimal prompt and must remain tiny.
+func BuildMinimalSystemPrompt() string {
+	return CasualChatContract()
+}
+
+// BuildAgenticSystemPrompt returns the full workspace prompt for agentic
+// execution (never used for casual intents).
+func BuildAgenticSystemPrompt(mode, username string) string {
+	return ForModeWithUser(mode, username)
+}

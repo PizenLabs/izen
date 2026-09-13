@@ -112,6 +112,37 @@ func CasualChatSystemPrompt() string {
 	return prompt.CasualChatSystemPrompt()
 }
 
+// BuildMinimalSystemPrompt is the INVARIANT 2 compressed system prompt for
+// conversational turns. It MUST stay ≤50 tokens (identity + concise answer
+// instruction only) and is used exclusively when IsCasualChat is true.
+// It returns the raw contract without style directive so it stays ≤50 tokens;
+// rendering can still apply style per prompt.BuildMinimalSystemPrompt but the
+// invariant ceiling is enforced on the contract itself.
+func BuildMinimalSystemPrompt() string {
+	return prompt.BuildMinimalSystemPrompt()
+}
+
+// BuildAgenticSystemPrompt is the INVARIANT 2 full workspace prompt reserved
+// strictly for tool-assisted execution. It is never used for casual intents.
+func BuildAgenticSystemPrompt(mode, username string) string {
+	return prompt.ForModeWithUser(mode, username)
+}
+
+// IsCasualWithFileCheck reports whether a casual-classified intent should
+// have its tool payload pruned: casual or direct_greeting, or an ask intent
+// with ≥90% confidence and zero file references. It is a helper for the
+// intent-aware payload pruning engine.
+func IsCasualWithFileCheck(intentType string, confidence float64, hasFileRefs bool) bool {
+	lower := strings.ToLower(strings.TrimSpace(intentType))
+	if lower == "casual" || lower == "direct_greeting" || lower == "conversation" {
+		return true
+	}
+	if lower == "ask" && confidence >= 0.90 && !hasFileRefs {
+		return true
+	}
+	return false
+}
+
 // CasualChatMaxTokens returns the max_tokens budget for casual chat
 // responses. It is a healthy default (2048) so casual replies can form
 // complete sentences instead of being cut off mid-generation by a tiny

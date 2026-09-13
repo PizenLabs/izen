@@ -351,6 +351,179 @@ func (s *Session) AddMessage(role, content string, maxTurns int) {
 	}
 }
 
+// GetLLMMessages returns the conversation history slice that should be
+// passed to the LLM. It is the TUI-history separation boundary (INVARIANT 3):
+// system-level UI notifications (latency logs, provider warnings, internal
+// event traces) are kept in the viewport/docLayout only and never enter this
+// slice. For casual turns the caller can request a stripped view (casual=true)
+// which keeps only user/assistant text pairs and drops heavy context blocks.
+func (s *Session) GetLLMMessages(casual bool) []Message {
+	if s == nil {
+		return nil
+	}
+	var out []Message
+	for _, m := range s.History {
+		// INVARIANT 3: never leak internal system traces to the LLM.
+		if m.Role == "system" {
+			lower := m.Content
+			if containsInternalLog(lower) {
+				continue
+			}
+			if casual {
+				continue
+			}
+			// Only explicit policy notices survive on agentic path.
+			if !isPolicyNotice(lower) {
+				continue
+			}
+		}
+		if casual {
+			if m.Role != "user" && m.Role != "assistant" {
+				continue
+			}
+			sanitized := stripHeavyBlocks(m.Content)
+			if sanitized == "" {
+				continue
+			}
+			out = append(out, Message{Role: m.Role, Content: sanitized, Timestamp: m.Timestamp})
+		} else {
+			out = append(out, m)
+		}
+	}
+	// INVARIANT 1 & 3: casual history window is aggressively truncated to keep
+	// the greeting payload <100 tokens. 6 messages ≈ 3 exchanges is enough for
+	// continuity without re-inflating the window.
+	if casual && len(out) > 6 {
+		out = out[len(out)-6:]
+	}
+	return out
+}
+
+func containsInternalLog(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	lower := s
+	// Lowercase check for latency traces.
+	for _, needle := range []string{"submit_prompt failed", "[event] promptadmitted", "latency=", "provider mismatch", "command submit_prompt"} {
+		// Case-insensitive for the event line.
+		found := false
+		ls := lower
+		ln := needle
+		// Simple case-insensitive contains via lowercasing both.
+		lsLow := ""
+		for _, r := range ls {
+			if r >= 'A' && r <= 'Z' {
+				lsLow += string(r + 32)
+			} else {
+				lsLow += string(r)
+			}
+		}
+		if len(lsLow) >= len(ln) {
+			for i := 0; i <= len(lsLow)-len(ln); i++ {
+				if lsLow[i:i+len(ln)] == ln {
+					found = true
+					break
+				}
+			}
+		}
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+func isPolicyNotice(s string) bool {
+	return len(s) > 0 && (contains(s, "Read-Only execution environment") || contains(s, "TOOL") && contains(s, "POLICY"))
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && indexOf(s, sub) >= 0
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+func stripHeavyBlocks(s string) string {
+	if s == "" {
+		return s
+	}
+	if idx := indexOf(s, "## GOVERNED FILE CONTEXT"); idx >= 0 {
+		s = s[:idx]
+	}
+	if idx := indexOf(s, "## Workspace File:"); idx >= 0 {
+		s = s[:idx]
+	}
+	if contains(s, "### ACTIVE OBJECTIVE") {
+		if idx := indexOf(s, "\n\n"); idx >= 0 {
+			parts := s[idx+2:]
+			return stripHeavyBlocks(parts)
+		}
+		return ""
+	}
+	// Drop fenced code blocks for casual slim history.
+	if contains(s, "```") {
+		lines := splitLines(s)
+		var out []string
+		inFence := false
+		for _, line := range lines {
+			trimmed := trimSpace(line)
+			if len(trimmed) >= 3 && trimmed[:3] == "```" {
+				inFence = !inFence
+				continue
+			}
+			if !inFence {
+				out = append(out, line)
+			}
+		}
+		s = joinLines(out)
+	}
+	return trimSpace(s)
+}
+
+func splitLines(s string) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
+
+func joinLines(lines []string) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	res := lines[0]
+	for _, l := range lines[1:] {
+		res += "\n" + l
+	}
+	return res
+}
+
+func trimSpace(s string) string {
+	start := 0
+	end := len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\n' || s[start] == '\r' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\n' || s[end-1] == '\r' || s[end-1] == '\t') {
+		end--
+	}
+	return s[start:end]
+}
+
 // ClearHistory resets the history slice to empty.
 func (s *Session) ClearHistory() {
 	s.History = []Message{}
