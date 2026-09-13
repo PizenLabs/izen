@@ -12,8 +12,8 @@ import (
 func TestZeroToolPayloadOnGreeting_OpenRouter(t *testing.T) {
 	minimal := gateway.BuildMinimalSystemPrompt()
 	req := ai.Request{
-		Model:   "openai/gpt-4o",
-		System:  minimal,
+		Model:    "openai/gpt-4o",
+		System:   minimal,
 		Messages: []ai.Message{{Role: "user", Content: "hi"}},
 		Tools: []ai.ToolDefinition{
 			{Type: "function", Function: ai.ToolFunction{Name: "write_file", Description: "test"}},
@@ -32,8 +32,8 @@ func TestZeroToolPayloadOnGreeting_OpenRouter(t *testing.T) {
 	// Agentic must retain tools
 	agentic := gateway.BuildAgenticSystemPrompt("ask", "Tester")
 	req2 := ai.Request{
-		Model:   "openai/gpt-4o",
-		System:  agentic,
+		Model:    "openai/gpt-4o",
+		System:   agentic,
 		Messages: []ai.Message{{Role: "user", Content: "refactor file.go"}},
 		Tools: []ai.ToolDefinition{
 			{Type: "function", Function: ai.ToolFunction{Name: "write_file", Description: "test"}},
