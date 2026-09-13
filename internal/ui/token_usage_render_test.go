@@ -20,9 +20,9 @@ func TestRenderTokenUsage_UsageTruth(t *testing.T) {
 		substrs []string
 	}{
 		{"unknown renders unknown", false, 0, 0, 0, 0, []string{"usage unknown"}},
-		{"unknown with stale counters renders count", false, 10, 20, 30, 0, []string{"↑10 in · ↓20 out"}},
+		{"unknown with stale counters renders count", false, 10, 20, 30, 0, []string{"↑10 · ↓20"}},
 		{"known zero renders 0 tok", true, 0, 0, 0, 0, []string{"0 tok"}},
-		{"known provider usage", true, 2860, 2048, 4908, 0, []string{"↑2.9k in · ↓2.0k out"}},
+		{"known provider usage", true, 2860, 2048, 4908, 0, []string{"↑2.9k · ↓2.0k"}},
 		{"known zero with context window", true, 0, 0, 0, 128000, []string{"0 tok (0%)"}},
 	}
 	for _, c := range cases {

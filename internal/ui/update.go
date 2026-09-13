@@ -3152,6 +3152,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Clear planPending flag to prevent spinner lock on plan mode completion.
 		m.planPending = false
 
+		// TURN LIFECYCLE COMMIT: the turn totals were already folded into the
+		// session baselines (InputTokens += tokenInput above); clear the live
+		// increments so the next turn starts clean while monotonic growth is
+		// preserved in the baselines.
+		m.streamLiveTokens = 0
+		m.streamBaseInputTokens = 0
+
 		// ── MANDATORY SYNCHRONOUS FLUSH (STREAM COMPLETION) ─────────
 		// The final frame must render NOW, on this turn — never deferred to a
 		// pending repaintTickMsg that could be dropped, starved, or processed

@@ -40,7 +40,7 @@ func TestTrackerRecordAndSnapshot(t *testing.T) {
 	}
 
 	got := FormatUsage(s)
-	want := "↑2.3k in · ↓1.5k out"
+	want := "↑2.3k · ↓1.5k"
 	if got != want {
 		t.Errorf("FormatUsage = %q, want %q", got, want)
 	}
@@ -67,11 +67,11 @@ func TestFormatUsageZeroTotal(t *testing.T) {
 }
 
 func TestFormatUsageValues(t *testing.T) {
-	if got := FormatUsageValues(800, 300); got != "↑800 in · ↓300 out" {
-		t.Errorf("FormatUsageValues = %q, want %q", got, "↑800 in · ↓300 out")
+	if got := FormatUsageValues(800, 300); got != "↑800 · ↓300" {
+		t.Errorf("FormatUsageValues = %q, want %q", got, "↑800 · ↓300")
 	}
-	if got := FormatUsageValues(2300, 1500); got != "↑2.3k in · ↓1.5k out" {
-		t.Errorf("FormatUsageValues = %q, want %q", got, "↑2.3k in · ↓1.5k out")
+	if got := FormatUsageValues(2300, 1500); got != "↑2.3k · ↓1.5k" {
+		t.Errorf("FormatUsageValues = %q, want %q", got, "↑2.3k · ↓1.5k")
 	}
 }
 
@@ -84,14 +84,14 @@ func TestFormatUsageContext(t *testing.T) {
 		limit  int
 		want   string
 	}{
-		{"cloud split", 2300, 1500, 3800, 128000, "↑2.3k in · ↓1.5k out (3%)"},
-		{"cloud small", 800, 300, 1100, 128000, "↑800 in · ↓300 out (1%)"},
+		{"cloud split", 2300, 1500, 3800, 128000, "↑2.3k · ↓1.5k (3%)"},
+		{"cloud small", 800, 300, 1100, 128000, "↑800 · ↓300 (1%)"},
 		{"total fallback", 0, 0, 3800, 128000, "3.8k tok (3%)"},
 		{"zero usage", 0, 0, 0, 128000, "0 tok (0%)"},
-		{"unknown window", 2300, 1500, 3800, 0, "↑2.3k in · ↓1.5k out"},
+		{"unknown window", 2300, 1500, 3800, 0, "↑2.3k · ↓1.5k"},
 		{"negative window", 0, 0, 3800, -1, "3.8k tok"},
 		{"empty window", 0, 0, 0, 0, "0 tok"},
-		{"1M window", 10000, 5000, 15000, 1000000, "↑10k in · ↓5.0k out (2%)"},
+		{"1M window", 10000, 5000, 15000, 1000000, "↑10k · ↓5.0k (2%)"},
 	}
 	for _, c := range cases {
 		if got := FormatUsageContext(c.input, c.output, c.total, c.limit); got != c.want {
