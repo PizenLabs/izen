@@ -17,6 +17,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/autonomy"
@@ -207,6 +208,35 @@ type smoothStreamTickMsg time.Time
 // never chained recursively — a fresh frame is only scheduled when new tokens
 // actually arrive.
 type repaintTickMsg time.Time
+
+// isScrollActive reports whether a scroll burst is in progress using the
+// lastScrollTime watermark (TTY render decoupling §3): a burst is live for
+// scrollActiveWindow after the last wheel/scroll-key event. No timers, no
+// goroutines — pure time.Since on the render path. The zero timestamp is the
+// cleared sentinel; time.Since(time.Time{}) is hugely negative, so the zero
+// value must never be treated as an active burst.
+func (m *model) isScrollActive() bool {
+	return !m.lastScrollTime.IsZero() && time.Since(m.lastScrollTime) < scrollActiveWindow
+}
+
+// markScrollBurst records the current instant as the last scroll event,
+// starting (or extending) the scroll burst window. Called by every wheel /
+// scroll-key handler in place of arming a release timer.
+func (m *model) markScrollBurst() {
+	m.lastScrollTime = time.Now()
+}
+
+// endScrollBurst clears the burst watermark instantly. Called on any KeyMsg
+// (instant edit recovery) and on tail re-engagement so the active cursor
+// returns on the very next frame.
+func (m *model) endScrollBurst() {
+	m.lastScrollTime = time.Time{}
+}
+
+// scrollActiveWindow is the scroll-burst inactivity window: 150ms after the
+// last wheel/scroll-key event the static prompt suppression lifts and the
+// active cursor returns on the next natural render pass.
+const scrollActiveWindow = 150 * time.Millisecond
 
 type spinnerTickMsg time.Time
 
@@ -737,6 +767,21 @@ type model struct {
 	// Input
 	ti    textinput.Model
 	input strings.Builder // kept in sync with ti for suggestions.go
+
+	// ── PROMPT RENDER ISOLATION (streaming-scroll decoupling) ──
+	// cachedPromptView memoizes the rendered prompt input line so viewport
+	// scroll events and stream token arrivals reuse the last frame instead
+	// of re-evaluating ti.View() (and its cursor ANSI) 25+ times/sec.
+	// cachedPromptKey is the invalidation key (value + cursor pos + focus);
+	// cursor blink ticks invalidate explicitly via invalidatePromptCache.
+	cachedPromptView string
+	cachedPromptKey  string
+	// cachedPromptStaticView is the SCROLL-SUPPRESSED static prompt frame:
+	// identical text/prefix with hardware cursor codes stripped (rendered
+	// from a blurred clone, never mutating m.ti). Scroll frames use it via
+	// renderPromptForFrame so zero cursor ANSI reaches stdout mid-scroll.
+	cachedPromptStaticView string
+	cachedPromptStaticKey  string
 
 	// Multi-line paste folding (atomic pill badges)
 	pasteCounter int
@@ -1701,6 +1746,43 @@ type model struct {
 	// userScrolledAway mirrors userIsScrollingUp: true when the user has
 	// manually scrolled away from the tail, suppressing auto-tail-lock.
 	userScrolledAway bool
+	// userScrollLocked is the explicit manual-scroll engagement lock
+	// (STREAMING-SCROLL DECOUPLING mandate): set on wheel-up / key scroll
+	// away from the tail, cleared ONLY when the offset reaches the absolute
+	// bottom. It is kept in sync with userScrolledAway/userIsScrollingUp
+	// by setScrollLocked/followTail/lockTailToNewPrompt; stream token
+	// ingestion consults it (via calculateEffectiveYOffset) and never
+	// mutates yOffset while it is true.
+	userScrollLocked bool
+	// lastScrollTime is the timestamp watermark of the most recent
+	// wheel/scroll-key event (TTY render decoupling §3). isScrollActive()
+	// derives the scroll-burst window from time.Since(lastScrollTime) — a
+	// ZERO-timer, zero-goroutine scroll state. While a burst is live every
+	// render pass uses the scroll-suppressed static prompt frame and reuses
+	// cached header/footer chrome. Any KeyMsg clears it instantly via
+	// endScrollBurst (edit recovery); the watermark expires on inactivity.
+	// The zero value is the cleared sentinel (see isScrollActive).
+	lastScrollTime time.Time
+	// scrollDocLines is the full scrollable document line pool (chrome +
+	// docLayout rendered rows + tail lines) cached by refreshViewportContent
+	// for the fast-path viewport assembly. len() == lastScrollTotal is the
+	// freshness guard; the pool is only rebuilt when the document actually
+	// changes. WIDTH PADDING is applied at compose time, never stored.
+	scrollDocLines []string
+	// scrollSpaceLine is a cached row of `scrollSpaceWidth` spaces used to
+	// pad pool lines to the viewport width (byte-identical to the bubbles
+	// viewport's Width() padding) with zero per-frame allocation.
+	scrollSpaceLine   string
+	scrollSpaceWidth  int
+	scrollChromeDirty bool // set for every Update message EXCEPT pure scroll frames (wheel / scroll keys), so the scroll fast path reuses chrome ONLY across consecutive scroll-only frames with zero intervening state change
+	// chromeCacheValid/Width/Header/Footer memoize the last full compose's
+	// fixed header/footer blocks for the scroll fast path.
+	chromeCacheValid bool
+	chromeCacheWidth int
+	cachedHeaderView string
+	cachedFooterView string
+	// chromeCacheHits counts fast-path reuses (test observability).
+	chromeCacheHits int
 	// lastScrollTotal caches the full scrollable document height (chrome +
 	// records/streaming + tail panels) from the most recent refresh so
 	// scroll-bounds helpers (selection auto-scroll, wheel) stay consistent
@@ -3186,6 +3268,13 @@ func (m *model) push(r role, text string) {
 	if m.activitySurfaceSealed {
 		return
 	}
+	// ── INGESTION-TIME PURGING (hardware cursor isolation) ───────
+	// All text is sanitized at the ingestion seam BEFORE it is committed to
+	// state memory or viewport buffers. Hardware cursor control sequences
+	// (\x1b[?25h/l, position \x1b[H, erase \x1b[2K, save/restore, \r)
+	// are stripped here so the View() render loop remains O(1) and performs
+	// zero regex / wrapping. SGR color sequences (\x1b[...m) are preserved.
+	text = SanitizeForIngest(text)
 	text = sanitizeIngressANSI(text)
 	if isBoundedPatchRecovery(text) {
 		text = RenderBoundedPatchRecoveryBadge()
@@ -3645,6 +3734,7 @@ func wrapIndentedLine(text string, maxWidth int) []string {
 // pushRecords appends multiple records.
 func (m *model) pushRecords(recs []record) {
 	for _, rec := range recs {
+		rec.text = SanitizeForIngest(rec.text)
 		rec.text = sanitizeIngressANSI(rec.text)
 		m.records = append(m.records, rec)
 		m.cacheRecordToHistory(rec)
@@ -4176,6 +4266,25 @@ func (m *model) refreshViewportContent() {
 	}
 	m.docScrollOffset = yOffset
 	m.lastScrollTotal = total
+
+	// ── Scroll line pool (TTY render decoupling §4) ─────────────────
+	// Cache the full scrollable document as a flat line pool (chrome +
+	// docLayout rendered rows + tail lines) so scroll frames can be served
+	// by slice+join without re-rendering the document. Rebuilt ONLY here —
+	// never per scroll event. Also cache the viewport-width space row used
+	// to mirror the viewport's Width() padding at compose time.
+	pool := make([]string, 0, total)
+	for i := 0; i < recStart; i++ {
+		pool = append(pool, chromeLines[i])
+	}
+	docLen := m.docLayout.Len()
+	for i := 0; i < docLen; i++ {
+		pool = append(pool, m.docLayout.Lines[i].RenderedStr)
+	}
+	pool = append(pool, tailLines...)
+	m.scrollDocLines = pool
+	m.scrollSpaceLine = strings.Repeat(" ", m.width)
+	m.scrollSpaceWidth = m.width
 
 	var visible []string
 	switch {
@@ -4835,14 +4944,18 @@ func (m *model) renderStreamThinkingOnly(width int) string {
 
 // calculateEffectiveYOffset returns the effective viewport offset over the
 // full scrollable document. When the user has NOT scrolled away from the tail
-// (!m.userScrolledAway), it is continuously pinned to the tail:
+// (!m.userScrolledAway && !m.userScrollLocked), it is continuously pinned to
+// the tail:
 //
 //	yOffset = max(0, total - Viewport.Height)
 //
-// Otherwise it is the app-owned scroll offset clamped to the document. An
-// active mouse drag owns the viewport: the offset is preserved exactly so the
-// selection controller (handleSelectionAutoScroll) can move it without the
-// tail-lock fighting it.
+// STREAMING-SCROLL DECOUPLING: while userScrollLocked is true, incoming
+// stream tokens update the backing document layout WITHOUT mutating yOffset —
+// the offset is preserved (clamped) so the layout never bounces between the
+// tail and the manual position frame-by-frame. Otherwise it is the app-owned
+// scroll offset clamped to the document. An active mouse drag owns the
+// viewport: the offset is preserved exactly so the selection controller
+// (handleSelectionAutoScroll) can move it without the tail-lock fighting it.
 func (m *model) calculateEffectiveYOffset(total int) int {
 	maxOff := total - m.Viewport.Height
 	if maxOff < 0 {
@@ -4858,7 +4971,7 @@ func (m *model) calculateEffectiveYOffset(total int) int {
 		}
 		return off
 	}
-	if !m.userScrolledAway {
+	if !m.userScrolledAway && !m.userScrollLocked {
 		return maxOff
 	}
 	off := m.docScrollOffset
@@ -4888,10 +5001,13 @@ func (m *model) maxAppScroll() int {
 
 // setScrollLocked flips the single tail-lock flag. userScrolledAway is the
 // authoritative "user left the tail" state; userIsScrollingUp is kept in sync
-// for the legacy callers that still read it.
+// for the legacy callers that still read it; userScrollLocked is the explicit
+// manual-scroll engagement lock consumed by the streaming-scroll decoupling
+// guard (calculateEffectiveYOffset). All three always move together.
 func (m *model) setScrollLocked(locked bool) {
 	m.userScrolledAway = locked
 	m.userIsScrollingUp = locked
+	m.userScrollLocked = locked
 }
 
 // followTail re-engages auto-tail-lock and pins the viewport to the tail. It
@@ -4905,10 +5021,21 @@ func (m *model) followTail() {
 	m.refreshViewportContent()
 }
 
-// scrollBy moves the app-owned scroll offset by delta rows and flags the user
-// as having scrolled away from the tail (re-lock via Space / followTail). The
-// offset is clamped to the document by refreshViewportContent on the same
-// pass, so wheel input can never overscroll.
+// scrollBy moves the app-owned scroll offset by delta rows with deterministic
+// auto-scroll re-engagement. Scrolling up (delta < 0) always engages the
+// manual lock (suppressing stream tail-follow); scrolling down (delta > 0)
+// re-engages live tailing ONLY when the offset reaches the absolute bottom
+// (yOffset >= maxScroll). The offset is clamped to the cached document bound
+// (maxAppScroll) so wheel input can never overscroll.
+//
+// ZERO-TIMER HOT PATH (TTY render decoupling §2/§3): scrollBy performs pure
+// O(1) offset mutation and marks the scroll burst watermark — it NEVER
+// re-renders the document and NEVER arms a timer. The full document render
+// happens once in refreshViewportContent; subsequent scroll frames reuse the
+// cached scrollDocLines pool via slice+join (Task 4). Special-path modes that
+// own their render surface (vi-mode via Viewport.YOffset, mouse selection via
+// the framebuffer overlay) AND any frame whose line pool is missing/stale
+// self-heal with a synchronous refresh.
 func (m *model) scrollBy(delta int) {
 	if !m.Ready {
 		return
@@ -4917,8 +5044,90 @@ func (m *model) scrollBy(delta int) {
 		return
 	}
 	m.setScrollLocked(true)
+	m.markScrollBurst()
 	m.docScrollOffset += delta
-	m.refreshViewportContent()
+	if maxOff := m.maxAppScroll(); m.docScrollOffset > maxOff {
+		m.docScrollOffset = maxOff
+	}
+	if m.docScrollOffset < 0 {
+		m.docScrollOffset = 0
+	}
+	// Self-healing refresh for special-path modes and cold pools: these
+	// frames cannot be served from the line pool.
+	if m.inViMode || m.mouseSel.Active || !m.scrollPoolValid() {
+		m.refreshViewportContent()
+	}
+	// DETERMINISTIC RE-ENGAGEMENT: only a downward scroll that lands on the
+	// absolute bottom releases the manual lock so the live stream tail
+	// resumes. An upward scroll always holds the lock (even when the
+	// document has no scrollable range), and anything short of the bottom
+	// keeps it so tokens accumulate without yanking the view. The scroll
+	// burst watermark is NOT cleared here — tail re-engagement is about
+	// scroll-lock, while the prompt burst persists until any KeyMsg or the
+	// watermark expiry, matching the legacy release-timer semantics.
+	if delta > 0 && m.docScrollOffset >= m.maxAppScroll() {
+		m.setScrollLocked(false)
+	}
+}
+
+// scrollPoolValid reports whether the cached scrollDocLines pool is fresh:
+// non-empty and sized exactly to lastScrollTotal (the last refresh's full
+// scrollable document height). The pool is rebuilt only by refreshViewportContent.
+func (m *model) scrollPoolValid() bool {
+	return len(m.scrollDocLines) > 0 && len(m.scrollDocLines) == m.lastScrollTotal
+}
+
+// composeViewportWindow builds the fast-path body for the visible window
+// [top, top+height) as a raw slice+join over the scrollDocLines pool. Each
+// line is padded to width with trailing spaces (over-wide lines are truncated
+// to width cells, mirroring the viewport's MaxWidth) and trailing rows become
+// width-space fillers — matching the bubbles viewport's Width()/Height()
+// padding (verified by TestFastPathViewportAssembly) with ZERO Lipgloss
+// computation on the scroll hot path.
+func (m *model) composeViewportWindow(top, width, height int) string {
+	pool := m.scrollDocLines
+	cnt := len(pool) - top
+	if cnt > height {
+		cnt = height
+	}
+	if cnt < 0 {
+		cnt = 0
+	}
+	spaceLine := m.scrollSpaceLine
+	var b strings.Builder
+	b.Grow(height * (width + 1))
+	for i := 0; i < cnt; i++ {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		line := pool[top+i]
+		cells := ansiCellWidth(line)
+		switch {
+		case cells > width:
+			b.WriteString(ansi.Truncate(line, width, ""))
+		default:
+			b.WriteString(line)
+			if pad := width - cells; pad > 0 {
+				b.WriteString(spaceLine[:pad])
+			}
+		}
+	}
+	for i := cnt; i < height; i++ {
+		b.WriteByte('\n')
+		b.WriteString(spaceLine)
+	}
+	return b.String()
+}
+
+// ansiCellWidth returns the visual cell width of s, ANSI-aware: escape
+// sequences are stripped and CJK/wide runes counted via runewidth, matching
+// the cell-width semantics of the bubbles viewport's padding.
+func ansiCellWidth(s string) int {
+	w := runewidth.StringWidth(ansi.Strip(s))
+	if w < 0 {
+		return 0
+	}
+	return w
 }
 
 // scheduleRepaint is the single-flight 30FPS repaint gate: at most one

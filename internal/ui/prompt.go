@@ -4,10 +4,30 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+// ── Virtual Software Cursor (TTY render decoupling §1) ─────────────────────
+
+// applyVirtualCursorMode pins the input cursor to the pure software cursor
+// contract: an always-reversed in-band SGR block cell that is memoryless
+// across frames. CursorStatic disables the bubbletea cursor state machine —
+// Focus() never arms a blink timer, the cell never swaps phases, and the
+// prompt emits zero hardware cursor sequences (\x1b[?25h / \x1b[?25l) and
+// zero CSI cursor positioning for the cursor itself.
+func (m *model) applyVirtualCursorMode() {
+	m.ti.Cursor.SetMode(cursor.CursorStatic)
+}
+
+// virtualCursorEnabled reports whether the input cursor runs in software
+// cursor mode (testability).
+func (m *model) virtualCursorEnabled() bool {
+	return m.ti.Cursor.Mode() == cursor.CursorStatic
+}
 
 type confirmModel struct {
 	question string
@@ -269,14 +289,71 @@ func RenderPasteBadgesStyled(text string) string {
 	})
 }
 
+// invalidatePromptCache drops the memoized prompt frames (active and
+// static) so the next render recomputes. Call on keyboard input, cursor
+// moves, focus shifts, and cursor blink ticks — never on scroll or stream
+// messages.
+func (m *model) invalidatePromptCache() {
+	m.cachedPromptKey = ""
+	m.cachedPromptStaticKey = ""
+}
+
 // renderPromptView returns the textinput view string with paste badges
-// rendered as styled pill badges. This is a PURE projection function — it
-// performs zero string manipulation, zero regex matching, and zero state
-// mutation. SGR mouse-fragment sanitization happens exclusively on write
-// (Update → textinput.Write), never here, so scrolling and the per-tick
-// View() flush remain GC-free and never block the Bubble Tea event queue.
+// rendered as styled pill badges. This is the ACTIVE input view: it carries
+// the live cursor for editing.
+//
+// PROMPT RENDER ISOLATION: the rendered line is memoized and re-generated
+// ONLY when prompt state actually changes (input text, cursor position, or
+// focus). Viewport scrolling (tea.MouseMsg) and stream token arrivals
+// (tokenMsg) reuse the cached frame directly, so the prompt never emits
+// cursor hide/show ANSI during viewport-only frame updates.
 func (m *model) renderPromptView() string {
-	return RenderPasteBadgesStyled(m.ti.View())
+	focus := "0"
+	if m.ti.Focused() {
+		focus = "1"
+	}
+	key := m.ti.Value() + "\x00" + strconv.Itoa(m.ti.Position()) + "\x00" + focus
+	if m.cachedPromptKey == key && m.cachedPromptView != "" {
+		return m.cachedPromptView
+	}
+	m.cachedPromptKey = key
+	m.cachedPromptView = RenderPasteBadgesStyled(m.ti.View())
+	return m.cachedPromptView
+}
+
+// renderPromptViewStatic returns the SCROLL-SUPPRESSED static prompt view:
+// identical text and prompt prefix with hardware cursor codes stripped —
+// the cursor renders as nothing at all, so scroll frames emit zero cursor
+// positioning ANSI to stdout and the prompt stays visually frozen.
+//
+// It renders from a blurred CLONE of the textinput (textinput.Model is a
+// lock-free value struct; Blur on the copy flips focus without touching
+// m.ti), so the live input state — value, cursor position, blink timer —
+// is never mutated by a scroll frame. Memoized separately from the active
+// view; invalidated by the same prompt-state changes.
+func (m *model) renderPromptViewStatic() string {
+	key := m.ti.Value() + "\x00" + strconv.Itoa(m.ti.Position())
+	if m.cachedPromptStaticKey == key && m.cachedPromptStaticView != "" {
+		return m.cachedPromptStaticView
+	}
+	tiCopy := m.ti
+	tiCopy.Blur()
+	m.cachedPromptStaticKey = key
+	m.cachedPromptStaticView = RenderPasteBadgesStyled(tiCopy.View())
+	return m.cachedPromptStaticView
+}
+
+// renderPromptForFrame dispatches the dual-mode prompt view: while a scroll
+// burst is active (lastScrollTime watermark) every frame uses the static,
+// cursor-suppressed view; otherwise the live active view with cursor.
+// Key input, focus changes, and the expiry of the 150ms scroll-activation
+// window restore the active view — instantly on edit, on the first natural
+// render pass after the window expires (no timer is armed).
+func (m *model) renderPromptForFrame() string {
+	if m.isScrollActive() {
+		return m.renderPromptViewStatic()
+	}
+	return m.renderPromptView()
 }
 
 // expandPromptForSubmit expands all paste badges in the current prompt value

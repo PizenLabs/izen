@@ -128,9 +128,79 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		borderColor = viBorderStyle
 	}
 
+	// ── SCROLL FAST PATH (zero-overhead viewport scroll assembly) ──
+	// A scroll frame changes ONLY the viewport slice bounds: header and
+	// footer chrome are byte-identical to the last full compose whenever no
+	// state-changing message intervened (scrollChromeDirty == false, set for
+	// every Update message except pure wheel/scroll-key frames). Reuse the
+	// cached blocks and fast-concatenate, bypassing Lipgloss recomputation
+	// across unchanged sections. Live overlays (toasts) always force the
+	// full path so transient chrome can never freeze mid-burst.
+	//
+	// TASK-4 ASSEMBLY: the body is composed by raw string slice+join over
+	// the cached scrollDocLines pool (composeViewportWindow) — the same rows
+	// the full path renders, so the two paths are byte-identical. The pool
+	// is gated on freshness (len == lastScrollTotal) and the cached space
+	// row must match the current width. Special modes that own their render
+	// surface (vi-mode via Viewport.YOffset, mouse selection via the
+	// framebuffer overlay) always take the full path.
+	if m.isScrollActive() && !m.scrollChromeDirty && m.chromeCacheValid &&
+		m.chromeCacheWidth == width && m.toast == "" &&
+		!m.inViMode && !m.mouseSel.Active &&
+		len(m.scrollDocLines) == m.lastScrollTotal && m.scrollDocLines != nil &&
+		m.scrollSpaceWidth == width {
+		m.chromeCacheHits++
+		var inputView strings.Builder
+		if m.autocompleteActive && len(m.autocompleteItems) > 0 {
+			inputView.WriteString(m.renderAutocompleteDropdown(width))
+		}
+		inputView.WriteString(rule(width, borderColor) + "\n")
+		switch {
+		case m.inViMode && m.viCmdMode:
+			promptLabel := viCmdStyle.Render(m.viCmdBuf)
+			inputView.WriteString(promptLabel + "\n")
+		case m.inViMode:
+			inputView.WriteString(viStatusStyle.Render("-- "+m.viModeLabel()+" --") + "\n")
+		default:
+			promptLabel := modeColor.Render(mode.String() + " " + Icon.Command)
+			inputView.WriteString(promptLabel + " " + m.renderPromptForFrame() + "\n")
+		}
+		inputView.WriteString(rule(width, borderColor))
+
+		var proposalDockView string
+		if m.state == StateAwaitingApproval || m.state == StateProcessing {
+			proposalDockView = m.renderProposalBlock()
+		}
+
+		geo := m.viewportGeometry()
+		m.Viewport.Height = geo.Height
+		top := m.docScrollOffset
+		if maxOff := len(m.scrollDocLines) - geo.Height; top > maxOff && maxOff > 0 {
+			top = maxOff
+		}
+		if top < 0 {
+			top = 0
+		}
+
+		return Workspace{
+			Header:       m.cachedHeaderView,
+			Viewport:     m.composeViewportWindow(top, width, geo.Height),
+			ProposalDock: proposalDockView,
+			Input:        inputView.String(),
+			Footer:       m.cachedFooterView,
+			Actions:      actions,
+		}
+	}
+
 	// ── Fixed Header / Footer (authoritative geometry source) ──
 	headerView := m.renderTopBar(width)
 	footerView := m.renderFixedFooter(width, actions)
+	// Memoize the fixed chrome for the scroll fast path. Scroll frames
+	// reuse these verbatim; any non-scroll message dirties the cache.
+	m.cachedHeaderView = headerView
+	m.cachedFooterView = footerView
+	m.chromeCacheWidth = width
+	m.chromeCacheValid = true
 
 	// ── Input region: autocomplete + separators + prompt ──
 	var inputView strings.Builder
@@ -147,7 +217,7 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		inputView.WriteString(viStatusStyle.Render("-- "+m.viModeLabel()+" --") + "\n")
 	default:
 		promptLabel := modeColor.Render(mode.String() + " " + Icon.Command)
-		inputView.WriteString(promptLabel + " " + m.renderPromptView() + "\n")
+		inputView.WriteString(promptLabel + " " + m.renderPromptForFrame() + "\n")
 	}
 	inputView.WriteString(rule(width, borderColor))
 
@@ -164,9 +234,32 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 	geo := m.viewportGeometry()
 	m.Viewport.Height = geo.Height
 
+	// ── Full-path body source ──
+	// Non-special frames with a fresh line pool serve the SAME slice+join
+	// the fast path uses (byte-parity, and the pool is always re-sliced at
+	// the CURRENT docScrollOffset so a successful scroll-offset to this
+	// frame — e.g. a keypress after a wheel burst — can never render the
+	// stale pre-scroll window). Vi-mode, active mouse selection, and cold
+	// pools fall through to the viewport surface the refresh populated.
+	var viewportView string
+	if !m.inViMode && !m.mouseSel.Active &&
+		len(m.scrollDocLines) == m.lastScrollTotal && m.scrollDocLines != nil &&
+		m.scrollSpaceWidth == width {
+		top := m.docScrollOffset
+		if maxOff := len(m.scrollDocLines) - geo.Height; top > maxOff && maxOff > 0 {
+			top = maxOff
+		}
+		if top < 0 {
+			top = 0
+		}
+		viewportView = m.composeViewportWindow(top, width, geo.Height)
+	} else {
+		viewportView = m.Viewport.View()
+	}
+
 	return Workspace{
 		Header:       headerView,
-		Viewport:     m.Viewport.View(),
+		Viewport:     viewportView,
 		ProposalDock: proposalDockView,
 		Input:        inputView.String(),
 		Footer:       footerView,
