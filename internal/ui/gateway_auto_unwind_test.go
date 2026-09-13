@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -189,5 +191,105 @@ func TestGateway_BackwardTransitionHandledGracefully(t *testing.T) {
 	}
 	if m2.state != StateChat {
 		t.Errorf("UI state = %v, want StateChat (predictable after rejection)", m2.state)
+	}
+}
+
+// TestGateway_CompositePromptDoesNotUnwind is the composite-prompt guard:
+// "Hi, please investigate memory leak" carries a technical directive and
+// MUST NOT trigger casual unwind, even with a conversational opener. The
+// machine stays in StatePlanning.
+func TestGateway_CompositePromptDoesNotUnwind(t *testing.T) {
+	m := readyChatModel(newTestModel())
+	m.resolver.Set(modes.ModePlan)
+	driveIntoPlanning(t, m)
+
+	composite := "Hi, please investigate memory leak"
+	if isCasualConversationPrompt(composite) {
+		t.Fatalf("isCasualConversationPrompt(%q) = true, want false (composite with technical directive)", composite)
+	}
+	if m.handleCasualAutoUnwind(composite) {
+		t.Fatal("composite prompt must not be consumed by the auto-unwind guard")
+	}
+	if m.workflowSM.State() != workflow.StatePlanning {
+		t.Errorf("workflowSM.State() = %v, want StatePlanning (untouched)", m.workflowSM.State())
+	}
+	if got := m.resolver.Current(); got != modes.ModePlan {
+		t.Errorf("resolver mode = /%s, want /plan (untouched)", got)
+	}
+}
+
+// TestGateway_GenerationEpochDropsStaleRuntimeResult proves epoch isolation:
+// after handleCasualAutoUnwind increments generationEpoch, a RuntimeResultMsg
+// carrying the pre-unwind epoch is silently discarded.
+func TestGateway_GenerationEpochDropsStaleRuntimeResult(t *testing.T) {
+	m := readyChatModel(newTestModel())
+	m.resolver.Set(modes.ModePlan)
+	driveIntoPlanning(t, m)
+
+	epochBefore := m.generationEpoch
+	if !m.handleCasualAutoUnwind("hi") {
+		t.Fatal("expected casual unwind to consume 'hi'")
+	}
+	if m.generationEpoch <= epochBefore {
+		t.Fatalf("generationEpoch = %d, want > %d after unwind", m.generationEpoch, epochBefore)
+	}
+	if m.workflowSM.State() != workflow.StateIdle {
+		t.Fatalf("workflowSM.State() = %v, want StateIdle (unwound)", m.workflowSM.State())
+	}
+
+	before := recordsText(m)
+	staleErr := fmt.Errorf("stale-worker-marker-should-never-surface")
+	newModel, _ := m.Update(runtimeResultMsg{typ: appruntime.CommandSwitchMode, err: staleErr, Epoch: epochBefore})
+	m2 := newModel.(*model)
+	if after := recordsText(m2); after != before {
+		// The stale payload must not append any record.
+		if strings.Contains(after, "stale-worker-marker-should-never-surface") {
+			t.Errorf("stale RuntimeResultMsg was not dropped:\n%s", after)
+		} else if len(after) != len(before) {
+			t.Errorf("stale RuntimeResultMsg mutated records (before %d chars, after %d chars)", len(before), len(after))
+		}
+	}
+}
+
+// TestGateway_SentinelErrorClassification asserts isBackwardTransitionError
+// strictly evaluates errors.Is for the workflow sentinels and never falls
+// back to raw string matching.
+func TestGateway_SentinelErrorClassification(t *testing.T) {
+	// Wrapped sentinels MUST be recognized.
+	for _, sentinel := range []error{
+		workflow.ErrBackwardTransitionDisallowed,
+		workflow.ErrInvalidTransition,
+		workflow.ErrEventNotAllowed,
+	} {
+		wrapped := fmt.Errorf("outer context: %w", sentinel)
+		if !isBackwardTransitionError(wrapped) {
+			t.Errorf("isBackwardTransitionError(wrapped %v) = false, want true", sentinel)
+		}
+		if !errors.Is(wrapped, sentinel) {
+			t.Errorf("errors.Is sanity check failed for %v", sentinel)
+		}
+	}
+	// A plain error carrying the legacy message but no sentinel MUST NOT be
+	// recognized — this proves string matching is gone.
+	plain := errors.New("moving to a previous phase is not permitted")
+	if isBackwardTransitionError(plain) {
+		t.Errorf("isBackwardTransitionError(plain string-matched error) = true, want false (sentinel enforcement)")
+	}
+	if isBackwardTransitionError(nil) {
+		t.Error("isBackwardTransitionError(nil) = true, want false")
+	}
+	// Core machine rejections MUST be sentinel-backed.
+	m := readyChatModel(newTestModel())
+	driveIntoPlanning(t, m)
+	// Planning -> Review is not a valid event edge: must wrap ErrEventNotAllowed.
+	err := m.workflowSM.SendEvent(workflow.EventReview, workflow.TransitionContext{})
+	if err == nil {
+		t.Fatal("expected a transition rejection (Planning via Review), got nil")
+	}
+	if !errors.Is(err, workflow.ErrEventNotAllowed) {
+		t.Errorf("core rejection = %v, want errors.Is ErrEventNotAllowed", err)
+	}
+	if !isBackwardTransitionError(err) {
+		t.Errorf("isBackwardTransitionError(core rejection %v) = false, want true", err)
 	}
 }

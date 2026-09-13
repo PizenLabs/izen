@@ -305,7 +305,7 @@ func TestProgressCtrlCUsableDuringProviderWait(t *testing.T) {
 
 	// The status bar advertises that cancellation is available during the wait.
 	status := stripANSITest(m.renderRuntimeStatus(120))
-	if !strings.Contains(status, "Ctrl+C") {
+	if !strings.Contains(status, "^C stop") {
 		t.Fatalf("status bar does not advertise cancellation during provider wait: %q", status)
 	}
 

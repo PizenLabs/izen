@@ -185,24 +185,24 @@ func TestResponsiveFooterTiers(t *testing.T) {
 	}{
 		{
 			width:         120,
-			shouldContain: []string{modelName, "↓100", "↑50", "10%", cost, "[build]"},
+			shouldContain: []string{modelName, "↑100", "↓50", "10%", cost, "[build]"},
 			description:   "Tier1 Full >=100 contains all fields",
 		},
 		{
 			width:          85,
-			shouldContain:  []string{modelName, "↓100", "↑50", "10%", cost},
+			shouldContain:  []string{modelName, "↑100", "↓50", "10%", cost},
 			mustNotContain: []string{"[build]"},
 			description:    "Tier2 Standard 70-99 contains tok+ctx+cost without mode",
 		},
 		{
 			width:          55,
-			shouldContain:  []string{"↓100", "↑50"},
+			shouldContain:  []string{"↑100", "↓50"},
 			mustNotContain: []string{cost, "10%"},
 			description:    "Tier3 Compact 45-69 contains short model + tok only",
 		},
 		{
 			width:          35,
-			shouldContain:  []string{"↓100", "↑50"},
+			shouldContain:  []string{"↑100", "↓50"},
 			mustNotContain: []string{cost},
 			description:    "Tier4 Minimal <45 contains only tok",
 		},
