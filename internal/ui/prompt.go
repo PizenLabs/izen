@@ -6,12 +6,49 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/cursor"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 // ── Virtual Software Cursor (TTY render decoupling §1) ─────────────────────
+//
+// The input cursor is a purely in-band software cell — an always-reversed SGR
+// block — driven by a BI-MODAL controller:
+//
+//	SCROLL-FROZEN-ON: during a scroll burst the cursor FREEZES in the visible
+//	(ON) position — the static scroll frame renders the reversed block, so the
+//	prompt never loses its cursor while the viewport moves.
+//
+//	IDLE SOFTWARE BLINK: when the input is focused and no scroll is active the
+//	cell alternates visible/hidden every 500ms via the model-level
+//	cursorBlinkTickMsg. The real bubbles cursor stays pinned to CursorStatic
+//	(memoryless — Focus() arms no blink timer, no hardware ANSI sequences
+//	\x1b[?25h / \x1b[?25l, no CSI positioning); the phase is applied to a cheap
+//	CLONE of the textinput at render time, so the model's cursor state is never
+//	flipped by the blink loop.
+
+// cursorBlinkInterval is the idle software-blink half-cycle: the reversed
+// block alternates visible/hidden every 500ms while the input is focused and
+// idle. The scroll-frozen ON state can outlive it for the duration of the
+// burst — the window is never extended, only frozen.
+const cursorBlinkInterval = 500 * time.Millisecond
+
+// cursorBlinkTickMsg is the model-level software blink tick. It is a pure
+// internal timer — it never reaches bubbles' textinput/cursor state machine,
+// so no hardware ANSI and no bubbles blink-timer goroutine is ever involved.
+type cursorBlinkTickMsg time.Time
+
+// cursorBlinkTickCmd returns a tea.Cmd that emits cursorBlinkTickMsg after
+// cursorBlinkInterval. It is re-armed perpetually from Init (proTip-style)
+// while the input is focused; the handler short-circuits to nil when the
+// prompt loses focus or vi-mode owns the input region.
+func (m *model) cursorBlinkTickCmd() tea.Cmd {
+	return tea.Tick(cursorBlinkInterval, func(t time.Time) tea.Msg {
+		return cursorBlinkTickMsg(t)
+	})
+}
 
 // applyVirtualCursorMode pins the input cursor to the pure software cursor
 // contract: an always-reversed in-band SGR block cell that is memoryless
@@ -291,8 +328,9 @@ func RenderPasteBadgesStyled(text string) string {
 
 // invalidatePromptCache drops the memoized prompt frames (active and
 // static) so the next render recomputes. Call on keyboard input, cursor
-// moves, focus shifts, and cursor blink ticks — never on scroll or stream
-// messages.
+// moves, and focus shifts — never on scroll, stream messages, or the
+// software-blink tick itself (the blink phase is folded INTO the memo key, so
+// a phase flip naturally recomputes without an explicit invalidation).
 func (m *model) invalidatePromptCache() {
 	m.cachedPromptKey = ""
 	m.cachedPromptStaticKey = ""
@@ -300,37 +338,53 @@ func (m *model) invalidatePromptCache() {
 
 // renderPromptView returns the textinput view string with paste badges
 // rendered as styled pill badges. This is the ACTIVE input view: it carries
-// the live cursor for editing.
+// the live software cursor for editing.
+//
+// BI-MODAL BLINK: the cursor cell is rendered from a CLONE of m.ti with the
+// idle blink phase applied (Blink=false ⇔ the always-reversed SGR block; the
+// hidden phase renders the plain character so the cursor is invisible). The
+// real m.ti cursor is never mutated — it stays pinned to CursorStatic.
 //
 // PROMPT RENDER ISOLATION: the rendered line is memoized and re-generated
-// ONLY when prompt state actually changes (input text, cursor position, or
-// focus). Viewport scrolling (tea.MouseMsg) and stream token arrivals
-// (tokenMsg) reuse the cached frame directly, so the prompt never emits
-// cursor hide/show ANSI during viewport-only frame updates.
+// ONLY when prompt state actually changes (input text, cursor position,
+// focus, or blink phase). Viewport scrolling (tea.MouseMsg) and stream token
+// arrivals (tokenMsg) reuse the cached frame directly, so the prompt never
+// emits cursor hide/show ANSI during viewport-only frame updates. Scroll
+// frames bypass this view entirely (see renderPromptViewStatic).
 func (m *model) renderPromptView() string {
 	focus := "0"
 	if m.ti.Focused() {
 		focus = "1"
 	}
-	key := m.ti.Value() + "\x00" + strconv.Itoa(m.ti.Position()) + "\x00" + focus
+	phase := "0"
+	if m.cursorHiddenPhase {
+		phase = "1"
+	}
+	key := m.ti.Value() + "\x00" + strconv.Itoa(m.ti.Position()) + "\x00" + focus + "\x00" + phase
 	if m.cachedPromptKey == key && m.cachedPromptView != "" {
 		return m.cachedPromptView
 	}
+	tiCopy := m.ti
+	tiCopy.Cursor.Blink = m.cursorHiddenPhase
 	m.cachedPromptKey = key
-	m.cachedPromptView = RenderPasteBadgesStyled(m.ti.View())
+	m.cachedPromptView = RenderPasteBadgesStyled(tiCopy.View())
 	return m.cachedPromptView
 }
 
 // renderPromptViewStatic returns the SCROLL-SUPPRESSED static prompt view:
-// identical text and prompt prefix with hardware cursor codes stripped —
-// the cursor renders as nothing at all, so scroll frames emit zero cursor
-// positioning ANSI to stdout and the prompt stays visually frozen.
+// identical text and prompt prefix with the cursor FROZEN IN THE ON POSITION.
+// Unlike the old blur-suppressed frame (which dropped the cursor entirely
+// during scroll), the static frame renders the always-reversed SGR block so
+// the cursor stays visible while the viewport moves — with zero hardware
+// cursor codes and byte-stable output across the burst.
 //
 // It renders from a blurred CLONE of the textinput (textinput.Model is a
 // lock-free value struct; Blur on the copy flips focus without touching
-// m.ti), so the live input state — value, cursor position, blink timer —
-// is never mutated by a scroll frame. Memoized separately from the active
-// view; invalidated by the same prompt-state changes.
+// m.ti), then forces Blink=false so the frozen block never depends on the
+// idle blink phase. The live input state — value, cursor position, blink
+// phase — is never mutated by a scroll frame. Memoized separately from the
+// active view; the key excludes the blink phase so consecutive scroll frames
+// reuse one byte-identical frame.
 func (m *model) renderPromptViewStatic() string {
 	key := m.ti.Value() + "\x00" + strconv.Itoa(m.ti.Position())
 	if m.cachedPromptStaticKey == key && m.cachedPromptStaticView != "" {
@@ -338,6 +392,7 @@ func (m *model) renderPromptViewStatic() string {
 	}
 	tiCopy := m.ti
 	tiCopy.Blur()
+	tiCopy.Cursor.Blink = false // frozen-ON reversed block
 	m.cachedPromptStaticKey = key
 	m.cachedPromptStaticView = RenderPasteBadgesStyled(tiCopy.View())
 	return m.cachedPromptStaticView

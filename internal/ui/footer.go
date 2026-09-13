@@ -24,14 +24,17 @@ import (
 //	   No token counters, no cost, no zero-value indicators — a brand-new
 //	   session never clutters the footer with idle telemetry.
 //	b. EXECUTING     (isExecuting)
-//	   Live stream bar: "⠋ Generating...  ·  ↓<live_tok> tok ($<live_cost>)  ·  <rate> tok/s
-//	   ·  [model]  ·  Ctrl+C interrupt" seeded at t=0 as 0 tok ($C_in).
-//	   The spinner pulses cyan→amber. The instant
-//	   execution ends, isExecuting() flips false and the bar is replaced —
-//	   'Ctrl+C interrupt' and the '⏸' icon never survive past completion.
+//	   Live stream bar: "⠋ Generating...  ·  ↑<in> in ↓<out> out (<cost>)  ·  <rate> tok/s
+//	   ·  [model]  ·  ^C stop" seeded at t=0 as "↑C_in in · ↓0 out". The token
+//	   slots and rate are fixed-width (no horizontal jitter), and the "^C stop"
+//	   interrupt badge is the LAST segment to ever be dropped when the pane
+//	   narrows (see footerDropToFit). The spinner pulses cyan→amber. The
+//	   instant execution ends, isExecuting() flips false and the bar is
+//	   replaced — '^C stop' never survives past completion.
 //	c. ACTIVE SESSION IDLE (sessionHasRunPrompts && !isExecuting)
 //	   Persistent refined telemetry anchored on the active model name:
-//	   "<Model>  ·  ↓<in> + ↑<out> tok (<ctx_pct>%)  ·  <Cost>".
+//	   "<Model>  ·  ↑<in> in · ↓<out> out (<ctx_pct>%)  ·  <Cost>".
+//	   ↑ = input tokens, ↓ = output tokens (explicit input/output separation).
 //	   The Mode Badge belongs EXCLUSIVELY to the Top Bar right side — it never
 //	   appears in the footer.
 //
@@ -84,7 +87,7 @@ func (m *model) renderFixedFooter(width int, actions []Action) string {
 	var s string
 	switch {
 	case m.isExecuting():
-		s = m.renderExecutingFooter()
+		s = m.renderExecutingFooter(width)
 	case !m.sessionHasRunPrompts:
 		s = m.renderFreshLaunchFooter()
 	default:
@@ -187,26 +190,28 @@ func (m *model) getActiveModelDisplay() string {
 // core specified in the task. It is a pure function that strictly respects
 // the available terminal width (termWidth):
 //
-//	Tier 1: Full Width >= 100  →  model  ·  ↓in + ↑out tok (pct%)  ·  cost  ·  [mode]
-//	Tier 2: Standard 70..99     →  model  ·  ↓in + ↑out tok (pct%)  ·  cost
-//	Tier 3: Compact 45..69      →  shortModel  ·  ↓in + ↑out tok
-//	Tier 4: Minimal <45         →  ↓in + ↑out tok
+//	Tier 1: Full Width >= 100  →  model  ·  ↑in in · ↓out out (pct%)  ·  cost  ·  [mode]
+//	Tier 2: Standard 70..99     →  model  ·  ↑in in · ↓out out (pct%)  ·  cost
+//	Tier 3: Compact 45..69      →  shortModel  ·  ↑in in · ↓out out
+//	Tier 4: Minimal <45         →  ↑in in · ↓out out
 //
 // The returned string is strictly truncated or padded to exactly width.
 func renderActiveIdleFooter(width int, modelName string, inTok, outTok int, ctxPct float64, cost string, mode string) string {
+	in := statusArrowIn(status.FormatTokens(inTok))
+	out := statusArrowOut(status.FormatTokens(outTok))
 	var s string
 	switch {
 	case width >= 100:
-		s = fmt.Sprintf("%s  ·  ↓%d + ↑%d tok (%d%%)  ·  %s  ·  [%s]", modelName, inTok, outTok, int(ctxPct), cost, mode)
+		s = fmt.Sprintf("%s  ·  %s in · %s out (%d%%)  ·  %s  ·  [%s]", modelName, in, out, int(ctxPct), cost, mode)
 	case width >= 70:
-		s = fmt.Sprintf("%s  ·  ↓%d + ↑%d tok (%d%%)  ·  %s", modelName, inTok, outTok, int(ctxPct), cost)
+		s = fmt.Sprintf("%s  ·  %s in · %s out (%d%%)  ·  %s", modelName, in, out, int(ctxPct), cost)
 	default:
 		// Compact and minimal share the shortModel helper for 45..69.
 		if width >= 45 {
 			shortModel := truncateModelName(modelName, 12)
-			s = fmt.Sprintf("%s  ·  ↓%d + ↑%d tok", shortModel, inTok, outTok)
+			s = fmt.Sprintf("%s  ·  %s in · %s out", shortModel, in, out)
 		} else {
-			s = fmt.Sprintf("↓%d + ↑%d tok", inTok, outTok)
+			s = fmt.Sprintf("%s in · %s out", in, out)
 		}
 	}
 	return fitToWidth(s, width)
@@ -227,19 +232,20 @@ func (m *model) renderFreshLaunchFooter() string {
 // width so split-pane layouts never cause wrapping:
 //
 //	Tier 1 >=100: full model + usage (with pct) + cost
-//	Tier 2 70-99: same as tier 1 (standard)
-//	Tier 3 45-69: short model (12 cells) + compact tok (no pct, no cost)
-//	Tier 4 <45:   minimal tok only
+//	Tier 2 70-99: same tier 1 + chip overlay
+//	Tier 3 45-69: short model (12 cells) + compact usage (↑in · ↓out)
+//	Tier 4 <45:   minimal usage only (↑in · ↓out)
 //
-// The Mode Badge is deliberately absent — the Top Bar owns it. 'Ctrl+C
-// interrupt' and the '⏸' icon are never present here. The caller
+// Both compact and full usage render via the canonical status formatters
+// (↑ = input, ↓ = output). The Mode Badge is deliberately absent — the Top
+// Bar owns it. '^C stop' and the '⏸' icon are never present here. The caller
 // (renderFixedFooter) enforces the final exact-width fit via fitToWidth.
 func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
 	cost := llm.EnforceFreeModelOverride(m.cfg.ActiveModelName(), m.AccumulatedCost)
 	costStr := llm.FormatCost(cost)
 	modelName := m.getActiveModelDisplay()
 	fullUsage := status.FormatUsageContext(m.InputTokens, m.OutputTokens, m.TotalTokens, m.activeContextLimit())
-	compactTok := "↓" + status.FormatTokens(m.InputTokens) + " + ↑" + status.FormatTokens(m.OutputTokens) + " tok"
+	compactTok := status.FormatUsageValues(m.InputTokens, m.OutputTokens)
 
 	var base string
 	switch {
@@ -350,37 +356,40 @@ func (m *model) noFirstByteReceived() bool {
 	return true
 }
 
-// renderExecutingFooter renders the live EXECUTING bar:
+// renderExecutingFooter renders the live EXECUTING bar, width-aware:
 //
 //	pre-TTFT (no first token yet):
-//	  ⠋ Connecting... 14s [groq/llama-3.3-70b]  ·  Ctrl+C interrupt
+//	  ⠋ Connecting... 14s [groq/llama-3.3-70b]  ·  ^C stop
 //	post-first-token (live cost burn):
-//	  ⠋ Generating...  ·  ↓<tok> tok ($<cost>)  ·  <rate> tok/s  ·  [model]  ·  Ctrl+C interrupt
+//	  ⠋ Generating...  ·  ↑<in> in ↓<out> out ($<cost>)  ·  <rate> tok/s  ·  [model]  ·  ^C stop
 //
-// The pre-TTFT countdown renders on every FrameTickMsg (30ms) while the
-// first byte is awaited and freezes the moment it arrives. It counts DOWN
-// the dynamic TTFT deadline (ttftDuration: 15s fast models, up to 90s for
-// reasoning/free-tier) as a single integer — stable width, no decimal
-// flicker. remaining = max(0, ttft - elapsed); when it reaches 0 before
-// headers arrive the stall error path reports
-// "provider response stalled: TTFT timeout (<ttft>s elapsed)". Phase
-// details (DNS/TLS/headers) appear exclusively in that error event log.
+// ↑ = input tokens, ↓ = output tokens; the in/out slots are fixed-width so
+// the metric line never jitters while counts grow. The pre-TTFT countdown
+// renders on every FrameTickMsg (30ms) while the first byte is awaited and
+// freezes the moment it arrives. It counts DOWN the dynamic TTFT deadline
+// (ttftDuration: 15s fast models, up to 90s for reasoning/free-tier) as a
+// single integer — stable width, no decimal flicker. remaining = max(0,
+// ttft - elapsed); when it reaches 0 before headers arrive the stall error
+// path reports "provider response stalled: TTFT timeout (<ttft>s elapsed)".
 // The live tok count is max(authoritative provider stage count, per-chunk
-// live estimate) so the meter advances on every StreamChunkMsg; the cost is
+// live estimate) so the meter advances on every chunk; the cost is
 // C_est = (T_in*P_in + T_out*P_out)/1M seeded at t=0 with 0 output tokens
-// (Generating... 0 tok ($C_in) 0.0 tok/s, $free when pricing is 0). This bar
-// exists strictly while an operation is in flight; on completion it is
-// replaced wholesale, so 'Ctrl+C interrupt' / '⏸' can never linger.
+// ($free when pricing is 0). This bar exists strictly while an operation is
+// in flight; on completion it is replaced wholesale, so '^C stop' can never
+// linger. When narrow, footerDropToFit drops segments in priority order
+// (model → rate → tokens) and the '^C stop' badge is always last to drop.
 // When in StateRetrying (retryInfo != nil), an explicit retry banner is shown
 // instead of hanging on "Generating...": "[Retry N/M] <error>. Retrying in Xs..."
-func (m *model) renderExecutingFooter() string {
+func (m *model) renderExecutingFooter(width int) string {
+	// The interrupt badge is drop-proof: computed once, shared by all paths.
+	stop := interruptLabelStyle.Render(stopBadge)
 	// Retry state takes precedence: show explicit banner, not stale generating.
 	if m.retryInfo != nil {
 		banner := formatRetryBanner(m.retryInfo)
-		return footerSep(
-			m.executingSpinner()+" "+footerExecLabelStyle.Render(banner),
-			interruptLabelStyle.Render(Icon.Interrupt+" Ctrl+C interrupt"),
-		)
+		return footerDropToFit(width, []string{
+			m.executingSpinner() + " " + footerExecLabelStyle.Render(banner),
+			stop,
+		})
 	}
 	st := m.stageSnapshot()
 	// Pre-TTFT connection phase: single-number countdown against the
@@ -403,30 +412,54 @@ func (m *model) renderExecutingFooter() string {
 		}
 		pulse := fmt.Sprintf("Connecting... %ds [%s]",
 			remaining, truncateModelName(m.ttftProviderModelLabel(), 24))
-		return footerSep(
-			m.executingSpinner()+" "+footerExecLabelStyle.Render(pulse),
-			interruptLabelStyle.Render(Icon.Interrupt+" Ctrl+C interrupt"),
-		)
+		return footerDropToFit(width, []string{
+			m.executingSpinner() + " " + footerExecLabelStyle.Render(pulse),
+			stop,
+		})
 	}
 	modelName := m.getActiveModelDisplay()
 	liveOut := m.streamLiveOutputTokens()
 	costLabel := m.streamCostLabel()
-	// FIXED-WIDTH METRICS: pre-allocate character widths for the token
-	// count and rate segments so the footer never shifts or wraps while
-	// streaming. Right-padding keeps widths deterministic as counts grow.
-	// Only the count/rate cores are padded (not the cost/model tails) so
-	// the total line still fits narrow panes; the caller fitToWidth caps it.
-	tokCount := padFixedWidth("↓"+status.FormatTokens(liveOut)+" tok", execTokCountWidth)
-	tokSeg := tokCount + " (" + costLabel + ")"
+	// FIXED-WIDTH METRICS: the in/out token slots and the rate segment are
+	// padded to deterministic widths so the bar never shifts while counts
+	// grow. Cost rides inside the token segment (feature-preserving); the
+	// model badge truncates at 12 cells. footerDropToFit strips the least
+	// critical trailing segments when the pane narrows.
+	tokIn := padFixedWidth(statusArrowIn(status.FormatTokens(m.streamBaseInputTokens))+" in", execInSlotWidth)
+	tokOut := padFixedWidth(statusArrowOut(status.FormatTokens(liveOut))+" out", execOutSlotWidth)
+	tokSeg := tokIn + " " + tokOut + " (" + costLabel + ")"
 	rateSeg := padFixedWidth(formatTokenRate(m.streamTokenRate(st))+" tok/s", execRateSegmentWidth)
-	return footerSep(
-		m.executingSpinner()+" "+footerExecLabelStyle.Render("Generating..."),
+	return footerDropToFit(width, []string{
+		m.executingSpinner() + " " + footerExecLabelStyle.Render("Generating..."),
 		footerTokStyle.Render(tokSeg),
 		footerExecMetaStyle.Render(rateSeg),
-		footerModelStyle.Render("["+truncateModelName(modelName, 16)+"]"),
-		interruptLabelStyle.Render(Icon.Interrupt+" Ctrl+C interrupt"),
-	)
+		footerModelStyle.Render("[" + truncateModelName(modelName, 12) + "]"),
+		stop,
+	})
 }
+
+// footerDropToFit renders a footer line from ordered segments, preserving the
+// LAST segment ('^C stop') as the drop-proof anchor: whenever the joined line
+// exceeds width, the least critical segment is dropped (model badge → rate →
+// token telemetry) and the line re-measured. The return value never exceeds
+// width — fitToWidth truncates only in the extreme sub-30-cell panes where
+// even the bare spinner+badge pair overflows.
+func footerDropToFit(width int, segments []string) string {
+	for len(segments) > 2 {
+		line := footerSep(segments...)
+		if lipgloss.Width(line) <= width {
+			return fitToWidth(line, width)
+		}
+		segments = append(segments[:len(segments)-2], segments[len(segments)-1])
+	}
+	return fitToWidth(footerSep(segments...), width)
+}
+
+// statusArrowIn and statusArrowOut prefix a formatted token count with the
+// explicit input/output glyph contract: ↑ = input (prompt), ↓ = output
+// (completion).
+func statusArrowIn(n string) string  { return "↑" + n }
+func statusArrowOut(n string) string { return "↓" + n }
 
 // executingSpinner renders the braille spinner frame with a cyan→amber
 // pulsation, signalling live background activity during EXECUTING.
@@ -497,12 +530,22 @@ func formatTokenRate(rate float64) string {
 // ── FIXED-WIDTH STATUS METRICS (streaming-scroll decoupling) ─────────────
 // Token counts and tok/s rates are padded to deterministic cell widths so the
 // executing footer never shifts horizontally while text streams. Padding is
-// trailing (right-pad) so existing substrings ("↓128 tok", "12.8", "tok/s")
-// remain intact for tests and the line never wraps mid-stream.
+// trailing (right-pad) so existing substrings ("↑128 in", "12.8", "tok/s")
+// remain intact for tests and the line never wraps mid-stream. The in/out
+// slots carry the explicit ↑/↓ input/output label (arrow + " in"/" out"); the
+// rate slot and the drop-proof "^C stop" interrupt badge complete the bar.
 const (
-	execTokCountWidth    = 10 // e.g. "↓128 tok" (8 cells) + pad; covers "↓12.3k tok"
+	execTokCountWidth    = 10 // legacy: "↓128 tok" (8 cells) + pad; covers "↓12.3k tok"
 	execRateSegmentWidth = 11 // e.g. "12.8 tok/s" (10 cells) + pad
+	execInSlotWidth      = 11 // fixed-width "↑12.3k in" slot (10 cells) + pad
+	execOutSlotWidth     = 11 // fixed-width "↓12.3k out" slot (10 cells) + pad
 )
+
+// stopBadge is the compact interrupt affordance that anchors the executing
+// footer's right edge. It replaces the legacy "⏸ Ctrl+C interrupt" pair —
+// one badge, both the hint and the escape hatch, and the LAST segment a
+// width-aware executing footer ever drops (see footerDropToFit).
+const stopBadge = "^C stop"
 
 // padFixedWidth right-pads s with spaces to exactly w cells (cell-aware).
 // Longer strings are returned unchanged (the caller fitToWidth truncates).

@@ -13,9 +13,11 @@ import (
 
 // TestPromptCursorSuppression pins the dual-mode prompt contract: while a
 // scroll burst is active (lastScrollTime watermark) every frame renders the
-// cursor-suppressed static view (zero cursor ANSI, byte-stable across frames,
-// input state untouched), and the watermark expiry restores the active view
-// on the next natural render — with zero timers.
+// cursor-FROZEN static view (cursor pinned ON as a reverse-video SGR block,
+// byte-stable across frames, input state untouched), and the watermark expiry
+// restores the active blink-mode view on the next natural render — with zero
+// timers. The blink phase is folded into the active view's memo key, so a
+// scroll frame can never be rewritten by a mid-burst phase flip.
 func TestPromptCursorSuppression(t *testing.T) {
 	// Cursor styling is a no-op under the test env's ASCII color profile;
 	// force TrueColor so cursor ANSI is observable in the assertions.
@@ -27,15 +29,23 @@ func TestPromptCursorSuppression(t *testing.T) {
 	m.applyVirtualCursorMode()
 	m.ti.SetValue("ask hello")
 	m.ti.Focus()
-	// Focused with a memoryless software cursor, the active view carries the
-	// reverse-video cursor block; the static view (blurred clone) renders it
-	// plain. No synthetic blink injection: with the cursor pinned to
-	// CursorStatic, cursor.BlinkMsg cannot flip its phase.
+	// Focused with a memoryful idle blink parked at the HIDDEN half-cycle,
+	// the active view renders the cursor plain (invisible); the static
+	// scroll frame FREEZES it ON as a reverse-video block. Pinning the
+	// phase true makes the two modes observably distinct — the dual-mode
+	// contract: one cursor, one of two deterministic presentations.
+	m.cursorHiddenPhase = true
 
 	active := m.renderPromptView()
 	static := m.renderPromptViewStatic()
 	if active == static {
 		t.Fatalf("dual-mode prompt requires distinct active/static frames, both %q", active)
+	}
+	if !strings.Contains(static, "\x1b[7m") {
+		t.Fatalf("static frame must freeze the cursor ON as a reverse-video block: %q", static)
+	}
+	if strings.Contains(active, "\x1b[7m") {
+		t.Fatalf("hidden-phase active frame must render the cursor plain (invisible): %q", active)
 	}
 	val, pos, focused := m.ti.Value(), m.ti.Position(), m.ti.Focused()
 
@@ -260,9 +270,13 @@ func TestFastPathViewportAssembly(t *testing.T) {
 }
 
 // TestVirtualSoftwareCursor pins the TTY decoupling §1 contract: the prompt
-// cursor is a pure in-band SGR cell — always-reversed block, no blink timer,
-// no hardware cursor sequences (\x1b[?25h/\x1b[?25l) and no CSI positioning —
-// stable across synthetic blink ticks.
+// cursor is a pure in-band SGR cell — reverse-video block in the visible
+// phase, plain character in the hidden phase, no hardware cursor sequences
+// (\x1b[?25h/\x1b[?25l) and no CSI positioning — with the phase toggled ONLY
+// by the model-level cursorBlinkTickMsg. bubbles' own cursor.BlinkMsg must
+// not disturb the presentation (the active view renders from a clone whose
+// Blink flag is driven by cursorHiddenPhase), and the static scroll frame
+// freezes the cursor in the ON position independently of the blink phase.
 func TestVirtualSoftwareCursor(t *testing.T) {
 	prev := lipgloss.ColorProfile()
 	lipgloss.SetColorProfile(termenv.TrueColor)
@@ -292,20 +306,37 @@ func TestVirtualSoftwareCursor(t *testing.T) {
 		t.Errorf("active prompt must render the cursor as a reverse-video SGR block: %q", out)
 	}
 
-	// Memoryless: synthetic blink ticks must not flip the cursor phase.
+	// bubbles' own blink message must not sway the presentation: the active
+	// frame is cloned with Blink sourced from cursorHiddenPhase, so the
+	// underlying ti flag stays irrelevant to what renders.
 	first := m.renderPromptView()
 	for i := 0; i < 3; i++ {
 		_, _ = m.Update(cursor.BlinkMsg{})
 	}
 	if got := m.renderPromptView(); got != first {
-		t.Errorf("software cursor must be stable across blink ticks\nbefore: %q\nafter: %q", first, got)
+		t.Errorf("software cursor presentation must be stable across bubbles blink messages\nbefore: %q\nafter: %q", first, got)
 	}
 
-	// Static (scroll-suppressed) clone renders the SAME text WITHOUT the
-	// reverse-video block — frozen, byte-stable.
+	// The model-level idle blink toggles the phase while focused and idle.
+	if !m.cursorHiddenPhase {
+		_, _ = m.Update(cursorBlinkTickMsg(time.Now()))
+		if !m.cursorHiddenPhase {
+			t.Error("cursorBlinkTickMsg must flip the hidden phase while focused")
+		}
+	}
+	hidden := m.renderPromptView()
+	if strings.Contains(hidden, "\x1b[7m") {
+		t.Errorf("hidden-phase active frame must render the cursor plain: %q", hidden)
+	}
+	if hidden == first {
+		t.Errorf("hidden-phase frame must differ from the visible-phase frame: %q", hidden)
+	}
+
+	// Static (scroll-suppressed) clone FREEZES the cursor ON as a
+	// reverse-video block regardless of the phase — byte-stable, frozen.
 	static := m.renderPromptViewStatic()
-	if static == first {
-		t.Fatal("static prompt view must drop the active cursor block")
+	if !strings.Contains(static, "\x1b[7m") {
+		t.Fatal("static prompt view must freeze the cursor ON as a reverse-video SGR block")
 	}
 	for i := 0; i < 3; i++ {
 		if got := m.renderPromptViewStatic(); got != static {

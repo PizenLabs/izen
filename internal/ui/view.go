@@ -832,10 +832,11 @@ func (m *model) renderRuntimeStatus(width int) string {
 	// AI INTERRUPT ENGINE: high-visibility indicator that Ctrl+C is available
 	// while ANY execution operation is in flight (streaming, provider wait,
 	// agent run, patch generation, shell). Cancellation must be discoverable,
-	// not implied.
+	// not implied. The compact '^C stop' badge matches the executing footer
+	// affordance so both surfaces speak the same interrupt language.
 	if m.streaming || m.shellRunning || m.agentRunning || m.reviewRunning ||
 		m.pipelineRunning || m.planPending || m.activeOp != nil {
-		b.WriteString(interruptLabelStyle.Render(Icon.Interrupt + " Ctrl+C interrupt "))
+		b.WriteString(interruptLabelStyle.Render(stopBadge + " "))
 	}
 
 	// Agent label — shown immediately after the spinner, before model name

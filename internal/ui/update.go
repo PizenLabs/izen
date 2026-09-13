@@ -65,13 +65,14 @@ func (m *model) Init() tea.Cmd {
 	// during rapid scroll; all cursor rendering is via soft view cursors.
 	hideCursor := tea.HideCursor
 	if m.initStage != initNone && m.initStage != initComplete {
-		return tea.Batch(hideCursor, m.smoothStreamTickCmd(), m.proTipTickCmd(), m.configLoadedCmd())
+		return tea.Batch(hideCursor, m.smoothStreamTickCmd(), m.proTipTickCmd(), m.cursorBlinkTickCmd(), m.configLoadedCmd())
 	}
 	cmds := []tea.Cmd{
 		hideCursor,
 		m.smoothStreamTickCmd(),
 		m.proTipTickCmd(),
 		m.ti.Focus(),
+		m.cursorBlinkTickCmd(),
 		m.initSessionStartCheckpoint,
 		m.configLoadedCmd(),
 	}
@@ -809,6 +810,24 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		m.refreshViewportContent()
 		return m, m.proTipTickCmd()
+
+	case cursorBlinkTickMsg:
+		// ── IDLE SOFTWARE BLINK (bi-modal cursor) ──────────────────
+		// The 500ms model-level tick toggles the cursor phase ONLY while the
+		// prompt is focused, idle, and NOT mid-scroll: an active scroll burst
+		// FREEZES the cursor in the visible ON position (the scroll frame
+		// renders renderPromptViewStatic in-place), and a phase flip would
+		// rewrite the frozen static frame. Vi-mode and active mouse selection
+		// own the input region, so the blink stays suppressed there too. The
+		// phase is folded into renderPromptView's memo key, so a flip
+		// naturally recomputes the active frame without invalidating the
+		// scroll-frozen static cache. The tick re-arms perpetually (proTip
+		// style) so the blink resumes the moment the prompt regains focus —
+		// no per-focus-site arming.
+		if m.ti.Focused() && !m.inViMode && !m.mouseSel.Active && !m.isScrollActive() {
+			m.cursorHiddenPhase = !m.cursorHiddenPhase
+		}
+		return m, m.cursorBlinkTickCmd()
 
 	case agentStartMsg:
 		m.agentRunning = true
@@ -2250,6 +2269,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case FrameTickMsg:
+		// ── FRAME-LOCKED RING DRAIN (engine→UI decoupling) ─────────
+		// The master 30FPS frame tick is the single point where overflow
+		// tokens parked in the lock-free ring by the non-blocking producer
+		// re-join the rendering pipeline. Each drained chunk appends to the
+		// SAME utf8StreamBuf/throttle buffers the flush below drains, so the
+		// pass stays single-FIFO and the repaint stays single-flight.
+		m.drainStreamRing()
 		// ── DEBOUNCED FRAME TICKER (30ms / ~33 FPS) ─────────────────────
 		// STREAM BUFFER CONTRACT: Option A — Cumulative Overwrite.
 		// StreamBuffer.ReadValidString() returns the FULL accumulated string
@@ -2543,12 +2569,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// "streaming" (never "thinking"), without exposing the reasoning text.
 		// NO token count is asserted here: only the producer's authoritative
 		// streamUsageMsg (provider-reported usage) may populate the count.
-		// The live tok/s estimate advances on every reasoning chunk so the
-		// footer rate meter stays live while thinking streams.
 		sanitizedThinking := SanitizeForIngest(string(msg))
-		m.streamLiveTokens += estimateStreamTokens(sanitizedThinking)
-		m.setStage("model", m.getActiveModelName(), stageStreaming)
-		m.ensureStreamBlocks().Append(KindThinking, sanitizedThinking)
+		m.ingestThinkingToken(sanitizedThinking)
 		// Full stream transparency: the reasoning chunk is also retained in the
 		// active ThinkingBuffer via the ThoughtBufferUpdatedMsg protocol so the
 		// Ctrl+O thought drawer renders it live. The repaint is throttled to
@@ -2570,60 +2592,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		//
 		// FRAME-THROTTLED EMISSION: raw token chunks are written through the
 		// StreamThrottle which enforces a 16ms (≈60FPS) minimum frame interval.
-		// The smoothStreamTick handler then flushes word-aligned content from
-		// the throttle buffer instead of draining streamBuffer directly. This
-		// eliminates layout snapping caused by dumping raw buffer chunks.
 		// IMPORTANT: markdown AST parsing and table width layout recalculation
 		// MUST NOT be invoked here. Token reception only appends to the
 		// UTF-8 safe StreamBuffer and the throttle; rendering is driven by
 		// FrameTickMsg (30ms) via ReadValidString() with updated==true gate.
 		raw := SanitizeForIngest(string(msg))
-		// SMOOTH CLEARING: the first content token replaces the shimmer
-		// loading line with the streaming output. The shimmer tick loop stops
-		// itself on the next frame, so no animation frame ever bleeds into
-		// the rendered answer.
-		if raw != "" && m.shimmerActive {
-			m.stopShimmer()
-		}
-		m.responseBuffer.WriteString(raw)
-		// ── AUTHORITATIVE STAGE: real provider tokens are arriving ──
-		// Only content bytes received from the provider mark the stage as
-		// streaming. The token count is NEVER derived from the response
-		// buffer length — it is populated only by the producer's authoritative
-		// streamUsageMsg (provider-reported usage). The live tok/s estimate
-		// advances on every content chunk (estimate only, never the count).
-		m.streamLiveTokens += estimateStreamTokens(raw)
-		// Inter-token idle deadline: once the first byte arrives, arm a
-		// rolling streamInterTokenIdle (30s) deadline, reset on every chunk.
-		// A continuous generation never trips it; only a stalled socket
-		// does (mirrors the IdleTimeoutReader watchdog on the byte path).
-		if raw != "" && m.streamCancel != nil && m.streamInterTokenDeadline.IsZero() {
-			m.streamInterTokenDeadline = time.Now().Add(streamInterTokenIdle)
-		} else if raw != "" && !m.streamInterTokenDeadline.IsZero() {
-			m.streamInterTokenDeadline = time.Now().Add(streamInterTokenIdle)
-		}
-
-		if raw != "" {
-			m.setStage("model", m.getActiveModelName(), stageStreaming)
-		}
-		m.traceBuffer.WriteString(raw)
-		// UTF-8 safe byte buffer (Option A cumulative source of truth):
-		// while utf8StreamBuf is active it is the SOLE content emitter
-		// (drained by FrameTickMsg). Raw tokens are appended ONLY here —
-		// never additionally to the throttle/legacy buffers — so no byte
-		// can be emitted twice. The throttle/legacy paths are strictly
-		// fallbacks for harnesses with no utf8 buffer.
-		switch {
-		case m.utf8StreamBuf != nil:
-			m.utf8StreamBuf.Append([]byte(raw))
-		case m.streamThrottle != nil:
-			m.streamThrottle.Write(raw)
-		default:
-			m.streamBuffer += raw
-		}
-		if m.streamParser != nil {
-			m.streamParser.ProcessChunk(raw)
-		}
+		m.ingestContentToken(raw)
 		var cmds []tea.Cmd
 		if m.execStreaming {
 			cmds = append(cmds, m.readExecStream())
@@ -2655,23 +2629,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// The provider reported a usage update while the stream is live. Feed
 		// ONLY that authoritative count into the streaming indicator — never a
 		// character-count estimate. A zero/unknown usage leaves the count
-		// empty so the renderer shows plain "streaming". The reasoning split
-		// also backs the compact thought summary so its "N tokens" is
-		// provider-reported, not estimated. The live tok/s estimate is
-		// floored by the authoritative total (output + reasoning) so the
-		// rate meter reflects reasoning tokens too.
-		m.setStageMetrics(0, 0, msg.output)
-		if total := msg.output + msg.reasoning; total > m.streamLiveTokens {
-			m.streamLiveTokens = total
-		}
-		// Authoritative prompt count replaces the t=0 chars/4 estimate so
-		// C_est converges on billed input tokens mid-stream.
-		if msg.input > 0 {
-			m.streamBaseInputTokens = msg.input
-		}
-		if m.thinkingBuffer != nil && msg.reasoning > 0 {
-			m.thinkingBuffer.SetReasoningTokens(msg.reasoning)
-		}
+		// empty so the renderer shows plain "streaming".
+		m.ingestStreamUsage(msg.input, msg.output, msg.reasoning)
 		// The usage message was pulled off the stream channel — chain the next
 		// read so the token/done messages behind it keep flowing.
 		if m.execStreaming {
@@ -2681,6 +2640,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 	case streamDoneMsg:
 		// ── AUTHORITATIVE STAGE: provider stream completed ─────────
+		// NO-TOKEN-LEFT-BEHIND: flush any ring-overflow tokens before the
+		// terminal teardown so a burst parked under full-channel backpressure
+		// is fully rendered before the stage resolves.
+		m.drainStreamRing()
 		// A terminal stream is done; the stage can never linger as "streaming".
 		m.setStage("model", m.getActiveModelName(), stageDone)
 		// Freeze Thought duration timer upon stream completion.
@@ -2706,6 +2669,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 
 		m.streamCh = nil
+		m.streamRing = nil
 		m.streaming = false
 		m.streamCancel = nil
 		// Clean up the inter-token timeout timer and deadline.
@@ -3215,11 +3179,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// OPERATION LIFECYCLE: a stream error must release any in-flight
 		// build-patch operation (defensive; streams normally run without one).
 		m.finalizeBuildOperation(msg.err)
+		// NO-TOKEN-LEFT-BEHIND: flush ring-overflow tokens so a mid-stream
+		// failure preserves every rendered byte up to the error.
+		m.drainStreamRing()
 		// ── AUTHORITATIVE STAGE: provider stream failed ─────────────
 		// A terminal stream failure marks the stage failed so no "waiting" /
 		// "streaming" indicator can survive the error.
 		m.setStage("model", m.getActiveModelName(), stageFailed)
 		m.streamCh = nil
+		m.streamRing = nil
 		m.streaming = false
 		m.streamParser = nil
 		m.streamCancel = nil

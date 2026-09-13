@@ -172,7 +172,8 @@ func buildQuietTraceLine(s string) string {
 }
 
 // buildQuietTraceLineWithTokens is the Turn-aware variant. When TurnTokens >0
-// it appends ` · ↓in + ↑out tok` before the toggle hint. Zero means no API call.
+// it appends ` · ↑in in · ↓out out` before the toggle hint. Zero means no API
+// call. ↑ = input, ↓ = output (the shared status-bar glyph convention).
 func buildQuietTraceLineWithTokens(s string, turnIn, turnOut int) string {
 	base := buildQuietTraceLine(s)
 	if turnIn <= 0 && turnOut <= 0 {
@@ -182,7 +183,7 @@ func buildQuietTraceLineWithTokens(s string, turnIn, turnOut int) string {
 	const suffix = " · Alt+E to toggle"
 	if strings.HasSuffix(base, suffix) {
 		prefix := strings.TrimSuffix(base, suffix)
-		return fmt.Sprintf("%s · ↓%s + ↑%s tok%s", prefix, formatTokensCompact(turnIn), formatTokensCompact(turnOut), suffix)
+		return fmt.Sprintf("%s · ↑%s in · ↓%s out%s", prefix, formatTokensCompact(turnIn), formatTokensCompact(turnOut), suffix)
 	}
 	return base
 }

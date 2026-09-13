@@ -801,8 +801,17 @@ type model struct {
 	PreRenderedHistory string
 
 	// Streaming
-	streamCh        chan tea.Msg
-	execStreamCh    chan tea.Msg
+	streamCh     chan tea.Msg
+	execStreamCh chan tea.Msg
+	// streamRing is the lock-free overflow ring for the engine→UI token
+	// channel. The producer goroutine WRITES through a non-blocking send:
+	// when the bounded channel is temporarily full (UI event-loop
+	// backpressure) the token is pushed here instead of blocking the LLM
+	// thread. The UI drains the ring in its frame-flush pass (FrameTickMsg)
+	// and in every terminal stream handler, so no byte is ever lost. It is
+	// only ever accessed via atomic ops from the producer's captured
+	// reference and from the main Update goroutine.
+	streamRing      *streamRing
 	responseBuffer  strings.Builder
 	reasoningBuffer strings.Builder
 	streaming       bool
@@ -862,7 +871,7 @@ type model struct {
 	CheckpointID    string
 
 	// TurnTokens is the prompt/completion count for the latest API turn
-	// (e.g. ↓433 + ↑581). SessionTokens (InputTokens/OutputTokens/TotalTokens)
+	// (e.g. ↑433 in · ↓581 out). SessionTokens (InputTokens/OutputTokens/TotalTokens)
 	// is the cumulative total across the entire session.
 	TurnInputTokens  int
 	TurnOutputTokens int
@@ -1194,6 +1203,16 @@ type model struct {
 	// Viewport scroll tracking: when the user scrolls up to inspect code,
 	// auto-scroll to bottom is suppressed until SPACE or a new message.
 	userIsScrollingUp bool
+
+	// ── Bi-modal software cursor state ─────────────────────────────────
+	// cursorHiddenPhase is the IDLE software-blink phase: true = the cursor
+	// cell is currently in the HIDDEN (invisible) half-cycle. The zero value
+	// (false = visible reversed block) is deliberately the blink-ON phase so
+	// a zero-value model renders a visible cursor with no initialization. It
+	// is toggled ONLY by cursorBlinkTickMsg while the input is focused,
+	// idle, and not mid-scroll; while a scroll burst is active the frame
+	// freezes in the ON position via renderPromptViewStatic.
+	cursorHiddenPhase bool
 
 	// Vi-mode navigation state
 	inViMode        bool      // viewport navigation mode active
@@ -2134,7 +2153,7 @@ func (m *model) markUsageKnown() {
 }
 
 // resetTokenMetrics resets all token counters and UI cost to zero.
-// Called by /new to ensure the footer instantly shows ↓0 + ↑0 tok (0%).
+// Called by /new to ensure the footer instantly shows ↑0 in · ↓0 out (0%).
 func (m *model) resetTokenMetrics() {
 	m.InputTokens = 0
 	m.OutputTokens = 0
@@ -3807,6 +3826,7 @@ func (m *model) resolveModelID(nodeBinding string) string {
 func (m *model) resetStreamingState() {
 	m.streaming = false
 	m.streamCh = nil
+	m.streamRing = nil
 	m.streamCancel = nil
 	m.streamTickActive = false
 	m.refreshScheduled = false
@@ -3882,6 +3902,7 @@ func (m *model) clearBusyFlags() {
 func (m *model) reconcileSpinner() {
 	m.clearBusyFlags()
 	m.streamCh = nil
+	m.streamRing = nil
 	m.streamCancel = nil
 	m.shellCh = nil
 	if m.shellCancel != nil {

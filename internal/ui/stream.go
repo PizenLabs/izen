@@ -174,6 +174,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamBaseInputTokens = estimatePromptTokens(content)
 	m.streamInputPricePerM, m.streamOutputPricePerM = m.lookupStreamPricing(m.getActiveModelName())
 	m.streamCh = make(chan tea.Msg, 1024)
+	m.streamRing = newStreamRing(streamRingCapacity)
 	m.streaming = true
 	m.spinnerFrame = 0
 	// A fresh stream starts a new assistant record: the streaming tail is
@@ -340,12 +341,43 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	}
 	m.initStreamCostTelemetry(totalChars)
 
-	// Capture the channel reference locally so the goroutine (and the
+	// Capture the channel + ring references locally so the goroutine (and the
 	// ReasoningHandler below, which runs on the producer goroutine during
-	// ExecuteStream reads) never reads m.streamCh after Update() clears it to
-	// nil. Without this, the deferred close(m.streamCh) would panic with
-	// "close of nil channel".
+	// ExecuteStream reads) never reads m.streamCh/m.streamRing after Update()
+	// clears them to nil. Without this, the deferred close(m.streamCh) would
+	// panic with "close of nil channel".
 	streamCh := m.streamCh
+	ring := m.streamRing
+
+	// ── NON-BLOCKING PRODUCER (engine→UI decoupling) ───────────────────
+	// Every message the producer emits goes through send. The primary path is
+	// a non-blocking channel send (the UI re-arms readStream on every token,
+	// so the channel drains on each Update delivery). When the channel is
+	// temporarily full — the event loop is mid-frame and hasn't re-armed —
+	// overflow is parked in the lock-free streamRing instead of blocking the
+	// LLM thread; the UI frame-pass drain (FrameTickMsg) and the terminal
+	// stream handlers flush it. Terminal messages (done/err) are rare (1-2
+	// per stream) and MUST cross in order, so their overflow falls back to a
+	// blocking send — never to the ring — guaranteeing they are always
+	// delivered ahead of the next stream's lifetime.
+	send := func(msg tea.Msg) {
+		select {
+		case streamCh <- msg:
+			return
+		default:
+		}
+		if ring != nil {
+			switch msg.(type) {
+			case streamDoneMsg, streamErrMsg:
+				// pinned to the channel: terminal messages never enter the ring
+			default:
+				if ring.Push(msg) {
+					return
+				}
+			}
+		}
+		streamCh <- msg // blocking fallback (drained by the read loop)
+	}
 
 	req := ai.Request{
 		Model:     m.getActiveModelName(),
@@ -361,7 +393,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			// UI renders them inline in the dimmed thinking style, in arrival
 			// order relative to content tokens.
 			if chunk != "" {
-				streamCh <- thinkingTokenMsg(chunk)
+				send(thinkingTokenMsg(chunk))
 			}
 			return nil
 		},
@@ -415,10 +447,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 
 		defer func() {
 			if r := recover(); r != nil {
-				select {
-				case streamCh <- streamErrMsg{err: fmt.Errorf("stream panic: %v", r)}:
-				default:
-				}
+				send(streamErrMsg{err: fmt.Errorf("stream panic: %v", r)})
 			}
 		}()
 		defer close(streamCh)
@@ -426,7 +455,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 
 		rawStream, err := m.provider.ExecuteStream(ctx, req)
 		if err != nil {
-			streamCh <- streamErrMsg{err: err}
+			send(streamErrMsg{err: err})
 			return
 		}
 		defer func() { _ = rawStream.Close() }()
@@ -479,7 +508,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 				return
 			}
 			lastUsage = u
-			streamCh <- streamUsageMsg{input: u.PromptTokens, output: u.CompletionTokens, reasoning: u.ReasoningTokens}
+			send(streamUsageMsg{input: u.PromptTokens, output: u.CompletionTokens, reasoning: u.ReasoningTokens})
 		}
 
 		// Two-phase TTFT: the first chunk (content or thinking) proves the
@@ -494,11 +523,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 		full, ingestErr := ingestLLMStream(idleBody, m.bus, func(text string) {
 			relaxToSteady()
-			streamCh <- tokenMsg(text)
+			send(tokenMsg(text))
 			emitUsage()
 		}, func(text string) {
 			relaxToSteady()
-			streamCh <- thinkingTokenMsg(text)
+			send(thinkingTokenMsg(text))
 			emitUsage()
 		})
 
@@ -544,16 +573,16 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			// provider-reported usage (or a character estimate) even when it
 			// was interrupted — carry it on the error message so the footer
 			// reports consumed tokens instead of a silent 0.
-			streamCh <- streamErrMsg{err: ingestErr, content: full, tokenInput: tokIn, tokenOutput: tokOut, usageEstimated: usageEstimated}
+			send(streamErrMsg{err: ingestErr, content: full, tokenInput: tokIn, tokenOutput: tokOut, usageEstimated: usageEstimated})
 			return
 		}
-		streamCh <- streamDoneMsg{
+		send(streamDoneMsg{
 			content:        full,
 			tokenInput:     tokIn,
 			tokenOutput:    tokOut,
 			usageEstimated: usageEstimated,
 			truncated:      truncated,
-		}
+		})
 	}()
 
 	return tea.Batch(m.streamTraceCmd(), m.readStream(), m.smoothStreamTickCmd(), m.shimmerTickCmd())
