@@ -871,10 +871,20 @@ type model struct {
 	CheckpointID    string
 
 	// TurnTokens is the prompt/completion count for the latest API turn
-	// (e.g. ↑433 in · ↓581 out). SessionTokens (InputTokens/OutputTokens/TotalTokens)
+	// (e.g. ↑433 · ↓581). SessionTokens (InputTokens/OutputTokens/TotalTokens)
 	// is the cumulative total across the entire session.
 	TurnInputTokens  int
 	TurnOutputTokens int
+
+	// ── SESSION-LEVEL MONOTONIC METRIC ACCUMULATOR ────────────────
+	// Base counters (InputTokens/OutputTokens) hold the committed cumulative
+	// totals from prior turns. Live counters (streamBaseInputTokens /
+	// streamLiveTokens + stage tokens) hold the in-flight current-turn
+	// increments. Effective display totals are Base + Live so metrics grow
+	// monotonically across the session and update live during streaming.
+	// On turn completion (streamDoneMsg) the live increments are committed
+	// into the base baseline, preserving monotonic growth. See SessionMetrics
+	// and sessionDisplayInput/sessionDisplayOutput below.
 
 	// usageKnown reports whether the provider has ever reported authoritative
 	// (or explicit-estimate) usage this session. The footer distinguishes
@@ -2146,6 +2156,80 @@ func (m *model) commitTokenUsage(input, output int) {
 	}
 }
 
+// SessionMetrics is the session-level monotonic accumulator for token
+// telemetry. Base counters hold committed prior-turn totals; Live counters
+// hold the in-flight current-turn increments. Display totals are always
+// Base + Live so the footer grows monotonically across turns and updates
+// live during streaming.
+type SessionMetrics struct {
+	BaseInputTokens  int // Cumulative input tokens from prior turns
+	BaseOutputTokens int // Cumulative output tokens from prior turns
+	LiveInputTokens  int // Current turn input tokens
+	LiveOutputTokens int // Current turn streaming output tokens
+}
+
+// TotalInput returns the effective session display input (Base + Live).
+func (s SessionMetrics) TotalInput() int { return s.BaseInputTokens + s.LiveInputTokens }
+
+// TotalOutput returns the effective session display output (Base + Live).
+func (s SessionMetrics) TotalOutput() int { return s.BaseOutputTokens + s.LiveOutputTokens }
+
+// snapshotSessionMetrics builds the live accumulator view from the model's
+// committed session baselines (InputTokens/OutputTokens) plus the in-flight
+// current-turn increments (streamBaseInputTokens / live output tokens).
+func (m *model) snapshotSessionMetrics() SessionMetrics {
+	baseIn, baseOut := 0, 0
+	if m != nil {
+		baseIn = m.InputTokens
+		baseOut = m.OutputTokens
+	}
+	liveIn, liveOut := 0, 0
+	if m != nil && m.isExecuting() {
+		liveIn = m.streamBaseInputTokens
+		if liveIn < 0 {
+			liveIn = 0
+		}
+		liveOut = m.streamLiveOutputTokens()
+	}
+	return SessionMetrics{
+		BaseInputTokens:  baseIn,
+		BaseOutputTokens: baseOut,
+		LiveInputTokens:  liveIn,
+		LiveOutputTokens: liveOut,
+	}
+}
+
+// sessionDisplayInput returns the monotonic session input total for the
+// footer: prior-turn baseline + live current-turn prompt tokens while
+// executing, baseline alone when idle.
+func (m *model) sessionDisplayInput() int {
+	return m.snapshotSessionMetrics().TotalInput()
+}
+
+// sessionDisplayOutput returns the monotonic session output total for the
+// footer: prior-turn baseline + live streamed tokens while executing,
+// baseline alone when idle.
+func (m *model) sessionDisplayOutput() int {
+	return m.snapshotSessionMetrics().TotalOutput()
+}
+
+// commitSessionTurn commits the completed turn's live increments into the
+// session baseline (Base += Live) and clears the live counters for the next
+// interaction while preserving monotonic growth.
+func (m *model) commitSessionTurn(liveIn, liveOut int) {
+	if liveIn < 0 {
+		liveIn = 0
+	}
+	if liveOut < 0 {
+		liveOut = 0
+	}
+	m.InputTokens += liveIn
+	m.OutputTokens += liveOut
+	m.TotalTokens = m.InputTokens + m.OutputTokens
+	m.TurnInputTokens = liveIn
+	m.TurnOutputTokens = liveOut
+}
+
 // markUsageKnown records that the provider reported authoritative usage this
 // session, transitioning the footer from "usage unknown" to a real count.
 func (m *model) markUsageKnown() {
@@ -2153,13 +2237,15 @@ func (m *model) markUsageKnown() {
 }
 
 // resetTokenMetrics resets all token counters and UI cost to zero.
-// Called by /new to ensure the footer instantly shows ↑0 in · ↓0 out (0%).
+// Called by /new to ensure the footer instantly shows ↑0 · ↓0 (0%).
 func (m *model) resetTokenMetrics() {
 	m.InputTokens = 0
 	m.OutputTokens = 0
 	m.TotalTokens = 0
 	m.TurnInputTokens = 0
 	m.TurnOutputTokens = 0
+	m.streamBaseInputTokens = 0
+	m.streamLiveTokens = 0
 	m.AccumulatedCost = 0
 	m.usageKnown = false
 	m.ContextLimit = 0

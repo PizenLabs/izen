@@ -10,7 +10,7 @@ import (
 // TestTokenTracker_SingleCall_NoDoubleCounting verifies the 2x multiplier bug:
 // a single OpenRouter API call returning 793 prompt / 960 completion must be
 // recorded as exactly 793/960, not 1586/1920 (1.6k/1.9k) via double accumulation.
-// The status bar string must render as ↑793 in · ↓960 out.
+// The status bar string must render minimalist as ↑793 · ↓960 (no suffixes).
 func TestTokenTracker_SingleCall_NoDoubleCounting(t *testing.T) {
 	tr := status.New()
 	tr.Record(793, 960)
@@ -19,8 +19,8 @@ func TestTokenTracker_SingleCall_NoDoubleCounting(t *testing.T) {
 		t.Fatalf("Tracker = (%d, %d), want (793, 960)", snap.Input, snap.Output)
 	}
 	formatted := status.FormatUsage(snap)
-	if formatted != "↑793 in · ↓960 out" {
-		t.Fatalf("formatted = %q, want %q", formatted, "↑793 in · ↓960 out")
+	if formatted != "↑793 · ↓960" {
+		t.Fatalf("formatted = %q, want %q", formatted, "↑793 · ↓960")
 	}
 	// Ensure the provider's authoritative usage is the single source: streaming
 	// estimates must not be added on top of the final Usage payload.
