@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/PizenLabs/izen/internal/core/domain/evidence"
 	"github.com/PizenLabs/izen/internal/presentation/diff"
 	"github.com/PizenLabs/izen/internal/runtime/authorization"
 	"github.com/PizenLabs/izen/internal/runtime/executor"
@@ -67,10 +68,32 @@ type OrchestratorConfig struct {
 }
 
 // ExecutionResult reports the outcome of one control-loop cycle.
+//
+// Terminal/Verdict/Completed form the Truthful State Transition product:
+// audit persistence failure structurally invalidates success (Completed=false,
+// Verdict != VerdictPassed) while the disk mutation is left intact
+// (Mutation Non-Rollback Isolation; see EvidenceCompromised). AuditError wraps
+// ErrAuditPersistenceFailed when the synchronous session-finalization flush
+// failed.
 type ExecutionResult struct {
 	ProposalID string
 	Target     string
 	Action     authorization.ApprovalAction
 	Committed  bool
 	Evidence   diff.MutationEvidence
+	// Terminal is the authoritative completion product bound to audit
+	// durability. On audit flush failure it is Failed/FAIL/incomplete even
+	// when Committed is true.
+	Terminal evidence.TerminalState
+	// Verdict is the terminal evidence classification (Passed/Failed/
+	// Inconclusive). Audit failure forces Failed.
+	Verdict evidence.EvidenceState
+	// Completed mirrors Terminal.Completed: false when audit persistence
+	// failed, regardless of mutation success.
+	Completed bool
+	// AuditError wraps ErrAuditPersistenceFailed on flush failure, else nil.
+	AuditError error
+	// EvidenceCompromised marks that the filesystem mutation stands on disk
+	// but its audit evidence is compromised (failed flush, never rolled back).
+	EvidenceCompromised bool
 }

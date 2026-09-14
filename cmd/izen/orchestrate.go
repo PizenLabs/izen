@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	legacyaudit "github.com/PizenLabs/izen/internal/audit"
 	"github.com/PizenLabs/izen/internal/cli"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/runtime/orchestrator"
@@ -92,13 +95,55 @@ func runOrchestrateCommand(args []string) error {
 	defer cancel()
 
 	stack := cli.Wire(&orchestrateAdapter{provider: provider, model: model}, dir, os.Stdin, os.Stdout)
+
+	// ── AUDIT DURABILITY (Truthful State Transition binding) ──────────
+	// The synchronous audit seam is wired into the orchestrator BEFORE the
+	// cycle runs: session finalization performs a blocking Flush whose error
+	// structurally invalidates success (ErrAuditPersistenceFailed) without
+	// rolling back the disk mutation. The same blocking flush is tied to
+	// SIGINT/SIGTERM and the defer chain so termination can never bypass it.
+	auditFlusher := legacyaudit.NewLogger(dir)
+	if stack.Orchestrator != nil {
+		stack.Orchestrator.WithAuditFlusher(auditFlusher)
+	}
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sigDone := make(chan struct{})
+	defer close(sigDone)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			fmt.Fprintf(os.Stderr, "izen orchestrate: caught %v — flushing audit log synchronously…\n", sig)
+			if ferr := auditFlusher.Flush(); ferr != nil {
+				fmt.Fprintf(os.Stderr, "izen orchestrate: audit flush on signal failed: %v\n", ferr)
+			}
+		case <-sigDone:
+		}
+	}()
+	defer func() {
+		signal.Stop(sigCh)
+		// Belt-and-braces final flush: RunCycle already flushed at terminal
+		// finalization and propagated its error; this defer guarantees the
+		// blocking flush sequence runs even if the cycle panics or returns
+		// early. Errors are reported, never swallowed.
+		if ferr := auditFlusher.Flush(); ferr != nil {
+			fmt.Fprintf(os.Stderr, "izen orchestrate: final audit flush failed: %v\n", ferr)
+		}
+	}()
+
 	res, runErr := stack.Run(ctx, dir, prompt)
 
 	if res != nil {
 		fmt.Printf("proposal: %s target: %s action: %s committed: %t\n",
 			res.ProposalID, res.Target, cli.ActionLabel(res.Action), res.Committed)
+		if res.AuditError != nil {
+			fmt.Fprintf(os.Stderr, "izen orchestrate: audit persistence failed — evidence integrity compromised (mutations stand, success invalidated): %v\n", res.AuditError)
+		}
 	}
 	if runErr != nil {
+		if errors.Is(runErr, orchestrator.ErrAuditPersistenceFailed) {
+			return fmt.Errorf("izen orchestrate: %w", runErr)
+		}
 		if errors.Is(runErr, orchestrator.ErrExecutionRejected) {
 			fmt.Println("execution rejected: the proposal was not applied")
 			return nil

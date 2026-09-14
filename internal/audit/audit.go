@@ -95,6 +95,31 @@ func (l *Logger) LogPipeline(entry PipelineEntry) error {
 	return l.append(state.LocalPath(l.root, state.AuditDir, "pipeline.log"), data)
 }
 
+// Flush is the synchronous durability seam for the legacy sync logger.
+// Every append opens, writes, and closes its file, so all records are already
+// durable once append returns; Flush fsyncs the audit directory entry so a
+// newly created events file is itself durable. It MUST NOT be swallowed:
+// callers bind its error into the Truthful State Transition evaluation
+// (ErrAuditPersistenceFailed in internal/runtime/orchestrator).
+func (l *Logger) Flush() error {
+	if l == nil {
+		return fmt.Errorf("audit: nil logger")
+	}
+	dir := state.LocalPath(l.root, state.AuditDir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("audit flush mkdir: %w", err)
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("audit flush open dir: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("audit flush sync: %w", err)
+	}
+	return nil
+}
+
 func (l *Logger) append(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {

@@ -39,6 +39,11 @@ type Store struct {
 	w      *bufio.Writer
 	path   string
 	closed bool
+	// failWrites is a test/adversarial hook: when non-nil, Write and Flush
+	// fail with its error instead of touching disk. It simulates I/O disk
+	// write errors and read-only permissions deterministically without
+	// chmod races. Nil disables injection.
+	failWrites error
 }
 
 // NewStore opens (creating as needed) the NDJSON log file at path, creating
@@ -69,11 +74,24 @@ func (s *Store) Path() string {
 	return s.path
 }
 
+// InjectWriteError arms a deterministic I/O failure: subsequent Write and
+// Flush calls fail with err instead of touching disk. Pass nil to clear.
+// It is the adversarial seam for audit-persistence-failure tests (simulated
+// disk write error / read-only permission on events.ndjson).
+func (s *Store) InjectWriteError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failWrites = err
+}
+
 // Write marshals one envelope as a single NDJSON line and appends it. It is
 // safe for concurrent use.
 func (s *Store) Write(env events.Envelope) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failWrites != nil {
+		return fmt.Errorf("audit: injected write failure on %s: %w", s.path, s.failWrites)
+	}
 	if s.closed {
 		return errors.New("audit: store closed")
 	}
@@ -90,19 +108,30 @@ func (s *Store) Write(env events.Envelope) error {
 	return nil
 }
 
-// Flush pushes any buffered lines to the underlying file. Safe to call from
-// any goroutine.
+// Flush pushes any buffered lines to the underlying file and fsyncs it for
+// durability. Safe to call from any goroutine. A flush failure MUST NOT be
+// swallowed: callers bind it into the Truthful State Transition evaluation
+// (ErrAuditPersistenceFailed in internal/runtime/orchestrator).
 func (s *Store) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failWrites != nil {
+		return fmt.Errorf("audit: injected flush failure on %s: %w", s.path, s.failWrites)
+	}
 	if s.closed {
 		return nil
 	}
-	return s.w.Flush()
+	if err := s.w.Flush(); err != nil {
+		return fmt.Errorf("audit: flush %s: %w", s.path, err)
+	}
+	if err := s.f.Sync(); err != nil {
+		return fmt.Errorf("audit: sync %s: %w", s.path, err)
+	}
+	return nil
 }
 
-// Close flushes buffered lines and closes the underlying file. Subsequent
-// writes fail. Idempotent.
+// Close flushes buffered lines, fsyncs, and closes the underlying file.
+// Subsequent writes fail. Idempotent.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -110,10 +139,24 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
+	if s.failWrites != nil {
+		_ = s.f.Close()
+		return fmt.Errorf("audit: injected close failure on %s: %w", s.path, s.failWrites)
+	}
 	ferr := s.w.Flush()
+	var serr error
+	if ferr == nil {
+		serr = s.f.Sync()
+	}
 	cerr := s.f.Close()
 	if ferr != nil {
-		return ferr
+		return fmt.Errorf("audit: flush %s: %w", s.path, ferr)
 	}
-	return cerr
+	if serr != nil {
+		return fmt.Errorf("audit: sync %s: %w", s.path, serr)
+	}
+	if cerr != nil {
+		return fmt.Errorf("audit: close %s: %w", s.path, cerr)
+	}
+	return nil
 }
