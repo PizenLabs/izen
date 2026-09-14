@@ -95,6 +95,8 @@ func (m *model) renderTopBar(width int) string {
 
 // executingTitle resolves the header execution title from authoritative
 // signals: shimmer text first, workflow state second, static fallback last.
+//
+//nolint:unused
 func (m *model) executingTitle() string {
 	if m == nil {
 		return "EXECUTING"

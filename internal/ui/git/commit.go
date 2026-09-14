@@ -3,6 +3,7 @@
 package git
 
 import (
+	"context"
 	"os/exec"
 	"strings"
 
@@ -37,7 +38,7 @@ func HasHEAD(dir string) bool {
 	if dir == "" {
 		dir = "."
 	}
-	cmd := exec.Command("git", "rev-parse", "--verify", "HEAD")
+	cmd := exec.CommandContext(context.Background(), "git", "rev-parse", "--verify", "HEAD")
 	cmd.Dir = dir
 	if err := cmd.Run(); err != nil {
 		return false
@@ -79,7 +80,7 @@ func (f CommitForm) Run(dir string) error {
 	if dir == "" {
 		dir = "."
 	}
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(context.Background(), "git", args...)
 	cmd.Dir = dir
 	return cmd.Run()
 }

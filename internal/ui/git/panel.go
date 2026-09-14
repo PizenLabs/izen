@@ -1,6 +1,7 @@
 package git
 
 import (
+	"context"
 	"os/exec"
 	"strings"
 
@@ -135,9 +136,10 @@ func (p *Panel) Render(width int) string {
 	var b strings.Builder
 	b.WriteString(gitTitleStyle.Render("Git Control Panel  (Ctrl+G close · Ctrl+A AI message)") + "\n")
 	files := p.Files()
-	if len(files) == 0 {
+	switch {
+	case len(files) == 0:
 		b.WriteString(gitMutedStyle.Render("(clean tree — nothing staged or unstaged)") + "\n")
-	} else if width < 80 {
+	case width < 80:
 		// Single-column collapse for narrow terminals.
 		for i, f := range files {
 			marker := "  "
@@ -152,7 +154,7 @@ func (p *Panel) Render(width int) string {
 		}
 		b.WriteString(gitMutedStyle.Render("── diff ──") + "\n")
 		b.WriteString(truncateLines(p.DiffPreview, 20) + "\n")
-	} else {
+	default:
 		// Two-pane: left files (30 cells), right diff preview.
 		leftW := 30
 		var left strings.Builder
@@ -166,11 +168,12 @@ func (p *Panel) Render(width int) string {
 				name = string([]rune(name)[:leftW-5]) + "…"
 			}
 			row := marker + name
-			if i == p.Cursor {
+			switch {
+			case i == p.Cursor:
 				row = gitSelStyle.Render(row)
-			} else if p.IsStaged(f) {
+			case p.IsStaged(f):
 				row = gitStagedStyle.Render(row)
-			} else {
+			default:
 				row = gitUnstagedStyle.Render(row)
 			}
 			left.WriteString(row + "\n")
@@ -203,7 +206,7 @@ func ListStatus(dir string) (staged, unstaged []string) {
 	if dir == "" {
 		dir = "."
 	}
-	cmd := exec.Command("git", "status", "--porcelain")
+	cmd := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
@@ -222,11 +225,12 @@ func ListStatus(dir string) (staged, unstaged []string) {
 		if path == "" {
 			continue
 		}
-		if x != ' ' && x != '?' {
+		switch {
+		case x != ' ' && x != '?':
 			staged = append(staged, path)
-		} else if y != ' ' {
+		case y != ' ':
 			unstaged = append(unstaged, path)
-		} else if x == '?' {
+		case x == '?':
 			unstaged = append(unstaged, path)
 		}
 	}
@@ -249,7 +253,7 @@ func GetDiff(dir, path string, staged bool) (string, error) {
 	} else {
 		args = []string{"diff", "--", path}
 	}
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(context.Background(), "git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil && len(out) == 0 {

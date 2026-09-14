@@ -208,7 +208,7 @@ func (a AskComponent) Render(width int) string {
 		if opt.Recommended {
 			title += " " + askRecStyle.Render("(Recommended)")
 		}
-		b.WriteString(fmt.Sprintf("%s%s\n", cursor, title))
+		fmt.Fprintf(&b, "%s%s\n", cursor, title)
 		if opt.Description != "" {
 			b.WriteString("    " + askDescStyle.Render(opt.Description) + "\n")
 		}

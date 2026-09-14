@@ -95,10 +95,7 @@ func ParseUnifiedDiff(file, body string, oldStart, newStart int) DiffComponent {
 			lines = append(lines, DiffLine{Kind: '-', OldNo: oldNo, Text: strings.TrimPrefix(raw[1:], " ")})
 			oldNo++
 		default:
-			text := raw
-			if strings.HasPrefix(text, " ") {
-				text = text[1:]
-			}
+			text := strings.TrimPrefix(raw, " ")
 			lines = append(lines, DiffLine{Kind: ' ', OldNo: oldNo, NewNo: newNo, Text: text})
 			oldNo++
 			newNo++

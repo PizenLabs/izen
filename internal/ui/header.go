@@ -102,7 +102,6 @@ func RenderExecutingHeader(title string, tick int, width int) string {
 			t = string(rs[:budget])
 		}
 		left = executingHeaderTitleStyle.Render("● " + t)
-		content = left + " " + sweep
 	}
 	return headerBorderStyle.Width(width).Render(padRightOverlay(left, sweep, width))
 }
