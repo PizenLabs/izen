@@ -18,6 +18,10 @@ type Orchestrator struct {
 	validator *executor.ProposalValidator
 	executor  *executor.FileExecutor
 	gate      *authorization.ApprovalGate
+	// audit is the synchronous audit durability seam bound into the
+	// Truthful State Transition evaluation. Nil disables audit gating
+	// (legacy/harness mode). Wired via WithAuditFlusher.
+	audit AuditFlusher
 }
 
 // NewOrchestrator returns an Orchestrator wired to the given engines.
@@ -148,14 +152,32 @@ func (o *Orchestrator) RunCycle(ctx context.Context, req preflight.PreflightRequ
 			return nil, fmt.Errorf("orchestrator: commit: %w", err)
 		}
 		result.Committed = true
+		// Step 8: Truthful State Transition finalization — the blocking,
+		// synchronous audit flush. A flush failure MUST NOT roll back the
+		// disk mutation (Mutation Non-Rollback Isolation) but it MUST
+		// invalidate success: Completed=false, Verdict=Failed with
+		// ErrAuditPersistenceFailed. The error is propagated, never
+		// swallowed.
+		if auditErr := o.finalizeAudit(result, true); auditErr != nil {
+			return result, auditErr
+		}
 		return result, nil
 	case authorization.ActionInspect:
 		// Inspection was authorized but not execution; the workspace is left
-		// untouched.
+		// untouched. Session finalization still flushes audit synchronously;
+		// a flush failure compromises the terminal even without a mutation.
+		if auditErr := o.finalizeAudit(result, false); auditErr != nil {
+			return result, auditErr
+		}
 		return result, nil
 	default:
 		// ActionCancel (or any rejected decision) aborts without modifying
-		// the workspace.
+		// the workspace. The terminal still finalizes audit durability; a
+		// flush failure is joined with the rejection so errors.Is finds
+		// ErrAuditPersistenceFailed while the rejection stays observable.
+		if auditErr := o.finalizeAudit(result, false); auditErr != nil {
+			return result, errors.Join(ErrExecutionRejected, auditErr)
+		}
 		return result, ErrExecutionRejected
 	}
 }

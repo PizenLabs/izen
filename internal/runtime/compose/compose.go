@@ -115,6 +115,11 @@ type Application struct {
 	// WithAuditDir. Empty disables auditing.
 	auditDir string
 
+	// auditCloseErr retains the audit logger teardown error from Close so it
+	// is queryable via AuditCloseErr instead of being swallowed. FlushAudit
+	// remains the authoritative session-finalization seam.
+	auditCloseErr error
+
 	// Authority is the single source of truth for workspace model state (I5).
 	// It owns the per-target model assignments and the active mode.
 	Authority *runtime.RuntimeAuthority
@@ -831,6 +836,38 @@ func Wire(opts ...Option) (*Application, error) {
 	return a, nil
 }
 
+// FlushAudit performs the blocking, synchronous audit flush for session
+// finalization: it drains every accepted envelope and fsyncs
+// <auditDir>/events.ndjson. Its error MUST be propagated into the Truthful
+// State Transition evaluation (ErrAuditPersistenceFailed) — never swallowed
+// or merely logged. A nil audit logger (auditing disabled) returns nil.
+func (a *Application) FlushAudit() error {
+	if a == nil || a.Audit == nil {
+		return nil
+	}
+	return a.Audit.Flush()
+}
+
+// AuditErr reports the first async write error observed by the audit logger,
+// if any. It is a secondary signal: FlushAudit is the authoritative
+// finalization seam (it surfaces both worker and flush errors).
+func (a *Application) AuditErr() error {
+	if a == nil || a.Audit == nil {
+		return nil
+	}
+	return a.Audit.Err()
+}
+
+// AuditCloseErr reports the audit logger teardown error retained by the last
+// Close call, if any. Close never swallows it silently: the error is retained
+// here for the composition root to report.
+func (a *Application) AuditCloseErr() error {
+	if a == nil {
+		return nil
+	}
+	return a.auditCloseErr
+}
+
 // Close tears down the Application: it stops the audit logger, the ledger
 // projection, the runtime presentation projection, the telemetry bridge and
 // the async compaction runner. Idempotent.
@@ -843,7 +880,13 @@ func (a *Application) Close() {
 		a.Compaction = nil
 	}
 	if a.Audit != nil {
-		_ = a.Audit.Close()
+		// The teardown error is retained on AuditCloseErr for the
+		// composition root to report — never swallowed. Session
+		// finalization itself MUST go through FlushAudit (whose error feeds
+		// the Truthful State Transition evaluation) before Close.
+		if err := a.Audit.Close(); err != nil {
+			a.auditCloseErr = err
+		}
 		a.Audit = nil
 	}
 	if a.telemetryAdapter != nil {
