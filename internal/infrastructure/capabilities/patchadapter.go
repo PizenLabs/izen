@@ -9,7 +9,13 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/domain/ports"
+	"github.com/PizenLabs/izen/internal/runtime/scope"
 )
+
+// ErrWorkspaceEscape is returned when a patch target resolves outside
+// the workspace root FD handle at execution time. It aliases
+// scope.ErrWorkspaceEscape; match with errors.Is.
+var ErrWorkspaceEscape = scope.ErrWorkspaceEscape
 
 // Patch strategy discriminators carried by PatchPayload.Modified. They are
 // chosen by Parse and honored by Validate and Apply.
@@ -29,13 +35,48 @@ var (
 // fallback patch strategy: unified diff, then SEARCH/REPLACE blocks, then a
 // whole-file rewrite. It never consults the domain safety policy; it is purely
 // a mechanical resolver and writer.
+//
+// Execution-time confinement: every Apply verifies its target at USE time
+// against the workspace-root FD handle (held open for the adapter
+// lifetime when bound, short-lived otherwise). A symlink swapped in
+// between resolution and application that points outside the root fails
+// closed with ErrWorkspaceEscape before any byte is written. Internal
+// symlinks resolving within the root remain permitted.
 type PatchAdapter struct {
 	root string
+	// scopeRoot is the FD-anchored workspace handle. It is opened lazily
+	// from root on first use when not bound explicitly, so every Apply is
+	// verified against an open descriptor rather than a string path.
+	scopeRoot *scope.Root
 }
 
 // NewPatchAdapter returns a PatchPort adapter that writes under root.
 func NewPatchAdapter(root string) *PatchAdapter {
 	return &PatchAdapter{root: root}
+}
+
+// NewPatchAdapterWithRoot returns a PatchPort adapter anchored at an
+// already-open workspace-root FD handle. The caller retains ownership of
+// root (Close); the adapter never closes a handle it did not open.
+func NewPatchAdapterWithRoot(root *scope.Root) *PatchAdapter {
+	p := &PatchAdapter{}
+	if root != nil {
+		p.scopeRoot = root
+		p.root = root.RootPath()
+	}
+	return p
+}
+
+// BindRoot anchors the adapter to an open workspace-root FD handle for
+// all subsequent Apply calls.
+func (p *PatchAdapter) BindRoot(root *scope.Root) {
+	if p == nil {
+		return
+	}
+	p.scopeRoot = root
+	if root != nil {
+		p.root = root.RootPath()
+	}
 }
 
 // Parse classifies a raw payload into a normalized PatchPayload. Unified diffs
@@ -78,6 +119,12 @@ func (p *PatchAdapter) Validate(ctx context.Context, patch ports.PatchPayload, c
 
 // Apply resolves the patch against the current on-disk content and writes the
 // result, returning line-change metrics.
+//
+// TOCTOU contract: the target is verified at USE time against the
+// workspace-root FD handle immediately before the read AND immediately
+// before the write. A relative or absolute symlink swapped in after
+// resolution that points outside the root forces ErrWorkspaceEscape with
+// zero bytes written outside the boundary.
 func (p *PatchAdapter) Apply(ctx context.Context, patch ports.PatchPayload) (ports.PatchResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ports.PatchResult{}, err
@@ -85,9 +132,23 @@ func (p *PatchAdapter) Apply(ctx context.Context, patch ports.PatchPayload) (por
 	if patch.File == "" {
 		return ports.PatchResult{}, fmt.Errorf("patch: missing target file")
 	}
+	// Lexical containment first (fast fail on absolute/traversal spellings).
 	full := filepath.Join(p.root, filepath.Clean(patch.File))
 	if rel, err := filepath.Rel(p.root, full); err != nil || strings.HasPrefix(rel, "..") {
-		return ports.PatchResult{}, fmt.Errorf("patch: target %q escapes workspace", patch.File)
+		return ports.PatchResult{}, fmt.Errorf("%w: patch target %q escapes workspace", scope.ErrWorkspaceEscape, patch.File)
+	}
+
+	// FD-anchored use-time verification (resolve-then-swap closes here).
+	scopeRoot, closeRoot, err := p.anchored()
+	if err != nil {
+		return ports.PatchResult{}, err
+	}
+	if closeRoot != nil {
+		defer closeRoot()
+	}
+	rel := filepath.Clean(patch.File)
+	if verr := scopeRoot.Verify(rel); verr != nil {
+		return ports.PatchResult{}, verr
 	}
 
 	current, err := readFileIfExists(full)
@@ -100,10 +161,13 @@ func (p *PatchAdapter) Apply(ctx context.Context, patch ports.PatchPayload) (por
 		return ports.PatchResult{}, err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-		return ports.PatchResult{}, fmt.Errorf("patch: mkdir for %s: %w", patch.File, err)
+	// Re-verify immediately before the write: the execution-time gate.
+	// Any symlink planted while the patch was being resolved is caught
+	// here, before a single byte is written.
+	if verr := scopeRoot.Verify(rel); verr != nil {
+		return ports.PatchResult{}, verr
 	}
-	if err := os.WriteFile(full, []byte(resolved), 0o644); err != nil {
+	if err := scopeRoot.AtomicWrite(rel, []byte(resolved), 0o644); err != nil {
 		return ports.PatchResult{}, fmt.Errorf("patch: write %s: %w", patch.File, err)
 	}
 
@@ -114,6 +178,23 @@ func (p *PatchAdapter) Apply(ctx context.Context, patch ports.PatchPayload) (por
 		LinesAdded:   added,
 		LinesRemoved: removed,
 	}, nil
+}
+
+// anchored returns the FD-anchored workspace handle for this Apply and,
+// when the handle is opened short-lived, a closer the caller must defer.
+// A bound handle is returned directly (never closed by the caller).
+func (p *PatchAdapter) anchored() (*scope.Root, func(), error) {
+	if p.scopeRoot != nil {
+		return p.scopeRoot, nil, nil
+	}
+	if strings.TrimSpace(p.root) == "" {
+		return nil, nil, fmt.Errorf("patch: missing workspace root")
+	}
+	r, err := scope.Open(p.root)
+	if err != nil {
+		return nil, nil, err
+	}
+	return r, func() { _ = r.Close() }, nil
 }
 
 // detectStrategy returns the fallback strategy that interprets payload.
