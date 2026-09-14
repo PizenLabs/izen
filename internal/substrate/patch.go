@@ -3,6 +3,8 @@
 package substrate
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,14 @@ import (
 // after automatic rollback. Use errors.Is(err, ErrPatchTransactionFailed)
 // to detect it; the original cause is wrapped and available via errors.Unwrap.
 var ErrPatchTransactionFailed = errors.New("substrate: patch transaction failed")
+
+// ErrConcurrentModification is the explicit conflict sentinel for concurrent
+// execution cycles targeting the SAME artifact. It aliases
+// lock.ErrConcurrentModification; match with errors.Is against either. When
+// two OS processes mutate the identical target concurrently, exactly one
+// commits and every loser fails with this sentinel (via per-artifact lock
+// contention or OCC baseline divergence) — never silent last-writer-wins.
+var ErrConcurrentModification = lock.ErrConcurrentModification
 
 // atomicWriteFile is the file-write hook used by ApplyPatch. It defaults to
 // atomicio.WriteFileAtomic and is overrideable in tests to inject mid-patch
@@ -113,20 +123,41 @@ func ApplyPatch(workDir string, patchPath string) error {
 		return fmt.Errorf("substrate: malformed patch %q: missing files", patchPath)
 	}
 
-	// Inter-process workspace lock: serialize against concurrent izen
-	// processes. A self-held lock (outer CLI/agent holder in this process)
-	// is reused instead of failing.
-	var unlock func()
-	if u, lerr := lock.TryAcquireWorkspaceLock(workDir); lerr != nil {
-		if errors.Is(lerr, lock.ErrWorkspaceLocked) && lock.IsHeldByCurrentProcess(workDir) {
-			unlock = func() {}
-		} else {
-			return fmt.Errorf("substrate: workspace lock: %w", lerr)
-		}
-	} else {
-		unlock = u
+	// Per-artifact cross-process isolation (Disjoint Session Parallelism):
+	// lock ONLY this patch's target files, never the whole workspace. Two
+	// processes touching disjoint file sets contend on disjoint lock files
+	// and proceed concurrently; two processes touching the SAME target
+	// contend on the same lock file and the loser fails closed with
+	// ErrConcurrentModification. A self-held legacy workspace lock (outer
+	// CLI/agent holder in this process) is reused instead of failing so
+	// nested ApplyPatch calls under an outer holder still proceed.
+	//
+	// OCC ordering: the baseline is fingerprinted BEFORE lock acquisition so
+	// a concurrent winner committing in the acquire window is detected by
+	// the under-lock re-verification instead of being overwritten.
+	targets := make([]string, 0, len(patch.Files))
+	for _, f := range patch.Files {
+		targets = append(targets, f.Path)
 	}
-	defer unlock()
+	baseline := lock.SnapshotBaseline(workDir, targets)
+	selfHeldWorkspace := lock.IsHeldByCurrentProcess(workDir)
+	var unlockArtifacts func()
+	if !selfHeldWorkspace {
+		u, lerr := lock.TryAcquireArtifactLocks(workDir, targets)
+		if lerr != nil {
+			return fmt.Errorf("substrate: artifact lock: %w", lerr)
+		}
+		unlockArtifacts = u
+	} else {
+		unlockArtifacts = func() {}
+	}
+	defer unlockArtifacts()
+
+	// Under-lock re-verification: any divergence since the pre-lock baseline
+	// proves a concurrent committer won the race — abort explicitly.
+	if err := lock.VerifyBaselineUnderLock(workDir, baseline); err != nil {
+		return fmt.Errorf("substrate: OCC baseline: %w", err)
+	}
 
 	cpID, err := checkpoint.CreateCheckpoint(workDir, "pre-patch-tx")
 	if err != nil {
@@ -167,6 +198,10 @@ func ApplyPatch(workDir string, patchPath string) error {
 			_ = alog.LogMutation(audit.MutationEntry{
 				File: f.Path, Action: "delete", PatchID: cpID,
 			})
+			// Deletion commits the absent state into the OCC clock.
+			if occErr := lock.AdvanceOCC(workDir, f.Path, ""); occErr != nil {
+				return fail("occ commit", f.Path, occErr)
+			}
 			continue
 		}
 		content := ""
@@ -183,6 +218,12 @@ func ApplyPatch(workDir string, patchPath string) error {
 		_ = alog.LogMutation(audit.MutationEntry{
 			File: f.Path, Action: "write", PatchID: cpID, Content: truncate(content, 4096),
 		})
+		// Commit the written bytes into the durable OCC clock while still
+		// holding the artifact lock: a concurrent committer interleaving
+		// here surfaces as ErrConcurrentModification, never silent LWW.
+		if occErr := lock.AdvanceOCC(workDir, f.Path, sha256Hex(content)); occErr != nil {
+			return fail("occ commit", f.Path, occErr)
+		}
 	}
 	_ = alog.LogEvent("", audit.EventPatchApplied, map[string]any{
 		"patch": patchPath, "checkpoint": cpID, "files": len(patch.Files),
@@ -276,4 +317,10 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// sha256Hex returns the hex sha256 of content for the OCC commit record.
+func sha256Hex(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
 }

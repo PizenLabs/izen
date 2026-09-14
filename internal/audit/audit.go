@@ -132,10 +132,14 @@ func (l *Logger) append(path string, data []byte) error {
 		return fmt.Errorf("audit open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
-	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("audit write: %w", err)
-	}
-	if _, err := f.Write([]byte("\n")); err != nil {
+	// Single write(2) of payload+newline: O_APPEND single writes are atomic
+	// across OS processes for small records, so concurrent izen processes
+	// never interleave bytes within a JSON line. Two separate writes (data,
+	// then "\n") would admit interleaving and corrupt the ndjson trail.
+	line := make([]byte, 0, len(data)+1)
+	line = append(line, data...)
+	line = append(line, '\n')
+	if _, err := f.Write(line); err != nil {
 		return fmt.Errorf("audit write: %w", err)
 	}
 	return nil
