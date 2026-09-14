@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/pkg/atomicio"
 )
 
 // ShadowCheckpoint represents a lightweight internal working-tree snapshot
@@ -308,6 +310,8 @@ func (e *Engine) RestoreSessionStart() error {
 }
 
 // save persists a checkpoint's metadata to disk under .izen/checkpoints/<id>/.
+// The write is atomic (temp+rename+fsync) so concurrent processes listing the
+// store never observe a truncated checkpoint.json.
 func (e *Engine) save(cp *ShadowCheckpoint) error {
 	cpDir := filepath.Join(e.dir, cp.ID)
 	if err := os.MkdirAll(cpDir, 0755); err != nil {
@@ -318,7 +322,7 @@ func (e *Engine) save(cp *ShadowCheckpoint) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return atomicio.WriteFileAtomic(path, data, 0644)
 }
 
 // isRepo checks whether the root contains a .git directory.

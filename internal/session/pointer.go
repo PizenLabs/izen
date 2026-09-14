@@ -227,21 +227,41 @@ func writeFileSync(path string, data []byte) error {
 }
 
 // atomic writeFileAtomic writes data to path via a same-directory temp file +
-// fsync + rename. The temp name is deterministic (path + ".tmp") so crash
-// recovery and concurrent readers see a fully-written file at path, never a
-// partial one.
+// fsync + rename. The temp name is UNIQUE per call (path + ".tmp.<rand>") so
+// two concurrent OS processes committing different slots never collide on a
+// shared staging name: readers see a fully-written file at path, never a
+// partial one, and losers never clobber the winner's staged bytes.
 func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := writeFileSync(tmp, data); err != nil {
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	tmpName := tmp.Name()
+	success := false
+	defer func() {
+		if !success {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	success = true
 	// Best-effort directory fsync so the rename itself is durable.
 	if d, err := os.Open(dir); err == nil {
 		_ = d.Sync()

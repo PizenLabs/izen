@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/pkg/lock"
 )
 
 // ── Phase 3 P3 — Optimistic Concurrency Control (OCC) engine ────────────────
@@ -43,6 +45,13 @@ import (
 // Every conflict error returned by the engine wraps this sentinel, so callers
 // can classify aborts with errors.Is regardless of the concrete conflicts.
 var ErrWorkspaceStateConflict = errors.New("execution: workspace state conflict")
+
+// ErrConcurrentModification is the explicit cross-process conflict sentinel
+// for concurrent execution cycles targeting the SAME artifact. It aliases
+// lock.ErrConcurrentModification so errors.Is matches across the lock,
+// substrate, and execution layers: exactly one contender commits, every loser
+// fails with this sentinel instead of silent last-writer-wins.
+var ErrConcurrentModification = lock.ErrConcurrentModification
 
 // OCCConflictKind is the taxonomy of a single diverged target.
 type OCCConflictKind string

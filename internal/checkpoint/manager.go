@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -25,7 +26,14 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/pkg/atomicio"
+	"github.com/PizenLabs/izen/internal/pkg/lock"
 )
+
+// isLockContention reports whether err is a cross-process lock conflict that
+// a disjoint writer should ride out with backoff rather than fail.
+func isLockContention(err error) bool {
+	return errors.Is(err, lock.ErrConcurrentModification)
+}
 
 // CheckpointRecord is the Phase 3 checkpoint manifest stored as
 // checkpoint.json.
@@ -104,9 +112,34 @@ func CreateCheckpoint(workDir string, label string) (string, error) {
 		_ = os.RemoveAll(cpDir)
 		return "", fmt.Errorf("checkpoint: marshal: %w", err)
 	}
-	if err := atomicio.WriteFileAtomic(filepath.Join(cpDir, "checkpoint.json"), data, 0o644); err != nil {
+	// The manifest commit is the atomic point of the checkpoint: hold the
+	// cross-process checkpoint flock across the temp+rename so concurrent
+	// izen processes never interleave pruner sweeps with manifest commits
+	// and readers never observe truncation. Disjoint writers sharing the
+	// store serialize briefly with bounded backoff and ALL succeed — the
+	// invariant is zero corruption with full parallelism, not spurious
+	// contention failures.
+	manifestPath := filepath.Join(cpDir, "checkpoint.json")
+	var commitErr error
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		commitErr = lock.WithCheckpointLock(workDir, func() error {
+			return atomicio.WriteFileAtomic(manifestPath, data, 0o644)
+		})
+		if commitErr == nil {
+			break
+		}
+		if !isLockContention(commitErr) {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if commitErr != nil {
 		_ = os.RemoveAll(cpDir)
-		return "", fmt.Errorf("checkpoint: write manifest: %w", err)
+		return "", fmt.Errorf("checkpoint: write manifest: %w", commitErr)
 	}
 	return id, nil
 }
