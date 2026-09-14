@@ -13,8 +13,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/PizenLabs/izen/internal/domain/ports"
+	"github.com/PizenLabs/izen/internal/runtime/scope"
 )
 
 // compile-time assertions that the adapters satisfy the domain ports.
@@ -28,8 +30,20 @@ var (
 // OSFile implements ports.FilePort over the operating system filesystem using
 // the os and filepath packages. Paths are resolved against an optional root
 // directory so the adapter can be confined to a workspace.
+//
+// Execution-time confinement: every Read, Write, Exists, and Remove
+// verifies its target at USE time against the workspace-root FD handle.
+// A symlink swapped in after resolution that points outside the root
+// fails closed with scope.ErrWorkspaceEscape before any I/O. Internal
+// symlinks resolving within the root remain permitted. Raw string-path
+// operations never proceed without FD-anchored verification when a root
+// is configured.
 type OSFile struct {
 	root string
+	// scopeRoot, when bound, anchors every operation to the open root FD
+	// for the adapter lifetime. Otherwise a short-lived handle is opened
+	// per call so verification still runs at use time.
+	scopeRoot *scope.Root
 }
 
 // NewOSFile returns a FilePort adapter rooted at root. An empty root means
@@ -38,12 +52,103 @@ func NewOSFile(root string) *OSFile {
 	return &OSFile{root: root}
 }
 
-// resolve joins path under the adapter root and cleans it.
-func (f *OSFile) resolve(path string) string {
-	if f.root == "" {
-		return path
+// NewOSFileWithRoot returns a FilePort adapter anchored at an already-open
+// workspace-root FD handle. The caller retains ownership of root.
+func NewOSFileWithRoot(root *scope.Root) *OSFile {
+	f := &OSFile{}
+	if root != nil {
+		f.scopeRoot = root
+		f.root = root.RootPath()
 	}
-	return filepath.Join(f.root, path)
+	return f
+}
+
+// BindRoot anchors the adapter to an open workspace-root FD handle.
+func (f *OSFile) BindRoot(root *scope.Root) {
+	if f == nil {
+		return
+	}
+	f.scopeRoot = root
+	if root != nil {
+		f.root = root.RootPath()
+	}
+}
+
+// anchored verifies path at use time and returns the absolute path plus,
+// for short-lived handles, a closer. An empty adapter root bypasses
+// anchoring (legacy unconfined behavior).
+func (f *OSFile) anchored(path string) (string, func(), error) {
+	if f.root == "" && f.scopeRoot == nil {
+		return path, nil, nil
+	}
+	if f.scopeRoot != nil {
+		rel, err := toRel(f.root, path)
+		if err != nil {
+			return "", nil, err
+		}
+		if err := f.scopeRoot.Verify(rel); err != nil {
+			return "", nil, err
+		}
+		return filepath.Join(f.root, rel), nil, nil
+	}
+	r, err := scope.Open(f.root)
+	if err != nil {
+		return "", nil, err
+	}
+	rel, rerr := toRel(f.root, path)
+	if rerr != nil {
+		_ = r.Close()
+		return "", nil, rerr
+	}
+	if verr := r.Verify(rel); verr != nil {
+		_ = r.Close()
+		return "", nil, verr
+	}
+	return filepath.Join(f.root, rel), func() { _ = r.Close() }, nil
+}
+
+// toRel converts an adapter-level path to a root-relative slash path and
+// enforces lexical containment. Absolute paths escaping the root fail
+// with scope.ErrWorkspaceEscape.
+func toRel(root, path string) (string, error) {
+	candidate := path
+	if filepath.IsAbs(path) {
+		rel, err := filepath.Rel(root, path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("%w: path %q escapes workspace", scope.ErrWorkspaceEscape, path)
+		}
+		candidate = rel
+	}
+	clean := filepath.Clean(filepath.FromSlash(candidate))
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w: path %q escapes workspace", scope.ErrWorkspaceEscape, path)
+	}
+	if clean == "." {
+		return "", fmt.Errorf("%w: empty path", scope.ErrWorkspaceEscape)
+	}
+	return clean, nil
+}
+
+// anchoredDir verifies a directory path at use time. "." / empty maps to
+// the root itself (always inside by construction).
+func (f *OSFile) anchoredDir(dir string) (string, func(), error) {
+	if f.root == "" && f.scopeRoot == nil {
+		if dir == "" {
+			return ".", nil, nil
+		}
+		return dir, nil, nil
+	}
+	if dir == "" || dir == "." {
+		if f.scopeRoot != nil {
+			return f.root, nil, nil
+		}
+		r, err := scope.Open(f.root)
+		if err != nil {
+			return "", nil, err
+		}
+		return f.root, func() { _ = r.Close() }, nil
+	}
+	return f.anchored(dir)
 }
 
 // Read returns the full content of the file at path.
@@ -51,7 +156,14 @@ func (f *OSFile) Read(ctx context.Context, path string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(f.resolve(path))
+	full, closeRoot, err := f.anchored(path)
+	if err != nil {
+		return "", err
+	}
+	if closeRoot != nil {
+		defer closeRoot()
+	}
+	data, err := os.ReadFile(full)
 	if err != nil {
 		return "", fmt.Errorf("osfile: read %s: %w", path, err)
 	}
@@ -59,12 +171,19 @@ func (f *OSFile) Read(ctx context.Context, path string) (string, error) {
 }
 
 // Write persists content to the file at path, creating parent directories as
-// needed.
+// needed. The target is verified at use time against the root FD; an
+// escaping symlink fails with scope.ErrWorkspaceEscape before any write.
 func (f *OSFile) Write(ctx context.Context, path string, content string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	full := f.resolve(path)
+	full, closeRoot, err := f.anchored(path)
+	if err != nil {
+		return err
+	}
+	if closeRoot != nil {
+		defer closeRoot()
+	}
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return fmt.Errorf("osfile: mkdir for %s: %w", path, err)
 	}
@@ -80,7 +199,14 @@ func (f *OSFile) List(ctx context.Context, dir string) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(f.resolve(dir))
+	full, closeRoot, err := f.anchoredDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	if closeRoot != nil {
+		defer closeRoot()
+	}
+	entries, err := os.ReadDir(full)
 	if err != nil {
 		return nil, fmt.Errorf("osfile: list %s: %w", dir, err)
 	}
@@ -96,7 +222,14 @@ func (f *OSFile) Exists(ctx context.Context, path string) bool {
 	if err := ctx.Err(); err != nil {
 		return false
 	}
-	_, err := os.Stat(f.resolve(path))
+	full, closeRoot, err := f.anchored(path)
+	if err != nil {
+		return false
+	}
+	if closeRoot != nil {
+		defer closeRoot()
+	}
+	_, err = os.Stat(full)
 	return err == nil
 }
 
@@ -105,7 +238,14 @@ func (f *OSFile) Remove(ctx context.Context, path string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.Remove(f.resolve(path)); err != nil {
+	full, closeRoot, err := f.anchored(path)
+	if err != nil {
+		return err
+	}
+	if closeRoot != nil {
+		defer closeRoot()
+	}
+	if err := os.Remove(full); err != nil {
 		return fmt.Errorf("osfile: remove %s: %w", path, err)
 	}
 	return nil
