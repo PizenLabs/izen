@@ -74,8 +74,38 @@ func (m *model) topBarToast() string {
 // overlaid on the far-right boundary. When a toast is active it replaces the
 // mode badge so the bar stays a single fixed line and never overlaps the
 // workflow-state badge.
+//
+// Execution state is elevated here (not the footer): while isExecuting() the
+// bar renders RenderExecutingHeader with the windowed right-to-left sweep,
+// driven by m.spinnerFrame which advances on the capped 90–100ms tick.
 func (m *model) renderTopBar(width int) string {
+	if m != nil && m.isExecuting() {
+		title := "EXECUTING"
+		if m.shimmerText != "" {
+			title = m.shimmerText
+		} else if m.workflowSM != nil {
+			title = m.workflowSM.State().String()
+		}
+		if h := RenderExecutingHeader(title, m.spinnerFrame, width); h != "" {
+			return h
+		}
+	}
 	return renderFixedHeader(m.runtimeCtx, m.workflowSM, m.resolver.Current(), width, m.indexingStatus, m.topBarToast())
+}
+
+// executingTitle resolves the header execution title from authoritative
+// signals: shimmer text first, workflow state second, static fallback last.
+func (m *model) executingTitle() string {
+	if m == nil {
+		return "EXECUTING"
+	}
+	if m.shimmerText != "" {
+		return m.shimmerText
+	}
+	if m.workflowSM != nil {
+		return m.workflowSM.State().String()
+	}
+	return "EXECUTING"
 }
 
 // padRightOverlay right-aligns an overlay token (toast or capability chip) onto

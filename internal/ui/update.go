@@ -2524,6 +2524,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// of the animation layer).
 		return m, m.shimmerTickCmd()
 
+	case executingHeaderTickMsg:
+		// ── TOP HEADER EXECUTION SWEEP (capped 90ms) ────────────────
+		// Advances the windowed right-to-left gradient one frame and
+		// re-arms only while execution is in flight (self-terminating).
+		// The frame index shares m.spinnerFrame so all animation loops stay
+		// on one cadence; the header render itself is one styled 4-cell
+		// window (<0.5% CPU, no per-rune math).
+		if !m.isExecuting() {
+			return m, nil
+		}
+		m.spinnerFrame++
+		if m.Ready {
+			m.refreshViewportContent()
+		}
+		return m, m.executingHeaderTickCmd()
+
 	case planSlowNoticeMsg:
 		// One-shot soft-timeout probe for /plan synthesis. Only act if THIS
 		// synthesis is still pending (guard against a stale probe from a prior

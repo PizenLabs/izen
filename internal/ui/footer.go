@@ -24,14 +24,15 @@ import (
 //	   No token counters, no cost, no zero-value indicators — a brand-new
 //	   session never clutters the footer with idle telemetry.
 //	b. EXECUTING     (isExecuting)
-//	   Live stream bar: "⠋ Generating...  ·  ↑<sessionIn> · ↓<sessionOut> (<cost>)  ·  <rate> tok/s
-//	   ·  [model]  ·  ^C stop" seeded at t=0 as "↑C_in · ↓0" where C_in is the
-//	   session cumulative (prior turns + current prompt). The token slots (8
-//	   cells each) and rate (12 cells) are fixed-width (no horizontal jitter),
-//	   and the "^C stop" badge (10 cells, pinned right) is the LAST segment to
-//	   ever be dropped when the pane narrows (see footerDropToFit). The spinner
-//	   pulses cyan→amber. The instant execution ends, isExecuting() flips false
-//	   and the bar is replaced — '^C stop' never survives past completion.
+//	   Pure telemetry bar: "<model> · <wall>s · ↑<sessionIn> · ↓<sessionOut> · <rate> tok/s
+//	   ·  ^C stop" seeded at t=0 as "↑C_in · ↓0" where C_in is the
+//	   session cumulative (prior turns + current prompt). The telemetry uses
+//	   natural widths (no horizontal jitter), and the "^C stop" badge (pinned
+//	   right) is the LAST segment to ever be dropped when the pane narrows
+//	   (see footerDropToFit). The execution shimmer lives in the Top Header —
+//	   the footer carries no static "Generating..." text. The instant execution
+//	   ends, isExecuting() flips false and the bar is replaced — '^C stop'
+//	   never survives past completion.
 //	c. ACTIVE SESSION IDLE (sessionHasRunPrompts && !isExecuting)
 //	   Persistent refined telemetry anchored on the active model name:
 //	   "<Model:22>  ·  ↑<in:8> · ↓<out:8>  ·  <Cost:12>  ·  <Action:10>".
@@ -408,24 +409,51 @@ func (m *model) noFirstByteReceived() bool {
 	return true
 }
 
-// renderExecutingFooter renders the live EXECUTING bar as a flex-flow line:
-// left cluster "Generating... · ↑<sessionIn> · ↓<sessionOut> · <rate> tok/s"
+// styleModel is the Slot 1 model-slug style of the pure telemetry footer.
+// It aliases footerModelStyle so the deep forest theme stays single-sourced.
+var styleModel = footerModelStyle
+
+// activeWallSeconds returns the live active wall-timer in seconds, driven by
+// time.Since(streamStartTime) with an executionStartedAt fallback. It never
+// goes negative and returns 0 when no clock is armed (e.g. headless tests).
+func (m *model) activeWallSeconds() float64 {
+	start := m.streamStartTime
+	if start.IsZero() {
+		start = m.executionStartedAt
+	}
+	if start.IsZero() {
+		return 0
+	}
+	elapsed := time.Since(start).Seconds()
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
+}
+
+// renderExecutingFooter renders the live EXECUTING bar as a pure telemetry
+// line (no static "Generating..." text):
+// left cluster "<model> · <wall>s · ↑<sessionIn> · ↓<sessionOut> · <rate> tok/s"
 // with natural widths joined by tight " · ", right block "^C stop" pinned
 // via flexPinRight.
 //
+//	Slot 1: compressed model slug (CompressModelSlug, styleModel)
+//	Slot 2: live active wall-timer as %.1fs driven by time.Since(streamStartTime)
+//	Slot 3: token telemetry ↑<in> · ↓<out> · <rate> tok/s
+//	Slot 4 (pinned right): keybind hint ^C stop
+//
 //	pre-TTFT (no first token yet):
 //	  left "Connecting... Ns [provider/model]", right "^C stop"
-//	post-first-token (live session burn):
-//	  left "Generating... · ↑<in> · ↓<out> · <rate> tok/s", right "^C stop"
+//	post-first-token (live session burn): pure telemetry line above.
 //
 // INVARIANT 2 (monotonic session accumulation): while streaming,
 // sessionInput = priorTurnsInput + currentTurnPrompt and sessionOutput =
 // priorTurnsOutput + liveStreamTokens, so multi-turn sessions grow
 // monotonically. Minimalist glyphs, zero "in"/"out" suffixes. The pre-TTFT
 // countdown renders on every FrameTickMsg while the first byte is awaited.
-// Narrow panes drop the rate first, then token telemetry — '^C stop' is
-// never dropped. When in StateRetrying, an explicit retry banner replaces
-// "Generating...".
+// Narrow panes drop the rate first, then token telemetry — model slug, wall
+// timer and '^C stop' always survive. When in StateRetrying, an explicit
+// retry banner replaces the telemetry line.
 func (m *model) renderExecutingFooter(width int) string {
 	// The interrupt badge is drop-proof and pinned to the exact right edge.
 	stop := interruptLabelStyle.Render(stopBadge)
@@ -459,20 +487,21 @@ func (m *model) renderExecutingFooter(width int) string {
 		return flexPinRight(left, stop, width)
 	}
 	sess := m.snapshotSessionMetrics()
+	modelSlug := styleModel.Render(status.CompressModelSlug(m.getActiveModelName()))
+	wallSeg := footerExecMetaStyle.Render(fmt.Sprintf("%.1fs", m.activeWallSeconds()))
 	tokIn := footerTokStyle.Render(statusArrowIn(status.FormatTokens(sess.TotalInput())))
 	tokOut := footerTokStyle.Render(statusArrowOut(status.FormatTokens(sess.TotalOutput())))
 	rateSeg := footerExecMetaStyle.Render(formatTokenRate(m.streamTokenRate(st)) + " tok/s")
-	stateSeg := m.executingSpinner() + " " + footerExecLabelStyle.Render("Generating...")
 
-	// Priority drop: rate first, then output, then input — state + stop
-	// always survive. Each candidate left cluster is flex-pinned; the first
-	// candidate whose natural width fits wins, otherwise the minimal pair
-	// is truncated dynamically by flexPinRight.
+	// Priority drop: rate first, then output, then input — model slug,
+	// wall-timer and stop always survive. Each candidate left cluster is
+	// flex-pinned; the first candidate whose natural width fits wins,
+	// otherwise the minimal pair is truncated dynamically by flexPinRight.
 	candidates := [][]string{
-		{stateSeg, tokIn, tokOut, rateSeg},
-		{stateSeg, tokIn, tokOut},
-		{stateSeg, tokIn},
-		{stateSeg},
+		{modelSlug, wallSeg, tokIn, tokOut, rateSeg},
+		{modelSlug, wallSeg, tokIn, tokOut},
+		{modelSlug, wallSeg, tokIn},
+		{modelSlug, wallSeg},
 	}
 	for _, tokens := range candidates {
 		left := footerSep(tokens...)
@@ -480,7 +509,7 @@ func (m *model) renderExecutingFooter(width int) string {
 			return flexPinRight(left, stop, width)
 		}
 	}
-	return flexPinRight(footerSep(stateSeg), stop, width)
+	return flexPinRight(footerSep(modelSlug, wallSeg), stop, width)
 }
 
 // footerDropToFit renders a footer line from ordered segments, preserving the

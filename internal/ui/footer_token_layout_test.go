@@ -27,10 +27,13 @@ func TestFooterTokenLayout(t *testing.T) {
 	m.setStageMetrics(0, 0, 128)
 
 	wide := stripANSIFooter(m.renderFixedFooter(100, nil))
-	for _, want := range []string{"Generating...", "↑0", "↓128", "tok/s", "^C stop", "⠙"} {
+	for _, want := range []string{"qwen2.5-coder:7b", "↑0", "↓128", "tok/s", "^C stop"} {
 		if !strings.Contains(wide, want) {
 			t.Errorf("executing footer missing %q:\n%q", want, wide)
 		}
+	}
+	if strings.Contains(wide, "Generating...") {
+		t.Errorf("executing footer must not contain Generating...:\n%q", wide)
 	}
 	// Minimalist invariant: zero "in"/"out" suffixes.
 	if strings.Contains(wide, "↑0 in") || strings.Contains(wide, "↓128 out") {
@@ -65,15 +68,14 @@ func TestFooterTokenLayout(t *testing.T) {
 			t.Errorf("width %d: ^C stop must anchor the right edge:\n%q", w, narrow)
 		}
 	}
-	// At 30 cols the secondary telemetry is gone but the spinner+label+stop
-	// anchor survives; the model badge is dropped before the rate before the
-	// tokens.
+	// At 30 cols the secondary telemetry is gone but the model slug +
+	// wall-timer + stop anchor survives; the rate drops before the tokens.
 	ultra := stripANSIFooter(m.renderFixedFooter(30, nil))
 	if strings.Contains(ultra, "tok/s") {
 		t.Errorf("width 30 should have dropped the rate segment:\n%q", ultra)
 	}
-	if !strings.Contains(ultra, "Generating...") || !strings.Contains(ultra, "^C stop") {
-		t.Errorf("width 30 must keep the spinner label + stop anchor:\n%q", ultra)
+	if !strings.Contains(ultra, "qwen2.5-coder") || !strings.Contains(ultra, "^C stop") {
+		t.Errorf("width 30 must keep the model slug + stop anchor:\n%q", ultra)
 	}
 
 	// ── Idle bar: minimalist ↑ · ↓ on the model anchor ──
