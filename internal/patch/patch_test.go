@@ -224,8 +224,9 @@ func TestEventsPublished(t *testing.T) {
 	}
 
 	waitFor(t, func() bool {
-		_, ok := got.Load(events.EventPatchValidated)
-		return ok
+		_, parsed := got.Load(events.EventPatchParsed)
+		_, validated := got.Load(events.EventPatchValidated)
+		return parsed && validated
 	})
 
 	if _, ok := got.Load(events.EventPatchParsed); !ok {
