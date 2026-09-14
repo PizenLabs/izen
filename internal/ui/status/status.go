@@ -115,13 +115,16 @@ func FormatTokens(n int) string {
 	return fmt.Sprintf("%dk", n/1000)
 }
 
-// FormatUsage renders the input/output token pair in the footer format:
+// FormatUsage renders the input/output token pair in the minimalist footer
+// format:
 //
-//	"↓8.4k + ↑1.2k tok"
+//	"↑8.4k · ↓1.2k"
 //
-// The glyphs label the split: ↓ = input (prompt) tokens, ↑ = output
-// (completion) tokens. When only a total is meaningful (no split available)
-// it falls back to "9.6k tok". Returns "" when no usage has been recorded.
+// INVARIANT 1 (minimalist directional glyph syntax): the ↑/↓ glyphs already
+// establish complete semantic context (↑ = input/prompt, ↓ =
+// output/completion) so trailing "in"/"out" text suffixes are prohibited.
+// When only a total is meaningful (no split available) it falls back to
+// "9.6k tok". Returns "" when no usage has been recorded.
 func FormatUsage(s Snapshot) string {
 	if !s.Has {
 		return ""
@@ -129,30 +132,31 @@ func FormatUsage(s Snapshot) string {
 	if s.Input == 0 && s.Output == 0 {
 		return fmt.Sprintf("%s tok", FormatTokens(s.Total))
 	}
-	return fmt.Sprintf("↓%s + ↑%s tok", FormatTokens(s.Input), FormatTokens(s.Output))
+	return fmt.Sprintf("%s · %s", arrowIn(FormatTokens(s.Input)), arrowOut(FormatTokens(s.Output)))
 }
 
 // FormatUsageValues is the stateless variant used by renderers that already
 // hold the raw input/output values (e.g. the model's accumulated counters).
-// The ↓/↑ glyphs label input (prompt) and output (completion) tokens.
+// Minimalist glyph syntax: ↑ = input (prompt), ↓ = output (completion), no
+// "in"/"out" suffixes.
 func FormatUsageValues(input, output int) string {
-	return fmt.Sprintf("↓%s + ↑%s tok", FormatTokens(input), FormatTokens(output))
+	return fmt.Sprintf("%s · %s", arrowIn(FormatTokens(input)), arrowOut(FormatTokens(output)))
 }
 
 // FormatUsageContext renders token usage against the model's context window
 // as a compact percentage line, matching modern TUI status-bar conventions:
 //
-//	"↓2.3k + ↑1.5k tok (3%)" — provider-reported input/output split
-//	"3.8k tok (3%)"           — total-only fallback (no split available)
-//	"0 tok (0%)"              — zero / no usage recorded
+//	"↑2.3k · ↓1.5k (3%)" — provider-reported input/output split
+//	"3.8k tok (3%)"      — total-only fallback (no split available)
+//	"0 tok (0%)"         — zero / no usage recorded
 //
-// The ↓/↑ glyphs label input (prompt) and output (completion) tokens.
+// Minimalist glyph syntax: ↑ = input, ↓ = output, no "in"/"out" suffixes.
 // When the context window is unknown (contextLimit <= 0) the percentage
 // suffix is omitted so the line never shows a meaningless "0%".
 func FormatUsageContext(input, output, total, contextLimit int) string {
 	var base string
 	if input > 0 || output > 0 {
-		base = fmt.Sprintf("↓%s + ↑%s tok", FormatTokens(input), FormatTokens(output))
+		base = fmt.Sprintf("%s · %s", arrowIn(FormatTokens(input)), arrowOut(FormatTokens(output)))
 	} else {
 		base = fmt.Sprintf("%s tok", FormatTokens(total))
 	}
@@ -166,3 +170,10 @@ func FormatUsageContext(input, output, total, contextLimit int) string {
 	pct := int(math.Round(float64(used) / float64(contextLimit) * 100))
 	return fmt.Sprintf("%s (%d%%)", base, pct)
 }
+
+// arrowIn prefixes a token count with the input glyph (↑ = prompt tokens).
+func arrowIn(n string) string { return "↑" + n }
+
+// arrowOut prefixes a token count with the output glyph (↓ = completion
+// tokens).
+func arrowOut(n string) string { return "↓" + n }

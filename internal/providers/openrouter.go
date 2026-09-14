@@ -548,7 +548,12 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 			}
 		}
 	}
-	if len(req.Tools) > 0 {
+	// INVARIANT 1: ZERO-TOOL PAYLOAD ON CASUAL — if the system prompt is the
+	// minimal casual contract, tools MUST be omitted entirely (not even an empty
+	// array). Defensive: even if caller erroneously sets Tools, drop them.
+	if isCasualSystemPrompt(req.System) {
+		body.Tools = nil
+	} else if len(req.Tools) > 0 {
 		rawTools := make([]json.RawMessage, 0, len(req.Tools))
 		for _, t := range req.Tools {
 			data, err := json.Marshal(t)
@@ -560,6 +565,20 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 	}
 	body.ExtraParams = req.ExtraParams
 	return body
+}
+
+// isCasualSystemPrompt reports whether system is the minimal casual prompt.
+// It checks for the tiny contract without the full MODE contracts so a casual
+// greeting never carries tool schemas.
+func isCasualSystemPrompt(system string) bool {
+	if system == "" {
+		return false
+	}
+	// Minimal contract is "You are IZEN, a fast CLI coding companion..." without MODE.
+	if strings.Contains(system, "fast CLI coding companion") && !strings.Contains(system, "MODE:") {
+		return true
+	}
+	return false
 }
 
 // chatRequestStats carries the transport forensics of one logical invocation

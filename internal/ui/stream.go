@@ -56,6 +56,62 @@ const (
 	streamMaxDuration = 10 * time.Minute
 )
 
+// ── HISTORY TRACE SANITIZATION HELPERS (INVARIANT 3) ──────────────────────
+
+// sanitizeCasualMessageContent strips heavy context blocks from a message when
+// preparing a casual turn. It keeps only the user/assistant text and drops
+// governed file context, active objective frames, and fenced code blocks that
+// would inflate a greeting to hundreds of tokens.
+func sanitizeCasualMessageContent(s string) string {
+	if s == "" {
+		return s
+	}
+	// Strip GOVERNED FILE CONTEXT blocks.
+	if idx := strings.Index(s, "## GOVERNED FILE CONTEXT"); idx >= 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	if idx := strings.Index(s, "## Workspace File:"); idx >= 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	// Strip ACTIVE OBJECTIVE prefix (frame + remainder).
+	if strings.Contains(s, "### ACTIVE OBJECTIVE") {
+		// The frame ends at the first blank-line separation (\n\n) after the header.
+		if idx := strings.Index(s, "\n\n"); idx >= 0 {
+			// Find the double newline that terminates the frame header section.
+			// The injected frame is exactly "### ACTIVE OBJECTIVE\nID: ...\n..." + "\n\n" + original.
+			// Keep only the trailing original content after the frame.
+			parts := strings.SplitN(s, "\n\n", 2)
+			if len(parts) == 2 {
+				s = strings.TrimSpace(parts[len(parts)-1])
+				// Recurse in case multiple frames were nested.
+				return sanitizeCasualMessageContent(s)
+			}
+		} else {
+			// No separator — treat whole block as frame, return empty.
+			return ""
+		}
+	}
+	// Trim any remaining heavy markdown fences that would bloat casual history.
+	// We keep the text but drop fenced blocks for the casual slim path.
+	if strings.Contains(s, "```") {
+		// Remove fenced sections to keep casual history light.
+		var out strings.Builder
+		inFence := false
+		for _, line := range strings.Split(s, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "```") {
+				inFence = !inFence
+				continue
+			}
+			if !inFence {
+				out.WriteString(line + "\n")
+			}
+		}
+		s = strings.TrimSpace(out.String())
+	}
+	return strings.TrimSpace(s)
+}
+
 // debugLogPayload writes the exact outgoing LLM payload to
 // .izen/debug/payload.log so we can prove what the model actually receives on
 // each /ask turn. This is purely diagnostic — it appends one JSON line per
@@ -147,7 +203,16 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	plannerGoverned := m.askContextGoverned && m.resolver.Current() == modes.ModeAsk
 	m.askContextGoverned = false
 
-	content = injectObjectiveContext(content, m.sess.ObjectiveState)
+	// INVARIANT 1 & 2: Intent-Aware Payload Pruning — determine casual tier
+	// BEFORE any context injection so a greeting like "hi" never ingests the
+	// ACTIVE OBJECTIVE frame or file context (token ceiling <100).
+	rawContentForIntent := strings.TrimSpace(content)
+	isCasual := gateway.IsCasualChat(rawContentForIntent)
+	if isCasual {
+		// Casual path keeps raw greeting verbatim — no objective frame.
+	} else {
+		content = injectObjectiveContext(content, m.sess.ObjectiveState)
+	}
 	if m.streamCh != nil {
 		m.push(roleSystem, "Stream blocked: task active.")
 		return nil
@@ -174,6 +239,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamBaseInputTokens = estimatePromptTokens(content)
 	m.streamInputPricePerM, m.streamOutputPricePerM = m.lookupStreamPricing(m.getActiveModelName())
 	m.streamCh = make(chan tea.Msg, 1024)
+	m.streamRing = newStreamRing(streamRingCapacity)
 	m.streaming = true
 	m.spinnerFrame = 0
 	// A fresh stream starts a new assistant record: the streaming tail is
@@ -257,45 +323,62 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	}
 
 	var msgs []ai.Message
+	// INVARIANT 3: HISTORY TRACE SANITIZATION — system-level UI notifications
+	// (submit_prompt failed, latency logs, provider mismatch warnings) are TUI
+	// viewport only and MUST NOT enter the LLM history slice. The sanitization
+	// boundary is session.GetLLMMessages which enforces the TUI vs LLM
+	// separation; this loop adds the additional build-mode plan JSON isolation.
 	// Context isolation for /build: never replay a prior /plan JSON ledger back
 	// to the model. When it sees its own plan contract in history, weaker models
 	// re-print the plan instead of executing the active task. The staged task
 	// list (passed as the current user turn) is the single source of truth.
 	buildMode := m.resolver.Current() == modes.ModeBuild
-	if history := m.sess.History; len(history) > 0 {
-		for _, msg := range history {
-			raw := msg.Content
-			if buildMode && msg.Role == "assistant" {
-				if r := plan.ParseJSONPlan(raw); r != nil && r.Valid && r.Plan != nil {
-					continue
-				}
+	historySlice := m.sess.GetLLMMessages(isCasual)
+	for _, msg := range historySlice {
+		raw := msg.Content
+		if buildMode && msg.Role == "assistant" {
+			if r := plan.ParseJSONPlan(raw); r != nil && r.Valid && r.Plan != nil {
+				continue
 			}
-			// READS: Never pass viewport-rendered content — only session-persisted raw text.
-			msgs = append(msgs, ai.Message{
-				Role:    msg.Role,
-				Content: raw,
-			})
 		}
+		// READS: Never pass viewport-rendered content — only session-persisted raw text.
+		msgs = append(msgs, ai.Message{
+			Role:    msg.Role,
+			Content: raw,
+		})
 	}
 
 	// ── SLIDING WINDOW TRUNCATION ──────────────────────────────────
-	// Keep at most the last 20 history entries (≈10 exchanges) to
+	// Agentic: keep at most the last 20 history entries (≈10 exchanges) to
 	// prevent unbounded token growth across long sessions.
-	const maxHistoryMessages = 20
-	if len(msgs) > maxHistoryMessages {
-		msgs = msgs[len(msgs)-maxHistoryMessages:]
+	// Casual: keep at most the last 6 entries (≈3 exchanges) and already
+	// stripped heavy blocks above, targeting <100 input tokens total.
+	if isCasual {
+		const maxCasualHistoryMessages = 6
+		if len(msgs) > maxCasualHistoryMessages {
+			msgs = msgs[len(msgs)-maxCasualHistoryMessages:]
+		}
+	} else {
+		const maxHistoryMessages = 20
+		if len(msgs) > maxHistoryMessages {
+			msgs = msgs[len(msgs)-maxHistoryMessages:]
+		}
 	}
 
 	// ABSOLUTE GUARD: content MUST be raw input text, NOT m.Viewport.View() or any
 	// concatenation of rendered history + status bar + prompt prefix.
-	msgs = append(msgs, ai.Message{Role: "user", Content: content})
+	// For casual, ensure the final user turn is also stripped of any heavy
+	// block that might have been injected earlier.
+	finalUserContent := content
+	if isCasual {
+		finalUserContent = sanitizeCasualMessageContent(content)
+	}
+	msgs = append(msgs, ai.Message{Role: "user", Content: finalUserContent})
 
 	// ── AUTOMATIC FILE CONTEXT INJECTION ──────────────────────
-	// Skip injection for casual greetings / small talk — they don't
-	// need codebase context and pulling random snippets (config files,
-	// release notes, etc.) into the LLM window is both wasteful and
-	// the source of hallucinated RAG context on short inputs.
-	if m.workspaceRoot != "" && !gateway.IsCasualChat(content) {
+	// INVARIANT 1: ZERO-TOOL PAYLOAD ON CASUAL — casual greetings skip all
+	// file context ingestion (no RAG, no snippets).
+	if m.workspaceRoot != "" && !isCasual {
 		// CONTEXT GOVERNANCE (P3): When the Context Planner already governed
 		// the /ask turn (prepareAskStreamCmd assembled budget-fitted context and
 		// routed @file references through the FileSource adapter), the
@@ -318,8 +401,9 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// (often ~1500-2048 tokens) for code generation.
 	maxTokens := askCodingMaxTokens
 
-	if gateway.IsCasualChat(content) {
-		systemPrompt = gateway.CasualChatSystemPrompt()
+	// INVARIANT 2: DYNAMIC SYSTEM PROMPT TIERING
+	if isCasual {
+		systemPrompt = gateway.BuildMinimalSystemPrompt()
 		maxTokens = gateway.CasualChatMaxTokens()
 	} else {
 		systemPrompt = prompt.ForModeWithUser(m.resolver.Current().String(), m.userName)
@@ -340,12 +424,43 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	}
 	m.initStreamCostTelemetry(totalChars)
 
-	// Capture the channel reference locally so the goroutine (and the
+	// Capture the channel + ring references locally so the goroutine (and the
 	// ReasoningHandler below, which runs on the producer goroutine during
-	// ExecuteStream reads) never reads m.streamCh after Update() clears it to
-	// nil. Without this, the deferred close(m.streamCh) would panic with
-	// "close of nil channel".
+	// ExecuteStream reads) never reads m.streamCh/m.streamRing after Update()
+	// clears them to nil. Without this, the deferred close(m.streamCh) would
+	// panic with "close of nil channel".
 	streamCh := m.streamCh
+	ring := m.streamRing
+
+	// ── NON-BLOCKING PRODUCER (engine→UI decoupling) ───────────────────
+	// Every message the producer emits goes through send. The primary path is
+	// a non-blocking channel send (the UI re-arms readStream on every token,
+	// so the channel drains on each Update delivery). When the channel is
+	// temporarily full — the event loop is mid-frame and hasn't re-armed —
+	// overflow is parked in the lock-free streamRing instead of blocking the
+	// LLM thread; the UI frame-pass drain (FrameTickMsg) and the terminal
+	// stream handlers flush it. Terminal messages (done/err) are rare (1-2
+	// per stream) and MUST cross in order, so their overflow falls back to a
+	// blocking send — never to the ring — guaranteeing they are always
+	// delivered ahead of the next stream's lifetime.
+	send := func(msg tea.Msg) {
+		select {
+		case streamCh <- msg:
+			return
+		default:
+		}
+		if ring != nil {
+			switch msg.(type) {
+			case streamDoneMsg, streamErrMsg:
+				// pinned to the channel: terminal messages never enter the ring
+			default:
+				if ring.Push(msg) {
+					return
+				}
+			}
+		}
+		streamCh <- msg // blocking fallback (drained by the read loop)
+	}
 
 	req := ai.Request{
 		Model:     m.getActiveModelName(),
@@ -361,10 +476,15 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			// UI renders them inline in the dimmed thinking style, in arrival
 			// order relative to content tokens.
 			if chunk != "" {
-				streamCh <- thinkingTokenMsg(chunk)
+				send(thinkingTokenMsg(chunk))
 			}
 			return nil
 		},
+	}
+	// INVARIANT 1: ZERO-TOOL PAYLOAD ON CASUAL — casual intents MUST NOT carry
+	// tool definitions; nil ensures the JSON omits the tools key entirely.
+	if isCasual {
+		req.Tools = nil
 	}
 
 	// The request context is derived from the active operation (when one is
@@ -415,10 +535,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 
 		defer func() {
 			if r := recover(); r != nil {
-				select {
-				case streamCh <- streamErrMsg{err: fmt.Errorf("stream panic: %v", r)}:
-				default:
-				}
+				send(streamErrMsg{err: fmt.Errorf("stream panic: %v", r)})
 			}
 		}()
 		defer close(streamCh)
@@ -426,7 +543,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 
 		rawStream, err := m.provider.ExecuteStream(ctx, req)
 		if err != nil {
-			streamCh <- streamErrMsg{err: err}
+			send(streamErrMsg{err: err})
 			return
 		}
 		defer func() { _ = rawStream.Close() }()
@@ -479,7 +596,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 				return
 			}
 			lastUsage = u
-			streamCh <- streamUsageMsg{input: u.PromptTokens, output: u.CompletionTokens, reasoning: u.ReasoningTokens}
+			send(streamUsageMsg{input: u.PromptTokens, output: u.CompletionTokens, reasoning: u.ReasoningTokens})
 		}
 
 		// Two-phase TTFT: the first chunk (content or thinking) proves the
@@ -494,11 +611,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 		full, ingestErr := ingestLLMStream(idleBody, m.bus, func(text string) {
 			relaxToSteady()
-			streamCh <- tokenMsg(text)
+			send(tokenMsg(text))
 			emitUsage()
 		}, func(text string) {
 			relaxToSteady()
-			streamCh <- thinkingTokenMsg(text)
+			send(thinkingTokenMsg(text))
 			emitUsage()
 		})
 
@@ -544,16 +661,16 @@ func (m *model) streamCmd(content string) tea.Cmd {
 			// provider-reported usage (or a character estimate) even when it
 			// was interrupted — carry it on the error message so the footer
 			// reports consumed tokens instead of a silent 0.
-			streamCh <- streamErrMsg{err: ingestErr, content: full, tokenInput: tokIn, tokenOutput: tokOut, usageEstimated: usageEstimated}
+			send(streamErrMsg{err: ingestErr, content: full, tokenInput: tokIn, tokenOutput: tokOut, usageEstimated: usageEstimated})
 			return
 		}
-		streamCh <- streamDoneMsg{
+		send(streamDoneMsg{
 			content:        full,
 			tokenInput:     tokIn,
 			tokenOutput:    tokOut,
 			usageEstimated: usageEstimated,
 			truncated:      truncated,
-		}
+		})
 	}()
 
 	return tea.Batch(m.streamTraceCmd(), m.readStream(), m.smoothStreamTickCmd(), m.shimmerTickCmd())

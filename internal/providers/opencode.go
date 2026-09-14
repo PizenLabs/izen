@@ -92,7 +92,8 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 		ExtraParams: req.ExtraParams,
 	}
 
-	if len(req.Tools) > 0 {
+	// INVARIANT 1: casual minimal prompts must never carry tools.
+	if !isCasualSystemPrompt(req.System) && len(req.Tools) > 0 {
 		rawTools := make([]json.RawMessage, 0, len(req.Tools))
 		for _, t := range req.Tools {
 			data, err := json.Marshal(t)
@@ -209,7 +210,8 @@ func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (i
 		ExtraParams:   req.ExtraParams,
 	}
 
-	if len(req.Tools) > 0 {
+	// INVARIANT 1: casual minimal prompts must never carry tools.
+	if !isCasualSystemPrompt(req.System) && len(req.Tools) > 0 {
 		rawTools := make([]json.RawMessage, 0, len(req.Tools))
 		for _, t := range req.Tools {
 			data, err := json.Marshal(t)

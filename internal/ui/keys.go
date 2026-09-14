@@ -1442,6 +1442,8 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 func (m *model) lockTailToNewPrompt() {
 	m.userScrolledAway = false
 	m.userIsScrollingUp = false
+	m.userScrollLocked = false
+	m.endScrollBurst()
 	m.followTail()
 	m.refreshViewportContentImmediate()
 }

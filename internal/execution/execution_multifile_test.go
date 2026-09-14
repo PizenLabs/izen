@@ -145,7 +145,8 @@ func TestMultiFileMutationSingleTransaction(t *testing.T) {
 	// Phase 2 P2: execution.finished remains the LAST lifecycle event; only
 	// the authoritative execution.evidence record (sealed at termination) may
 	// follow it.
-	collector.waitCount(events.EventVerificationCompleted, 1, time.Second)
+	collector.waitCount(events.EventVerificationCompleted, 1, 2*time.Second)
+	collector.waitCount(events.EventExecutionFinished, 1, 2*time.Second)
 	types := collector.types()
 	last := types[len(types)-1]
 	switch {

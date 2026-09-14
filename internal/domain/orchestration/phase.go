@@ -10,7 +10,11 @@
 // aliases during migration.
 package orchestration
 
-import "fmt"
+import (
+	"fmt"
+
+	domainworkflow "github.com/PizenLabs/izen/internal/domain/workflow"
+)
 
 // Phase is a logical execution phase within the workflow.
 type Phase int
@@ -98,6 +102,15 @@ type TransitionError struct {
 
 func (e *TransitionError) Error() string {
 	return fmt.Sprintf("orchestrator: invalid transition %s -> %s: %s", e.From, e.To, e.Msg)
+}
+
+// Unwrap exposes the canonical invalid-transition sentinel so callers can
+// classify rejections with errors.Is instead of string matching.
+func (e *TransitionError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return domainworkflow.ErrInvalidTransition
 }
 
 // PhaseStateMachine is the pure phase-tracking value: current phase plus

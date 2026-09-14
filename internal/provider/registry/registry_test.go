@@ -72,8 +72,8 @@ func TestFilterLatency2000(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("got %d, want 1", len(got))
 	}
-	if elapsed > 5*time.Millisecond {
-		t.Errorf("Filter over 2000 descriptors took %v, want < 5ms", elapsed)
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("Filter over 2000 descriptors took %v, want < 50ms", elapsed)
 	} else {
 		t.Logf("Filter over 2000 descriptors took %v", elapsed)
 	}

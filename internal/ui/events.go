@@ -22,7 +22,13 @@ import (
 // domainEventMsg carries a DomainEvent published on the engine event bus into
 // the Bubble Tea event loop. The UI is a pure projection of the domain event
 // stream: engines publish headlessly and never call UI routines directly.
-type domainEventMsg struct{ ev events.DomainEvent }
+//
+// Epoch carries the dispatch generation; events with Epoch < generationEpoch
+// are stale and MUST be silently dropped.
+type domainEventMsg struct {
+	ev    events.DomainEvent
+	Epoch uint64
+}
 
 // presentationEventMsg carries a runtime.PresentationEvent — a domain event
 // already translated into a UI-ready, decoupled projection by the Application
@@ -37,9 +43,14 @@ type presentationEventMsg struct {
 // the Application-layer facade on a background goroutine. It never carries
 // state: the model is only ever mutated on the UI goroutine via the message
 // stream.
+//
+// Epoch carries the model.generationEpoch captured at dispatch time. Results
+// arriving with Epoch < generationEpoch are stale (a reset/unwind superseded
+// them) and MUST be silently dropped.
 type runtimeResultMsg struct {
-	typ appruntime.CommandType
-	err error
+	typ   appruntime.CommandType
+	err   error
+	Epoch uint64
 }
 
 // WorkflowStateChangedMsg is emitted when the WorkflowStateMachine transitions.

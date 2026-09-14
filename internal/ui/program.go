@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -58,6 +59,12 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 	ti := textinput.New()
 	ti.Prompt = ""
 	ti.CharLimit = 0
+	// VIRTUAL SOFTWARE CURSOR (TTY render decoupling §1): the input cursor is
+	// a pure in-band SGR cell — always-reversed block, no blink state machine,
+	// no hardware cursor codes (\x1b[?25h / \x1b[?25l). CursorStatic makes
+	// Focus() arm no blink timer, so the cursor cell is stable across render-
+	// path freeze/thaw with zero flicker.
+	ti.Cursor.SetMode(cursor.CursorStatic)
 	ti.Focus()
 
 	// ── EVENT BUS ──────────────────────────────────────────────────────────
