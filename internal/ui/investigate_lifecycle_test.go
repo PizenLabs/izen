@@ -102,12 +102,13 @@ func TestInvestigateResultMsgSuccessReleasesStuckProcessing(t *testing.T) {
 	}
 }
 
-// TestInvestigateEscCancelsActivePipelineContext asserts Esc during an active
-// /investigate (investigateRunning set, view frozen in StateProcessing) routes
-// through the emergency interrupt: it cancels the registered background
-// context from the central Emergency Interrupt Registry, clears
-// investigateRunning via syncUIState, restores input focus and dispatches a
-// CancelCmd — without killing the app.
+// TestInvestigateEscCancelsActivePipelineContext asserts double-Esc during an
+// active /investigate (investigateRunning set, view frozen in StateProcessing)
+// routes through the emergency interrupt: the first Esc only arms, the second
+// dispatches MsgCancelStream which cancels the registered background context
+// from the central Emergency Interrupt Registry, clears investigateRunning via
+// syncUIState, restores input focus and dispatches a CancelCmd — without
+// killing the app.
 func TestInvestigateEscCancelsActivePipelineContext(t *testing.T) {
 	m := newInvestigateBusyModel(t)
 
@@ -116,29 +117,58 @@ func TestInvestigateEscCancelsActivePipelineContext(t *testing.T) {
 	cancelled := false
 	m.backgroundCancels = append(m.backgroundCancels, func() { cancelled = true })
 
-	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m2 := res.(*model)
+	// First tap arms only — the pipeline must keep running.
+	res, armCmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mArmed := res.(*model)
+	if !mArmed.interruptState.armed {
+		t.Fatal("first Esc must arm the interrupt window")
+	}
+	if armCmd == nil {
+		t.Fatal("first Esc must return the disarm tick command")
+	}
+	if cancelled {
+		t.Error("first Esc must not cancel the investigate pipeline context")
+	}
+
+	// Second tap dispatches the cancellation signal.
+	res2, cancelCmd := mArmed.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m2 := res2.(*model)
+	if cancelCmd == nil {
+		t.Fatal("second Esc must return a command (MsgCancelStream)")
+	}
+	msgs := drainCmds(t, cancelCmd)
+	found := false
+	for _, msg := range msgs {
+		if _, ok := msg.(MsgCancelStream); ok {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("second Esc must dispatch MsgCancelStream")
+	}
+	res3, cmd := m2.Update(MsgCancelStream{})
+	m3 := res3.(*model)
 
 	if !cancelled {
-		t.Error("Esc did not cancel the registered investigate pipeline context")
+		t.Error("double-Esc did not cancel the registered investigate pipeline context")
 	}
-	if m2.state != StateChat {
-		t.Fatalf("state = %v, want StateChat after Esc cancel", m2.state)
+	if m3.state != StateChat {
+		t.Fatalf("state = %v, want StateChat after double-Esc cancel", m3.state)
 	}
-	if m2.investigateRunning || m2.agentRunning || m2.streaming || m2.reviewRunning {
-		t.Errorf("processing flags still set after Esc cancel: investigate=%v agent=%v stream=%v review=%v",
-			m2.investigateRunning, m2.agentRunning, m2.streaming, m2.reviewRunning)
+	if m3.investigateRunning || m3.agentRunning || m3.streaming || m3.reviewRunning {
+		t.Errorf("processing flags still set after double-Esc cancel: investigate=%v agent=%v stream=%v review=%v",
+			m3.investigateRunning, m3.agentRunning, m3.streaming, m3.reviewRunning)
 	}
-	if !m2.ti.Focused() {
-		t.Error("input focus not restored after Esc cancel of /investigate")
+	if !m3.ti.Focused() {
+		t.Error("input focus not restored after double-Esc cancel of /investigate")
 	}
 	if cmd == nil {
-		t.Fatal("Esc must return a command (CancelCmd) so the runtime observes the cancellation")
+		t.Fatal("MsgCancelStream must return a command (CancelCmd) so the runtime observes the cancellation")
 	}
 	// The tick loop must not be re-spun by the cancelled state.
-	_, cmd2 := m2.Update(smoothStreamTickMsg{})
+	_, cmd2 := m3.Update(smoothStreamTickMsg{})
 	if cmd2 != nil {
-		t.Fatal("tick loop still alive after Esc cancellation — spinner never stops")
+		t.Fatal("tick loop still alive after double-Esc cancellation — spinner never stops")
 	}
 }
 

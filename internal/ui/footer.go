@@ -25,14 +25,17 @@ import (
 //	   session never clutters the footer with idle telemetry.
 //	b. EXECUTING     (isExecuting)
 //	   Pure telemetry bar: "<model> · <wall>s · ↑<sessionIn> · ↓<sessionOut> · <rate> tok/s
-//	   ·  ^C stop" seeded at t=0 as "↑C_in · ↓0" where C_in is the
+//	   ·  Esc stop" seeded at t=0 as "↑C_in · ↓0" where C_in is the
 //	   session cumulative (prior turns + current prompt). The telemetry uses
-//	   natural widths (no horizontal jitter), and the "^C stop" badge (pinned
+//	   natural widths (no horizontal jitter), and the "Esc stop" badge (pinned
 //	   right) is the LAST segment to ever be dropped when the pane narrows
-//	   (see footerDropToFit). The execution shimmer lives in the Top Header —
-//	   the footer carries no static "Generating..." text. The instant execution
-//	   ends, isExecuting() flips false and the bar is replaced — '^C stop'
-//	   never survives past completion.
+//	   (see footerDropToFit). The first Esc arms a 1.5s window and flips the
+//	   badge to the high-visibility "Press Esc again!" warning; the second Esc
+//	   inside the window cancels. Ctrl+C stays a silent hard-interrupt
+//	   fallback and is never rendered. The execution shimmer lives in the Top
+//	   Header — the footer carries no static "Generating..." text. The instant
+//	   execution ends, isExecuting() flips false and the bar is replaced —
+//	   'Esc stop' never survives past completion.
 //	c. ACTIVE SESSION IDLE (sessionHasRunPrompts && !isExecuting)
 //	   Persistent refined telemetry anchored on the active model name:
 //	   "<Model:22>  ·  ↑<in:8> · ↓<out:8>  ·  <Cost:12>  ·  <Action:10>".
@@ -130,7 +133,7 @@ func (m *model) renderFixedFooter(width int, actions []Action) string {
 	var s string
 	switch {
 	case m.isExecuting():
-		s = m.renderExecutingFooter(width)
+		s = m.renderExecutingFooter(width, m.isInterruptArmed())
 	case !m.sessionHasRunPrompts:
 		s = m.renderFreshLaunchFooter(width)
 	default:
@@ -232,7 +235,7 @@ func (m *model) getActiveModelDisplay() string {
 // ── FLEX-FLOW FOOTER GEOMETRY (ZERO-GAP TELEMETRY) ──────────────────────
 // The footer is a two-zone flex dispatch: a left telemetry cluster with
 // natural inline flow (metrics joined by tight " · " separators, zero
-// trailing padding) and a right action badge (^C stop / ^P menu) pinned to
+// trailing padding) and a right action badge (Esc stop / ^P menu) pinned to
 // the exact right edge. The middle gap is dynamic whitespace:
 // gap = totalWidth - width(Left) - width(Right).
 //
@@ -289,7 +292,7 @@ func (m *model) renderFreshLaunchFooter(width int) string {
 // (m.InputTokens/m.OutputTokens).
 //
 // Minimalist glyph syntax: ↑<count> / ↓<count>, zero "in"/"out" suffixes.
-// The Mode Badge is deliberately absent — the Top Bar owns it. '^C stop' and
+// The Mode Badge is deliberately absent — the Top Bar owns it. 'Esc stop' and
 // the '⏸' icon are never present here. Narrow widths tier down (cost drops
 // first, then the model truncates) but the right badge is never dropped.
 func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
@@ -434,16 +437,18 @@ func (m *model) activeWallSeconds() float64 {
 // renderExecutingFooter renders the live EXECUTING bar as a pure telemetry
 // line (no static "Generating..." text):
 // left cluster "<model> · <wall>s · ↑<sessionIn> · ↓<sessionOut> · <rate> tok/s"
-// with natural widths joined by tight " · ", right block "^C stop" pinned
-// via flexPinRight.
+// with natural widths joined by tight " · ", right block pinned via
+// flexPinRight.
 //
 //	Slot 1: compressed model slug (CompressModelSlug, styleModel)
 //	Slot 2: live active wall-timer as %.1fs driven by time.Since(streamStartTime)
 //	Slot 3: token telemetry ↑<in> · ↓<out> · <rate> tok/s
-//	Slot 4 (pinned right): keybind hint ^C stop
+//	Slot 4 (pinned right): Esc stop affordance — subtle "Esc stop" idle hint,
+//	  high-contrast "Press Esc again!" warning while the 1.5s double-tap window
+//	  is armed (isArmed). Ctrl+C is never rendered (silent POSIX fallback).
 //
 //	pre-TTFT (no first token yet):
-//	  left "Connecting... Ns [provider/model]", right "^C stop"
+//	  left "Connecting... Ns [provider/model]", right Esc badge
 //	post-first-token (live session burn): pure telemetry line above.
 //
 // INVARIANT 2 (monotonic session accumulation): while streaming,
@@ -452,11 +457,17 @@ func (m *model) activeWallSeconds() float64 {
 // monotonically. Minimalist glyphs, zero "in"/"out" suffixes. The pre-TTFT
 // countdown renders on every FrameTickMsg while the first byte is awaited.
 // Narrow panes drop the rate first, then token telemetry — model slug, wall
-// timer and '^C stop' always survive. When in StateRetrying, an explicit
+// timer and the Esc badge always survive. When in StateRetrying, an explicit
 // retry banner replaces the telemetry line.
-func (m *model) renderExecutingFooter(width int) string {
-	// The interrupt badge is drop-proof and pinned to the exact right edge.
-	stop := interruptLabelStyle.Render(stopBadge)
+func (m *model) renderExecutingFooter(width int, isArmed bool) string {
+	// The interrupt badge is drop-proof and pinned to the exact right edge:
+	// subtle idle hint vs high-visibility re-confirm warning.
+	var stop string
+	if isArmed {
+		stop = styleWarnHint.Render(stopBadgeArmed)
+	} else {
+		stop = styleDimHint.Render(stopBadge)
+	}
 	// Retry state takes precedence: show explicit banner, not stale generating.
 	if m.retryInfo != nil {
 		banner := formatRetryBanner(m.retryInfo)
@@ -513,7 +524,7 @@ func (m *model) renderExecutingFooter(width int) string {
 }
 
 // footerDropToFit renders a footer line from ordered segments, preserving the
-// LAST segment ('^C stop') as the drop-proof anchor: whenever the joined line
+// LAST segment ('Esc stop') as the drop-proof anchor: whenever the joined line
 // exceeds width, the least critical segment is dropped and the line
 // re-measured. Segments use natural widths with the tight " · " separator;
 // the surviving line is right-pinned via flexPinRight so the anchor sits on
@@ -616,13 +627,17 @@ func formatTokenRate(rate float64) string {
 // fixed precision so numeric updates never reflow surrounding text
 // (INVARIANT 3). Metrics render at natural width with tight " · "
 // separators and zero trailing padding; the line never wraps mid-stream.
-// The drop-proof "^C stop" interrupt badge anchors the exact right edge.
+// The drop-proof "Esc stop" interrupt badge anchors the exact right edge.
 
-// stopBadge is the compact interrupt affordance that anchors the executing
-// footer's right edge. It replaces the legacy "⏸ Ctrl+C interrupt" pair —
-// one badge, both the hint and the escape hatch, and the LAST segment a
-// width-aware executing footer ever drops (see footerDropToFit).
-const stopBadge = "^C stop"
+// stopBadge is the subtle idle interrupt affordance pinned to the executing
+// footer's right edge. The first Esc arms the 1.5s double-tap window and flips
+// it to stopBadgeArmed. Ctrl+C is never rendered (silent POSIX fallback).
+const stopBadge = "Esc stop"
+
+// stopBadgeArmed is the high-visibility re-confirm warning rendered while the
+// Esc double-tap window is armed. It is the LAST segment a width-aware
+// executing footer ever drops (see footerDropToFit).
+const stopBadgeArmed = "Press Esc again!"
 
 // renderModeBadge renders the current mode as a compact capability badge:
 // read-only modes → "[READ-ONLY]", build → "[WRITE]", investigate → "[EXECUTE]".

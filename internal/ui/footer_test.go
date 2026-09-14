@@ -62,7 +62,7 @@ func TestFooterExecutingStateLiveBar(t *testing.T) {
 	width := 100
 	footer := stripANSIFooter(m.renderFixedFooter(width, nil))
 
-	for _, want := range []string{"qwen2.5-coder:7b", "10.0s", "↑0", "↓128", "tok/s", "^C stop"} {
+	for _, want := range []string{"qwen2.5-coder:7b", "10.0s", "↑0", "↓128", "tok/s", "Esc stop"} {
 		if !strings.Contains(footer, want) {
 			t.Errorf("executing footer missing %q:\n%q", want, footer)
 		}
@@ -166,7 +166,7 @@ func TestFooterCompletedStateRevertsToIdle(t *testing.T) {
 	m.setStageMetrics(0, 0, 256)
 
 	executing := stripANSIFooter(m.renderFixedFooter(100, nil))
-	if !strings.Contains(executing, "tok/s") || !strings.Contains(executing, "^C stop") {
+	if !strings.Contains(executing, "tok/s") || !strings.Contains(executing, "Esc stop") {
 		t.Fatalf("precondition: executing bar not rendered:\n%q", executing)
 	}
 

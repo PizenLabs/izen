@@ -829,14 +829,20 @@ func (m *model) renderRuntimeStatus(width int) string {
 	}
 	b.WriteByte(' ')
 
-	// AI INTERRUPT ENGINE: high-visibility indicator that Ctrl+C is available
-	// while ANY execution operation is in flight (streaming, provider wait,
-	// agent run, patch generation, shell). Cancellation must be discoverable,
-	// not implied. The compact '^C stop' badge matches the executing footer
-	// affordance so both surfaces speak the same interrupt language.
+	// AI INTERRUPT ENGINE: high-visibility indicator that Esc double-tap is
+	// available while ANY execution operation is in flight (streaming, provider
+	// wait, agent run, patch generation, shell). Cancellation must be
+	// discoverable, not implied. The compact 'Esc stop' badge matches the
+	// executing footer affordance so both surfaces speak the same interrupt
+	// language; while the 1.5s window is armed it flips to the warn-styled
+	// 'Press Esc again!'. Ctrl+C stays a silent fallback and is never rendered.
 	if m.streaming || m.shellRunning || m.agentRunning || m.reviewRunning ||
 		m.pipelineRunning || m.planPending || m.activeOp != nil {
-		b.WriteString(interruptLabelStyle.Render(stopBadge + " "))
+		if m.isInterruptArmed() {
+			b.WriteString(styleWarnHint.Render(stopBadgeArmed + " "))
+		} else {
+			b.WriteString(styleDimHint.Render(stopBadge + " "))
+		}
 	}
 
 	// Agent label — shown immediately after the spinner, before model name

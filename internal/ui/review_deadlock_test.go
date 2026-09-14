@@ -99,10 +99,11 @@ func TestReviewCleanTreeResultReleasesStuckProcessingWithError(t *testing.T) {
 	}
 }
 
-// TestReviewEscCancelsActivePipelineContext asserts Esc during an active
+// TestReviewEscCancelsActivePipelineContext asserts double-Esc during an active
 // review pipeline (reviewRunning set, view frozen in StateProcessing) routes
-// through the emergency interrupt: it cancels the registered background
-// context, clears every transient flag, returns focus to chat and dispatches a
+// through the emergency interrupt: the first Esc only arms, the second
+// dispatches MsgCancelStream which cancels the registered background context,
+// clears every transient flag, returns focus to chat and dispatches a
 // CancelCmd — without killing the app.
 func TestReviewEscCancelsActivePipelineContext(t *testing.T) {
 	m := newReviewBusyModel(t)
@@ -113,26 +114,55 @@ func TestReviewEscCancelsActivePipelineContext(t *testing.T) {
 	var cancelFunc = func() { cancelled = true }
 	m.backgroundCancels = append(m.backgroundCancels, cancelFunc)
 
-	res, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m2 := res.(*model)
+	// First tap arms only.
+	res, armCmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mArmed := res.(*model)
+	if !mArmed.interruptState.armed {
+		t.Fatal("first Esc must arm the interrupt window")
+	}
+	if armCmd == nil {
+		t.Fatal("first Esc must return the disarm tick command")
+	}
+	if cancelled {
+		t.Error("first Esc must not cancel the review pipeline context")
+	}
+
+	// Second tap dispatches the cancellation signal.
+	res2, cancelCmd := mArmed.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m2 := res2.(*model)
+	if cancelCmd == nil {
+		t.Fatal("second Esc must return a command (MsgCancelStream)")
+	}
+	msgs := drainCmds(t, cancelCmd)
+	found := false
+	for _, msg := range msgs {
+		if _, ok := msg.(MsgCancelStream); ok {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("second Esc must dispatch MsgCancelStream")
+	}
+	res3, cmd := m2.Update(MsgCancelStream{})
+	m3 := res3.(*model)
 
 	if !cancelled {
-		t.Error("Esc did not cancel the registered review pipeline context")
+		t.Error("double-Esc did not cancel the registered review pipeline context")
 	}
-	if m2.state != StateChat {
-		t.Fatalf("state = %v, want StateChat after Esc cancel", m2.state)
+	if m3.state != StateChat {
+		t.Fatalf("state = %v, want StateChat after double-Esc cancel", m3.state)
 	}
-	if m2.reviewRunning || m2.agentRunning || m2.streaming {
-		t.Errorf("processing flags still set after Esc cancel: review=%v agent=%v stream=%v",
-			m2.reviewRunning, m2.agentRunning, m2.streaming)
+	if m3.reviewRunning || m3.agentRunning || m3.streaming {
+		t.Errorf("processing flags still set after double-Esc cancel: review=%v agent=%v stream=%v",
+			m3.reviewRunning, m3.agentRunning, m3.streaming)
 	}
 	if cmd == nil {
-		t.Fatal("Esc must return a command (CancelCmd) so the runtime observes the cancellation")
+		t.Fatal("MsgCancelStream must return a command (CancelCmd) so the runtime observes the cancellation")
 	}
 	// The tick loop must not be re-spun by the cancelled state.
-	_, cmd2 := m2.Update(smoothStreamTickMsg{})
+	_, cmd2 := m3.Update(smoothStreamTickMsg{})
 	if cmd2 != nil {
-		t.Fatal("tick loop still alive after Esc cancellation — spinner never stops")
+		t.Fatal("tick loop still alive after double-Esc cancellation — spinner never stops")
 	}
 }
 

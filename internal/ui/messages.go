@@ -119,3 +119,16 @@ type ToolBatchSelectMsg struct {
 type ToolBatchToggleMsg struct {
 	BatchID string
 }
+
+// ── Double-Tap Esc Interrupt Protocol ─────────────────────────────────────
+// MsgResetInterruptState disarms the Esc arming window. SequenceID must match
+// the model's current interrupt sequence or the tick is stale and ignored.
+type MsgResetInterruptState struct {
+	SequenceID uint64
+}
+
+// MsgCancelStream is the single stream-cancellation signal. It is emitted by
+// the second Esc inside the arming window (via cancelStreamCmd) and by the
+// silent Ctrl+C hard-interrupt fallback; the Update handler funnels both
+// through the same emergency-interrupt path.
+type MsgCancelStream struct{}
