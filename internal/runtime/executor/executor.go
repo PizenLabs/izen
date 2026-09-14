@@ -50,14 +50,32 @@ func (e *RuntimeExecutor) OCCGate() *occ.OCCGate { return e.occ }
 // Substrate returns the substrate.
 func (e *RuntimeExecutor) Substrate() *substrate.Substrate { return e.substrate }
 
-// Execute implements the 6-step pipeline:
-// 1. Validate OCCGate sequence version
-// 2. Construct AuthorizationInput
-// 3. Call guard.Evaluate
-// 4. Trigger checkpoint if needed
-// 5. Delegate to substrate.ExecuteUnit
-// 6. Record observation and advance version
+// Execute implements the 6-step pipeline with a synchronous deterministic
+// fast-path gate at Step 0:
+//  0. Fast-path static gate (capabilities → targets → references → preflight),
+//     bounded O(N) on target depth, early exit before any checkpoint/substrate.
+//  1. Validate OCCGate sequence version
+//  2. Construct AuthorizationInput
+//  3. Call guard.Evaluate (sole 8-clause authority, before substrate.ExecuteUnit)
+//  4. Trigger checkpoint if needed
+//  5. Delegate to substrate.ExecuteUnit
+//  6. Record observation and advance version
 func (e *RuntimeExecutor) Execute(ctx context.Context, intent domain.ExecutionIntent) (domain.ExecutionObservation, error) {
+	// Step 0: Synchronous deterministic fast-path gate. Drops unauthorized or
+	// unsafe static requests before OCC, checkpoint, or substrate work. The
+	// final verdict still rests with guard.Evaluate at Step 3 (StageAuthorize);
+	// this stage only denies early on static evidence. LLM-derived bytes are
+	// treated as untrusted: any authority override directive denies with
+	// ErrCapabilityDenied at the execution boundary.
+	if fastRes := e.fastPathPreflight(ctx, intent); !fastRes.Permitted {
+		obs := domain.ExecutionObservation{
+			UnitID:          intent.Unit.UnitID,
+			ProposalOutcome: domain.ProposalRejected,
+			FailureSignals:  []domain.FailureSignal{{Class: domain.FailureUnknown, Message: fastRes.Reason}},
+		}
+		return obs, fmt.Errorf("%w: %s", fastPathClauseErr(fastRes.FailedClause, fastRes.Reason), fastRes.Reason)
+	}
+
 	// Step 1: Validate OCCGate sequence version for current state.
 	if e.occ != nil {
 		if _, err := e.occ.ValidateAndAdvance(&e.version, intent.ExpectedVersion); err != nil {

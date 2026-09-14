@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	coreauth "github.com/PizenLabs/izen/internal/core/domain/authorization"
 	"github.com/PizenLabs/izen/internal/runtime/authorization"
 	"github.com/PizenLabs/izen/internal/runtime/executor"
 	"github.com/PizenLabs/izen/internal/runtime/preflight"
@@ -37,7 +38,15 @@ func NewOrchestrator(
 // RunCycle executes one full control-loop cycle:
 //
 //  1. Preflight: compile the raw intent into a CompiledRequest.
+//     1b. Fast-path static gate (synchronous, deterministic, bounded O(N) on
+//     target depth): lexical target safety always runs; when
+//     cfg.FastPathAuth is set the full static gate (capabilities → targets →
+//     references → preflight) runs and drops unauthorized requests BEFORE any
+//     model invocation. No network call is made on fast-path denial.
 //  2. Non-deterministic proposal: ask the provider for a ProposedMutation.
+//     The returned proposal is strictly UNTRUSTED.
+//     2b. Execution-boundary sanitization: any authority override directive
+//     smuggled in proposal bytes drops with ErrCapabilityDenied.
 //  3. Deterministic validation: reject unsafe proposals before any approval
 //     session or snapshot exists.
 //  4. Approval session creation: open a fresh session and capture the
@@ -51,6 +60,11 @@ func NewOrchestrator(
 //  7. Atomic execution or abort: ActionExecute commits atomically;
 //     ActionCancel (or any non-execute decision) aborts without touching the
 //     workspace.
+//
+// Reasoning-vs-authority separation is preserved: model output never grants
+// authority. Downstream diagnostic/repair tasks may still invoke reasoning;
+// security is enforced at the execution boundary (RuntimeExecutor +
+// fast-path gate), never by stripping model capabilities.
 func (o *Orchestrator) RunCycle(ctx context.Context, req preflight.PreflightRequest, provider ProposalProvider, ui UIProjectionBridge, cfg OrchestratorConfig) (*ExecutionResult, error) {
 	if o == nil {
 		return nil, errors.New("orchestrator: nil Orchestrator")
@@ -83,13 +97,37 @@ func (o *Orchestrator) RunCycle(ctx context.Context, req preflight.PreflightRequ
 		return nil, fmt.Errorf("orchestrator: preflight: %w", err)
 	}
 
-	// Step 2: Non-deterministic proposal (LLM stage).
+	// Step 1b: Synchronous deterministic fast-path gate BEFORE any model
+	// invocation. Lexical target safety always runs (bounded O(N) on target
+	// depth); the full static gate runs when cfg.FastPathAuth is set.
+	// Denial here prevents any LLM network call, saving tokens and latency.
+	if fastErr := o.fastPathBeforeModel(ctx, req, compiled, cfg); fastErr != nil {
+		return nil, fastErr
+	}
+
+	// Step 2: Non-deterministic proposal (LLM stage). The proposal is strictly
+	// untrusted and carries zero authority.
 	proposal, err := provider.GenerateProposal(ctx, compiled)
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: generate proposal: %w", err)
 	}
 	if proposal == nil {
 		return nil, errors.New("orchestrator: proposal provider returned a nil proposal")
+	}
+
+	// Step 2b: Execution-boundary sanitization. Authority override directives
+	// smuggled in model output are dropped unconditionally with
+	// ErrCapabilityDenied — model bytes never grant authority.
+	if sanErr := executor.SanitizeUntrustedPayload(proposal.RawPatch); sanErr != nil {
+		return nil, fmt.Errorf("%w: %w: %s", ErrProposalValidationFailed, coreauth.ErrCapabilityDenied, sanErr.Error())
+	}
+	if proposal.TargetRef != nil {
+		if sanErr := executor.SanitizeUntrustedPayload(proposal.TargetRef.Canonical); sanErr != nil {
+			return nil, fmt.Errorf("%w: %w: %s", ErrProposalValidationFailed, coreauth.ErrCapabilityDenied, sanErr.Error())
+		}
+		if sanErr := executor.SanitizeUntrustedPayload(proposal.TargetRef.Raw); sanErr != nil {
+			return nil, fmt.Errorf("%w: %w: %s", ErrProposalValidationFailed, coreauth.ErrCapabilityDenied, sanErr.Error())
+		}
 	}
 
 	// Step 3: Deterministic validation. Failure halts the cycle before any

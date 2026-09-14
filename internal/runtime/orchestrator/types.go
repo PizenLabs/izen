@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/core/domain/evidence"
 	"github.com/PizenLabs/izen/internal/presentation/diff"
 	"github.com/PizenLabs/izen/internal/runtime/authorization"
@@ -57,6 +58,25 @@ type UIProjectionBridge interface {
 	WaitForApproval(ctx context.Context) (authorization.ApprovalEvent, error)
 }
 
+// FastPathAuthConfig carries the static authorization evidence for the
+// pre-model fast-path gate. When nil, RunCycle enforces only lexical target
+// safety before the provider call (backward-compatible). When non-nil, the
+// full static gate (capabilities → targets → references → preflight) runs
+// synchronously after preflight and drops unauthorized requests before any
+// network call to the LLM provider. The execution boundary still enforces the
+// 8-clause guard before mutation.
+type FastPathAuthConfig struct {
+	Capabilities        domain.DomainCapabilitySet
+	Budget              domain.ResourceBudget
+	Artifact            domain.ArtifactRef
+	Objective           domain.Objective
+	CheckpointID        domain.CheckpointID
+	HasCheckpoint       bool
+	HumanApproved       bool
+	BudgetIsPreApproval bool
+	SourceState         domain.SourceState
+}
+
 // OrchestratorConfig carries execution options for a single RunCycle.
 type OrchestratorConfig struct {
 	// TokenBudget is the context token budget applied to preflight when the
@@ -65,6 +85,10 @@ type OrchestratorConfig struct {
 	// ViewportConfig is the terminal geometry used to project the proposal
 	// diff.
 	ViewportConfig diff.ViewportConfig
+	// FastPathAuth, when non-nil, enables the synchronous static
+	// authorization gate before the provider call. Nil preserves legacy
+	// behavior (lexical target safety only).
+	FastPathAuth *FastPathAuthConfig
 }
 
 // ExecutionResult reports the outcome of one control-loop cycle.
