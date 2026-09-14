@@ -190,16 +190,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	// swallow the keyboard — the user can always interrupt back to
 	// interactive chat (Philosophy Rule 1: Human-Centered / Reversible).
 	//
-	//   - Ctrl+C: hard interrupt whenever any workflow operation is in flight
-	//     or the view is in a locked state.
-	//   - Esc:    emergency abort while the view is frozen in StateProcessing
-	//     (or a plan synthesis is pending); in all other states Esc keeps its
-	//     normal contextual role (reject approval, dismiss overlay, ...).
+	//   - Ctrl+C: silent hard interrupt whenever any workflow operation is in
+	//     flight or the view is in a locked state. It disarms any pending Esc
+	//     window and cancels immediately (POSIX SIGINT fallback, never rendered).
+	//   - Esc:    double-tap interrupt while executing: the first exact KeyEsc
+	//     arms a 1.5s window (footer flips to "Press Esc again!"), the second
+	//     inside the window cancels the stream. A modal/approval overlay owns
+	//     Esc first (isolation) — the interrupt never fires through a modal.
+	//     Bubble Tea's decoder resolves arrows (\x1b[A…) to distinct types, so
+	//     matching KeyEsc here never blocks arrow input polling.
 	//   - Ctrl+D: emergency abort while frozen in StateProcessing only;
 	//     otherwise it keeps its clean-shutdown role in chat.
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
 		switch keyMsg.Type {
 		case tea.KeyCtrlC:
+			// Silent hard-interrupt fallback: drop any armed Esc window first.
+			m.disarmInterrupt()
 			// Unified Ctrl+C protocol: first press cancels the active
 			// operation (or dismisses the ambiguity card) gracefully; a
 			// second press while a cancellation is in progress hard-exits
@@ -213,13 +219,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				return m.handleEmergencyInterrupt("ctrl-c")
 			}
 		case tea.KeyEsc:
-			// Esc aborts any active review OR investigate pipeline (manual
-			// /review, /investigate, or a $test/$run/$log sub-command that
-			// holds reviewRunning) by cancelling the registered background
-			// context and returning focus to the input bar — never killing
-			// the app.
-			if m.state == StateProcessing || m.planPending || m.reviewRunning || m.investigateRunning {
-				return m.handleEmergencyInterrupt("escape")
+			// Double-tap Esc protocol while executing. Modal/approval overlays
+			// keep Esc (reject/dismiss) — handleInterruptEsc reports
+			// handled=false there so normal routing proceeds below.
+			if m.isExecuting() {
+				if handled, cmd := m.handleInterruptEsc(); handled {
+					return m, cmd
+				}
 			}
 		case tea.KeyCtrlD:
 			if m.state == StateProcessing {
@@ -244,6 +250,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, cmd
 		}
 		_ = sigMsg
+		return m, nil
+	}
+
+	// ── DOUBLE-TAP ESC INTERRUPT MESSAGES ───────────────────────────────
+	// Race-free reset chain: only the tick bearing the latest sequenceID may
+	// disarm; stale ticks from earlier presses are ignored.
+	if resetMsg, ok := msg.(MsgResetInterruptState); ok {
+		if resetMsg.SequenceID == m.interruptState.sequenceID {
+			m.disarmInterrupt()
+		}
+		return m, nil
+	}
+	// Single cancellation signal for the second Esc (via cancelStreamCmd) and
+	// the silent Ctrl+C fallback. Funnels through the emergency interrupt so
+	// every in-flight context is cancelled deterministically.
+	if _, ok := msg.(MsgCancelStream); ok {
+		m.disarmInterrupt()
+		if m.isExecuting() || m.activeOp != nil {
+			return m.handleEmergencyInterrupt("escape")
+		}
 		return m, nil
 	}
 
@@ -2523,6 +2549,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// component's own Tick() cadence would otherwise drift from the rest
 		// of the animation layer).
 		return m, m.shimmerTickCmd()
+
+	case executingHeaderTickMsg:
+		// ── TOP HEADER EXECUTION SWEEP (capped 90ms) ────────────────
+		// Advances the windowed right-to-left gradient one frame and
+		// re-arms only while execution is in flight (self-terminating).
+		// The frame index shares m.spinnerFrame so all animation loops stay
+		// on one cadence; the header render itself is one styled 4-cell
+		// window (<0.5% CPU, no per-rune math).
+		if !m.isExecuting() {
+			return m, nil
+		}
+		m.spinnerFrame++
+		if m.Ready {
+			m.refreshViewportContent()
+		}
+		return m, m.executingHeaderTickCmd()
 
 	case planSlowNoticeMsg:
 		// One-shot soft-timeout probe for /plan synthesis. Only act if THIS

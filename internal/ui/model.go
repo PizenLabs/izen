@@ -733,6 +733,19 @@ type providerSwitchMsg struct {
 // Also dispatched by the Ctrl+C hard-override handler.
 type TaskFinishedMsg struct{}
 
+// ── Double-Tap Esc Interrupt Protocol ─────────────────────────────────────
+// InterruptState tracks the 1.5s arming window between the first and second
+// Esc press while executing. sequenceID prevents race conditions from stale
+// reset timers: only the tick bearing the latest ID may disarm.
+type InterruptState struct {
+	armed      bool
+	armedAt    time.Time
+	sequenceID uint64
+}
+
+// InterruptWindow is the double-tap arming window for Esc stream cancel.
+const InterruptWindow = 1500 * time.Millisecond
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 type model struct {
@@ -1201,6 +1214,13 @@ type model struct {
 	streamInterTokenTimer    *time.Timer
 	streamInterTokenDeadline time.Time
 	interruptRequested       bool
+
+	// ── Double-Tap Esc Interrupt Protocol ──────────────────────────
+	// interruptState arms a 1.5s window on the first Esc press while
+	// executing; only a second Esc inside the window cancels the stream.
+	// sequenceID guards the single event-driven tea.Tick reset against
+	// stale timers from previous presses (zero polling, zero CPU overhead).
+	interruptState InterruptState
 
 	// Retry state machine (engine.RetryInfo projection for status bar)
 	retryInfo *retryStatusInfo
@@ -2802,6 +2822,9 @@ func (m *model) unwindBuildFailure() {
 //  4. Drops in-flight approval/patch state so the viewport returns to chat.
 //  5. Re-derives the presentation state to interactive StateChat.
 func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
+	// Any emergency interrupt settles the Esc double-tap window: a fired or
+	// superseded cancel must never leave a stale "Press Esc again!" hint.
+	m.disarmInterrupt()
 	// 0. Cancel the authoritative operation context FIRST so provider calls
 	// and subprocesses spawned under the active operation observe the
 	// cancellation immediately (Section 6: context propagation).

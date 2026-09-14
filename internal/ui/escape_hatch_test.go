@@ -51,22 +51,58 @@ func TestEmergencyEscapeHatchCtrlCUnfreezesStateProcessing(t *testing.T) {
 	}
 }
 
-// TestEmergencyEscapeHatchEscUnfreezesStateProcessing asserts Esc is an
-// unblockable escape hatch while frozen in StateProcessing.
+// TestEmergencyEscapeHatchEscUnfreezesStateProcessing asserts the double-tap
+// Esc protocol unfreezes a stuck StateProcessing: the first Esc only arms the
+// 1.5s window (no cancel), the second Esc inside the window dispatches
+// MsgCancelStream, and handling that message returns to interactive StateChat
+// clearing every transient processing flag.
 func TestEmergencyEscapeHatchEscUnfreezesStateProcessing(t *testing.T) {
 	m := newProcessingModel()
 
-	resModel, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	// First tap arms only — state and flags must be untouched.
+	resModel, armCmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m2 := resModel.(*model)
-
-	if m2.state != StateChat {
-		t.Errorf("state = %v, want StateChat after Esc", m2.state)
+	if !m2.interruptState.armed {
+		t.Fatal("first Esc must arm the interrupt window")
 	}
-	if m2.agentRunning || m2.streaming || m2.planPending {
-		t.Errorf("processing flags still set after Esc")
+	if m2.state != StateProcessing {
+		t.Errorf("state = %v, want StateProcessing after first Esc (arm only)", m2.state)
+	}
+	if !m2.streaming || !m2.agentRunning || !m2.planPending {
+		t.Error("first Esc must not clear processing flags")
+	}
+	if armCmd == nil {
+		t.Fatal("first Esc must return the disarm tick command")
+	}
+
+	// Second tap inside the window dispatches the cancellation signal.
+	resModel2, cancelCmd := m2.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m3 := resModel2.(*model)
+	if cancelCmd == nil {
+		t.Fatal("second Esc must return a command (MsgCancelStream)")
+	}
+	msgs := drainCmds(t, cancelCmd)
+	foundCancel := false
+	for _, msg := range msgs {
+		if _, ok := msg.(MsgCancelStream); ok {
+			foundCancel = true
+		}
+	}
+	if !foundCancel {
+		t.Fatalf("second Esc must dispatch MsgCancelStream, got %T", msgs)
+	}
+
+	// Handling the signal performs the emergency interrupt.
+	resModel3, cmd := m3.Update(MsgCancelStream{})
+	m4 := resModel3.(*model)
+	if m4.state != StateChat {
+		t.Errorf("state = %v, want StateChat after double-Esc", m4.state)
+	}
+	if m4.agentRunning || m4.streaming || m4.planPending {
+		t.Errorf("processing flags still set after double-Esc")
 	}
 	if cmd == nil {
-		t.Fatal("Esc must return a command (interrupt record)")
+		t.Fatal("MsgCancelStream must return a command (interrupt record)")
 	}
 }
 

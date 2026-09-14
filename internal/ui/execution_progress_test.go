@@ -303,9 +303,11 @@ func TestProgressCtrlCUsableDuringProviderWait(t *testing.T) {
 		t.Fatal("provider never started")
 	}
 
-	// The status bar advertises that cancellation is available during the wait.
+	// The status bar advertises that cancellation is available during the wait
+	// via the double-tap Esc affordance (Ctrl+C stays a silent fallback and
+	// is never rendered).
 	status := stripANSITest(m.renderRuntimeStatus(120))
-	if !strings.Contains(status, "^C stop") {
+	if !strings.Contains(status, "Esc stop") {
 		t.Fatalf("status bar does not advertise cancellation during provider wait: %q", status)
 	}
 

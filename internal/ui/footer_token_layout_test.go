@@ -10,11 +10,11 @@ import (
 // layout:
 //   - the executing bar carries minimalist ↑input / ↓output slots (no
 //     "in"/"out" suffixes), a live cost, tok/s rate, a truncated [model]
-//     badge and the drop-proof ^C stop badge
+//     badge and the drop-proof Esc stop badge
 //   - the in/out slots are FIXED-WIDTH (8 cells each): growing counts
 //     (1 → 9.9k) never shift the metric column positions
 //   - priority-drop: at narrowing widths the model badge drops first, then the
-//     rate, then token telemetry — while ^C stop survives at every usable width
+//     rate, then token telemetry — while Esc stop survives at every usable width
 //   - the idle bar renders minimalist ↑ · ↓ anchored on the model
 func TestFooterTokenLayout(t *testing.T) {
 	// ── Executing bar: full telemetry with minimalist arrows ──
@@ -27,10 +27,13 @@ func TestFooterTokenLayout(t *testing.T) {
 	m.setStageMetrics(0, 0, 128)
 
 	wide := stripANSIFooter(m.renderFixedFooter(100, nil))
-	for _, want := range []string{"Generating...", "↑0", "↓128", "tok/s", "^C stop", "⠙"} {
+	for _, want := range []string{"qwen2.5-coder:7b", "↑0", "↓128", "tok/s", "Esc stop"} {
 		if !strings.Contains(wide, want) {
 			t.Errorf("executing footer missing %q:\n%q", want, wide)
 		}
+	}
+	if strings.Contains(wide, "Generating...") {
+		t.Errorf("executing footer must not contain Generating...:\n%q", wide)
 	}
 	// Minimalist invariant: zero "in"/"out" suffixes.
 	if strings.Contains(wide, "↑0 in") || strings.Contains(wide, "↓128 out") {
@@ -55,25 +58,24 @@ func TestFooterTokenLayout(t *testing.T) {
 			smallGap, largeGap, small, large)
 	}
 
-	// ── Priority drop: ^C stop survives every usable width ──
+	// ── Priority drop: Esc stop survives every usable width ──
 	for _, w := range []int{70, 48, 30} {
 		narrow := stripANSIFooter(m.renderFixedFooter(w, nil))
-		if !strings.Contains(narrow, "^C stop") {
-			t.Errorf("width %d: ^C stop badge dropped:\n%q", w, narrow)
+		if !strings.Contains(narrow, "Esc stop") {
+			t.Errorf("width %d: Esc stop badge dropped:\n%q", w, narrow)
 		}
-		if !strings.HasSuffix(strings.TrimSpace(narrow), "^C stop") {
-			t.Errorf("width %d: ^C stop must anchor the right edge:\n%q", w, narrow)
+		if !strings.HasSuffix(strings.TrimSpace(narrow), "Esc stop") {
+			t.Errorf("width %d: Esc stop must anchor the right edge:\n%q", w, narrow)
 		}
 	}
-	// At 30 cols the secondary telemetry is gone but the spinner+label+stop
-	// anchor survives; the model badge is dropped before the rate before the
-	// tokens.
+	// At 30 cols the secondary telemetry is gone but the model slug +
+	// wall-timer + stop anchor survives; the rate drops before the tokens.
 	ultra := stripANSIFooter(m.renderFixedFooter(30, nil))
 	if strings.Contains(ultra, "tok/s") {
 		t.Errorf("width 30 should have dropped the rate segment:\n%q", ultra)
 	}
-	if !strings.Contains(ultra, "Generating...") || !strings.Contains(ultra, "^C stop") {
-		t.Errorf("width 30 must keep the spinner label + stop anchor:\n%q", ultra)
+	if !strings.Contains(ultra, "qwen2.5-coder") || !strings.Contains(ultra, "Esc stop") {
+		t.Errorf("width 30 must keep the model slug + stop anchor:\n%q", ultra)
 	}
 
 	// ── Idle bar: minimalist ↑ · ↓ on the model anchor ──

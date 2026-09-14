@@ -46,8 +46,9 @@ func TestFooterFreshLaunchState(t *testing.T) {
 	}
 }
 
-// TestFooterExecutingStateLiveBar pins the EXECUTING state: the dynamic live
-// execution bar with spinner, live token count, token rate and interrupt hint.
+// TestFooterExecutingStateLiveBar pins the EXECUTING state: the pure
+// telemetry bar with compressed model slug, live wall-timer, token count,
+// token rate and interrupt hint (no static "Generating..." text).
 // Minimalist glyphs: ↑<n> / ↓<n> with zero "in"/"out" suffixes.
 func TestFooterExecutingStateLiveBar(t *testing.T) {
 	m := readyChatModel(newTestModel())
@@ -61,10 +62,14 @@ func TestFooterExecutingStateLiveBar(t *testing.T) {
 	width := 100
 	footer := stripANSIFooter(m.renderFixedFooter(width, nil))
 
-	for _, want := range []string{"Generating...", "↑0", "↓128", "tok/s", "^C stop", "⠙"} {
+	for _, want := range []string{"qwen2.5-coder:7b", "10.0s", "↑0", "↓128", "tok/s", "Esc stop"} {
 		if !strings.Contains(footer, want) {
 			t.Errorf("executing footer missing %q:\n%q", want, footer)
 		}
+	}
+	// Pure telemetry: the static label lives in the Top Header now.
+	if strings.Contains(footer, "Generating...") {
+		t.Errorf("executing footer must not contain Generating...:\n%q", footer)
 	}
 	// The executing bar never renders idle hints.
 	if strings.Contains(footer, "Alt+E trace") || strings.Contains(footer, "Ctrl+H help") || strings.Contains(footer, "? help") {
@@ -161,7 +166,7 @@ func TestFooterCompletedStateRevertsToIdle(t *testing.T) {
 	m.setStageMetrics(0, 0, 256)
 
 	executing := stripANSIFooter(m.renderFixedFooter(100, nil))
-	if !strings.Contains(executing, "Generating...") {
+	if !strings.Contains(executing, "tok/s") || !strings.Contains(executing, "Esc stop") {
 		t.Fatalf("precondition: executing bar not rendered:\n%q", executing)
 	}
 

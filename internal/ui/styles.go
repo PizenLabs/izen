@@ -171,8 +171,16 @@ var (
 			Padding(0, 1).
 			Bold(true)
 
-	// Catppuccin Mocha soft interrupt indicator
+	// Catppuccin Mocha soft interrupt indicator (legacy; the double-tap Esc
+	// protocol renders styleDimHint/styleWarnHint instead).
+	//nolint:unused
 	interruptLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMaroon)).Faint(true)
+
+	// Double-tap Esc footer hints: subtle idle affordance vs high-contrast
+	// re-confirm warning. Single-sourced here so the footer and the status
+	// header speak the same interrupt language.
+	styleDimHint  = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen)).Faint(true)
+	styleWarnHint = lipgloss.NewStyle().Foreground(lipgloss.Color(colorYellow)).Bold(true)
 
 	// Semantic renderer diff styles
 	semanticAddStyle    = lipgloss.NewStyle().Background(lipgloss.Color("#18302b")).Foreground(lipgloss.Color("#6cd0a1"))

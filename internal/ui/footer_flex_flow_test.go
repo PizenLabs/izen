@@ -42,7 +42,7 @@ func TestFooterFlexFlowLayout(t *testing.T) {
 		}
 	}
 
-	// ── Executing: Generating... · ↑712 · ↓25 · rate + ^C stop ──
+	// ── Executing: <model> · <wall>s · ↑712 · ↓25 · rate + ^C stop ──
 	exec := readyChatModel(newTestModel())
 	exec.state = StateProcessing
 	exec.streaming = true
@@ -58,8 +58,8 @@ func TestFooterFlexFlowLayout(t *testing.T) {
 		if lipgloss.Width(got) != width {
 			t.Errorf("exec width %d: got %d, want %d:\n%q", width, lipgloss.Width(got), width, got)
 		}
-		if !strings.Contains(got, "Generating...") {
-			t.Errorf("exec width %d missing state label:\n%q", width, got)
+		if !strings.Contains(got, "qwen2.5-coder") {
+			t.Errorf("exec width %d missing model slug:\n%q", width, got)
 		}
 		if !strings.HasSuffix(strings.TrimSpace(got), stopBadge) {
 			t.Errorf("exec width %d: %q must pin to the right edge:\n%q", width, stopBadge, got)
