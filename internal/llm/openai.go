@@ -232,15 +232,31 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		return LLMResponse{}, fmt.Errorf("openai: no choices")
 	}
 
-	// Task 1: truncated payload handling — intercept BEFORE envelope parsing.
-	if openaiResp.Choices[0].FinishReason == "length" {
-		return LLMResponse{}, fmt.Errorf("%w: finish_reason=length", ErrPayloadTruncated)
-	}
-
 	content := ""
 	if openaiResp.Choices[0].Message != nil {
 		msg := openaiResp.Choices[0].Message
 		content = usableContent(msg.Content, msg.Reasoning, msg.ReasoningContent)
+	}
+	// Task 1: truncated payload handling — intercept BEFORE envelope parsing,
+	// but PRESERVE the canonical partial buffer. Universal Stream Outcome:
+	// length -> PARTIAL across all tiers; never clear/swallow the buffer.
+	if openaiResp.Choices[0].FinishReason == "length" {
+		tokenIn, tokenOut, cacheRead := 0, 0, 0
+		if openaiResp.Usage != nil {
+			tokenIn = openaiResp.Usage.PromptTokens
+			tokenOut = openaiResp.Usage.CompletionTokens
+			if openaiResp.Usage.PromptDetails != nil {
+				cacheRead = openaiResp.Usage.PromptDetails.CachedTokens
+			}
+		}
+		return LLMResponse{
+			Content:         content,
+			TokenInput:      tokenIn,
+			TokenOutput:     tokenOut,
+			CacheReadTokens: cacheRead,
+			FinishReason:    "length",
+			Truncated:       true,
+		}, fmt.Errorf("%w: finish_reason=length", ErrPayloadTruncated)
 	}
 	content = SanitizeOutput(content)
 
@@ -260,6 +276,8 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		TokenInput:      tokenIn,
 		TokenOutput:     tokenOut,
 		CacheReadTokens: cacheRead,
+		FinishReason:    "stop",
+		Truncated:       false,
 	}
 
 	if strings.Contains(c.baseURL, "openrouter") {
@@ -438,9 +456,18 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	}
 
 	// Fail fast on truncated payload — do NOT attempt envelope parsing.
+	// Universal Stream Outcome: preserve the canonical partial buffer
+	// verbatim (no synthetic mutation); callers map length -> PARTIAL.
 	if truncated {
 		cancel()
-		return LLMResponse{TokenInput: tokenIn, TokenOutput: tokenOut}, fmt.Errorf("%w: finish_reason=length", ErrPayloadTruncated)
+		return LLMResponse{
+			Content:         full.String(),
+			TokenInput:      tokenIn,
+			TokenOutput:     tokenOut,
+			CacheReadTokens: cacheRead,
+			FinishReason:    "length",
+			Truncated:       true,
+		}, fmt.Errorf("%w: finish_reason=length", ErrPayloadTruncated)
 	}
 	content := full.String()
 	if strings.TrimSpace(content) == "" {
@@ -453,6 +480,8 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		TokenInput:      tokenIn,
 		TokenOutput:     tokenOut,
 		CacheReadTokens: cacheRead,
+		FinishReason:    "stop",
+		Truncated:       false,
 	}
 
 	if strings.Contains(c.baseURL, "openrouter") {

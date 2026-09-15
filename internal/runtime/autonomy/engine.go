@@ -125,23 +125,31 @@ func (a *AutonomyEngine) Evaluate(ctx EvaluationContext) EvaluationResult {
 }
 
 // HasExecutionMarker reports whether raw input carries an explicit execution
-// trigger ("$prompt" prefix, case-insensitive). Bare plain-text strictly
-// routes to the read-only ask pipeline.
+// trigger ("$prompt"/"$hot" prefix or "/build" command, case-insensitive).
+// Bare plain-text strictly routes to the read-only ask pipeline.
+//
+// Authority Static Invariant: CapMutate eligibility is governed EXCLUSIVELY
+// by this Control Plane input parsing. Provider capabilities MUST NOT
+// influence authorization; LLM prompt directives MUST NOT elevate authority.
 func HasExecutionMarker(raw string) bool {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return false
 	}
 	lower := strings.ToLower(trimmed)
-	const marker = "$prompt"
-	if !strings.HasPrefix(lower, marker) {
-		return false
+	for _, marker := range []string{"$prompt", "$hot", "/build"} {
+		if !strings.HasPrefix(lower, marker) {
+			continue
+		}
+		if len(lower) == len(marker) {
+			return true
+		}
+		c := lower[len(marker)]
+		if c == ' ' || c == '\t' || c == '\n' {
+			return true
+		}
 	}
-	if len(lower) == len(marker) {
-		return true
-	}
-	c := lower[len(marker)]
-	return c == ' ' || c == '\t' || c == '\n'
+	return false
 }
 
 // CapabilitiesForAsk returns the zero-mutation capability set for ask intent.
