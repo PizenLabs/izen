@@ -80,17 +80,28 @@ func ConstrainCapabilitiesForIntent(kind domain.IntentKind, caps domain.DomainCa
 }
 
 // HasExecutionMarker reports whether raw input carries an explicit execution
-// trigger. Only a "$prompt" prefix (case-insensitive, leading whitespace
-// allowed) or an explicit UI execution action routes to the execution
-// pipeline; bare plain-text strictly routes to the read-only ask pipeline.
+// trigger. Only a "$prompt"/"$hot" prefix or a "/build" command prefix
+// (case-insensitive, leading whitespace allowed) or an explicit UI execution
+// action routes to the execution pipeline; bare plain-text strictly routes to
+// the read-only ask pipeline.
+//
+// Authority Static Invariant: CapMutate eligibility is governed EXCLUSIVELY
+// by this Control Plane input parsing. Provider model capabilities, context
+// length, or token pricing MUST NOT influence authorization state. LLM prompt
+// directives (including words like "delete file") MUST NOT elevate authority.
 func HasExecutionMarker(raw string) bool {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return false
 	}
 	lower := strings.ToLower(trimmed)
-	return strings.HasPrefix(lower, "$prompt") &&
-		(len(lower) == len("$prompt") || lower[len("$prompt")] == ' ' || lower[len("$prompt")] == '\t' || lower[len("$prompt")] == '\n')
+	for _, marker := range []string{"$prompt", "$hot", "/build"} {
+		if strings.HasPrefix(lower, marker) &&
+			(len(lower) == len(marker) || lower[len(marker)] == ' ' || lower[len(marker)] == '\t' || lower[len(marker)] == '\n') {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidateProviderModel verifies provider/model tuple compatibility

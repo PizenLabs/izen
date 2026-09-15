@@ -114,8 +114,14 @@ type ExecutionResult struct {
 	// when Committed is true.
 	Terminal evidence.TerminalState
 	// Verdict is the terminal evidence classification (Passed/Failed/
-	// Inconclusive). Audit failure forces Failed.
+	// Inconclusive/PARTIAL). Audit failure forces Failed. A provider stream
+	// ending with finish_reason="length" records Verdict=PARTIAL
+	// (EvidenceState.PARTIAL) across ALL provider tiers.
 	Verdict evidence.EvidenceState
+	// Status is the universal stream outcome label ("COMPLETE", "PARTIAL",
+	// "FAILED", "CANCELLED"). Truncation returns "PARTIAL" without a
+	// terminal execution error.
+	Status string
 	// Completed mirrors Terminal.Completed: false when audit persistence
 	// failed, regardless of mutation success.
 	Completed bool

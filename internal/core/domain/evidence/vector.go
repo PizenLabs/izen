@@ -79,6 +79,11 @@ const (
 	VerdictPassed       EvidenceState = iota // all required levels PASS contiguously
 	VerdictFailed                            // any required level FAIL or monotonic gap
 	VerdictInconclusive                      // any required level UNKNOWN/SKIP or missing
+	// PARTIAL is the universal stream outcome for finish_reason="length":
+	// the provider truncated at its completion ceiling. The canonical token
+	// buffers are preserved verbatim; the UI renders a boundary badge without
+	// synthetic content mutation. Applies across ALL provider tiers.
+	PARTIAL
 )
 
 func (s EvidenceState) String() string {
@@ -89,6 +94,8 @@ func (s EvidenceState) String() string {
 		return "FAILED"
 	case VerdictInconclusive:
 		return "INCONCLUSIVE"
+	case PARTIAL:
+		return "PARTIAL"
 	default:
 		return "INCONCLUSIVE"
 	}

@@ -4,13 +4,45 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/core/domain"
 	coreauth "github.com/PizenLabs/izen/internal/core/domain/authorization"
+	"github.com/PizenLabs/izen/internal/core/domain/evidence"
+	"github.com/PizenLabs/izen/internal/llm"
+	providercap "github.com/PizenLabs/izen/internal/provider"
 	"github.com/PizenLabs/izen/internal/runtime/authorization"
 	"github.com/PizenLabs/izen/internal/runtime/executor"
 	"github.com/PizenLabs/izen/internal/runtime/preflight"
 )
+
+// isTruncationError reports whether err signals finish_reason="length"
+// across ALL provider tiers (llm, ai, or string dialect). Truncation maps to
+// the universal PARTIAL outcome, never a terminal execution error, and the
+// canonical partial buffers are preserved (never cleared/swallowed).
+func isTruncationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, llm.ErrPayloadTruncated) || errors.Is(err, ai.ErrPayloadTruncated) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "finish_reason=length") ||
+		strings.Contains(msg, "finish_reason\"=\"length\"") ||
+		strings.Contains(msg, "errpayloadtruncated")
+}
+
+// partialResult builds the universal PARTIAL outcome for a truncated stream:
+// Verdict=EvidenceState.PARTIAL, Status="PARTIAL" (provider.StreamPartial),
+// Committed=false, no terminal error.
+func partialResult() *ExecutionResult {
+	return &ExecutionResult{
+		Verdict: evidence.PARTIAL,
+		Status:  string(providercap.StreamPartial),
+	}
+}
 
 // Orchestrator is the control-plane orchestrator. It owns the deterministic
 // control-loop pipeline and the fail-safe rollback guarantee: a cycle either
@@ -108,11 +140,15 @@ func (o *Orchestrator) RunCycle(ctx context.Context, req preflight.PreflightRequ
 		if err := executor.ValidateProviderModel(cfg.FastPathAuth.Provider, cfg.FastPathAuth.Model); err != nil {
 			return nil, err
 		}
+		// Read-only code evidence in ASK stream output is PERMITTED; disk
+		// mutation stays denied (Committed=false, no executor call).
 		return &ExecutionResult{
 			ProposalID: "",
 			Target:     "",
 			Action:     authorization.ActionNone,
 			Committed:  false,
+			Verdict:    evidence.VerdictPassed,
+			Status:     string(providercap.StreamComplete),
 		}, nil
 	}
 
@@ -126,8 +162,16 @@ func (o *Orchestrator) RunCycle(ctx context.Context, req preflight.PreflightRequ
 
 	// Step 2: Non-deterministic proposal (LLM stage). The proposal is strictly
 	// untrusted and carries zero authority.
+	//
+	// Universal Stream Outcome Invariant: finish_reason="length" maps to
+	// PARTIAL (EvidenceState.PARTIAL) across ALL provider tiers. It returns
+	// a PARTIAL status with the preserved partial buffers, never a terminal
+	// execution error and never a cleared/swallowed buffer.
 	proposal, err := provider.GenerateProposal(ctx, compiled)
 	if err != nil {
+		if isTruncationError(err) {
+			return partialResult(), nil
+		}
 		return nil, fmt.Errorf("orchestrator: generate proposal: %w", err)
 	}
 	if proposal == nil {
@@ -200,6 +244,7 @@ func (o *Orchestrator) RunCycle(ctx context.Context, req preflight.PreflightRequ
 		Target:     proposal.TargetRef.Canonical,
 		Action:     action,
 		Evidence:   valRes.Evidence,
+		Status:     string(providercap.StreamComplete),
 	}
 
 	// Step 7: Atomic execution or abort.
