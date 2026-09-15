@@ -2017,6 +2017,21 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			maxOut = 800
 		}
 	}
+	// Constrained Output Budget Invariant: models capped at max_output <= 1024
+	// (or ":free" free-tier IDs) force max_tokens = min(requested, 980) and
+	// DISABLE FULL_REWRITE entirely, forcing SEARCH_REPLACE output.
+	// The numeric guard is gated on provider-style model IDs (vendor/model)
+	// so a strategy-derived 1024 budget for mock/local providers does not
+	// misfire — only provider-advertised caps are constrained.
+	constrained := ModelProfile{OutputTokenCap: profile.MaxOutputTokens, ModelID: model}.IsConstrained()
+	if constrained {
+		if maxOut <= 0 || maxOut > ConstrainedMaxTokens {
+			maxOut = ConstrainedMaxTokens
+		}
+		if !patchOnly {
+			patchOnly = true
+		}
+	}
 	for _, target := range targets {
 		var data []byte
 		if cached, ok := x.getSnapshotContent(target); ok {

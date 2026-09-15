@@ -75,6 +75,10 @@ type FastPathAuthConfig struct {
 	HumanApproved       bool
 	BudgetIsPreApproval bool
 	SourceState         domain.SourceState
+	// Provider/Model carry the active runtime binding for fail-fast
+	// compatibility verification. Empty means unwired (legacy harness).
+	Provider string
+	Model    string
 }
 
 // OrchestratorConfig carries execution options for a single RunCycle.

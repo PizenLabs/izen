@@ -112,14 +112,62 @@ func (a *BudgetAdvisor) EstimateRequiredTokens(strategy ExecutionStrategy, fileS
 	}
 }
 
+// IsConstrainedOutputBudget reports whether a model's max output budget is
+// constrained (<= 1024, positive only). Constrained models MUST force
+// max_tokens = min(requested, 980) and DISABLE FULL_REWRITE entirely.
+func IsConstrainedOutputBudget(maxOutputTokens int) bool {
+	return maxOutputTokens > 0 && maxOutputTokens <= 1024
+}
+
+// ConstrainedMaxTokens is the enforced output budget for constrained models.
+const ConstrainedMaxTokens = 980
+
+// ClampMaxTokensForConstrained enforces min(requested, 980) for constrained
+// budgets; unconstrained budgets pass through unchanged.
+func ClampMaxTokensForConstrained(requested, maxOutputTokens int) int {
+	if !IsConstrainedOutputBudget(maxOutputTokens) {
+		return requested
+	}
+	if requested <= 0 || requested > ConstrainedMaxTokens {
+		return ConstrainedMaxTokens
+	}
+	return requested
+}
+
 // Advise evaluates a BudgetAdvisoryRequest against the model's max output
 // budget. It always returns an advice value; when the requested strategy fits,
 // Overflow is false and no surface is built. When it does not fit, a
 // Recommendation and a DecisionSurface are populated so the caller can present
 // the two choices without failing the cycle.
+//
+// Constrained Output Budget Invariant: a constrained model (max_output <= 1024)
+// can NEVER dispatch FULL_REWRITE — the advisor forces overflow with a
+// BOUNDED_PATCH recommendation even when the raw estimate would fit.
 func (a *BudgetAdvisor) Advise(req BudgetAdvisoryRequest) BudgetAdvice {
 	if req.Strategy == "" {
 		req.Strategy = StrategyFullRewrite
+	}
+	if IsConstrainedOutputBudget(req.MaxOutputTokens) && req.Strategy == StrategyFullRewrite {
+		fileTokens := a.EstimateFileTokens(req.FileSizeBytes)
+		required := a.EstimateRequiredTokens(req.Strategy, fileTokens)
+		bounded := a.EstimateRequiredTokens(StrategyBoundedPatch, fileTokens)
+		rec := Recommendation{
+			Strategy:        StrategyBoundedPatch,
+			Effort:          capability.EffortHigh,
+			EstimatedOutput: bounded,
+			MaxTokens:       ClampMaxTokensForConstrained(bounded, req.MaxOutputTokens),
+		}
+		rec.FitsBudget = bounded <= req.MaxOutputTokens
+		return BudgetAdvice{
+			Requested:       req.Strategy,
+			RequiredTokens:  required,
+			FileTokens:      fileTokens,
+			MaxOutputTokens: req.MaxOutputTokens,
+			OriginalEffort:  req.Effort,
+			Overflow:        true,
+			Recommendation:  &rec,
+			Surface:         buildSurface(req, fileTokens, required, rec),
+		}
 	}
 	if req.Effort == "" {
 		req.Effort = capability.EffortHigh

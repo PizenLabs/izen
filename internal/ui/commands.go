@@ -457,11 +457,61 @@ func (m *model) handleInput(line string) tea.Cmd {
 // runtime is not wired (headless/test harnesses), the input falls through to
 // the unified IntentGateway (RuntimeExecutor), which selects the execution
 // path deterministically; the UI never decides the path.
+//
+// Autonomy Intent Masking Invariant: the Intent Classifier masking runs
+// BEFORE any Autonomy Engine decision. Plain text without an explicit
+// execution marker ("$prompt"/"$hot" prefix) or explicit mode strictly routes
+// to the read-only ask pipeline — prompt semantics ("rewrite", "fix",
+// "delete") NEVER escalate a bare objective into a mutation workspace.
+// The Autonomy Engine therefore generates zero CapMutate/CapPropose requests
+// for such input and the phase stays ask.
 func (m *model) routeFreeInput(line string) tea.Cmd {
 	if m.autonomy != nil {
+		if !hasFreeInputExecutionMarker(line) && isBareMutationObjective(line) {
+			return m.handleMessageContent(line)
+		}
 		return m.runAutonomyRoutedCmd(line)
 	}
 	return m.runGatedLine(line)
+}
+
+// hasFreeInputExecutionMarker reports whether a free-form line carries an
+// explicit execution trigger ("$prompt"/"$hot" prefix, case-insensitive).
+// Bare plain-text — even containing mutation words — carries no marker.
+func hasFreeInputExecutionMarker(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	for _, marker := range []string{"$prompt", "$hot"} {
+		if strings.HasPrefix(lower, marker) &&
+			(len(lower) == len(marker) || lower[len(marker)] == ' ' || lower[len(marker)] == '\t' || lower[len(marker)] == '\n') {
+			return true
+		}
+	}
+	return false
+}
+
+// isBareMutationObjective reports whether the line carries mutation-like
+// semantics that MUST NOT escalate without an execution marker. It mirrors
+// the deterministic mutation-verb set so the mask stays in sync with the
+// autonomy classifier's mutation signals.
+func isBareMutationObjective(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	if lower == "" {
+		return false
+	}
+	for _, verb := range []string{
+		"remove ", "delete ", "add ", "create ", "generate ", "implement ",
+		"write ", "update ", "modify ", "change ", "fix ", "correct ",
+		"edit ", "insert ", "replace ", "rewrite ", "build ", "refactor ",
+	} {
+		if strings.Contains(lower, verb) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *model) handleMessageContent(line string) tea.Cmd {

@@ -22,11 +22,23 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	coreauth "github.com/PizenLabs/izen/internal/core/domain/authorization"
 	"github.com/PizenLabs/izen/internal/runtime/executor"
 	"github.com/PizenLabs/izen/internal/runtime/preflight"
 )
+
+// isProviderConfigDenial reports whether a fast-path denial reason carries
+// the provider-configuration sentinel (fail-fast boundary, not a clause).
+// The reason embeds ErrInvalidProviderConfiguration.Error() via %w wrapping,
+// so substring match is the stable detector.
+func isProviderConfigDenial(reason string) bool {
+	if reason == "" {
+		return false
+	}
+	return strings.Contains(reason, executor.ErrInvalidProviderConfiguration.Error())
+}
 
 // fastPathBeforeModel enforces Step 1b. It returns nil when the cycle may
 // proceed to the provider, or a denial error when the request must be dropped
@@ -64,7 +76,7 @@ func (o *Orchestrator) fastPathBeforeModel(ctx context.Context, req preflight.Pr
 		RawTargets:          []string{compiled.TargetRef.Raw},
 		ProposalTargets:     []string{compiled.TargetRef.Canonical},
 		Objective:           auth.Objective,
-		Capabilities:        auth.Capabilities,
+		Capabilities:        executor.ConstrainCapabilitiesForIntent(auth.Objective.Intent.Kind, auth.Capabilities),
 		Budget:              auth.Budget,
 		Artifact:            auth.Artifact,
 		CheckpointID:        auth.CheckpointID,
@@ -74,10 +86,18 @@ func (o *Orchestrator) fastPathBeforeModel(ctx context.Context, req preflight.Pr
 		SourceState:         auth.SourceState,
 		ProposalDiffLines:   0,
 		ProposalFiles:       1,
+		Provider:            auth.Provider,
+		Model:               auth.Model,
 	}
 	res := gate.EvaluateStaticPreflight(ctx, in)
 	if res.Permitted {
 		return nil
+	}
+	// Fail-fast provider boundary: preserve ErrInvalidProviderConfiguration
+	// so errors.Is finds it immediately with zero timeout wait.
+	if isProviderConfigDenial(res.Reason) {
+		return fmt.Errorf("orchestrator: fast-path gate denied at stage %s: %w: %w: %s",
+			res.Stage, ErrProposalValidationFailed, executor.ErrInvalidProviderConfiguration, res.Reason)
 	}
 	clauseErr := fastPathClauseSentinel(res.FailedClause)
 	// Join preserves both the validation contract and the clause sentinel:

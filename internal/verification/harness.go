@@ -121,7 +121,7 @@ func ParseAndValidateProposal(raw string) (*RawProposalJSON, error) {
 	}
 	var p RawProposalJSON
 	if err := json.Unmarshal([]byte(raw), &p); err != nil {
-		return nil, fmt.Errorf("%w: %w: %v", ErrProposalValidationFailed, ErrSyntaxError, err)
+		return nil, fmt.Errorf("%w: %w: %w", ErrProposalValidationFailed, ErrSyntaxError, err)
 	}
 	// Re-check structured fields for injection (defense in depth)
 	combined := p.Plan + " " + p.Content + " " + p.RawPatch + " " + p.TargetFile

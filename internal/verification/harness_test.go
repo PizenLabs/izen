@@ -256,7 +256,7 @@ func TestModelSubstitutionMatrix_IdenticalSecurityAndTruth(t *testing.T) {
 
 	// Run matrix via harness evaluator (evidence-driven truth)
 	h := &BenchmarkHarness{RequiredLevel: evidence.L3_UnitTests}
-	var outcomes []MatrixOutcome
+	outcomes := make([]MatrixOutcome, 0, len(providers))
 	for _, p := range providers {
 		// Simulate commit (apply provider patch) but evidence still failing
 		result := domain.MutationResult{Applied: true, Targets: []string{filepath.Join(dir, "a.go")}}

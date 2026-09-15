@@ -197,6 +197,74 @@ func (c ModelCapabilities) TotalMaxTokens(effort EffortLevel) int {
 	return total
 }
 
+// ── Constrained output-budget policy ────────────────────────────────────
+//
+// Constrained Output Budget Invariant: for providers/models flagged with
+// max_output_tokens <= 1024 (or OpenRouter free-tier models), the runtime
+// MUST force max_tokens = min(requested, 980) and DISABLE FULL_REWRITE patch
+// generation entirely, forcing SEARCH_REPLACE or UNIFIED_DIFF modes.
+
+// ConstrainedOutputThreshold is the max_output ceiling at or below which a
+// model is treated as constrained (free-tier style).
+const ConstrainedOutputThreshold = 1024
+
+// ConstrainedMaxTokens is the enforced output budget for constrained models.
+// 980 leaves headroom below a 1024 ceiling so the completion never hits
+// finish_reason="length" / OUTPUT_EXHAUSTED.
+const ConstrainedMaxTokens = 980
+
+// IsConstrained reports whether the model's advertised max output budget
+// marks it as constrained (<= 1024 tokens). A zero/negative budget means
+// "unknown ceiling" and is NOT constrained.
+func (c ModelCapabilities) IsConstrained() bool {
+	return c.MaxOutputTokens > 0 && c.MaxOutputTokens <= ConstrainedOutputThreshold
+}
+
+// RequiresSearchReplace reports whether the model MUST use SEARCH_REPLACE /
+// UNIFIED_DIFF output instead of FULL_REWRITE. It is true exactly when the
+// model is constrained.
+func (c ModelCapabilities) RequiresSearchReplace() bool {
+	return c.IsConstrained()
+}
+
+// ClampMaxTokens enforces the constrained budget: min(requested, 980) when
+// constrained, requested unchanged otherwise. A non-positive requested budget
+// maps to 980 for constrained models (never the 4096 default, which would
+// overflow a 1024 ceiling).
+func (c ModelCapabilities) ClampMaxTokens(requested int) int {
+	if !c.IsConstrained() {
+		return requested
+	}
+	if requested <= 0 || requested > ConstrainedMaxTokens {
+		return ConstrainedMaxTokens
+	}
+	return requested
+}
+
+// IsConstrainedOutputBudget reports whether a raw max_output token budget
+// marks a model as constrained (<= 1024). Zero/negative means unknown.
+func IsConstrainedOutputBudget(maxOutputTokens int) bool {
+	return maxOutputTokens > 0 && maxOutputTokens <= ConstrainedOutputThreshold
+}
+
+// ClampMaxTokensForBudget enforces min(requested, 980) for constrained
+// budgets; unconstrained budgets pass through unchanged.
+func ClampMaxTokensForBudget(requested, maxOutputTokens int) int {
+	if !IsConstrainedOutputBudget(maxOutputTokens) {
+		return requested
+	}
+	if requested <= 0 || requested > ConstrainedMaxTokens {
+		return ConstrainedMaxTokens
+	}
+	return requested
+}
+
+// IsFreeTierModelID reports whether a model ID looks like an OpenRouter
+// free-tier model (":free" suffix, case-insensitive).
+func IsFreeTierModelID(modelID string) bool {
+	return len(modelID) >= 5 && strings.EqualFold(strings.TrimSpace(modelID)[len(strings.TrimSpace(modelID))-5:], ":free")
+}
+
 // splitVendor splits an OpenRouter-style "vendor/model" identifier into its
 // vendor prefix and bare model name. A bare identifier yields vendor "" and
 // the full string as the model.
