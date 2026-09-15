@@ -20,6 +20,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ir"
 	"github.com/PizenLabs/izen/internal/knowledge"
 	"github.com/PizenLabs/izen/internal/providers"
+	"github.com/PizenLabs/izen/internal/runtime/executor"
 	"github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/internal/tui/components/ask"
@@ -435,6 +436,37 @@ func publishRunLifecycle(bus *events.Bus, requestID string, res *app.Result, run
 	))
 }
 
+// validateProviderModelBinding verifies provider/model tuple compatibility
+// synchronously (no network). It mirrors the fast-path gate's fail-fast
+// boundary so misconfiguration aborts before any provider invocation.
+func validateProviderModelBinding(provider, model string) error {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" {
+		return nil
+	}
+	hasSlash := false
+	for i, c := range model {
+		if c == '/' {
+			if i > 0 && len(model) > i+1 {
+				hasSlash = true
+			}
+			break
+		}
+	}
+	switch provider {
+	case "ollama":
+		if hasSlash {
+			return fmt.Errorf("%w: model %q does not belong to provider %q", executor.ErrInvalidProviderConfiguration, model, provider)
+		}
+	case "openrouter":
+		if !hasSlash {
+			return fmt.Errorf("%w: model %q does not belong to provider %q", executor.ErrInvalidProviderConfiguration, model, provider)
+		}
+	}
+	return nil
+}
+
 // buildActiveProvider constructs the ai.Provider for the configured active
 // provider and returns it together with the effective model name. The API key
 // resolves with strict precedence: ~/.izen/config.yml wins over the shell
@@ -459,6 +491,13 @@ func buildActiveProvider(cfg *config.Config) (ai.Provider, string, error) {
 		)
 	}
 	model := cfg.ActiveModelName()
+	// Fail-fast provider boundary: a mismatched provider/model tuple (e.g.
+	// provider "ollama" with model "cohere/north-mini-code:free") aborts here
+	// with ErrInvalidProviderConfiguration before any execution loop or
+	// preflight timeout can engage. Zero provider calls are made on mismatch.
+	if err := validateProviderModelBinding(name, model); err != nil {
+		return nil, "", err
+	}
 	switch name {
 	case "ollama":
 		return providers.NewOllamaProvider(provCfg.BaseURL, apiKey, model), model, nil

@@ -52,6 +52,82 @@ import (
 // size. Do not claim O(1): depth-proportional iteration is the documented bound.
 const MaxTargetDepth = 256
 
+// ErrInvalidProviderConfiguration signals a provider/model tuple mismatch
+// detected during static preflight (e.g. provider "ollama" assigned model
+// "cohere/north-mini-code:free"). It aborts fail-fast BEFORE any provider
+// network call, with zero timeout wait.
+var ErrInvalidProviderConfiguration = fmt.Errorf("executor: invalid provider configuration")
+
+// AskCapabilityMask is the hard Intent Ceiling for ask intent: the ONLY
+// capabilities an ask cycle may exercise. It is the domain projection of
+// {CapRead, CapAnalyze} (CapSearch is the domain's analysis/search flag).
+// Under NO circumstances may ask grant CapWrite/CapPatch (the domain's
+// Propose/Mutate equivalents), regardless of prompt semantics or active Mode.
+var AskCapabilityMask = domain.DomainCapabilitySet(domain.CapRead | domain.CapSearch)
+
+// IsAskIntent reports whether kind is the read-only ask intent.
+func IsAskIntent(kind domain.IntentKind) bool { return kind == domain.IntentAsk }
+
+// ConstrainCapabilitiesForIntent enforces the Intent Ceiling Invariant:
+// Capabilities(ask) = Capabilities(CurrentMode) ∩ {CapRead, CapAnalyze}.
+// For ask, the grant is intersected with AskCapabilityMask; all other intents
+// pass through unchanged. Prompt semantics never elevate ask.
+func ConstrainCapabilitiesForIntent(kind domain.IntentKind, caps domain.DomainCapabilitySet) domain.DomainCapabilitySet {
+	if IsAskIntent(kind) {
+		return caps & AskCapabilityMask
+	}
+	return caps
+}
+
+// HasExecutionMarker reports whether raw input carries an explicit execution
+// trigger. Only a "$prompt" prefix (case-insensitive, leading whitespace
+// allowed) or an explicit UI execution action routes to the execution
+// pipeline; bare plain-text strictly routes to the read-only ask pipeline.
+func HasExecutionMarker(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	return strings.HasPrefix(lower, "$prompt") &&
+		(len(lower) == len("$prompt") || lower[len("$prompt")] == ' ' || lower[len("$prompt")] == '\t' || lower[len("$prompt")] == '\n')
+}
+
+// ValidateProviderModel verifies provider/model tuple compatibility
+// synchronously without network I/O. Ollama (local) models must NOT carry a
+// vendor slash prefix; OpenRouter models MUST carry vendor/model schema.
+// Mismatch returns ErrInvalidProviderConfiguration for fail-fast abort.
+func ValidateProviderModel(provider, model string) error {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" && model == "" {
+		return nil // no binding wired: nothing to verify (legacy harness)
+	}
+	if provider == "" || model == "" {
+		return fmt.Errorf("%w: incomplete binding provider=%q model=%q", ErrInvalidProviderConfiguration, provider, model)
+	}
+	hasSlash := false
+	for i, c := range model {
+		if c == '/' {
+			if i > 0 && len(model) > i+1 {
+				hasSlash = true
+			}
+			break
+		}
+	}
+	switch provider {
+	case "ollama":
+		if hasSlash {
+			return fmt.Errorf("%w: model %q does not belong to provider %q", ErrInvalidProviderConfiguration, model, provider)
+		}
+	case "openrouter":
+		if !hasSlash {
+			return fmt.Errorf("%w: model %q does not belong to provider %q", ErrInvalidProviderConfiguration, model, provider)
+		}
+	}
+	return nil
+}
+
 // FastPathStage identifies which decoupled semantic stage produced a verdict.
 type FastPathStage string
 
@@ -88,6 +164,10 @@ type FastPathInput struct {
 	SourceState         domain.SourceState
 	ProposalDiffLines   int
 	ProposalFiles       int
+	// Provider/Model carry the active runtime binding for fail-fast
+	// compatibility verification. Empty means unwired (legacy harness).
+	Provider string
+	Model    string
 }
 
 // FastPathResult is the deterministic verdict of the fast-path gate.
@@ -135,6 +215,11 @@ func (g *FastPathGate) EvaluateStatic(ctx context.Context, in FastPathInput) Fas
 	default:
 	}
 
+	// Fail-fast provider boundary first.
+	if err := ValidateProviderModel(in.Provider, in.Model); err != nil {
+		return FastPathResult{Permitted: false, Reason: err.Error(), FailedClause: authorization.ClauseCapability, Stage: StagePreflight, Elapsed: time.Since(start)}
+	}
+
 	if res := g.ResolveCapabilities(in); !res.Permitted {
 		res.Elapsed = time.Since(start)
 		return res
@@ -161,10 +246,17 @@ func (g *FastPathGate) EvaluateStatic(ctx context.Context, in FastPathInput) Fas
 // pre-model invocation gate used by the orchestrator to drop unauthorized
 // requests before any network call. The execution boundary still invokes the
 // full Authorize stage (guard) before mutation.
+//
+// Fail-fast provider boundary: the provider/model tuple is verified FIRST,
+// synchronously, before any other stage. Mismatch aborts immediately with
+// ErrInvalidProviderConfiguration and zero provider calls.
 func (g *FastPathGate) EvaluateStaticPreflight(_ context.Context, in FastPathInput) FastPathResult {
 	start := time.Now()
 	if g == nil {
 		g = NewFastPathGate(nil, 0)
+	}
+	if err := ValidateProviderModel(in.Provider, in.Model); err != nil {
+		return FastPathResult{Permitted: false, Reason: err.Error(), FailedClause: authorization.ClauseCapability, Stage: StagePreflight, Elapsed: time.Since(start)}
 	}
 	for _, stage := range []func(FastPathInput) FastPathResult{
 		g.ResolveCapabilities, g.ResolveTargets, g.CheckReferences, g.ValidatePreflight,
@@ -181,14 +273,24 @@ func (g *FastPathGate) EvaluateStaticPreflight(_ context.Context, in FastPathInp
 // Static early-deny for the CapabilityGranted clause. Mirrors formula.go's
 // ClauseCapability without granting anything: when the proposal mutates files
 // but the scoped grant lacks Write and Patch, deny immediately.
+//
+// Intent Ceiling: ask intent is hard-masked to AskCapabilityMask
+// ({CapRead, CapAnalyze} projection). An ask cycle is purely read-only: file
+// targets alone NEVER imply a write need, so the stage permits and defers
+// mutation denial to the guard (which masks ask grants and denies any
+// write-bearing proposal). Prompt words like "rewrite"/"fix" never elevate.
 func (g *FastPathGate) ResolveCapabilities(in FastPathInput) FastPathResult {
+	if IsAskIntent(in.Objective.Intent.Kind) {
+		return FastPathResult{Permitted: true, Stage: StageCapabilities}
+	}
 	targets := in.ProposalTargets
 	if len(targets) == 0 {
 		targets = in.RawTargets
 	}
 	needsWrite := len(targets) > 0
 	if needsWrite {
-		if !in.Capabilities.Has(domain.CapWrite) && !in.Capabilities.Has(domain.CapPatch) {
+		effective := ConstrainCapabilitiesForIntent(in.Objective.Intent.Kind, in.Capabilities)
+		if !effective.Has(domain.CapWrite) && !effective.Has(domain.CapPatch) {
 			return FastPathResult{
 				Permitted:    false,
 				Reason:       authorization.ErrCapabilityDenied.Error(),
@@ -409,6 +511,10 @@ func SanitizeUntrustedPayload(raw string) error {
 // the orchestrator skips the provider network call. The full guard still runs
 // in Authorize; this stage never permits alone.
 func (g *FastPathGate) ValidatePreflight(in FastPathInput) FastPathResult {
+	// Fail-fast provider boundary: mismatch aborts before any clause work.
+	if err := ValidateProviderModel(in.Provider, in.Model); err != nil {
+		return FastPathResult{Permitted: false, Reason: err.Error(), FailedClause: authorization.ClauseCapability, Stage: StagePreflight}
+	}
 	// ClauseIntent: ValidIntent.
 	if in.Objective.Intent.Kind == domain.IntentUnknown || in.Objective.Intent.Kind == "" {
 		return FastPathResult{Permitted: false, Reason: authorization.ErrInvalidIntent.Error(), FailedClause: authorization.ClauseIntent, Stage: StagePreflight}
@@ -416,16 +522,23 @@ func (g *FastPathGate) ValidatePreflight(in FastPathInput) FastPathResult {
 	if in.Objective.Intent.Confidence < 0 || in.Objective.Intent.Confidence > 1 {
 		return FastPathResult{Permitted: false, Reason: authorization.ErrInvalidIntent.Error(), FailedClause: authorization.ClauseIntent, Stage: StagePreflight}
 	}
-	// ClausePlan: ValidPlan ∨ ValidMicroPlan.
-	state := in.Artifact.State
-	if state != "AUTHORIZED" && state != "StateAuthorized" {
-		if !in.BudgetIsPreApproval || (state != "VALIDATED" && state != "StateValidated") {
-			return FastPathResult{Permitted: false, Reason: authorization.ErrNoAuthorizedPlan.Error(), FailedClause: authorization.ClausePlan, Stage: StagePreflight}
+	// Zero Side-Effect for Ask: an ask cycle MUST NOT require checkpoints,
+	// authorized plans, or approval, and MUST NOT stage patches or trigger
+	// preflight barriers. Skip Plan/Checkpoint/Approval clauses entirely;
+	// only Intent, SourceHash (stale), and Budget still apply.
+	isAsk := IsAskIntent(in.Objective.Intent.Kind)
+	if !isAsk {
+		// ClausePlan: ValidPlan ∨ ValidMicroPlan.
+		state := in.Artifact.State
+		if state != "AUTHORIZED" && state != "StateAuthorized" {
+			if !in.BudgetIsPreApproval || (state != "VALIDATED" && state != "StateValidated") {
+				return FastPathResult{Permitted: false, Reason: authorization.ErrNoAuthorizedPlan.Error(), FailedClause: authorization.ClausePlan, Stage: StagePreflight}
+			}
 		}
-	}
-	// ClauseCheckpoint: CheckpointCreated.
-	if in.CheckpointID == "" && !in.HasCheckpoint {
-		return FastPathResult{Permitted: false, Reason: authorization.ErrNoCheckpoint.Error(), FailedClause: authorization.ClauseCheckpoint, Stage: StagePreflight}
+		// ClauseCheckpoint: CheckpointCreated.
+		if in.CheckpointID == "" && !in.HasCheckpoint {
+			return FastPathResult{Permitted: false, Reason: authorization.ErrNoCheckpoint.Error(), FailedClause: authorization.ClauseCheckpoint, Stage: StagePreflight}
+		}
 	}
 	// ClauseSourceHash: SourceHashMatch (sentinel STALE only; full verification
 	// stays in the guard/substrate).
@@ -450,15 +563,18 @@ func (g *FastPathGate) ValidatePreflight(in FastPathInput) FastPathResult {
 		return FastPathResult{Permitted: false, Reason: authorization.ErrBudgetExceeded.Error(), FailedClause: authorization.ClauseBudget, Stage: StagePreflight}
 	}
 	// ClauseApproval: HumanApproved ∨ BudgetIsPreApproval (with micro budget).
-	if !in.HumanApproved && !in.BudgetIsPreApproval {
-		return FastPathResult{Permitted: false, Reason: authorization.ErrApprovalRequired.Error(), FailedClause: authorization.ClauseApproval, Stage: StagePreflight}
-	}
-	if in.BudgetIsPreApproval && !in.HumanApproved {
-		if in.Budget.MaxFiles > 0 && totalFiles > 2 {
+	// Skipped for ask: read-only streaming requires no human approval.
+	if !isAsk {
+		if !in.HumanApproved && !in.BudgetIsPreApproval {
 			return FastPathResult{Permitted: false, Reason: authorization.ErrApprovalRequired.Error(), FailedClause: authorization.ClauseApproval, Stage: StagePreflight}
 		}
-		if in.Budget.MaxDiffLines > 0 && in.ProposalDiffLines > 50 {
-			return FastPathResult{Permitted: false, Reason: authorization.ErrApprovalRequired.Error(), FailedClause: authorization.ClauseApproval, Stage: StagePreflight}
+		if in.BudgetIsPreApproval && !in.HumanApproved {
+			if in.Budget.MaxFiles > 0 && totalFiles > 2 {
+				return FastPathResult{Permitted: false, Reason: authorization.ErrApprovalRequired.Error(), FailedClause: authorization.ClauseApproval, Stage: StagePreflight}
+			}
+			if in.Budget.MaxDiffLines > 0 && in.ProposalDiffLines > 50 {
+				return FastPathResult{Permitted: false, Reason: authorization.ErrApprovalRequired.Error(), FailedClause: authorization.ClauseApproval, Stage: StagePreflight}
+			}
 		}
 	}
 	return FastPathResult{Permitted: true, Stage: StagePreflight}
@@ -492,7 +608,7 @@ func (g *FastPathGate) Authorize(ctx context.Context, in FastPathInput) FastPath
 		CheckpointID:  in.CheckpointID,
 		SourceState:   in.SourceState,
 		Budget:        in.Budget,
-		Capabilities:  in.Capabilities,
+		Capabilities:  ConstrainCapabilitiesForIntent(in.Objective.Intent.Kind, in.Capabilities),
 		Approval:      authorization.ApprovalToken{HumanApproved: in.HumanApproved, BudgetIsPreApproval: in.BudgetIsPreApproval},
 		Proposal:      authorization.ProposalRef{TargetFiles: targets, DiffLines: in.ProposalDiffLines, Files: totalFiles},
 		HasCheckpoint: in.HasCheckpoint,

@@ -380,7 +380,9 @@ func (m *model) renderStageLine() string {
 	return renderStageStatus(st)
 }
 
-// formatDurationElapsed renders a duration like "4.2s" / "1m 3s".
+// formatDurationElapsed renders a duration like "4.2s" / "9m 29s" / "1h 01m".
+// Human-Readable Duration Invariant: durations > 60s render as "Xm Ys"
+// (zero-padded seconds) and durations >= 1h render as "Xh Ym".
 func formatDurationElapsed(d time.Duration) string {
 	if d < 0 {
 		d = 0
@@ -388,5 +390,9 @@ func formatDurationElapsed(d time.Duration) string {
 	if d < time.Minute {
 		return d.Round(100 * time.Millisecond).String()
 	}
-	return fmt.Sprintf("%dm %s", int(d.Minutes()), (d % time.Minute).Round(time.Second))
+	totalSecs := int(d.Round(time.Second).Seconds())
+	if totalSecs < 3600 {
+		return fmt.Sprintf("%dm %02ds", totalSecs/60, totalSecs%60)
+	}
+	return fmt.Sprintf("%dh %02dm", totalSecs/3600, (totalSecs%3600)/60)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/PizenLabs/izen/internal/core/domain"
 	coreauth "github.com/PizenLabs/izen/internal/core/domain/authorization"
 	"github.com/PizenLabs/izen/internal/runtime/authorization"
 	"github.com/PizenLabs/izen/internal/runtime/executor"
@@ -95,6 +96,24 @@ func (o *Orchestrator) RunCycle(ctx context.Context, req preflight.PreflightRequ
 	compiled, err := o.preflight.Execute(req)
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: preflight: %w", err)
+	}
+
+	// Step 1a: Zero Side-Effect for Ask. When static auth evidence declares
+	// intent=ask, the cycle short-circuits to a purely read-only response:
+	// no provider invocation, no patch staging, no checkpoint/snapshot, no
+	// diff preview, no preflight barrier wait, no AST verification loop.
+	// Provider/model mismatch still fails fast BEFORE the short-circuit so
+	// misconfiguration never silently degrades to a timeout loop.
+	if cfg.FastPathAuth != nil && cfg.FastPathAuth.Objective.Intent.Kind == domain.IntentAsk {
+		if err := executor.ValidateProviderModel(cfg.FastPathAuth.Provider, cfg.FastPathAuth.Model); err != nil {
+			return nil, err
+		}
+		return &ExecutionResult{
+			ProposalID: "",
+			Target:     "",
+			Action:     authorization.ActionNone,
+			Committed:  false,
+		}, nil
 	}
 
 	// Step 1b: Synchronous deterministic fast-path gate BEFORE any model

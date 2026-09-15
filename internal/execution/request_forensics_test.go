@@ -177,9 +177,14 @@ func TestForensicWireBody_AutonomousVsBuild(t *testing.T) {
 
 	model := "cohere/north-mini-code:free"
 
+	// Constrained free-tier models force SEARCH_REPLACE: the patch anchor must
+	// exist in the file or the strict contract retries. Use a line that actually
+	// appears in reproIndexHTMLCompact so the single mock response succeeds under
+	// both tolerant and bounded contracts.
+	freePatch := "<<<<<<< SEARCH\n  <title>Landing Page</title>\n=======\n  <title>Landing Page Patched</title>\n>>>>>>>"
 	runPath := func(mode string, preFix bool) ai.Request {
 		mock := &mockProvider{responses: []*ai.Response{{
-			Content: sampleReplace,
+			Content: freePatch,
 			Usage:   ai.ProviderUsage{Known: true},
 		}}}
 		cfg := config.Default()
@@ -265,7 +270,10 @@ func TestForensicWireBody_AutonomousVsBuild(t *testing.T) {
 	t.Logf("  PRE-FIX wire body:\n%s", marshalBody(preFixBody))
 
 	// Assertions that pin the forensic facts.
-	if autonomousPostFix.Reasoning != nil {
+	// Constrained free-tier models explicitly disable reasoning to keep the
+	// hidden channel from consuming the 980-token budget — a Disabled config
+	// is the expected wire for cohere/north-mini-code:free.
+	if autonomousPostFix.Reasoning != nil && (!autonomousPostFix.Reasoning.Disabled || autonomousPostFix.Reasoning.Level != "" || autonomousPostFix.Reasoning.BudgetTokens != 0 || autonomousPostFix.Reasoning.CoTLimit != 0) {
 		t.Errorf("autonomous request carried a reasoning config (%+v) — production code never sets one", autonomousPostFix.Reasoning)
 	}
 	if autonomousPostFix.MaxTokens == 0 {

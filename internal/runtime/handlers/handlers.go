@@ -505,12 +505,42 @@ func (h *CancelHandler) Handle(ctx context.Context, cmd runtime.RuntimeCommand) 
 
 // ── Intent classification ────────────────────────────────────────────────────
 
+// HasExecutionMarker reports whether raw input carries an explicit execution
+// trigger. Only a "$prompt" prefix (case-insensitive, leading whitespace
+// allowed) counts as execution syntax; bare plain-text — even containing
+// mutation words like "rewrite", "delete", "fix" — strictly routes to the
+// read-only ask pipeline. An explicit mode (e.g. c.Mode="build") is handled
+// by ClassifyIntent as an explicit action trigger.
+func HasExecutionMarker(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if !strings.HasPrefix(lower, "$prompt") {
+		return false
+	}
+	if len(lower) == len("$prompt") {
+		return true
+	}
+	c := lower[len("$prompt")]
+	return c == ' ' || c == '\t' || c == '\n'
+}
+
 // ClassifyIntent maps a raw prompt (and optional explicit mode) onto a
-// canonical execution phase. An explicit mode wins; otherwise a deterministic
-// keyword pass selects the phase, defaulting to ask.
+// canonical execution phase.
+//
+// Intent-Capability Boundary: an explicit mode wins (explicit action
+// trigger); otherwise execution syntax ("$prompt" prefix) is required to
+// leave the ask pipeline. Plain-text without "$prompt" ALWAYS parses as
+// ask, regardless of prompt semantics ("rewrite", "fix", "delete", ...).
+// This prevents automatic capability escalation from prompt wording alone.
 func ClassifyIntent(prompt, mode string) (string, float64) {
 	if ph, ok := ParsePhase(mode); ok {
 		return ph.String(), 0.95
+	}
+	if !HasExecutionMarker(prompt) {
+		return "ask", 0.5
 	}
 	lower := strings.ToLower(prompt)
 	switch {
