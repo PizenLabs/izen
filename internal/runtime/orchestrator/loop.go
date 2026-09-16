@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/PizenLabs/izen/internal/runtime/executor"
 	"github.com/PizenLabs/izen/internal/runtime/gate"
@@ -14,17 +12,8 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
-// ErrNilSubstrate is returned when a Loop is constructed without mandatory Substrate in production.
-var ErrNilSubstrate = errors.New("orchestrator: nil substrate — Substrate is mandatory; reserve nil for isolated unit test harnesses")
-
-func isTestHarness() bool {
-	for _, arg := range os.Args {
-		if strings.HasPrefix(arg, "-test.") {
-			return true
-		}
-	}
-	return strings.HasSuffix(os.Args[0], ".test")
-}
+// ErrNilSubstrate is returned when a Loop is constructed without mandatory Substrate.
+var ErrNilSubstrate = errors.New("orchestrator: nil substrate — Substrate is mandatory; pass an explicit non-nil substrate.ProposalExecutor")
 
 // LoopState enumerates the states of the closed execution loop.
 type LoopState int
@@ -175,43 +164,22 @@ type Loop struct {
 	lastReason     string
 }
 
-// NewLoop wires the closed execution path. A nil reader defaults to the
-// filesystem reader. Substrate is mandatory in production; test harnesses may
-// wire via WithSubstrate or NewLoopWithSubstrate. If no Substrate is set and
-// not in a test harness, Loop initialization fails fast.
-func NewLoop(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.FileExecutor, reader SnapshotReader) *Loop {
-	if reader == nil {
-		reader = FSSnapshotReader{}
-	}
-	l := &Loop{
-		harnessExtractor: extractor,
-		gatePipeline:     gp,
-		executor:         exec,
-		reader:           reader,
-		state:            StateIdle,
-	}
-	if l.substrate == nil && !isTestHarness() {
-		// Fail fast in production: loop requires substrate.
-		panic(ErrNilSubstrate)
-	}
-	return l
-}
-
-// WithSubstrate wires the Substrate authority. When set, ExecuteCycle builds a
-// Proposal and submits via Substrate.Execute. Direct mutation is forbidden.
-func WithSubstrate(s substrate.ProposalExecutor) func(*Loop) {
-	return func(l *Loop) {
-		if s != nil {
-			l.substrate = s
-		}
-	}
-}
-
-// NewLoopWithSubstrate wires the closed path with a Substrate authority.
-// It is the mandatory production constructor; nil Substrate panics.
-func NewLoopWithSubstrate(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.FileExecutor, reader SnapshotReader, sub substrate.ProposalExecutor) *Loop {
+// NewLoop wires the closed execution path with an explicit, non-nil Substrate.
+// A nil reader defaults to the filesystem reader. A nil substrate (or nil
+// extractor, gate pipeline, executor) returns an explicit error — hidden
+// global DI fallbacks are forbidden.
+func NewLoop(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.FileExecutor, reader SnapshotReader, sub substrate.ProposalExecutor) (*Loop, error) {
 	if sub == nil {
-		panic(ErrNilSubstrate)
+		return nil, ErrNilSubstrate
+	}
+	if extractor == nil {
+		return nil, errors.New("orchestrator loop: no RMAH extractor wired")
+	}
+	if gp == nil {
+		return nil, errors.New("orchestrator loop: no gate pipeline wired")
+	}
+	if exec == nil {
+		return nil, errors.New("orchestrator loop: no runtime executor wired")
 	}
 	if reader == nil {
 		reader = FSSnapshotReader{}
@@ -223,7 +191,14 @@ func NewLoopWithSubstrate(extractor ModelOutputExtractor, gp GatePipeline, exec 
 		reader:           reader,
 		substrate:        sub,
 		state:            StateIdle,
-	}
+	}, nil
+}
+
+// NewLoopWithSubstrate wires the closed path with a Substrate authority.
+// It is retained for call-site compatibility and delegates to NewLoop;
+// nil Substrate returns ErrNilSubstrate instead of panicking.
+func NewLoopWithSubstrate(extractor ModelOutputExtractor, gp GatePipeline, exec *executor.FileExecutor, reader SnapshotReader, sub substrate.ProposalExecutor) (*Loop, error) {
+	return NewLoop(extractor, gp, exec, reader, sub)
 }
 
 // Observe captures the target file's bytes into the memory snapshot ONCE per

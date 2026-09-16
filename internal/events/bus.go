@@ -11,6 +11,12 @@ import (
 // queue before the bus starts dropping.
 const DefaultBufferSize = 256
 
+// MaxConsecutiveControlDrains bounds how many control events are dispatched
+// consecutively before yielding to one telemetry event. Control events take
+// precedence over telemetry, but the bound prevents telemetry starvation when
+// the control queue is saturated.
+const MaxConsecutiveControlDrains = 10
+
 // EventPriority partitions delivery into the two bus classes.
 type EventPriority int
 
@@ -365,22 +371,44 @@ func (s *subscription) popControl() DomainEvent {
 // cancel. Returns when the queue is empty or the subscription was cancelled
 // (the caller's loop then exits on the closed done channel).
 func drainControl(sub *subscription) {
+	drainControlBounded(sub, 0)
+}
+
+// drainControlBounded delivers up to max queued control events (max <= 0 means
+// unbounded). It returns true when more control events remain queued, so the
+// caller can yield to telemetry to prevent starvation. Cancellation is
+// re-checked before each handler invocation.
+func drainControlBounded(sub *subscription, max int) (more bool) {
+	n := 0
 	for ev := sub.popControl(); ev != nil; ev = sub.popControl() {
 		select {
 		case <-sub.done:
-			return
+			return false
 		default:
 		}
 		sub.handler(ev)
+		n++
+		if max > 0 && n >= max {
+			// Bounded yield: check whether more control remains.
+			return sub.hasControl()
+		}
 	}
+	return false
 }
 
-// dispatchLoop drains a subscription's queues into its handler, control first:
-// every wake path empties the unbounded control queue BEFORE the next
-// telemetry event is handled, so a state-machine checkpoint is dispatched even
-// when hundreds of telemetry items are queued ahead of it. Control delivery is
-// guaranteed while the subscription is live. The loop exits as soon as the
-// subscription is cancelled.
+// hasControl reports whether the control queue still holds undrained events.
+func (s *subscription) hasControl() bool {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	return s.controlHead < len(s.controlQ)
+}
+
+// dispatchLoop drains a subscription's queues into its handler with bounded
+// control priority: up to MaxConsecutiveControlDrains control events are
+// dispatched consecutively, then one telemetry event is serviced before
+// resuming control. Control delivery stays guaranteed while the subscription
+// is live; telemetry can never be starved by a saturated control queue.
+// The loop exits as soon as the subscription is cancelled.
 func (b *Bus) dispatchLoop(sub *subscription) {
 	defer b.wg.Done()
 	for {
@@ -388,7 +416,24 @@ func (b *Bus) dispatchLoop(sub *subscription) {
 		case <-sub.done:
 			return
 		case <-sub.controlWake:
-			drainControl(sub)
+			for drainControlBounded(sub, MaxConsecutiveControlDrains) {
+				// Bounded yield: service one telemetry event before resuming
+				// control, so a saturated control queue cannot starve telemetry.
+				select {
+				case <-sub.done:
+					return
+				case ev := <-sub.ch:
+					sub.handler(ev)
+				default:
+				}
+				// Drain the control-wake nudge accumulated during the yield
+				// without blocking; remaining control is re-checked by the
+				// loop condition itself.
+				select {
+				case <-sub.controlWake:
+				default:
+				}
+			}
 		default:
 			// Control queue quiet — service the bounded telemetry queue, but
 			// keep the control wake in this select so a control event that
@@ -397,13 +442,37 @@ func (b *Bus) dispatchLoop(sub *subscription) {
 			case <-sub.done:
 				return
 			case <-sub.controlWake:
-				drainControl(sub)
+				for drainControlBounded(sub, MaxConsecutiveControlDrains) {
+					select {
+					case <-sub.done:
+						return
+					case ev := <-sub.ch:
+						sub.handler(ev)
+					default:
+					}
+					select {
+					case <-sub.controlWake:
+					default:
+					}
+				}
 			case ev := <-sub.ch:
 				select {
 				case <-sub.done:
 					return
 				case <-sub.controlWake:
-					drainControl(sub)
+					for drainControlBounded(sub, MaxConsecutiveControlDrains) {
+						select {
+						case <-sub.done:
+							return
+						case ev := <-sub.ch:
+							sub.handler(ev)
+						default:
+						}
+						select {
+						case <-sub.controlWake:
+						default:
+						}
+					}
 				default:
 				}
 				sub.handler(ev)

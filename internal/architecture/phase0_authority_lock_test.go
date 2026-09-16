@@ -297,11 +297,9 @@ func TestPhase0UIPackageOwnsNoTransactionOrMutationAuthority(t *testing.T) {
 // targets. A NEW site anywhere fails the lock; so does silently REMOVING a
 // recorded site (the reviewer must consciously update this table).
 var phase0UIWriteInventory = map[string]string{
-	"internal/ui/commands.go::debugLogPlan":               "MkdirAll,OpenFile",
 	"internal/ui/commands.go::runTestEngine":              "MkdirAll",
-	"internal/ui/debug_completion.go::debugLogCompletion": "MkdirAll,OpenFile",
 	"internal/ui/model.go::saveHistory":                   "MkdirAll,OpenFile",
-	"internal/ui/stream.go::debugLogPayload":              "MkdirAll,OpenFile",
+	"internal/ui/telemetry_sink.go::writeTelemetryRecord": "MkdirAll,OpenFile",
 	"internal/ui/update.go::Update":                       "OpenFile",
 }
 

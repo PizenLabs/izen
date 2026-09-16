@@ -63,17 +63,6 @@ func NewOSFileWithRoot(root *scope.Root) *OSFile {
 	return f
 }
 
-// BindRoot anchors the adapter to an open workspace-root FD handle.
-func (f *OSFile) BindRoot(root *scope.Root) {
-	if f == nil {
-		return
-	}
-	f.scopeRoot = root
-	if root != nil {
-		f.root = root.RootPath()
-	}
-}
-
 // anchored verifies path at use time and returns the absolute path plus,
 // for short-lived handles, a closer. An empty adapter root bypasses
 // anchoring (legacy unconfined behavior).

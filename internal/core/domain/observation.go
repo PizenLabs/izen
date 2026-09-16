@@ -43,6 +43,11 @@ type BudgetUsage struct {
 	Files        int `json:"files"`
 	DiffLines    int `json:"diff_lines"`
 	ShellCmds    int `json:"shell_cmds"`
+	// StepTokens is the current-turn token consumption (reset per turn).
+	StepTokens int `json:"step_tokens"`
+	// TaskTokens is the aggregate task-level token consumption (persists
+	// across turns; never reset by ResetStep).
+	TaskTokens int `json:"task_tokens"`
 }
 
 type DependencyFreshness uint8

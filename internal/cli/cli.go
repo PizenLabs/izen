@@ -30,6 +30,7 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime/harness"
 	"github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	"github.com/PizenLabs/izen/internal/runtime/preflight"
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/internal/runtime/target"
 	"github.com/PizenLabs/izen/internal/runtime/ui/decision"
 )
@@ -330,13 +331,20 @@ func Wire(llm LLMProvider, root string, in io.Reader, out io.Writer) *Stack {
 	harnessPipeline := harness.NewExtractorPipeline()
 	gatePipeline := gate.NewPipeline()
 	snapshotReader := orchestrator.FSSnapshotReader{}
-	// Loop is wired with SnapshotReader DI; harness extractor is adapted per-target at Run time.
-	loop := orchestrator.NewLoop(
+	// Loop is wired with explicit Substrate authority: production bootstrap
+	// passes a concrete Substrate; nil is rejected with an explicit error.
+	loop, err := orchestrator.NewLoop(
 		&orchestrator.MemoryBackedExtractor{Pipeline: harnessPipeline, TargetFile: ""},
 		gatePipeline,
 		exec,
 		snapshotReader,
+		substrate.NewConcreteSubstrate(root),
 	)
+	if err != nil {
+		// Explicit construction invariant: Loop without Substrate must fail.
+		// Fall back to nil Loop so Stack.Run fails closed instead of panicking.
+		loop = nil
+	}
 
 	return &Stack{
 		Preflight:       pf,

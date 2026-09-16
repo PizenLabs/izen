@@ -35,16 +35,12 @@ func debugEnabled() bool {
 	}
 }
 
-// debugLogCompletion appends one raw-completion composition record to
-// .izen/debug/completions.log. It is purely diagnostic — it never affects the
-// runtime path, and it is a strict no-op when the log cannot be written or
-// when IZEN_DEBUG is not enabled.
+// debugLogCompletion enqueues one raw-completion composition record for
+// .izen/debug/completions.log via the async non-blocking telemetry channel.
+// It never blocks the UI thread: saturation drops and counts. It is a strict
+// no-op when IZEN_DEBUG is not enabled.
 func debugLogCompletion(raw string, tokIn, tokOut int, finishReason string, stage string) {
 	if !debugEnabled() {
-		return
-	}
-	dir := filepath.Join(".izen", "debug")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
 	stats := ai.CompletionStatsOf(raw)
@@ -63,10 +59,5 @@ func debugLogCompletion(raw string, tokIn, tokOut int, finishReason string, stag
 		return
 	}
 	data = append(data, '\n')
-	f, err := os.OpenFile(filepath.Join(dir, "completions.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	defer func() { _ = f.Close() }()
-	_, _ = f.Write(data)
+	enqueueTelemetryWrite(filepath.Join(".izen", "debug"), "completions.log", data)
 }
