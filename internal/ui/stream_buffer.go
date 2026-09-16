@@ -1,6 +1,9 @@
 package ui
 
-import "strings"
+import (
+	"strings"
+	"sync"
+)
 
 // StreamBlockKind classifies a stored stream block as either final response
 // content (rendered bright) or thinking/reasoning text (rendered dimmed/faint).
@@ -27,7 +30,11 @@ type StreamBlock struct {
 // It is the structured counterpart of the flat currentStreamContent string:
 // thinking text is never merged into content, so the renderer can distinguish
 // the two streams by construction.
+//
+// Thread-safe via sync.RWMutex: high-throughput producers may Append while
+// the UI thread concurrently reads Blocks/Content/Thinking/Len.
 type StreamBuffer struct {
+	mu     sync.RWMutex
 	blocks []StreamBlock
 }
 
@@ -40,9 +47,11 @@ func NewStreamBuffer() *StreamBuffer {
 // same-kind tokens merge into the active block; a kind change starts a new
 // block.
 func (b *StreamBuffer) Append(kind StreamBlockKind, text string) {
-	if text == "" {
+	if b == nil || text == "" {
 		return
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if n := len(b.blocks); n > 0 && b.blocks[n-1].Kind == kind {
 		b.blocks[n-1].Text += text
 		return
@@ -53,6 +62,11 @@ func (b *StreamBuffer) Append(kind StreamBlockKind, text string) {
 // Blocks returns a copy of the stored blocks so callers can iterate without
 // racing a concurrent Append on the UI goroutine.
 func (b *StreamBuffer) Blocks() []StreamBlock {
+	if b == nil {
+		return nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	out := make([]StreamBlock, len(b.blocks))
 	copy(out, b.blocks)
 	return out
@@ -60,6 +74,11 @@ func (b *StreamBuffer) Blocks() []StreamBlock {
 
 // HasThinking reports whether any thinking block is stored.
 func (b *StreamBuffer) HasThinking() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	for _, bl := range b.blocks {
 		if bl.Kind == KindThinking {
 			return true
@@ -70,6 +89,11 @@ func (b *StreamBuffer) HasThinking() bool {
 
 // HasContent reports whether any content block is stored.
 func (b *StreamBuffer) HasContent() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	for _, bl := range b.blocks {
 		if bl.Kind == KindContent {
 			return true
@@ -80,6 +104,11 @@ func (b *StreamBuffer) HasContent() bool {
 
 // Len returns the total number of text bytes across all blocks.
 func (b *StreamBuffer) Len() int {
+	if b == nil {
+		return 0
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	n := 0
 	for _, bl := range b.blocks {
 		n += len(bl.Text)
@@ -89,6 +118,11 @@ func (b *StreamBuffer) Len() int {
 
 // Content returns the concatenated content blocks (the final answer).
 func (b *StreamBuffer) Content() string {
+	if b == nil {
+		return ""
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	var sb strings.Builder
 	for _, bl := range b.blocks {
 		if bl.Kind == KindContent {
@@ -100,6 +134,11 @@ func (b *StreamBuffer) Content() string {
 
 // Thinking returns the concatenated thinking blocks (the reasoning text).
 func (b *StreamBuffer) Thinking() string {
+	if b == nil {
+		return ""
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	var sb strings.Builder
 	for _, bl := range b.blocks {
 		if bl.Kind == KindThinking {
@@ -111,5 +150,10 @@ func (b *StreamBuffer) Thinking() string {
 
 // Reset clears all stored blocks.
 func (b *StreamBuffer) Reset() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.blocks = nil
 }

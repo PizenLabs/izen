@@ -67,18 +67,6 @@ func NewPatchAdapterWithRoot(root *scope.Root) *PatchAdapter {
 	return p
 }
 
-// BindRoot anchors the adapter to an open workspace-root FD handle for
-// all subsequent Apply calls.
-func (p *PatchAdapter) BindRoot(root *scope.Root) {
-	if p == nil {
-		return
-	}
-	p.scopeRoot = root
-	if root != nil {
-		p.root = root.RootPath()
-	}
-}
-
 // Parse classifies a raw payload into a normalized PatchPayload. Unified diffs
 // and SEARCH/REPLACE payloads are preserved verbatim in Modified; whole-file
 // rewrites are fenced-stripped and flagged with IsFullRewrite. The target file

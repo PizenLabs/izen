@@ -150,15 +150,10 @@ func sanitizeCasualMessageContent(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// debugLogPayload writes the exact outgoing LLM payload to
-// .izen/debug/payload.log so we can prove what the model actually receives on
-// each /ask turn. This is purely diagnostic — it appends one JSON line per
-// streamCmd invocation and never affects the runtime path.
+// debugLogPayload enqueues the exact outgoing LLM payload for
+// .izen/debug/payload.log via the async non-blocking telemetry channel so the
+// UI thread never blocks on disk I/O. This is purely diagnostic.
 func debugLogPayload(content string, msgs []ai.Message) {
-	dir := filepath.Join(".izen", "debug")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
 	// Capture only the final user message and the last 4 history turns to
 	// keep the log compact and focused on ordering/duplication evidence.
 	last := msgs
@@ -179,12 +174,7 @@ func debugLogPayload(content string, msgs []ai.Message) {
 		return
 	}
 	data = append(data, '\n')
-	f, err := os.OpenFile(filepath.Join(dir, "payload.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	defer func() { _ = f.Close() }()
-	_, _ = f.Write(data)
+	enqueueTelemetryWrite(filepath.Join(".izen", "debug"), "payload.log", data)
 }
 
 // injectObjectiveContext prefixes the active human-confirmed objective frame
