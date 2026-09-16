@@ -142,7 +142,11 @@ func formatElapsed(d time.Duration) string {
 	if secs < 60 {
 		return fmt.Sprintf("%.1fs", secs)
 	}
-	m := int(secs) / 60
-	rem := secs - float64(m*60)
-	return fmt.Sprintf("%dm%.0fs", m, rem)
+	// Human-Readable Duration Invariant: >60s renders as "Xm Ys"
+	// (e.g. 569.3s -> "9m 29s") and >=1h as "Xh Ym".
+	totalSecs := int(d.Round(time.Second).Seconds())
+	if totalSecs < 3600 {
+		return fmt.Sprintf("%dm %02ds", totalSecs/60, totalSecs%60)
+	}
+	return fmt.Sprintf("%dh %02dm", totalSecs/3600, (totalSecs%3600)/60)
 }

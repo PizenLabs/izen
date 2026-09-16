@@ -56,13 +56,16 @@ func readTarget(t *testing.T, path string) string {
 func newLoop(t *testing.T, targetPath string, reader SnapshotReader) *Loop {
 	t.Helper()
 	sub := substrate.NewConcreteSubstrate(filepath.Dir(targetPath))
-	l := NewLoop(
+	l, err := NewLoop(
 		NewMemoryBackedExtractor(targetPath),
 		gate.NewPipeline(),
 		executor.NewExecutor(),
 		reader,
+		sub,
 	)
-	l.substrate = sub
+	if err != nil {
+		t.Fatalf("NewLoop: %v", err)
+	}
 	return l
 }
 

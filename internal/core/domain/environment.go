@@ -49,6 +49,12 @@ type ResourceBudget struct {
 	MaxDiffLines     int           `json:"max_diff_lines"`
 	MaxShellCommands int           `json:"max_shell_commands"`
 	MaxLatency       time.Duration `json:"max_latency"`
+	// StepTokens is the single-turn (one cycle/step) token ceiling. Exceeding
+	// it yields a PARTIAL turn outcome while the task persists.
+	StepTokens int `json:"step_tokens"`
+	// TaskTokens is the aggregate task-level token ceiling across all turns.
+	// Exceeding it exhausts the task.
+	TaskTokens int `json:"task_tokens"`
 }
 
 type SourceState struct {

@@ -45,6 +45,23 @@ const defaultOpenRouterMaxTokens = 4096
 // budget: larger requests are clamped, never sent unconstrained.
 const maxOpenRouterMaxTokens = 8192
 
+// constrainedOpenRouterMaxTokens is the enforced output budget for
+// constrained/free-tier models (max_output <= 1024). 980 leaves headroom
+// below a 1024 ceiling so the completion never hits finish_reason="length".
+const constrainedOpenRouterMaxTokens = 980
+
+// isOpenRouterFreeTierModel reports whether a model ID is an OpenRouter
+// free-tier model (":free" suffix, case-insensitive). Free-tier models are
+// treated as constrained (max_output <= 1024) even when the caller does not
+// pass an explicit output cap.
+func isOpenRouterFreeTierModel(model string) bool {
+	m := strings.TrimSpace(model)
+	if len(m) < 5 {
+		return false
+	}
+	return strings.EqualFold(m[len(m)-5:], ":free")
+}
+
 // openRouterMaxRateLimitRetries bounds how many times a request answered with
 // HTTP 429 (Too Many Requests / rate limit) is retried before the error is
 // surfaced to the caller. Each retry waits longer (exponential backoff), so the
@@ -490,11 +507,22 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 	// are honored up to the 8192 hard cap. Callers with tighter budgets
 	// (bounded-patch mutation, read-only plans) pass their own smaller
 	// MaxTokens, which is preserved verbatim below the cap.
-	if body.MaxTokens == 0 {
-		body.MaxTokens = defaultOpenRouterMaxTokens
-	}
-	if body.MaxTokens > maxOpenRouterMaxTokens {
-		body.MaxTokens = maxOpenRouterMaxTokens
+	//
+	// Constrained Output Budget Invariant: OpenRouter free-tier models
+	// (":free" suffix, max_output <= 1024) MUST force
+	// max_tokens = min(requested, 980) so the completion never hits
+	// finish_reason="length" / OUTPUT_EXHAUSTED.
+	if isOpenRouterFreeTierModel(model) {
+		if body.MaxTokens <= 0 || body.MaxTokens > constrainedOpenRouterMaxTokens {
+			body.MaxTokens = constrainedOpenRouterMaxTokens
+		}
+	} else {
+		if body.MaxTokens == 0 {
+			body.MaxTokens = defaultOpenRouterMaxTokens
+		}
+		if body.MaxTokens > maxOpenRouterMaxTokens {
+			body.MaxTokens = maxOpenRouterMaxTokens
+		}
 	}
 	if stream {
 		body.StreamOptions = &streamOptions{IncludeUsage: true}

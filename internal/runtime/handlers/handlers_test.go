@@ -114,9 +114,10 @@ func TestSubmitPromptHandler_ExplicitModeRoutesPhase(t *testing.T) {
 }
 
 func TestSubmitPromptHandler_KeywordClassifiesIntent(t *testing.T) {
+	// Execution syntax routes to the execution pipeline.
 	deps, c := newDeps()
 	h := New(deps).Submit()
-	if err := h.Handle(context.Background(), runtime.SubmitPromptCmd{Prompt: "why does the build fail"}); err != nil {
+	if err := h.Handle(context.Background(), runtime.SubmitPromptCmd{Prompt: "$prompt why does the build fail"}); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
 	if !hasType(c, events.EventIntentParsed) {
@@ -125,6 +126,29 @@ func TestSubmitPromptHandler_KeywordClassifiesIntent(t *testing.T) {
 	if got := deps.Workflow.Phase(); got != workflow.PhaseInvestigate {
 		t.Fatalf("phase = %s, want investigate (keyword intent)", got)
 	}
+}
+
+func TestSubmitPromptHandler_PlainTextRoutesToAsk(t *testing.T) {
+	// Intent-Capability Boundary: plain-text without $prompt strictly routes
+	// to ask, even with mutation/failure semantics.
+	deps, _ := newDeps()
+	h := New(deps).Submit()
+	for _, prompt := range []string{
+		"why does the build fail",
+		"check this file @index.html and rewrite it",
+		"delete all files and rewrite main.go",
+	} {
+		d2, _ := newDeps()
+		h2 := New(d2).Submit()
+		if err := h2.Handle(context.Background(), runtime.SubmitPromptCmd{Prompt: prompt}); err != nil {
+			t.Fatalf("Submit(%q): %v", prompt, err)
+		}
+		if got := d2.Workflow.Phase(); got != workflow.PhaseAsk {
+			t.Fatalf("Submit(%q) phase = %s, want ask (plain-text boundary)", prompt, got)
+		}
+	}
+	_ = h
+	_ = deps
 }
 
 func TestSubmitPromptHandler_EmptyPrompt(t *testing.T) {
@@ -234,10 +258,19 @@ func TestClassifyIntent(t *testing.T) {
 		mode   string
 		want   string
 	}{
-		{"plan the migration", "", "plan"},
-		{"implement the feature", "", "build"},
-		{"debug the crash", "", "investigate"},
-		{"review the changes", "", "review"},
+		// Intent-Capability Boundary: plain-text without $prompt strictly
+		// routes to ask, regardless of mutation semantics.
+		{"plan the migration", "", "ask"},
+		{"implement the feature", "", "ask"},
+		{"debug the crash", "", "ask"},
+		{"review the changes", "", "ask"},
+		{"check this file @index.html and rewrite it", "", "ask"},
+		{"delete all files and rewrite main.go", "", "ask"},
+		// Explicit execution syntax routes to the execution pipeline.
+		{"$prompt plan the migration", "", "plan"},
+		{"$prompt implement the feature", "", "build"},
+		{"$prompt debug the crash", "", "investigate"},
+		{"$prompt review the changes", "", "review"},
 		{"hello world", "", "ask"},
 		{"anything at all", "build", "build"},
 	}

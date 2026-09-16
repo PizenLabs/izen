@@ -146,6 +146,126 @@ func FallbackShapeForBudgetExceeded() BudgetShape {
 	return ShapeBoundedPatch
 }
 
+// ── Constrained output-budget policy ────────────────────────────────────
+//
+// Constrained Output Budget Invariant: for providers/models flagged with
+// max_output_tokens <= 1024 (or OpenRouter free-tier models), the runtime
+// MUST force max_tokens = min(requested, 980) and DISABLE FULL_REWRITE
+// patch generation entirely, forcing SEARCH_REPLACE or UNIFIED_DIFF modes.
+
+// ConstrainedOutputThreshold is the max_output ceiling at or below which a
+// model is treated as constrained.
+const ConstrainedOutputThreshold = 1024
+
+// ConstrainedMaxTokens is the enforced output budget for constrained models.
+const ConstrainedMaxTokens = 980
+
+// PatchStrategySearchReplace is the enforced diff format for constrained
+// models. The model emits exactly one anchored SEARCH/REPLACE block, never a
+// full-file rewrite.
+const PatchStrategySearchReplace = "SEARCH_REPLACE"
+
+// PatchStrategyFullRewrite is the disabled strategy for constrained models.
+const PatchStrategyFullRewrite = "FULL_REWRITE"
+
+// ModelProfile is the minimal capability record the output-budget policy
+// reasons over: the model's advertised output cap.
+type ModelProfile struct {
+	// OutputTokenCap is the model's max_output_tokens budget (0 = unknown).
+	OutputTokenCap int
+	// ModelID carries the provider model identifier (used for ":free"
+	// free-tier detection when the numeric cap is unknown).
+	ModelID string
+}
+
+// IsConstrained reports whether the profile is output-constrained
+// (cap <= 1024 for OpenRouter-style vendor/model IDs, or a ":free"
+// free-tier model ID). The slash guard prevents the strategy-derived
+// 1024 budget for mock/local providers (e.g. "mock") from being
+// mis-identified as a provider cap — mock budgets are strategy-owned,
+// not provider-advertised.
+func (p ModelProfile) IsConstrained() bool {
+	if p.OutputTokenCap > 0 && p.OutputTokenCap <= ConstrainedOutputThreshold && isProviderModelID(p.ModelID) {
+		return true
+	}
+	m := p.ModelID
+	trimmed := m
+	for len(trimmed) > 0 && (trimmed[0] == ' ' || trimmed[0] == '\t' || trimmed[0] == '\n') {
+		trimmed = trimmed[1:]
+	}
+	for len(trimmed) > 0 {
+		last := trimmed[len(trimmed)-1]
+		if last == ' ' || last == '\t' || last == '\n' {
+			trimmed = trimmed[:len(trimmed)-1]
+		} else {
+			break
+		}
+	}
+	if len(trimmed) >= 5 {
+		suffix := trimmed[len(trimmed)-5:]
+		if len(suffix) == 5 && (suffix[0] == ':' || suffix[0] == 'F' || suffix[0] == 'f') {
+			lower := ""
+			for _, c := range suffix {
+				if c >= 'A' && c <= 'Z' {
+					lower += string(c + 32)
+				} else {
+					lower += string(c)
+				}
+			}
+			if lower == ":free" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isProviderModelID(modelID string) bool {
+	m := modelID
+	// Trim spaces.
+	for len(m) > 0 && (m[0] == ' ' || m[0] == '\t' || m[0] == '\n') {
+		m = m[1:]
+	}
+	for len(m) > 0 && (m[len(m)-1] == ' ' || m[len(m)-1] == '\t' || m[len(m)-1] == '\n') {
+		m = m[:len(m)-1]
+	}
+	for _, c := range m {
+		if c == '/' {
+			return true
+		}
+	}
+	return false
+}
+
+// ClampMaxTokens enforces min(requested, 980) for constrained profiles.
+func (p ModelProfile) ClampMaxTokens(requested int) int {
+	if !p.IsConstrained() {
+		return requested
+	}
+	if requested <= 0 || requested > ConstrainedMaxTokens {
+		return ConstrainedMaxTokens
+	}
+	return requested
+}
+
+// IsConstrainedOutputBudget reports whether a raw max_output budget is
+// constrained (<= 1024, positive only).
+func IsConstrainedOutputBudget(maxOutputTokens int) bool {
+	return maxOutputTokens > 0 && maxOutputTokens <= ConstrainedOutputThreshold
+}
+
+// ClampMaxTokensForBudget enforces min(requested, 980) for constrained
+// budgets.
+func ClampMaxTokensForBudget(requested, maxOutputTokens int) int {
+	if !IsConstrainedOutputBudget(maxOutputTokens) {
+		return requested
+	}
+	if requested <= 0 || requested > ConstrainedMaxTokens {
+		return ConstrainedMaxTokens
+	}
+	return requested
+}
+
 // FormatBudgetGuardrailMessage renders a compact, presentation-safe summary
 // of a guardrail refusal. It is used by the DecisionSurface reason string
 // when the runtime parks awaiting_human after a budget-exhausted dispatch.

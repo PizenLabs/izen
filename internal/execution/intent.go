@@ -10,7 +10,7 @@ import (
 // ── IntentGateway (unified intent resolution) ──────────────────────────────
 //
 // The IntentGateway is the single entry point every user action crosses:
-// bare text, $prompt, $hot — all produce an ExecutionRequest. It performs the
+// bare text, $prompt, $hot, /build — all produce an ExecutionRequest. It performs the
 // deterministic resolution BEFORE any execution:
 //
 //	User Input
@@ -88,6 +88,9 @@ func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, In
 	case strings.HasPrefix(lower, "$hot"):
 		res.Directive = "hot"
 		prompt = strings.TrimSpace(raw[len("$hot"):])
+	case strings.HasPrefix(lower, "/build"):
+		res.Directive = "build"
+		prompt = strings.TrimSpace(raw[len("/build"):])
 	}
 	if prompt == "" {
 		// No executable content beyond the directive marker: surface a

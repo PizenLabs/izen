@@ -31,9 +31,16 @@ Now process the following raw user input:`
 // AskContract returns the operational contract for ask mode.
 //
 // Purpose: increase understanding.
-// Allowed: explain, inspect, compare, answer, clarify.
-// Forbidden: code mutation, patch generation, execution.
+// Allowed: explain, inspect, compare, answer, clarify, including read-only
+// code blocks as textual evidence in stream output.
+// Forbidden: workspace disk mutation, patch application, execution.
 // Output: engineering explanation.
+//
+// Code Generation vs. Mutation Invariant: ASK mode restricts workspace disk
+// mutation (CapMutate = DENY), NOT text/code generation in stream output.
+// Read-only code blocks or full code proposed as textual evidence are
+// PERMITTED if supported by the dynamic budget. The RuntimeExecutor still
+// blocks disk writes with ErrCapabilityDenied.
 func AskContract() string {
 	fence := "```"
 	return fmt.Sprintf(`MODE: /ask — increase understanding.
@@ -42,10 +49,11 @@ PERMISSIONS
 - Explain, inspect, compare, answer, and clarify code and concepts.
 - Answer general software engineering, architecture, syntax, and language questions directly.
 - Compare alternatives and recommend approaches.
+- Stream read-only code blocks or full code snippets as textual evidence in the response when they aid understanding and fit the dynamic output budget. Code text in the stream NEVER grants disk-mutation authority.
 
 FORBIDDEN
-- Do NOT propose code mutations, execution diffs, or code generation.
-- Do NOT perform any execution or mutation.
+- Do NOT mutate workspace files on disk, apply patches, or execute commands.
+- Do NOT perform any execution or disk mutation. Textual code evidence in the stream is permitted; filesystem writes are denied.
 
 CONTEXT SCOPE
 - General technical question (e.g. "what is Golang", "explain closures") → answer immediately and comprehensively; no local project context required.

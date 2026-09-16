@@ -200,6 +200,62 @@ func (e *Engine) StageAll() error {
 	return err
 }
 
+// HasHEAD reports whether the repo has a resolvable HEAD commit. Empty repos
+// (no commits) and non-repos return false — never an error outward.
+func (e *Engine) HasHEAD() bool {
+	_, err := e.CurrentHash()
+	return err == nil
+}
+
+// StatusPaths splits porcelain status into staged and unstaged path lists,
+// mirroring `git status --porcelain`. Renames ("R  old -> new") resolve to the
+// new path; non-repos and empty repos return empty lists (never an error).
+func (e *Engine) StatusPaths() (staged, unstaged []string) {
+	entries, err := e.Status()
+	if err != nil {
+		return nil, nil
+	}
+	for _, ent := range entries {
+		path := renameTargetPath(ent.Path)
+		if path == "" {
+			continue
+		}
+		if ent.Staging != " " && ent.Staging != "?" {
+			staged = append(staged, path)
+			continue
+		}
+		if ent.Worktree != " " || ent.Staging == "?" {
+			unstaged = append(unstaged, path)
+		}
+	}
+	return staged, unstaged
+}
+
+// renameTargetPath normalizes "old -> new" porcelain rename entries to the new
+// path. Plain paths pass through unchanged.
+func renameTargetPath(p string) string {
+	if idx := strings.Index(p, " -> "); idx >= 0 {
+		return p[idx+4:]
+	}
+	return p
+}
+
+// DiffCachedFile returns the cached (staged) diff for a single path.
+func (e *Engine) DiffCachedFile(path string) (string, error) {
+	return e.git("diff", "--cached", "--no-color", "--", path)
+}
+
+// RunCommit runs a prebuilt `git commit ...` argv (as produced by the UI git
+// panel's BuildArgs). It fails fast unless the argv is a commit invocation so
+// a UI bug can never smuggle an arbitrary git subcommand through the panel.
+func (e *Engine) RunCommit(args []string) error {
+	if len(args) == 0 || args[0] != "commit" {
+		return fmt.Errorf("git: RunCommit expects argv beginning with \"commit\", got %v", args)
+	}
+	_, err := e.git(args...)
+	return err
+}
+
 func (e *Engine) ResetHard(ref string) error {
 	_, err := e.git("reset", "--hard", ref)
 	return err

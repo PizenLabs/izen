@@ -173,11 +173,6 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	if len(openaiResp.Choices) == 0 {
 		return nil, fmt.Errorf("openai: no choices in response")
 	}
-	// Task 1: fail fast on truncated payload before envelope parsing.
-	if openaiResp.Choices[0].FinishReason == "length" {
-		return nil, fmt.Errorf("%w: finish_reason=length", ai.ErrPayloadTruncated)
-	}
-
 	content := ""
 	if openaiResp.Choices[0].Message != nil {
 		msg := openaiResp.Choices[0].Message
@@ -195,6 +190,20 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	}
 	usage.CompletedAt = time.Now()
 	usage.FinishReason = openaiResp.Choices[0].FinishReason
+	// Task 1: fail fast on truncated payload before envelope parsing, but
+	// PRESERVE the canonical partial buffer. Universal Stream Outcome:
+	// length -> PARTIAL across all tiers; never clear/swallow the buffer.
+	if openaiResp.Choices[0].FinishReason == "length" {
+		if usage.FirstTokenAt.IsZero() {
+			usage.FirstTokenAt = usage.CompletedAt
+		}
+		return &ai.Response{
+			Content:     content,
+			TokenInput:  tokenIn,
+			TokenOutput: tokenOut,
+			Usage:       usage,
+		}, fmt.Errorf("%w: finish_reason=length", ai.ErrPayloadTruncated)
+	}
 	if usage.FirstTokenAt.IsZero() {
 		usage.FirstTokenAt = usage.CompletedAt
 	}

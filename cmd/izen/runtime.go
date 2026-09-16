@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -13,9 +16,12 @@ import (
 	"github.com/PizenLabs/izen/internal/app/compiler"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/events"
+	auditevents "github.com/PizenLabs/izen/internal/events/audit"
 	"github.com/PizenLabs/izen/internal/ir"
 	"github.com/PizenLabs/izen/internal/knowledge"
 	"github.com/PizenLabs/izen/internal/providers"
+	"github.com/PizenLabs/izen/internal/runtime/executor"
+	"github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 	"github.com/PizenLabs/izen/internal/tui/components/ask"
 )
@@ -182,6 +188,57 @@ func runRuntimeCommand(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	// ── AUDIT PERSISTENCE (durable non-repudiation) ─────────────────────
+	// Every `izen run` execution persists the complete chronological lifecycle
+	// sequence to .izen/audit/events.ndjson via the async AuditLogger. The
+	// logger subscribes to the pipeline bus BEFORE any lifecycle event is
+	// published so the trail is complete; session finalization performs a
+	// BLOCKING synchronous Flush (also tied to SIGINT/SIGTERM below) whose
+	// error structurally invalidates execution success.
+	auditDir := filepath.Join(dir, ".izen", "audit")
+	auditLogger, err := auditevents.NewLogger(auditDir, pipeline.Bus())
+	if err != nil {
+		return fmt.Errorf("izen run: wire audit logger: %w", err)
+	}
+	if err := auditLogger.Start(); err != nil {
+		return fmt.Errorf("izen run: start audit logger: %w", err)
+	}
+	// Signal-bound synchronous flush: SIGINT/SIGTERM trigger a blocking
+	// flush before the process terminates so evidence is never lost to an
+	// interrupt. The channel is stopped on normal finalization.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sigDone := make(chan struct{})
+	defer close(sigDone)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			fmt.Fprintf(os.Stderr, "izen run: caught %v — flushing audit log synchronously…\n", sig)
+			if ferr := auditLogger.Flush(); ferr != nil {
+				fmt.Fprintf(os.Stderr, "izen run: audit flush on signal failed: %v\n", ferr)
+			}
+			if cerr := auditLogger.Close(); cerr != nil {
+				fmt.Fprintf(os.Stderr, "izen run: audit teardown on signal failed: %v\n", cerr)
+			}
+			signal.Stop(sigCh)
+			// Re-raise with default disposition so the exit status reflects
+			// the signal.
+			p, _ := os.FindProcess(os.Getpid())
+			_ = p.Signal(sig)
+		case <-sigDone:
+		}
+	}()
+	// Defer-chain teardown: guarantees the audit file is closed even on early
+	// returns. The authoritative session-finalization Flush above already
+	// propagated its error into the exit status; a teardown failure here is
+	// reported, never swallowed.
+	defer func() {
+		signal.Stop(sigCh)
+		if err := auditLogger.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "izen run: audit teardown failed: %v\n", err)
+		}
+	}()
+
 	// Attach a terminal status observer rendering kernel task and pipeline
 	// stage updates on stderr as they happen. A TUI subscribes with the same
 	// events.Bus contract.
@@ -190,7 +247,43 @@ func runRuntimeCommand(args []string) error {
 	})
 	defer unsub.Cancel()
 
+	// The canonical execution lifecycle opens here: the execution.started
+	// record is the first line of the chronological audit sequence.
+	//
+	// Architecture lock (TestLifecycleEventsGeneratedOnlyFromGraph): the
+	// typed lifecycle constructors (NewExecutionStarted,
+	// NewVerificationCompleted, NewExecutionFinished) may ONLY be invoked
+	// by the runtime-owned execution graph. This command routes through the
+	// V3 app pipeline — not the graph — so its audit trail is recorded as
+	// envelope records carrying the same canonical Source discriminators
+	// and equivalent payloads. Envelopes persist verbatim in events.ndjson
+	// (Source preserved) and never traverse typed subscriptions, so they
+	// cannot fabricate graph lifecycle state in any projection: they are
+	// bookkeeping of what this pipeline actually did.
+	requestID := events.NewEnvelopeID()
+	pipeline.Bus().PublishEnvelope(events.NewEnvelope(
+		events.DomainKindSystem, events.EventExecutionStarted,
+		events.ExecutionStartedPayload{RequestID: requestID, Mode: "run", Prompt: prompt},
+	))
+
 	res, runErr := pipeline.Run(ctx, app.Request{Intent: prompt, Targets: targets})
+
+	// The lifecycle closes here from the REAL pipeline outcome (never
+	// synthesised): plan.staged from the produced plan, patch.applied per
+	// validated artifact, verification.completed from the validation gate,
+	// and the terminal execution.finished. The audit logger persists every
+	// one of these because it subscribes to the whole bus.
+	publishRunLifecycle(pipeline.Bus(), requestID, res, runErr)
+
+	// ── SESSION FINALIZATION: blocking synchronous flush ──────────────
+	// Audit persistence failure structurally invalidates execution success:
+	// even when mutations succeeded and tests passed, a flush error forces
+	// a non-zero exit with ErrAuditPersistenceFailed and marks evidence
+	// integrity as compromised (mutations are NOT rolled back).
+	if flushErr := auditLogger.Flush(); flushErr != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "izen run: audit persistence failed — evidence integrity compromised (mutations stand, success invalidated)")
+		return fmt.Errorf("%w: audit flush: %w", orchestrator.ErrAuditPersistenceFailed, flushErr)
+	}
 
 	fmt.Println()
 	fmt.Println("── V3 pipeline audit trail ───────────────────────────────")
@@ -266,6 +359,114 @@ func runRuntimeCommand(args []string) error {
 	return nil
 }
 
+// publishRunLifecycle closes the canonical execution lifecycle for one
+// `izen run` execution from the REAL pipeline outcome. Every record is derived
+// from an observed pipeline stage — never synthesised — so the persisted
+// .izen/audit/events.ndjson sequence is truthful and chronological:
+//
+//	execution.started (published before Run) → plan.staged → patch.applied*
+//	→ execution.verification.completed → execution.finished
+//
+// Architecture lock (TestLifecycleEventsGeneratedOnlyFromGraph): the typed
+// NewVerificationCompleted / NewExecutionFinished constructors may ONLY be
+// invoked by the runtime-owned execution graph, so this non-graph pipeline
+// records those two transitions as envelope records with the same canonical
+// Source discriminators and equivalent payloads (see the execution.started
+// comment above). NewPlanStaged and NewPatchApplied are not graph-locked and
+// are published as typed events.
+func publishRunLifecycle(bus *events.Bus, requestID string, res *app.Result, runErr error) {
+	if bus == nil {
+		return
+	}
+	if res != nil && res.Plan != nil {
+		tasks := make([]string, 0, len(res.Plan.Artifacts))
+		for _, a := range res.Plan.Artifacts {
+			if a.Path != "" {
+				tasks = append(tasks, a.Path)
+			}
+		}
+		if len(tasks) == 0 {
+			for _, a := range res.Artifacts {
+				if a.Path != "" {
+					tasks = append(tasks, a.Path)
+				}
+			}
+		}
+		strategy := res.Plan.Metadata["strategy"]
+		if strategy == "" {
+			strategy = string(res.Mode)
+		}
+		bus.Publish(events.NewPlanStaged(len(tasks), tasks, strategy))
+	}
+	if res != nil {
+		for _, a := range res.Artifacts {
+			if a.Path == "" {
+				continue
+			}
+			bus.Publish(events.NewPatchApplied(a.Path, len(a.Content), 0, 0))
+		}
+		passed := true
+		steps := []string{"capability-validation"}
+		for _, v := range res.Validations {
+			if !v.Passed {
+				passed = false
+				break
+			}
+		}
+		// Verification is real: it reflects the validation gate verdict over
+		// the produced artifacts (plus planning when a plan exists).
+		if len(res.Artifacts) > 0 || res.Plan != nil {
+			if res.Plan != nil {
+				steps = append(steps, "plan")
+			}
+			bus.PublishEnvelope(events.NewEnvelope(
+				events.DomainKindSystem, events.EventVerificationCompleted,
+				events.VerificationCompletedPayload{RequestID: requestID, Passed: passed && runErr == nil, Steps: steps},
+			))
+		}
+	}
+	success := runErr == nil
+	outcome := "completed"
+	if !success {
+		outcome = "failed: " + runErr.Error()
+	}
+	bus.PublishEnvelope(events.NewEnvelope(
+		events.DomainKindSystem, events.EventExecutionFinished,
+		events.ExecutionFinishedPayload{RequestID: requestID, Success: success, Outcome: outcome},
+	))
+}
+
+// validateProviderModelBinding verifies provider/model tuple compatibility
+// synchronously (no network). It mirrors the fast-path gate's fail-fast
+// boundary so misconfiguration aborts before any provider invocation.
+func validateProviderModelBinding(provider, model string) error {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" {
+		return nil
+	}
+	hasSlash := false
+	for i, c := range model {
+		if c == '/' {
+			if i > 0 && len(model) > i+1 {
+				hasSlash = true
+			}
+			break
+		}
+	}
+	switch provider {
+	case "ollama":
+		if hasSlash {
+			return fmt.Errorf("%w: model %q does not belong to provider %q", executor.ErrInvalidProviderConfiguration, model, provider)
+		}
+	case "openrouter":
+		if !hasSlash {
+			return fmt.Errorf("%w: model %q does not belong to provider %q", executor.ErrInvalidProviderConfiguration, model, provider)
+		}
+	}
+	return nil
+}
+
 // buildActiveProvider constructs the ai.Provider for the configured active
 // provider and returns it together with the effective model name. The API key
 // resolves with strict precedence: ~/.izen/config.yml wins over the shell
@@ -290,6 +491,13 @@ func buildActiveProvider(cfg *config.Config) (ai.Provider, string, error) {
 		)
 	}
 	model := cfg.ActiveModelName()
+	// Fail-fast provider boundary: a mismatched provider/model tuple (e.g.
+	// provider "ollama" with model "cohere/north-mini-code:free") aborts here
+	// with ErrInvalidProviderConfiguration before any execution loop or
+	// preflight timeout can engage. Zero provider calls are made on mismatch.
+	if err := validateProviderModelBinding(name, model); err != nil {
+		return nil, "", err
+	}
 	switch name {
 	case "ollama":
 		return providers.NewOllamaProvider(provCfg.BaseURL, apiKey, model), model, nil

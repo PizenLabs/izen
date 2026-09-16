@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/compact"
@@ -268,6 +270,26 @@ func main() {
 	}
 	defer unlockWorkspace()
 
+	// ── AUDIT DURABILITY: blocking synchronous flush on signals + defer ──
+	// The audit logger persists every bus envelope to
+	// .izen/audit/events.ndjson asynchronously. Session finalization MUST
+	// flush it synchronously: the signal handler below performs a blocking
+	// Flush on SIGINT/SIGTERM (never swallowed — failures are reported to
+	// stderr so a lost audit trail can never masquerade as success), and
+	// the defer chain guarantees the same flush runs on every normal exit
+	// path before the application tears down.
+	stopAuditSignals := installAuditSignalFlush(app)
+	defer stopAuditSignals()
+	defer func() {
+		if err := app.FlushAudit(); err != nil {
+			fmt.Fprintf(os.Stderr, "izen: audit flush failed — evidence integrity compromised: %v\n", err)
+		}
+		app.Close()
+		if err := app.AuditCloseErr(); err != nil {
+			fmt.Fprintf(os.Stderr, "izen: audit teardown failed: %v\n", err)
+		}
+	}()
+
 	// ── Gate: missing local config → launch TUI onboarding ─────────────────
 	// NEVER write .izen/ or .izen/config.json to disk from main.go before the
 	// TUI program runs. If .izen/config.json doesn't exist, launch the TUI
@@ -303,6 +325,40 @@ func main() {
 		ui.RunRollbackEngine(cfg, root, localCfg, app, detection)
 	} else {
 		ui.RunMainDashboardWithApp(cfg, root, localCfg, app, bootErr, detection)
+	}
+}
+
+// installAuditSignalFlush ties the blocking, synchronous audit flush to OS
+// signals (SIGINT, SIGTERM) and returns a stop function for the defer chain.
+// On signal it performs a BLOCKING Flush of .izen/audit/events.ndjson before
+// the process proceeds to teardown; flush errors are reported to stderr and
+// never swallowed. In the TUI path the handler never exits the process
+// itself — the TUI owns exit — it only guarantees the evidence is durable.
+// A nil application (or nil audit logger) yields a no-op stop.
+func installAuditSignalFlush(app *compose.Application) func() {
+	if app == nil || app.Audit == nil {
+		return func() {}
+	}
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case sig := <-sigCh:
+			fmt.Fprintf(os.Stderr, "izen: caught %v — flushing audit log synchronously…\n", sig)
+			if err := app.FlushAudit(); err != nil {
+				fmt.Fprintf(os.Stderr, "izen: audit flush on signal failed — evidence integrity compromised: %v\n", err)
+			}
+		case <-done:
+		}
+	}()
+	return func() {
+		signal.Stop(sigCh)
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
 	}
 }
 

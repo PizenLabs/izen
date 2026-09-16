@@ -13,6 +13,8 @@ import (
 	"context"
 	"errors"
 
+	"github.com/PizenLabs/izen/internal/core/domain"
+	"github.com/PizenLabs/izen/internal/core/domain/evidence"
 	"github.com/PizenLabs/izen/internal/presentation/diff"
 	"github.com/PizenLabs/izen/internal/runtime/authorization"
 	"github.com/PizenLabs/izen/internal/runtime/executor"
@@ -56,6 +58,29 @@ type UIProjectionBridge interface {
 	WaitForApproval(ctx context.Context) (authorization.ApprovalEvent, error)
 }
 
+// FastPathAuthConfig carries the static authorization evidence for the
+// pre-model fast-path gate. When nil, RunCycle enforces only lexical target
+// safety before the provider call (backward-compatible). When non-nil, the
+// full static gate (capabilities → targets → references → preflight) runs
+// synchronously after preflight and drops unauthorized requests before any
+// network call to the LLM provider. The execution boundary still enforces the
+// 8-clause guard before mutation.
+type FastPathAuthConfig struct {
+	Capabilities        domain.DomainCapabilitySet
+	Budget              domain.ResourceBudget
+	Artifact            domain.ArtifactRef
+	Objective           domain.Objective
+	CheckpointID        domain.CheckpointID
+	HasCheckpoint       bool
+	HumanApproved       bool
+	BudgetIsPreApproval bool
+	SourceState         domain.SourceState
+	// Provider/Model carry the active runtime binding for fail-fast
+	// compatibility verification. Empty means unwired (legacy harness).
+	Provider string
+	Model    string
+}
+
 // OrchestratorConfig carries execution options for a single RunCycle.
 type OrchestratorConfig struct {
 	// TokenBudget is the context token budget applied to preflight when the
@@ -64,13 +89,45 @@ type OrchestratorConfig struct {
 	// ViewportConfig is the terminal geometry used to project the proposal
 	// diff.
 	ViewportConfig diff.ViewportConfig
+	// FastPathAuth, when non-nil, enables the synchronous static
+	// authorization gate before the provider call. Nil preserves legacy
+	// behavior (lexical target safety only).
+	FastPathAuth *FastPathAuthConfig
 }
 
 // ExecutionResult reports the outcome of one control-loop cycle.
+//
+// Terminal/Verdict/Completed form the Truthful State Transition product:
+// audit persistence failure structurally invalidates success (Completed=false,
+// Verdict != VerdictPassed) while the disk mutation is left intact
+// (Mutation Non-Rollback Isolation; see EvidenceCompromised). AuditError wraps
+// ErrAuditPersistenceFailed when the synchronous session-finalization flush
+// failed.
 type ExecutionResult struct {
 	ProposalID string
 	Target     string
 	Action     authorization.ApprovalAction
 	Committed  bool
 	Evidence   diff.MutationEvidence
+	// Terminal is the authoritative completion product bound to audit
+	// durability. On audit flush failure it is Failed/FAIL/incomplete even
+	// when Committed is true.
+	Terminal evidence.TerminalState
+	// Verdict is the terminal evidence classification (Passed/Failed/
+	// Inconclusive/PARTIAL). Audit failure forces Failed. A provider stream
+	// ending with finish_reason="length" records Verdict=PARTIAL
+	// (EvidenceState.PARTIAL) across ALL provider tiers.
+	Verdict evidence.EvidenceState
+	// Status is the universal stream outcome label ("COMPLETE", "PARTIAL",
+	// "FAILED", "CANCELLED"). Truncation returns "PARTIAL" without a
+	// terminal execution error.
+	Status string
+	// Completed mirrors Terminal.Completed: false when audit persistence
+	// failed, regardless of mutation success.
+	Completed bool
+	// AuditError wraps ErrAuditPersistenceFailed on flush failure, else nil.
+	AuditError error
+	// EvidenceCompromised marks that the filesystem mutation stands on disk
+	// but its audit evidence is compromised (failed flush, never rolled back).
+	EvidenceCompromised bool
 }

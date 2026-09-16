@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/core/domain"
@@ -10,6 +11,10 @@ import (
 	"github.com/PizenLabs/izen/internal/core/domain/occ"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
+
+func isCapabilityDenied(err error) bool {
+	return errors.Is(err, authorization.ErrCapabilityDenied)
+}
 
 type mockGuard struct {
 	decision authorization.AuthorizationDecision
@@ -74,8 +79,17 @@ func TestExecutor_UnapprovedIntentNeverReachesSubstrate(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected denied error")
 	}
+	// Fast-path gate denies static capability failures synchronously before
+	// the guard (Step 0), so guard.called may be false on the optimized path.
+	// Either denial point is valid as long as the verdict is capability-denied
+	// and neither checkpoint nor substrate is reached.
 	if !guard.called {
-		t.Fatal("guard was not called")
+		// Fast-path early denial: must still surface ErrCapabilityDenied.
+		if !isCapabilityDenied(err) {
+			t.Fatalf("fast-path denied without guard, but error is not capability-denied: %v", err)
+		}
+	} else if !isCapabilityDenied(err) {
+		t.Fatalf("guard denied, but error is not capability-denied: %v", err)
 	}
 	if ckpt.called {
 		t.Error("checkpoint should not be called when guard denies")

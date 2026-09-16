@@ -2836,23 +2836,27 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// next turn's content).
 		m.flushPendingReasoningFragment()
 
-		// Prevent blank lines when the response was truncated with zero
-		// content (finish_reason: length) or the provider returned nothing.
-		if final == "" {
+		// Universal Stream Outcome: truncated streams (finish_reason="length"
+		// -> EvidenceState.PARTIAL) MUST preserve canonical token buffers
+		// without synthetic content mutation. The partial content is pushed
+		// verbatim; a separate boundary badge signals PARTIAL. Never
+		// clear/swallow the buffer or inject synthetic filler into it.
+		// Only a non-truncated empty response gets the empty placeholder.
+		if final == "" && !msg.truncated {
 			final = "(response was empty)"
 		}
 
 		// Append the completed turn to PreRenderedHistory and freeze state.
 		m.push(roleAI, final)
 
-		// TRUNCATION NOTICE: finish_reason == "length" means the response was
-		// cut off by the API completion ceiling, not finished naturally. Signal
-		// it so the user knows the answer is incomplete rather than assuming a
-		// full response (the ~78-token OpenRouter truncation wall).
+		// PARTIAL BOUNDARY BADGE: finish_reason == "length" means the response
+		// was cut off by the API completion ceiling (EvidenceState.PARTIAL),
+		// not finished naturally. Rendered as a presentation-border badge;
+		// streamed token content above is preserved verbatim.
 		if msg.truncated {
 			log.Printf("[TRUNCATION] response hit max_tokens ceiling (finish_reason: length) — %d output tokens", msg.tokenOutput)
 			m.push(roleSystem, warningStyle.Render(
-				"[TRUNCATED] The response hit the provider's max_tokens limit and was cut off mid-generation (finish_reason: \"length\"). Increase max_tokens in the provider config to allow longer responses."))
+				"[PARTIAL] The response hit the provider's max_tokens limit and was cut off mid-generation (finish_reason: \"length\", EvidenceState.PARTIAL). Increase max_tokens in the provider config to allow longer responses."))
 		}
 
 		// ── IMPLICIT PIPELINE INTERCEPT: pipe stream output to next step ──

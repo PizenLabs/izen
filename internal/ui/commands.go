@@ -457,11 +457,61 @@ func (m *model) handleInput(line string) tea.Cmd {
 // runtime is not wired (headless/test harnesses), the input falls through to
 // the unified IntentGateway (RuntimeExecutor), which selects the execution
 // path deterministically; the UI never decides the path.
+//
+// Autonomy Intent Masking Invariant: the Intent Classifier masking runs
+// BEFORE any Autonomy Engine decision. Plain text without an explicit
+// execution marker ("$prompt"/"$hot" prefix) or explicit mode strictly routes
+// to the read-only ask pipeline — prompt semantics ("rewrite", "fix",
+// "delete") NEVER escalate a bare objective into a mutation workspace.
+// The Autonomy Engine therefore generates zero CapMutate/CapPropose requests
+// for such input and the phase stays ask.
 func (m *model) routeFreeInput(line string) tea.Cmd {
 	if m.autonomy != nil {
+		if !hasFreeInputExecutionMarker(line) && isBareMutationObjective(line) {
+			return m.handleMessageContent(line)
+		}
 		return m.runAutonomyRoutedCmd(line)
 	}
 	return m.runGatedLine(line)
+}
+
+// hasFreeInputExecutionMarker reports whether a free-form line carries an
+// explicit execution trigger ("$prompt"/"$hot" prefix, case-insensitive).
+// Bare plain-text — even containing mutation words — carries no marker.
+func hasFreeInputExecutionMarker(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	for _, marker := range []string{"$prompt", "$hot"} {
+		if strings.HasPrefix(lower, marker) &&
+			(len(lower) == len(marker) || lower[len(marker)] == ' ' || lower[len(marker)] == '\t' || lower[len(marker)] == '\n') {
+			return true
+		}
+	}
+	return false
+}
+
+// isBareMutationObjective reports whether the line carries mutation-like
+// semantics that MUST NOT escalate without an execution marker. It mirrors
+// the deterministic mutation-verb set so the mask stays in sync with the
+// autonomy classifier's mutation signals.
+func isBareMutationObjective(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	if lower == "" {
+		return false
+	}
+	for _, verb := range []string{
+		"remove ", "delete ", "add ", "create ", "generate ", "implement ",
+		"write ", "update ", "modify ", "change ", "fix ", "correct ",
+		"edit ", "insert ", "replace ", "rewrite ", "build ", "refactor ",
+	} {
+		if strings.Contains(lower, verb) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *model) handleMessageContent(line string) tea.Cmd {
@@ -1001,26 +1051,15 @@ const buildGenerationTimeout = 5 * time.Minute
 //     instead of freezing the prompt for the full budget.
 //  2. ctx (180s) — overall synthesis budget for a slow-but-alive model.
 
-// debugLogPlan writes plan-synthesis trace lines to .izen/debug/plan.log
-// instead of os.Stderr. Bubble Tea owns the terminal exclusively while
-// tea.WithAltScreen() is active — any direct stdout/stderr write from a
-// background goroutine races the renderer's own ANSI redraw sequences on the
-// same TTY and corrupts the visible frame (cursor jumps, dropped redraws,
-// an apparently "frozen" screen even though Update() is still running fine
-// underneath). This mirrors debugLogPayload in stream.go so plan-synthesis
-// tracing stays diagnostic without ever touching the live terminal.
+// debugLogPlan enqueues plan-synthesis trace lines for .izen/debug/plan.log
+// via the async non-blocking telemetry channel instead of os.Stderr. Bubble
+// Tea owns the terminal exclusively while tea.WithAltScreen() is active — any
+// direct stdout/stderr write from a background goroutine races the renderer's
+// own ANSI redraw sequences on the same TTY and corrupts the visible frame.
+// Enqueueing never blocks the UI thread: saturation drops and counts.
 func debugLogPlan(line string) {
-	dir := filepath.Join(".izen", "debug")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
 	entry := time.Now().Format(time.RFC3339Nano) + " " + line + "\n"
-	f, err := os.OpenFile(filepath.Join(dir, "plan.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	defer func() { _ = f.Close() }()
-	_, _ = f.WriteString(entry)
+	enqueueTelemetryWrite(filepath.Join(".izen", "debug"), "plan.log", []byte(entry))
 }
 
 // compressHandoffSource aggressively prunes and compresses the handoff

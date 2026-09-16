@@ -3,10 +3,9 @@
 package git
 
 import (
-	"context"
-	"os/exec"
 	"strings"
 
+	giteng "github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/modes/commit"
 )
 
@@ -38,12 +37,7 @@ func HasHEAD(dir string) bool {
 	if dir == "" {
 		dir = "."
 	}
-	cmd := exec.CommandContext(context.Background(), "git", "rev-parse", "--verify", "HEAD")
-	cmd.Dir = dir
-	if err := cmd.Run(); err != nil {
-		return false
-	}
-	return true
+	return giteng.NewEngine(dir).HasHEAD()
 }
 
 // CanAmend reports whether --amend is enabled: checkbox set AND HEAD exists.
@@ -80,9 +74,7 @@ func (f CommitForm) Run(dir string) error {
 	if dir == "" {
 		dir = "."
 	}
-	cmd := exec.CommandContext(context.Background(), "git", args...)
-	cmd.Dir = dir
-	return cmd.Run()
+	return giteng.NewEngine(dir).RunCommit(args)
 }
 
 // GenerateAIDraft reuses the /build commit engine to draft a message from the

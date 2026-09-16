@@ -9,7 +9,19 @@ import (
 // It matches the directive's required message and must be returned BEFORE any
 // envelope/JSON parsing, without attempting a FULL_REWRITE->BOUNDED_PATCH
 // transition.
+//
+// Universal Stream Outcome Invariant: truncation maps to PARTIAL
+// (EvidenceState.PARTIAL) across ALL provider tiers. Truncated streams MUST
+// preserve canonical token buffers without synthetic content mutation: the
+// LLMResponse accompanying this error carries the verbatim partial Content
+// plus token counts, and callers MUST surface it with a UI boundary badge
+// instead of clearing/swallowing the buffer.
 var ErrPayloadTruncated = errors.New("model output exceeded max_tokens limit: ErrPayloadTruncated")
+
+// IsPayloadTruncated reports whether err wraps ErrPayloadTruncated.
+func IsPayloadTruncated(err error) bool {
+	return errors.Is(err, ErrPayloadTruncated)
+}
 
 type PromptRequest struct {
 	Model       string
@@ -47,6 +59,12 @@ type LLMResponse struct {
 	CacheReadTokens  int
 	TotalCostUSD     float64
 	DurationMs       int64
+	// FinishReason is the provider-native terminal reason ("stop", "length",
+	// "tool_calls", ...). "length" maps to the universal PARTIAL outcome.
+	FinishReason string
+	// Truncated is true when finish_reason == "length" was observed. Content
+	// still carries the verbatim partial buffer; callers must not clear it.
+	Truncated bool
 }
 
 type StreamHandler func(chunk string) error

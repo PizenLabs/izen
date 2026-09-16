@@ -105,6 +105,22 @@ type CapabilityGuard interface {
 	Evaluate(ctx context.Context, in AuthorizationInput) AuthorizationDecision
 }
 
+// AskCapabilityMask is the hard Intent Ceiling for ask intent: the domain
+// projection of {CapRead, CapAnalyze} (CapSearch is the analysis flag).
+// Capabilities(ask) = Capabilities(CurrentMode) ∩ {CapRead, CapAnalyze}.
+// Ask NEVER grants Write/Patch (Propose/Mutate equivalents), regardless of
+// prompt semantics ("rewrite", "fix", "refactor") or active Mode.
+var AskCapabilityMask = domain.DomainCapabilitySet(domain.CapRead | domain.CapSearch)
+
+// ConstrainCapabilitiesForIntent intersects an ask grant with the read-only
+// mask; all other intents pass through unchanged.
+func ConstrainCapabilitiesForIntent(kind domain.IntentKind, caps domain.DomainCapabilitySet) domain.DomainCapabilitySet {
+	if kind == domain.IntentAsk {
+		return caps & AskCapabilityMask
+	}
+	return caps
+}
+
 // SimpleCapabilityGuard is a deterministic implementation of CapabilityGuard.
 type SimpleCapabilityGuard struct{}
 
@@ -112,6 +128,11 @@ type SimpleCapabilityGuard struct{}
 func (g *SimpleCapabilityGuard) Evaluate(_ context.Context, in AuthorizationInput) AuthorizationDecision {
 	frameID := domain.FrameID("")
 	unitID := domain.UnitID("")
+
+	// Intent Ceiling Invariant (strengthening, never weakening): mask ask
+	// grants to read-only BEFORE the Capability clause. All 8 clauses below
+	// are preserved verbatim.
+	in.Capabilities = ConstrainCapabilitiesForIntent(in.Objective.Intent.Kind, in.Capabilities)
 
 	// ClauseIntent: ValidIntent
 	if in.Objective.Intent.Kind == domain.IntentUnknown || in.Objective.Intent.Kind == "" {

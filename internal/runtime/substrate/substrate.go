@@ -15,7 +15,13 @@ import (
 	"github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/core/domain/authorization"
 	"github.com/PizenLabs/izen/internal/domain/ports"
+	"github.com/PizenLabs/izen/internal/runtime/scope"
 )
+
+// ErrWorkspaceEscape is the execution-boundary sentinel for substrate
+// targets resolving outside the workspace root FD handle. It aliases
+// scope.ErrWorkspaceEscape; match with errors.Is.
+var ErrWorkspaceEscape = scope.ErrWorkspaceEscape
 
 // ErrVerificationFailed is returned when the mandatory pre-commit AST
 // symbol re-anchoring verification fails. Substrate must rollback staged
@@ -71,10 +77,80 @@ type ProposalExecutor interface {
 // Substrate is the isolated side-effect executor for the Phase 4 pipeline.
 // It wraps the concrete OS capability ports and is the ONLY package allowed to
 // instantiate os/exec or perform os.WriteFile/os.Create mutations.
+//
+// Execution-time confinement: every file target is verified at USE time
+// against the workspace-root FD handle (bound for the substrate lifetime
+// when available, short-lived otherwise). A symlink swapped in between
+// authorization and application that points outside the root fails closed
+// with ErrWorkspaceEscape before any mutation. Internal symlinks
+// resolving within the root remain permitted.
 type Substrate struct {
 	root  string
 	shell ports.ShellPort
 	file  ports.FilePort
+	// scopeRoot optionally anchors verification to an open root FD for
+	// the substrate lifetime. When nil, a short-lived handle is opened
+	// per use-time check so verification still runs at execution time.
+	scopeRoot *scope.Root
+}
+
+// WithScopeRoot anchors the substrate to an open workspace-root FD
+// handle. The caller retains ownership (Close); the substrate never
+// closes a handle it did not open.
+func (s *Substrate) WithScopeRoot(r *scope.Root) *Substrate {
+	if s == nil {
+		return s
+	}
+	s.scopeRoot = r
+	return s
+}
+
+// verifyUse enforces execution-time confinement for one target. It runs
+// at USE time (after authorization, immediately before the mutation) so
+// a TOCTOU symlink swap fails closed with ErrWorkspaceEscape.
+func (s *Substrate) verifyUse(target string) error {
+	root := s.root
+	if root == "" {
+		if s.scopeRoot != nil {
+			root = s.scopeRoot.RootPath()
+		} else {
+			return nil
+		}
+	}
+	rel, err := substrateRel(root, target)
+	if err != nil {
+		return err
+	}
+	if s.scopeRoot != nil {
+		return s.scopeRoot.Verify(rel)
+	}
+	r, err := scope.Open(root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = r.Close() }()
+	return r.Verify(rel)
+}
+
+// substrateRel maps an execution target to a root-relative path and
+// enforces lexical containment. Absolute targets escaping the root fail
+// with ErrWorkspaceEscape.
+func substrateRel(root, target string) (string, error) {
+	if filepath.IsAbs(target) {
+		rel, err := filepath.Rel(root, target)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("%w: target %q escapes workspace", scope.ErrWorkspaceEscape, target)
+		}
+		if rel == "." {
+			return "", fmt.Errorf("%w: empty target", scope.ErrWorkspaceEscape)
+		}
+		return rel, nil
+	}
+	clean := filepath.Clean(target)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%w: target %q escapes workspace", scope.ErrWorkspaceEscape, target)
+	}
+	return clean, nil
 }
 
 // NewSubstrate creates a Substrate bound to workspace root with the given ports.
@@ -198,6 +274,13 @@ func (s *Substrate) ExecuteUnit(ctx context.Context, unit domain.ExecutionUnit) 
 			rollback()
 			return domain.MutationResult{}, err
 		}
+		// Execution-time confinement gate: verify at USE time, after
+		// authorization and immediately before touching the target, so
+		// a resolve-then-swap TOCTOU race fails closed here.
+		if verr := s.verifyUse(tgt); verr != nil {
+			rollback()
+			return domain.MutationResult{}, verr
+		}
 		// Check budget overflow via context.
 		select {
 		case <-ctx.Done():
@@ -222,6 +305,12 @@ func (s *Substrate) ExecuteUnit(ctx context.Context, unit domain.ExecutionUnit) 
 		abs := tgt
 		if !filepath.IsAbs(tgt) {
 			abs = filepath.Join(s.root, filepath.Clean(tgt))
+		}
+		// Second use-time gate immediately before the write: closes the
+		// record→write window against a swap planted during snapshotting.
+		if verr := s.verifyUse(tgt); verr != nil {
+			rollback()
+			return domain.MutationResult{}, verr
 		}
 		// Use FilePort when available, fallback to direct write (still isolated here).
 		if s.file != nil {
@@ -394,13 +483,37 @@ func (p *osShellPort) ExecuteIn(ctx context.Context, dir, command string) (ports
 }
 
 // osFilePort is the direct OS-backed FilePort adapter. It lives ONLY in
-// internal/runtime/substrate.
+// internal/runtime/substrate. Every mutating or resolving operation is
+// verified at use time against the root FD handle; escapes fail closed
+// with ErrWorkspaceEscape before any I/O.
 type osFilePort struct{ root string }
 
+// verifyPortUse enforces use-time confinement for the OS-backed port.
+// An empty root preserves legacy unconfined behavior; otherwise the
+// target must verify against a short-lived root FD handle.
+func verifyPortUse(root, path string) (string, error) {
+	if root == "" {
+		return path, nil
+	}
+	rel, err := substrateRel(root, path)
+	if err != nil {
+		return "", err
+	}
+	r, err := scope.Open(root)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = r.Close() }()
+	if err := r.Verify(rel); err != nil {
+		return "", err
+	}
+	return filepath.Join(root, rel), nil
+}
+
 func (p *osFilePort) Read(ctx context.Context, path string) (string, error) {
-	abs := path
-	if !filepath.IsAbs(path) && p.root != "" {
-		abs = filepath.Join(p.root, path)
+	abs, verr := verifyPortUse(p.root, path)
+	if verr != nil {
+		return "", verr
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {
@@ -410,12 +523,17 @@ func (p *osFilePort) Read(ctx context.Context, path string) (string, error) {
 }
 
 func (p *osFilePort) Write(ctx context.Context, path string, content string) error {
-	abs := path
-	if !filepath.IsAbs(path) && p.root != "" {
-		abs = filepath.Join(p.root, path)
+	abs, verr := verifyPortUse(p.root, path)
+	if verr != nil {
+		return verr
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
+	}
+	// Re-verify immediately before the write to close the check→use
+	// window against a swap planted during MkdirAll.
+	if _, verr := verifyPortUse(p.root, path); verr != nil {
+		return verr
 	}
 	return os.WriteFile(abs, []byte(content), 0o644)
 }
@@ -437,18 +555,18 @@ func (p *osFilePort) List(ctx context.Context, dir string) ([]string, error) {
 }
 
 func (p *osFilePort) Exists(ctx context.Context, path string) bool {
-	abs := path
-	if !filepath.IsAbs(path) && p.root != "" {
-		abs = filepath.Join(p.root, path)
+	abs, verr := verifyPortUse(p.root, path)
+	if verr != nil {
+		return false
 	}
 	_, err := os.Stat(abs)
 	return err == nil
 }
 
 func (p *osFilePort) Remove(ctx context.Context, path string) error {
-	abs := path
-	if !filepath.IsAbs(path) && p.root != "" {
-		abs = filepath.Join(p.root, path)
+	abs, verr := verifyPortUse(p.root, path)
+	if verr != nil {
+		return verr
 	}
 	return os.Remove(abs)
 }
