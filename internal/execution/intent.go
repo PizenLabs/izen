@@ -2,9 +2,13 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"strings"
 
+	intentdomain "github.com/PizenLabs/izen/internal/core/domain"
+	"github.com/PizenLabs/izen/internal/domain/command"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
+	"github.com/PizenLabs/izen/internal/parser"
 )
 
 // ── IntentGateway (unified intent resolution) ──────────────────────────────
@@ -32,6 +36,7 @@ import (
 // action. It is observable ($inspect) and carries the reasoning for every
 // decision before execution begins.
 type IntentResolution struct {
+	ScopeProvenance intentdomain.ScopeProvenance
 	// Raw is the exact line the user submitted.
 	Raw string
 	// Prompt is the strategy input (directive prefix stripped).
@@ -80,25 +85,39 @@ func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, In
 	res := IntentResolution{Raw: raw}
 
 	prompt := raw
-	lower := strings.ToLower(raw)
-	switch {
-	case strings.HasPrefix(lower, "$prompt"):
-		res.Directive = "prompt"
-		prompt = strings.TrimSpace(raw[len("$prompt"):])
-	case strings.HasPrefix(lower, "$hot"):
-		res.Directive = "hot"
-		prompt = strings.TrimSpace(raw[len("$hot"):])
-	case strings.HasPrefix(lower, "/build"):
-		res.Directive = "build"
-		prompt = strings.TrimSpace(raw[len("/build"):])
+	ast, err := parser.ParseInWorkspace(raw, nil, command.WorkspaceBuild)
+	if err != nil {
+		return ExecuteRequest{}, res, err
+	}
+	res.ScopeProvenance = ast.ScopeProvenance
+	for _, d := range ast.Directives {
+		if d.Name == "prompt" || d.Name == "hot" {
+			res.Directive = d.Name
+		}
+	}
+	if ast.Workspace == command.WorkspaceBuild && strings.HasPrefix(raw, "/build") && !res.ScopeProvenance.AllowsMutation() {
+		return ExecuteRequest{}, res, errors.New(intentdomain.ScopeAuthorizationError)
+	}
+	if res.Directive != "" {
+		var stripped strings.Builder
+		start := 0
+		for _, token := range parser.Tokenize(raw) {
+			if token.Kind != parser.TokenCommand || token.Marker == command.MarkerAt {
+				continue
+			}
+			stripped.WriteString(raw[start:token.Pos.Offset])
+			start = token.Pos.Offset + 1 + len(token.Name)
+		}
+		stripped.WriteString(raw[start:])
+		prompt = strings.TrimSpace(stripped.String())
 	}
 	if prompt == "" {
 		// No executable content beyond the directive marker: surface a
 		// clarification rather than executing an empty request.
-		profile := g.SelectStrategy(raw)
+		profile := g.selectScopedStrategy(raw, res.ScopeProvenance)
 		res.Prompt = raw
 		res.Profile = profile
-		req := ExecuteRequest{Prompt: raw, Strategy: &profile}
+		req := ExecuteRequest{Prompt: raw, Strategy: &profile, ScopeProvenance: res.ScopeProvenance}
 		freezeGatewayContext(&req, &res, profile, g.root)
 		return req, res, nil
 	}
@@ -106,7 +125,7 @@ func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, In
 
 	// Strategy selection is UNCONDITIONAL: the gateway always classifies the
 	// operation before any execution decides anything.
-	profile := g.SelectStrategy(prompt)
+	profile := g.selectScopedStrategy(prompt, res.ScopeProvenance)
 	res.Profile = profile
 
 	for _, t := range profile.Targets {
@@ -116,6 +135,7 @@ func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, In
 	}
 
 	req := ExecuteRequest{
+		ScopeProvenance: res.ScopeProvenance,
 		Prompt:          prompt,
 		Targets:         res.Targets,
 		MaxOutputTokens: profile.MaxOutputTokens,
@@ -123,6 +143,31 @@ func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, In
 	}
 	freezeGatewayContext(&req, &res, profile, g.root)
 	return req, res, nil
+}
+
+// selectScopedStrategy compiles an unauthorized goal to an observational graph,
+// even when its natural-language operation asks for file creation or mutation.
+func (g *IntentGateway) selectScopedStrategy(prompt string, scope intentdomain.ScopeProvenance) strategy.ExecutionStrategyProfile {
+	profile := g.SelectStrategy(prompt)
+	if scope.AllowsMutation() {
+		return profile
+	}
+	switch profile.Strategy {
+	case strategy.DirectDeterministic, strategy.TargetedMutation, strategy.MultiFilePlanning:
+		profile.Strategy = strategy.RepositoryInvestigation
+		profile.ContextPolicy = strategy.ContextPolicyRepository
+		profile.ContextKinds = []strategy.ContextKind{strategy.ContextUserIntent, strategy.ContextRepositoryConstraints, strategy.ContextDependencyEvidence}
+		if profile.FileCount() > 0 {
+			profile.Strategy = strategy.TargetedReasoning
+			profile.ContextPolicy = strategy.ContextPolicyTargetFileOnly
+			profile.ContextKinds = []strategy.ContextKind{strategy.ContextUserIntent, strategy.ContextExplicitTargets, strategy.ContextTargetContent}
+		}
+		profile.StrategyReason = "read-only intent: mutation scope was not authorized"
+		profile.ModelRequired, profile.Deterministic = true, false
+		profile.ModelDecision = "investigate the request and explain a plan without producing or applying file mutations"
+		profile.Artifact = strategy.ArtifactContract{Kind: "explanation", Bounded: true, Description: "read-only investigation or plan"}
+	}
+	return profile
 }
 
 // freezeGatewayContext seals the intent context payload onto both the request

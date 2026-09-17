@@ -18,6 +18,7 @@ import (
 	"github.com/PizenLabs/izen/internal/changeset"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/domain/capability/policy"
 	"github.com/PizenLabs/izen/internal/events"
@@ -73,7 +74,12 @@ type StreamCallback func(StreamEvent)
 
 // ExecuteRequest is a user execution submitted to the runtime.
 type ExecuteRequest struct {
-	// RequestID correlates every lifecycle event of this execution. Empty
+	// ScopeProvenance records how mutation scope was authorized for this
+	// request: ScopeDynamic ($prompt), ScopeDeclared ($hot), or ScopeNone
+	// (plain conversational input). ScopeNone requests are compile-locked to
+	// read-only actions and can never carry a mutation plan.
+	ScopeProvenance domain.ScopeProvenance
+	// RequestID correlates this execution across events and proofs; empty
 	// yields a deterministic auto-generated ID.
 	RequestID string
 	// SessionID is the originating session correlation (INV-SESSION-10). When
@@ -764,6 +770,16 @@ var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejec
 // trigger a duplicate LLM call (max 1 API request).
 var ErrNonRetryableArtifactError = errors.New("executor: non-retryable artifact error — ambiguous anchors require line-offset")
 
+// ErrAmbiguousAnchorContinuation requests one bounded scheduler continuation
+// with explicit line-offset evidence, never an identical executor-side retry.
+var ErrAmbiguousAnchorContinuation = errors.New("executor: AMBIGUOUS_ANCHOR: ambiguous anchor requires explicit line-offset bounds")
+
+// IsAmbiguousAnchorContinuation reports whether err is the typed recoverable
+// ambiguous-anchor continuation sentinel.
+func IsAmbiguousAnchorContinuation(err error) bool {
+	return err != nil && errors.Is(err, ErrAmbiguousAnchorContinuation)
+}
+
 // ErrHallucinatedAnchorError is the sentinel for N=0 hallucinated anchor
 // failures (strings.Count == 0). It is the zero-match counterpart to the
 // ambiguous (N>1) sentinel and is handled by one strict automatic retry.
@@ -773,6 +789,31 @@ var ErrHallucinatedAnchorError = errors.New("executor: hallucinated anchor — z
 // already consumed its single retry and must not open a full-file fallback.
 var ErrPhysicalOutputBudgetBreach = errors.New("executor: Physical Output Budget Breach")
 
+// AmbiguousAnchorFallbackLimit is the file-size ceiling under which an
+// ambiguous-anchor patch failure recovers via full-document replacement
+// instead of surfacing an error (Phase 6.4: 5120 bytes = 5 KB).
+const AmbiguousAnchorFallbackLimit = 5120
+
+// isAmbiguousAnchorContinuationEligible reports whether the target file is
+// small enough for the safe full-document fallback.
+func isAmbiguousAnchorContinuationEligible(original string) bool {
+	return len(original) < AmbiguousAnchorFallbackLimit
+}
+
+// recoverSmallFileAmbiguousAnchor never promotes a REPLACE snippet to a file.
+// A closed full-file envelope and the normal content gate are both required.
+func recoverSmallFileAmbiguousAnchor(original, raw, target string, gate func(string, string) (string, error)) (string, bool) {
+	if !isAmbiguousAnchorContinuationEligible(original) {
+		return "", false
+	}
+	candidate, ok := extractCompleteDocument(raw, target)
+	if !ok {
+		return "", false
+	}
+	normalized, err := gate(target, candidate)
+	return normalized, err == nil && normalized != ""
+}
+
 // IsNonRetryableArtifactError reports whether err is a non-retryable
 // artifact failure (ambiguous anchors without line-offset context).
 func IsNonRetryableArtifactError(err error) bool {
@@ -781,6 +822,12 @@ func IsNonRetryableArtifactError(err error) bool {
 	}
 	if errors.Is(err, ErrNonRetryableArtifactError) || errors.Is(err, ErrHallucinatedAnchorError) {
 		return true
+	}
+	// A typed recoverable continuation (Phase 6.4) is NEVER non-retryable:
+	// the scheduler recovers it via full-file fallback or a line-offset
+	// continuation turn.
+	if errors.Is(err, ErrAmbiguousAnchorContinuation) {
+		return false
 	}
 	// Ambiguous anchor is non-retryable unless the error already carries
 	// line-offset injection.
@@ -2234,41 +2281,29 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// full-artifact attempt instead of a relabeled retry.
 			patched, ok := ExtractBoundedPatch(original, raw)
 			if !ok {
-				// Circuit breaker: if the SEARCH anchor match is 0 (hallucinated)
-				// or >1 (ambiguous) without line-offset, fail fast without
-				// invoking RMAH retry. This prevents duplicate LLM calls.
-				// N=0 → HallucinatedAnchorError: [1] Fall back to full-file + [2] Re-prompt full text
-				// N>1 → NonRetryable (ambiguous): [1] Inject line-offset + [2] full-file fallback
-				if strings.Contains(raw, "<<<<<<< SEARCH") && !strings.Contains(strings.ToLower(raw), "line-offset") {
-					if blocks := ParseSearchReplaceBlocks(raw); len(blocks) > 0 {
-						for _, b := range blocks {
-							if b.search != "" {
-								if cnt := strings.Count(original, b.search); cnt != 1 {
-									if cnt == 0 {
-										return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — SEARCH matches 0 regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
-									}
-									return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: ambiguous anchor — SEARCH matches %d regions — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, cnt)
-								}
-								// Also check trimmed match via ResolveAnchors path.
-								if _, _, aerr := func() (int, int, error) {
-									lines := strings.Split(b.search, "\n")
-									return ResolveAnchors(lines, original)
-								}(); aerr != nil {
-									if errors.Is(aerr, ErrAmbiguousAnchor) {
-										return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %w — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, aerr)
-									}
-									if errors.Is(aerr, ErrFormatRejected) {
-										// Zero-match via ResolveAnchors (format rejected = not found)
-										lower := strings.ToLower(aerr.Error())
-										if strings.Contains(lower, "anchor not found") || strings.Contains(lower, "empty search") {
-											return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, aerr)
-										}
-									}
-								}
-							}
-						}
+				// Check every anchor before considering a complete-document fallback:
+				// a zero match in any block must never be hidden by an ambiguous one.
+				ambiguous := false
+				for _, b := range ParseSearchReplaceBlocks(raw) {
+					cnt := strings.Count(original, b.search)
+					if b.search == "" || cnt == 0 {
+						return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: SEARCH matches zero regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
 					}
+					ambiguous = ambiguous || cnt > 1
 				}
+				if ambiguous {
+					candidate, recovered := recoverSmallFileAmbiguousAnchor(original, raw, target, x.artifactGate)
+					if !recovered {
+						return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
+					}
+					// Validate the resolved document through the same patch validator,
+					// authorization, budget and mutation flow as any exact full-span edit.
+					raw = "<<<<<<< SEARCH\n" + original + "\n=======\n" + candidate + "\n>>>>>>> REPLACE"
+					patched, ok = ExtractBoundedPatch(original, raw)
+				}
+				if ok {
+					modified = patched
+				} else {
 				// RMAH Tier 2 fallback: free-tier models may return raw code
 				// fences instead of SEARCH/REPLACE blocks. Attempt the RMAH
 				// pipeline (Tier 1 already failed via ExtractBoundedPatch;
@@ -2295,12 +2330,12 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 						if strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor") {
 							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %s", ErrHallucinatedAnchorError, ErrArtifactRejected, target, detail)
 						}
-						if strings.Contains(lower, "ambiguous anchor") && !strings.Contains(lower, "line-offset") {
-							detail += " — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization"
-							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %s", ErrNonRetryableArtifactError, ErrArtifactRejected, target, detail)
+						if strings.Contains(lower, "ambiguous anchor") {
+							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
 						}
 					}
 					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, detail)
+				}
 				}
 			} else {
 				modified = patched
@@ -2336,13 +2371,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		if patchOnly && x != nil && x.artifactValidator != nil {
 			if _, err := x.artifactValidator.ValidateArtifact([]byte(raw), target); err != nil {
 				if errors.Is(err, ErrAmbiguousAnchor) {
-					lower := strings.ToLower(err.Error())
-					if !strings.Contains(lower, "line-offset") {
-						// Non-retryable ambiguous anchor — circuit breaker.
-						wrapped := fmt.Errorf("%w: %w: %s: %w — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, err)
-						return nil, invs, nil, trace, wrapped
-					}
-					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+					return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
 				}
 				if errors.Is(err, ErrScopeViolation) {
 					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)

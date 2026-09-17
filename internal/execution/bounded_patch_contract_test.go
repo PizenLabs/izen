@@ -255,18 +255,17 @@ func TestTruncatedBoundedPatchIsRejected(t *testing.T) {
 			Mode: "autonomy", Prompt: "change bar", Targets: []string{"dup.txt"},
 			Strategy: profile, MaxOutputTokens: 1024,
 		})
-		// Ambiguous anchors are now circuit-broken as NonRetryableArtifactError
-		// (max 1 API request, no duplicate LLM retry).
-		if !errors.Is(err, ErrNonRetryableArtifactError) && !errors.Is(err, ErrArtifactRejected) {
-			t.Fatalf("err = %v, want non-retryable rejection for ambiguous anchor (ErrNonRetryableArtifactError or ErrArtifactRejected)", err)
+		if !errors.Is(err, ErrAmbiguousAnchorContinuation) || IsNonRetryableArtifactError(err) {
+			t.Fatalf("err = %v, want recoverable anchor continuation", err)
 		}
 		if res.PendingPatchID != "" {
 			t.Fatal("ambiguous-anchor patch was staged")
 		}
-		// Circuit breaker must also expose DecisionSurface options.
-		lower := strings.ToLower(err.Error())
-		if !strings.Contains(lower, "line-offset") && !strings.Contains(lower, "full-file") {
-			t.Fatalf("error should contain DecisionSurface options [1] line-offset [2] full-file, got: %q", err.Error())
+		if res.Proof.Outcome != OutcomeArtifactRetryableRejected {
+			t.Fatalf("outcome = %s, want recoverable artifact rejection", res.Proof.Outcome)
+		}
+		if got := mustRead(t, root, "dup.txt"); got != dup {
+			t.Fatal("ambiguous anchor mutated the workspace")
 		}
 	})
 }

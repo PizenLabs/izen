@@ -3216,6 +3216,52 @@ func SanitizeRawCodeBlock(content string) string {
 	return strings.TrimSpace(strings.Join(result, "\n"))
 }
 
+// extractCompleteDocument accepts only a closed, path-tagged full-file envelope.
+// SEARCH/REPLACE bodies and unlabelled code fences are not full-file authority,
+// regardless of their size. The caller must still validate the document.
+func extractCompleteDocument(raw, target string) (string, bool) {
+	lines := strings.Split(raw, "\n")
+	start := -1
+	closing := ""
+	inPatch := false
+	var candidate string
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if start >= 0 {
+			if trimmed != closing {
+				continue
+			}
+			files := patch.ParseCodeFences(strings.Join(lines[start:i+1], "\n"))
+			if len(files) != 1 || filepath.Clean(files[0].Path) != filepath.Clean(target) || candidate != "" {
+				return "", false
+			}
+			candidate = files[0].Content
+			start = -1
+			continue
+		}
+		if trimmed == "<<<<<<< SEARCH" {
+			inPatch = true
+		}
+		if inPatch {
+			if strings.HasPrefix(trimmed, ">>>>>>>") {
+				inPatch = false
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "=== FILE:") {
+			start, closing = i, "=== END"
+		} else if strings.HasPrefix(trimmed, "```") {
+			if _, _, ok := patch.ParseFileHeader(strings.TrimPrefix(trimmed, "```")); ok {
+				start, closing = i, "```"
+			}
+		}
+	}
+	if start >= 0 || strings.TrimSpace(candidate) == "" || isPatchArtifactContent(candidate) {
+		return "", false
+	}
+	return candidate, true
+}
+
 // ExtractNewFileContent resolves the complete content for a brand-new (missing
 // or 0-byte) target file from an LLM response. A new file has no old content to
 // diff against, so diff markers are NEVER required — any code block or raw text

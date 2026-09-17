@@ -2,14 +2,31 @@ package domain
 
 import "github.com/PizenLabs/izen/internal/core/domain/occ"
 
+// ScopeProvenance records the explicit directive that authorized mutation.
+// Its zero value is deliberately read-only, including restored legacy state.
+type ScopeProvenance uint8
+
+const (
+	ScopeNone     ScopeProvenance = iota
+	ScopeDynamic                  // $prompt: the runtime resolves the mutation scope.
+	ScopeDeclared                 // $hot: the user declares a bounded mutation scope.
+)
+
+const ScopeAuthorizationError = "State Error: mutation plan requires scope authorization via $prompt or $hot"
+
+func (s ScopeProvenance) AllowsMutation() bool {
+	return s == ScopeDynamic || s == ScopeDeclared
+}
+
 // ExecutionIntent is the Control Plane's validated request handed to
 // RuntimeExecutor. It bundles the bounded ExecutionUnit with the full
 // authorization evidence bundle so the 6-clause formula can be evaluated
 // atomically before any side-effect reaches Substrate.
 type ExecutionIntent struct {
-	Objective Objective      `json:"objective"`
-	Unit      ExecutionUnit  `json:"unit"`
-	Budget    ResourceBudget `json:"budget"`
+	ScopeProvenance ScopeProvenance `json:"scope_provenance"`
+	Objective       Objective       `json:"objective"`
+	Unit            ExecutionUnit   `json:"unit"`
+	Budget          ResourceBudget  `json:"budget"`
 	// Capabilities is the scoped capability grant for this unit.
 	Capabilities DomainCapabilitySet `json:"capabilities"`
 	// SourceState is the workspace source fingerprint observed before execution.
