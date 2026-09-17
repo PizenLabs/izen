@@ -68,6 +68,8 @@ type ProposalStagingBuffer struct {
 	observedTokens int
 	payloadLimit   int
 	reason         StepOutcomeReason
+	symbolBaseline *SymbolBaseline
+	symbolTarget string
 }
 
 // NewProposalStagingBuffer opens an isolated staging buffer for one step.
@@ -79,6 +81,14 @@ func (b *ProposalStagingBuffer) WithRecoveryContext(state *durable.TaskState, me
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.state, b.provider, b.recovery = state, meta, recovery
+	return b
+}
+
+// WithSymbolBaseline binds a runtime-captured baseline before worker output.
+func (b *ProposalStagingBuffer) WithSymbolBaseline(target string, baseline *SymbolBaseline) *ProposalStagingBuffer {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.symbolTarget, b.symbolBaseline = target, baseline
 	return b
 }
 
@@ -278,6 +288,11 @@ type StagingDisposition struct {
 	// the stream). It is empty for every other outcome.
 	Reason StepOutcomeReason
 }
+// RedundantSymbolReason is the deterministic StepOutcomeReason label
+// attached to a StepOutcomePartial produced by the redundancy gate: a new
+// private helper with >70% signature/structure similarity to an available
+// baseline symbol. The proposal never reaches the workspace sink.
+const RedundantSymbolReason StepOutcomeReason = "REDUNDANT_SYMBOL"
 
 // StepOutcomeReason is a deterministic, closed reason vocabulary for Partial
 // step outcomes so scheduler continuation policy never parses free-form logs.
@@ -307,6 +322,17 @@ func (b *ProposalStagingBuffer) Finalize(finishReason string, truncated bool) St
 		return b.partialLocked()
 	case outcome == providercap.StreamComplete:
 		proposal := string(b.buf)
+		if redundant := b.symbolBaseline.Check(b.symbolTarget, proposal); redundant != nil {
+			b.buf = nil
+			b.discarded = true
+			b.outcome, b.reason = StepOutcomePartial, RedundantSymbolReason
+			r := b.recovery
+			r.Phase, r.Reason = durable.RecoveryRequired, string(RedundantSymbolReason)
+			r.ReuseTarget, r.ReuseSymbols = redundant.ExistingFile, []string{redundant.ExistingSymbol}
+			r.BaselineScope = b.symbolBaseline.Names()
+			if b.state != nil { b.state.RecoveryContext = r }
+			return b.dispositionLocked()
+		}
 		b.outcome = StepOutcomeComplete
 		return StagingDisposition{Outcome: StepOutcomeComplete, Proposal: proposal}
 	default:

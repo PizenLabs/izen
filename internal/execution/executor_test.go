@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -732,5 +733,94 @@ func TestRecovery_AmbiguousAnchorCircuitBreaker(t *testing.T) {
 	}
 	if got := mustRead(t, root, "note.txt"); got != repeated {
 		t.Fatalf("ambiguous snippet changed workspace: %q", got)
+	}
+}
+
+// TestExecutor_AmbiguousAnchorFullFileFallback (Phase 6.4): a small
+// ambiguous-anchor response only recovers when the worker also supplied a
+// complete path-tagged document; the workspace must actually change.
+func TestExecutor_AmbiguousAnchorFullFileFallback(t *testing.T) {
+	root := t.TempDir()
+	duplicate := "alpha\nbeta\nalpha\nbeta\nalpha\n"
+	updated := "alpha\nbeta\ngamma\nbeta\nalpha\n"
+	writeTarget(t, root, "note.txt", duplicate)
+	document := "```txt:note.txt\n" + updated + "```\n"
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\nalpha\n=======\ngamma\n>>>>>>>\n" + document,
+		Usage:   ai.ProviderUsage{PromptTokens: 700, CompletionTokens: 600, TotalTokens: 1300, Known: true},
+	}}}
+	x := testExecutor(t, root, mock, events.NewBus(events.DefaultBufferSize))
+	profile := strategy.ExecutionStrategyProfile{
+		Strategy:       strategy.TargetedMutation,
+		ModelRequired:  true,
+		StrategyReason: "test ambiguous full-file fallback",
+		Artifact:       strategy.ArtifactContract{Kind: "search_replace", Bounded: true},
+	}
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		RequestID: "r-ambiguous-fallback",
+		Mode:      "build",
+		Prompt:    "replace the first alpha with gamma",
+		Target:    "note.txt",
+		Strategy:  &profile,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.PendingPatchID == "" {
+		t.Fatal("expected staged patch from validated complete document")
+	}
+	if got := mustRead(t, root, "note.txt"); got != duplicate {
+		t.Fatal("workspace changed before approval")
+	}
+	if _, err := x.Approve(context.Background(), res.PendingPatchID); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if got := mustRead(t, root, "note.txt"); got != updated {
+		t.Fatalf("full-file fallback did not apply: %q", got)
+	}
+	if mock.callCount != 1 {
+		t.Fatalf("provider calls = %d, want 1", mock.callCount)
+	}
+}
+
+// TestExecutor_AmbiguousAnchorLargeFileRequiresContinuation keeps every
+// unsafe path closed: a >= 5 KB ambiguous target without a complete document
+// must surface the typed continuation error, never a snippet replacement.
+func TestExecutor_AmbiguousAnchorLargeFileRequiresContinuation(t *testing.T) {
+	root := t.TempDir()
+	duplicate := strings.Repeat("alpha\nbeta\n", 460)
+	writeTarget(t, root, "note.txt", duplicate)
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\nalpha\n=======\ngamma\n>>>>>>>",
+		Usage:   ai.ProviderUsage{PromptTokens: 700, CompletionTokens: 600, TotalTokens: 1300, Known: true},
+	}}}
+	x := testExecutor(t, root, mock, events.NewBus(events.DefaultBufferSize))
+	profile := strategy.ExecutionStrategyProfile{
+		Strategy:       strategy.TargetedMutation,
+		ModelRequired:  true,
+		StrategyReason: "test large ambiguous continuation",
+		Artifact:       strategy.ArtifactContract{Kind: "search_replace", Bounded: true},
+	}
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		RequestID: "r-ambiguous-continuation",
+		Mode:      "build",
+		Prompt:    "replace alpha with gamma",
+		Target:    "note.txt",
+		Strategy:  &profile,
+	})
+	if !errors.Is(err, ErrAmbiguousAnchorContinuation) {
+		t.Fatalf("err = %v, want typed continuation", err)
+	}
+	if IsNonRetryableArtifactError(err) {
+		t.Fatal("continuation must not be terminal nonretryable")
+	}
+	if res == nil || res.Err == nil || !errors.Is(res.Err, ErrAmbiguousAnchorContinuation) {
+		t.Fatalf("res.Err = %v, want typed continuation", res)
+	}
+	if got := mustRead(t, root, "note.txt"); got != duplicate {
+		t.Fatal("unauthorized snippet mutated the workspace")
+	}
+	if mock.callCount != 1 {
+		t.Fatalf("provider calls = %d, want 1", mock.callCount)
 	}
 }

@@ -193,7 +193,12 @@ func TestAuditLoggerNonBlockingUnderSlowWorker(t *testing.T) {
 
 	// A typed subscriber proves publishers are never blocked by the audit path.
 	received := make(chan events.DomainEvent, 1)
-	sub := bus.Subscribe(events.EventCommandReceived, func(ev events.DomainEvent) { received <- ev })
+	sub := bus.Subscribe(events.EventCommandReceived, func(ev events.DomainEvent) {
+		select {
+		case received <- ev:
+		default:
+		}
+	})
 	defer sub.Cancel()
 
 	done := make(chan struct{})

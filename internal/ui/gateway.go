@@ -73,6 +73,7 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 		return func() tea.Msg { return gatedExecutionMsg{det: det, err: gateErr} }
 	}
 	m.lastExecutionStrategy = det.Profile
+	m.bindScopeProvenance(det.ScopeProvenance)
 	m.hotfixBranding = "PROMPT"
 	// Mode is a presentation label only — never an execution-path decision.
 	if m.resolver != nil {

@@ -25,6 +25,7 @@ import (
 	"github.com/PizenLabs/izen/internal/command"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
+	coredomain "github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/domain"
 	cmdreg "github.com/PizenLabs/izen/internal/domain/command"
@@ -202,6 +203,7 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// preempt the "Input blocked: task active." gate. Zero pipeline
 	// propagation — no synthesis, tools, or provider calls.
 	if m.handleCasualAutoUnwind(line) {
+		m.bindScopeProvenance(coredomain.ScopeNone)
 		m.stopShimmer()
 		return nil
 	}
@@ -297,6 +299,11 @@ func (m *model) handleInput(line string) tea.Cmd {
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
 		return nil
+	}
+	// A mode-only /build consumes the existing staged authorization. Every
+	// new goal replaces it; mere text or mode selection never grants scope.
+	if ast.Goal != "" || len(ast.Directives) > 0 {
+		m.bindScopeProvenance(ast.ScopeProvenance)
 	}
 
 	// Directive- and global-bearing intents (including the /review $test
@@ -2674,6 +2681,15 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 // mutation is executed by the RuntimeExecutor; every OS command crosses the
 // interactive shell gate.
 func (m *model) handleBuildRun(stepNum int) tea.Cmd {
+	// ── SCOPE PROVENANCE GATE (Phase 6.4) ────────────────────────────
+	// The staged plan carries the provenance of the authorization that
+	// created it. ScopeNone provenance means the plan was never authorized
+	// for mutation: /build fails closed BEFORE any execution with the exact
+	// scope authorization error.
+	if m.sess != nil && !m.sess.StagedScopeProvenance.AllowsMutation() {
+		m.push(roleError, coredomain.ScopeAuthorizationError)
+		return nil
+	}
 	// Transition workflow state to Building before any execution
 	// begins. If the transition fails (e.g. missing plan guards
 	// when in StateIdle), handle gracefully and do not attempt
@@ -2768,6 +2784,10 @@ func (m *model) beginStagedTask(stepNum int) *plan.Task {
 // there is deliberately no caller-side fallback that could execute a
 // mutation outside the runtime boundary.
 func (m *model) dispatchStagedTask(task *plan.Task) tea.Cmd {
+	if m.sess == nil || !m.sess.StagedScopeProvenance.AllowsMutation() {
+		m.push(roleError, coredomain.ScopeAuthorizationError)
+		return nil
+	}
 	switch task.Type {
 	case "SHELL_EXEC":
 		return m.runStagedShellGate(task)

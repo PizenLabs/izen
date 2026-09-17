@@ -52,6 +52,11 @@ func (s *StepScheduler) RunNext(ctx context.Context, spec TaskSpec, state *durab
 		return result, fmt.Errorf("scheduler: continuation requires one explicit mutation target")
 	}
 	target := step.Targets[0]
+	// TargetASTs are scheduler-owned workspace snapshots, never worker claims.
+	sources := make(map[string]string, len(spec.Targets))
+	for _, scopedTarget := range spec.Targets { sources[scopedTarget] = spec.TargetASTs[scopedTarget] }
+	baseline, err := executor.NewSymbolBaseline(sources)
+	if err != nil { return result, err }
 	recovery := durable.RecoveryContext{}
 	if state.RecoveryContext.Target == target {
 		recovery = state.RecoveryContext
@@ -65,12 +70,18 @@ func (s *StepScheduler) RunNext(ctx context.Context, spec TaskSpec, state *durab
 	buffer := executor.NewProposalStagingBuffer(step.ID).
 		WithTokenGuard(executor.NewStreamTokenGuard(step.StepBudget, cancel)).
 		WithRecoveryContext(state, spec.Provider, recovery).
-		WithPayloadLimit(step.StepBudget)
+		WithPayloadLimit(step.StepBudget).
+		WithSymbolBaseline(target, baseline)
 	defer buffer.Discard()
 	slice := NewContextPlanner(MaxEvidencePerSlice).Assemble(spec.Objective, TaskStateSnapshot{
 		Objective: spec.Objective, RemainingBudget: spec.TaskRemainingBudget,
 		StateFingerprint: step.StateFingerprint,
 	}, step, spec.TargetASTs[target], spec.LatestEvidence)
+	slice.AvailableSymbols = baseline.Context()
+	if recovery.Reason == string(executor.RedundantSymbolReason) {
+		slice.RecoveryInstructions = fmt.Sprintf("REDUNDANT_SYMBOL: Reuse existing symbols %v from %s. Do not add equivalent private helpers. Replan a bounded patch against the unchanged baseline.", recovery.ReuseSymbols, recovery.ReuseTarget)
+	}
+	slice.InputTokens = estimateSliceTokens(slice)
 	received := step
 	received.Targets = append([]string(nil), step.Targets...)
 	stream, workerErr := worker(stepCtx, received, slice, buffer)
@@ -98,6 +109,9 @@ func (s *StepScheduler) RunNext(ctx context.Context, spec TaskSpec, state *durab
 	result.NeedsContinuation = disposition.NeedsContinuation
 	if err != nil {
 		return result, err
+	}
+	if outcome == executor.StepOutcomeComplete && patches > 0 && recovery.Reason == string(executor.RedundantSymbolReason) {
+		state.RecoveryContext = durable.RecoveryContext{}
 	}
 	if outcome == executor.StepOutcomeComplete && patches > 0 && step.Strategy == SKELETON_CREATE {
 		recovery.Phase = durable.BaselineEstablished

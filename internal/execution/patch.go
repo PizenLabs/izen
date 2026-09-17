@@ -2001,6 +2001,45 @@ func IsNoOpBoundedPatchResponse(raw string) bool {
 // It is the artifact boundary for the search_replace contract (truncation
 // recovery): a verbose or truncated response can never masquerade as the
 // mutation.
+// materializeOffsetPatch proves both the explicit line range and exact source
+// bytes before converting an offset edit to the ordinary validated contract.
+func materializeOffsetPatch(original, raw string, first, last int) (string, bool) {
+	const prefix = "<<<<<<< SEARCH line-offset="
+	lines := strings.Split(raw, "\n")
+	header := -1
+	start, end := 0, 0
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "<<<<<<< SEARCH") {
+			if header >= 0 || !strings.HasPrefix(strings.TrimSpace(line), prefix) {
+				return "", false
+			}
+			bounds := strings.Split(strings.TrimPrefix(strings.TrimSpace(line), prefix), "-")
+			if len(bounds) != 2 {
+				return "", false
+			}
+			var err error
+			start, err = strconv.Atoi(bounds[0])
+			if err != nil { return "", false }
+			end, err = strconv.Atoi(bounds[1])
+			if err != nil { return "", false }
+			header = i
+		}
+	}
+	source := strings.Split(original, "\n")
+	if header < 0 || start < first || end > last || start < 1 || end < start || end > len(source) {
+		return "", false
+	}
+	lines[header] = "<<<<<<< SEARCH"
+	blocks := ParseSearchReplaceBlocks(strings.Join(lines, "\n"))
+	if len(blocks) != 1 || blocks[0].search != strings.Join(source[start-1:end], "\n") {
+		return "", false
+	}
+	parts := append([]string(nil), source[:start-1]...)
+	parts = append(parts, strings.Split(blocks[0].replace, "\n")...)
+	parts = append(parts, source[end:]...)
+	return "<<<<<<< SEARCH\n" + original + "\n=======\n" + strings.Join(parts, "\n") + "\n>>>>>>> REPLACE", true
+}
+
 func ExtractBoundedPatch(original, raw string) (string, bool) {
 	input := SanitizeBoundedPatchResponse(raw)
 	if input == "" || original == "" {

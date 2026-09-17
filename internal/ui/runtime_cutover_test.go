@@ -226,6 +226,11 @@ func TestRuntimeCutoverFlagOnBuildCommandRoutesThroughExecutor(t *testing.T) {
 	}}}
 	m := cutoverModel(t, mock)
 	grantMutationCaps(m)
+	authorized, err := m.intentFromInput("$hot remove redundant content from @index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.bindScopeProvenance(authorized.ScopeProvenance)
 	// Stage a fast-track FILE_MUTATE plan like /plan would.
 	m.sess.StageTaskList(&[]plan.Task{{
 		StepNum:     1,

@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	intentdomain "github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes"
 )
@@ -38,6 +39,7 @@ func (m *model) runAutonomyRoutedCmd(objective string) tea.Cmd {
 // intent → capability → workspace → decision, and the decided BUILD workspace
 // executes with hotfix semantics.
 func (m *model) routeHotfixThroughAutonomy(objective string) tea.Cmd {
+	m.bindScopeProvenance(intentdomain.ScopeDeclared)
 	if m.autonomy == nil {
 		// Legacy compatibility: no decision runtime wired — fall back to the
 		// unified IntentGateway, which decides the execution path deterministically.

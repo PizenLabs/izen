@@ -108,6 +108,19 @@ func transitionAvailable(o autonomy.Observation) bool {
 	return o.RecoveryStrategy != autonomy.StrategyBoundedPatch
 }
 
+// isAnchorContinuation recognizes the executor's stable diagnostic reason after
+// its typed error crosses the serializable observation boundary.
+func isAnchorContinuation(o autonomy.Observation) bool {
+	return strings.Contains(o.Diagnostic, "AMBIGUOUS_ANCHOR")
+}
+
+// isRedundantSymbol recognizes the executor's stable REDUNDANT_SYMBOL
+// diagnostic (duplicate private helper). It is a typed recoverable replan,
+// never a terminal failure.
+func isRedundantSymbol(o autonomy.Observation) bool {
+	return strings.Contains(o.Diagnostic, "REDUNDANT_SYMBOL")
+}
+
 // isHallucinatedAnchor reports whether the observation is an N=0
 // hallucinated anchor failure (zero match). Distinct from ambiguous N>1.
 func isHallucinatedAnchor(o autonomy.Observation) bool {
@@ -148,6 +161,19 @@ func isNonRetryableAmbiguous(o autonomy.Observation) bool {
 //	I5  PreflightInfeasible → AskHuman (explicit re-scope; never silent)
 //	B5  WorkspaceDrift → Abort
 func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
+	if isAnchorContinuation(o) {
+		if o.ClarificationRequired || o.AttemptNum >= 1 || (b.MaxRecoveryCycles > 0 && o.RecoveryCycle >= b.MaxRecoveryCycles) {
+			return autonomy.LoopDecision{Action: autonomy.LoopAskHuman, Reason: "line-offset recovery exhausted; explicit anchor bounds required"}
+		}
+		return autonomy.LoopDecision{Action: autonomy.LoopRepair, Reason: "AMBIGUOUS_ANCHOR: inject explicit line-offset bounds before continuation"}
+	}
+	// ── REDUNDANT_SYMBOL: one bounded replan to REUSE the existing symbol ──
+	if isRedundantSymbol(o) {
+		if o.ClarificationRequired || o.AttemptNum >= 1 || (b.MaxRecoveryCycles > 0 && o.RecoveryCycle >= b.MaxRecoveryCycles) {
+			return autonomy.LoopDecision{Action: autonomy.LoopAskHuman, Reason: "redundant-symbol recovery exhausted; helper reuse requires explicit re-scope"}
+		}
+		return autonomy.LoopDecision{Action: autonomy.LoopRepair, Reason: "REDUNDANT_SYMBOL: replan a bounded patch reusing the existing symbol"}
+	}
 	// ── CIRCUIT BREAKER: N=0 Hallucinated (zero match) ───
 	if isHallucinatedAnchor(o) {
 		if o.AttemptNum < 1 {
@@ -249,6 +275,29 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 //     strategy so the executor's admission resolves the SAME ContractID and
 //     deterministically increments AttemptID.
 func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.LoopRequest, error) {
+	if isAnchorContinuation(o) {
+		if o.AttemptNum >= 1 {
+			return req, fmt.Errorf("%w: line-offset recovery exhausted for %s", ErrRecoveryHalted, o.Target)
+		}
+		req.RecoveryStrategy = autonomy.StrategyBoundedPatch
+		req.RecoveryAttempt = 1
+		req.RecoveryReason = "AMBIGUOUS_ANCHOR: explicit line-offset recovery"
+		req.ParentContractID = o.ContractID
+		req.Evidence = joinEvidence(req.Evidence, "AMBIGUOUS_ANCHOR: use the fresh numbered source window. Return exactly one SEARCH block headed <<<<<<< SEARCH line-offset=<start>-<end> with absolute 1-based inclusive line numbers. Copy all SEARCH lines from that exact range. Never guess an occurrence or return a full-file snippet.")
+		return req, nil
+	}
+	// ── REDUNDANT_SYMBOL: single bounded continuation, never an identical loop.
+	if isRedundantSymbol(o) {
+		if o.AttemptNum >= 1 {
+			return req, fmt.Errorf("%w: redundant-symbol replan exhausted for %s", ErrRecoveryHalted, o.Target)
+		}
+		req.RecoveryStrategy = autonomy.StrategyBoundedPatch
+		req.RecoveryAttempt = 1
+		req.RecoveryReason = "REDUNDANT_SYMBOL: bounded replan reusing existing symbol"
+		req.ParentContractID = o.ContractID
+		req.Evidence = joinEvidence(req.Evidence, o.Diagnostic+" Reuse the existing symbol; emit exactly one bounded SEARCH/REPLACE patch that calls it instead of declaring a new helper.")
+		return req, nil
+	}
 	// CIRCUIT BREAKER: Hallucinated (N=0) — distinct options.
 	if isHallucinatedAnchor(o) {
 		if o.AttemptNum >= 1 {

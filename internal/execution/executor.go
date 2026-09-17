@@ -27,6 +27,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	runtimeexecutor "github.com/PizenLabs/izen/internal/runtime/executor"
 )
 
 // ── RuntimeExecutor (Steps 1-3 of the authority migration) ─────────────────
@@ -2024,6 +2025,16 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	if modelErr != nil {
 		return nil, nil, nil, nil, modelErr
 	}
+	sources := make(map[string]string, len(targets))
+	for _, target := range targets {
+		if data, ok := x.getSnapshotContent(target); ok {
+			sources[target] = string(data)
+		}
+	}
+	symbolBaseline, symbolErr := runtimeexecutor.NewSymbolBaseline(sources)
+	if symbolErr != nil {
+		return nil, nil, nil, nil, fmt.Errorf("executor: scope symbol baseline: %w", symbolErr)
+	}
 
 	patches := make([]*Patch, 0, len(targets))
 	invs := make([]ModelInvocation, 0, len(targets))
@@ -2138,6 +2149,8 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// window — the no-op semantics classifier evaluates the claim against
 		// the same bytes, never against the unseen remainder of the file.
 		judgedContent := original
+		windowStart, windowEnd := 1, strings.Count(original, "\n") + 1
+		offsetRecovery := req.RecoveryAttempt > 0 && strings.Contains(req.Evidence, "AMBIGUOUS_ANCHOR")
 		if patchOnly {
 			system = boundedPatchSystemPrompt() + "\nSystem: You are strictly modifying ONE file: " + target + ". Do NOT output code or patches for any other files in this response."
 			outputContract = "search_replace"
@@ -2177,7 +2190,18 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			user = buildBoundedPatchUserPrompt(req.Prompt, req.Evidence, target, window)
 			contextBytes = len(window.content)
 			judgedContent = window.content
+			windowStart, windowEnd = window.startLine, window.endLine
+			if offsetRecovery {
+				var numbered strings.Builder
+				numbered.WriteString("\nExplicit line-offset source (prefixes are metadata, not SEARCH bytes):\n")
+				for i, line := range strings.Split(window.content, "\n") {
+					fmt.Fprintf(&numbered, "L%d: %s\n", window.startLine+i, line)
+				}
+				user += numbered.String()
+				system += "\nFor this line-offset continuation, head SEARCH with <<<<<<< SEARCH line-offset=<start>-<end>; use absolute inclusive line numbers from the numbered window."
+			}
 		}
+		user += "\n" + symbolBaseline.Context()
 		disableReasoning := false
 		if patchOnly {
 			// Reasoning models spend the SHARED output budget on hidden
@@ -2253,6 +2277,22 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			return nil, invs, nil, trace, gate
 		}
 
+		// TRANSPORT-VERBATIM VIEW: ingestion may lift the fenced document (or a
+		// wrapped patch block) out of a mixed payload. The line-offset
+		// materializer and the Phase 6.4 complete-document fallback must
+		// examine the EXACT bytes the worker produced — the IngestionTrace
+		// preserves them unmutated.
+		verbatim := raw
+		if trace != nil && trace.RawOutput != "" {
+			verbatim = trace.RawOutput
+		}
+		if offsetRecovery || strings.Contains(verbatim, "<<<<<<< SEARCH line-offset=") {
+			materialized, ok := materializeOffsetPatch(original, verbatim, windowStart, windowEnd)
+			if !ok {
+				return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: invalid or missing exact line-offset bounds", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
+			}
+			verbatim = materialized
+		}
 		var modified string
 		if patchOnly {
 			// NO-OP SENTINEL (pre-validation): a model that answers
@@ -2279,12 +2319,12 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// response can NEVER satisfy this contract — rejecting it here is
 			// what makes recovery semantically different from the initial
 			// full-artifact attempt instead of a relabeled retry.
-			patched, ok := ExtractBoundedPatch(original, raw)
+			patched, ok := ExtractBoundedPatch(original, verbatim)
 			if !ok {
 				// Check every anchor before considering a complete-document fallback:
 				// a zero match in any block must never be hidden by an ambiguous one.
 				ambiguous := false
-				for _, b := range ParseSearchReplaceBlocks(raw) {
+				for _, b := range ParseSearchReplaceBlocks(verbatim) {
 					cnt := strings.Count(original, b.search)
 					if b.search == "" || cnt == 0 {
 						return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: SEARCH matches zero regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
@@ -2292,18 +2332,24 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					ambiguous = ambiguous || cnt > 1
 				}
 				if ambiguous {
-					candidate, recovered := recoverSmallFileAmbiguousAnchor(original, raw, target, x.artifactGate)
+					candidate, recovered := recoverSmallFileAmbiguousAnchor(original, verbatim, target, x.artifactGate)
 					if !recovered {
 						return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
 					}
-					// Validate the resolved document through the same patch validator,
-					// authorization, budget and mutation flow as any exact full-span edit.
-					raw = "<<<<<<< SEARCH\n" + original + "\n=======\n" + candidate + "\n>>>>>>> REPLACE"
-					patched, ok = ExtractBoundedPatch(original, raw)
+					// Materialize the validated complete document as an exact
+					// full-span SEARCH/REPLACE envelope so the ordinary
+					// validator/authorization/budget/mutation flow applies.
+					verbatim = "<<<<<<< SEARCH\n" + original + "\n=======\n" + candidate + "\n>>>>>>> REPLACE"
+					patched, ok = ExtractBoundedPatch(original, verbatim)
 				}
-				if ok {
-					modified = patched
-				} else {
+			}
+			if ok {
+				modified = patched
+				// compileDiff and the raw-patch validator must see the envelope
+				// that actually produced the candidate (full-span after a
+				// complete-document fallback).
+				raw = verbatim
+			} else {
 				// RMAH Tier 2 fallback: free-tier models may return raw code
 				// fences instead of SEARCH/REPLACE blocks. Attempt the RMAH
 				// pipeline (Tier 1 already failed via ExtractBoundedPatch;
@@ -2336,9 +2382,6 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					}
 					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, detail)
 				}
-				}
-			} else {
-				modified = patched
 			}
 		} else {
 			modified = ResolveModifiedContent(original, raw)
@@ -2400,6 +2443,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			return nil, invs, nil, trace, gateErr
 		}
 		modified = normalized
+		if redundant := symbolBaseline.Check(target, modified); redundant != nil {
+			return nil, invs, nil, trace, fmt.Errorf("%w: %w", ErrArtifactRetryableRejected, redundant)
+		}
 		patches = append(patches, &Patch{
 			ID:       fmt.Sprintf("%s-patch-%d", requestID, len(patches)+1),
 			File:     target,

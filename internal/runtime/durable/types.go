@@ -1,5 +1,7 @@
 package durable
 
+import "github.com/PizenLabs/izen/internal/core/domain"
+
 // TaskStatus is the lifecycle state of a task.
 type TaskStatus string
 
@@ -68,17 +70,21 @@ type RecoveryContext struct {
 	LastCleanLine        int           `json:"lastCleanLine,omitempty"`
 	LastCleanByteOffset  int           `json:"lastCleanByteOffset,omitempty"`
 	LastCleanTokenOffset int           `json:"lastCleanTokenOffset,omitempty"`
+	ReuseTarget          string        `json:"reuseTarget,omitempty"`
+	ReuseSymbols         []string      `json:"reuseSymbols,omitempty"`
+	BaselineScope        []string      `json:"baselineScope,omitempty"`
 }
 
 type TaskState struct {
-	RecoveryContext   RecoveryContext  `json:"recoveryContext,omitempty"`
-	ID                string           `json:"id"`
-	Intent            string           `json:"intent"`
-	ActiveTargetScope []string         `json:"activeTargetScope"`
-	CurrentStepID     string           `json:"currentStepId"`
-	Cursor            *ExecutionCursor `json:"cursor"`
-	LastCheckpointID  string           `json:"lastCheckpointId"`
-	Status            TaskStatus       `json:"status"`
+	ScopeProvenance   domain.ScopeProvenance `json:"scopeProvenance"`
+	ID                string                 `json:"id"`
+	Intent            string                 `json:"intent"`
+	ActiveTargetScope []string               `json:"activeTargetScope"`
+	CurrentStepID     string                 `json:"currentStepId"`
+	RecoveryContext   RecoveryContext        `json:"recoveryContext,omitempty"`
+	Cursor            *ExecutionCursor       `json:"cursor"`
+	LastCheckpointID  string                 `json:"lastCheckpointId"`
+	Status            TaskStatus             `json:"status"`
 }
 
 // EventType is the closed set of ledger event types.

@@ -52,6 +52,8 @@ type ContextSlice struct {
 	Strategy        StepStrategy
 	StepBudget      int
 	Instructions    string
+	AvailableSymbols string
+	RecoveryInstructions string
 }
 
 // MaxEvidencePerSlice bounds the evidence tail carried per step.
@@ -132,6 +134,7 @@ func estimateSliceTokens(s ContextSlice) int {
 	toks += len(s.StateDigest)/4 + 4
 	toks += len(s.SystemProtocol)/4 + 6
 	toks += len(s.Instructions)/4 + len(s.Strategy)/4 + 4
+	toks += len(s.AvailableSymbols)/4 + len(s.RecoveryInstructions)/4
 	for _, e := range s.LatestEvidence {
 		toks += len(e.Kind)/4 + len(e.Subject)/4 + len(e.Digest)/4 + 8
 		// Detail is truncated to a fixed cap so one verbose evidence item
@@ -161,6 +164,8 @@ func (s ContextSlice) RenderPrompt() string {
 	if s.TargetAST != "" {
 		b.WriteString("AST: " + s.TargetAST + "\n")
 	}
+	if s.AvailableSymbols != "" { b.WriteString(s.AvailableSymbols + "\n") }
+	if s.RecoveryInstructions != "" { b.WriteString(s.RecoveryInstructions + "\n") }
 	for _, e := range s.LatestEvidence {
 		b.WriteString("EVIDENCE [" + e.Kind + "] " + e.Subject + " " + e.Digest + "\n")
 	}
