@@ -4,10 +4,45 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 )
+
+// defaultDebugLogDir is the production debug log directory. Override it via
+// SetDebugLogDir to isolate tests from the workspace.
+func defaultDebugLogDir() string {
+	return filepath.Join(".izen", "debug")
+}
+
+// debugLogMu serialises reads/writes of debugLogDir for test safety.
+var debugLogMu sync.RWMutex
+
+// debugLogDir is the filesystem directory for all debug log files written by
+// the telemetry sink. It defaults to the CWD-relative .izen/debug path but
+// can be overridden via SetDebugLogDir to isolate tests from the workspace.
+var debugLogDir = defaultDebugLogDir()
+
+// SetDebugLogDir overrides the default debug log directory. Pass "" to reset
+// to the production default. Tests MUST call this with t.TempDir() to avoid
+// touching the real workspace.
+func SetDebugLogDir(dir string) {
+	debugLogMu.Lock()
+	defer debugLogMu.Unlock()
+	if dir == "" {
+		debugLogDir = defaultDebugLogDir()
+	} else {
+		debugLogDir = dir
+	}
+}
+
+// getDebugLogDir returns the current debug log directory.
+func getDebugLogDir() string {
+	debugLogMu.RLock()
+	defer debugLogMu.RUnlock()
+	return debugLogDir
+}
 
 // completionLogEntry is one line of .izen/debug/completions.log. It records
 // the raw-vs-visible composition of an LLM completion so token loss / reasoning
@@ -59,5 +94,5 @@ func debugLogCompletion(raw string, tokIn, tokOut int, finishReason string, stag
 		return
 	}
 	data = append(data, '\n')
-	enqueueTelemetryWrite(filepath.Join(".izen", "debug"), "completions.log", data)
+	enqueueTelemetryWrite(getDebugLogDir(), "completions.log", data)
 }

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // TelemetrySinkBufferSize bounds the async TUI telemetry channel. Saturation
@@ -15,6 +16,9 @@ type telemetryWrite struct {
 	dir      string
 	filename string
 	data     []byte
+	// done, when non-nil, is closed AFTER the record is consumed by the
+	// write loop, so callers can synchronise on an empty sink (tests).
+	done chan struct{}
 }
 
 var (
@@ -56,9 +60,36 @@ func telemetryWriteLoop() {
 	}
 }
 
+// telemetryFlush blocks until every enqueued record has been consumed by the
+// write loop. It exists so tests can observe debug output deterministically
+// before asserting, and so teardown can close all open file handles before a
+// TempDir is removed. The sentinel enqueue is retried (drop-on-saturation must
+// never silently skip the barrier), and it times out rather than hang forever.
+//
+// flushTimeout is created fresh per call: a package-shared one-shot timer would
+// fire once after the first 5s and then get selected at random, skipping the
+// barrier in later flushes.
+func telemetryFlush() {
+	ensureTelemetrySink()
+	done := make(chan struct{})
+	for {
+		select {
+		case telemetryCh <- telemetryWrite{done: done}:
+			<-done
+			return
+		case <-time.After(5 * time.Second):
+			// Consumer wedged; the test will fail on its own assertion.
+			return
+		}
+	}
+}
+
 // writeTelemetryRecord persists one telemetry record. It is the only function
 // in the TUI telemetry path that touches the filesystem.
 func writeTelemetryRecord(w telemetryWrite) {
+	if w.done != nil {
+		defer close(w.done)
+	}
 	if w.dir == "" || w.filename == "" || len(w.data) == 0 {
 		return
 	}

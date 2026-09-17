@@ -366,14 +366,6 @@ func (s *subscription) popControl() DomainEvent {
 	return ev
 }
 
-// drainControl delivers every queued control event, re-checking cancellation
-// before each handler invocation so buffered events are not delivered after a
-// cancel. Returns when the queue is empty or the subscription was cancelled
-// (the caller's loop then exits on the closed done channel).
-func drainControl(sub *subscription) {
-	drainControlBounded(sub, 0)
-}
-
 // drainControlBounded delivers up to max queued control events (max <= 0 means
 // unbounded). It returns true when more control events remain queued, so the
 // caller can yield to telemetry to prevent starvation. Cancellation is

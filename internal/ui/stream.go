@@ -174,7 +174,7 @@ func debugLogPayload(content string, msgs []ai.Message) {
 		return
 	}
 	data = append(data, '\n')
-	enqueueTelemetryWrite(filepath.Join(".izen", "debug"), "payload.log", data)
+	enqueueTelemetryWrite(getDebugLogDir(), "payload.log", data)
 }
 
 // injectObjectiveContext prefixes the active human-confirmed objective frame

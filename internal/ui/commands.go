@@ -1059,7 +1059,7 @@ const buildGenerationTimeout = 5 * time.Minute
 // Enqueueing never blocks the UI thread: saturation drops and counts.
 func debugLogPlan(line string) {
 	entry := time.Now().Format(time.RFC3339Nano) + " " + line + "\n"
-	enqueueTelemetryWrite(filepath.Join(".izen", "debug"), "plan.log", []byte(entry))
+	enqueueTelemetryWrite(getDebugLogDir(), "plan.log", []byte(entry))
 }
 
 // compressHandoffSource aggressively prunes and compresses the handoff
