@@ -178,7 +178,9 @@ func estimateChunkTokens(p []byte) int {
 
 // ProactiveBudgetReason is the deterministic StepOutcomeReason label attached
 // to a StepOutcomePartial produced by proactive token ceiling enforcement.
-const ProactiveBudgetReason StepOutcomeReason = "proactive_token_ceiling_reached"
+const OutputCeilingReason StepOutcomeReason = "OUTPUT_CEILING"
+
+const ProactiveBudgetReason = OutputCeilingReason
 
 // IsProactiveBudgetCancel reports whether a finalize error represents the
 // deterministic partial classification of the stream budget guard — and ONLY

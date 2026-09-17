@@ -18,7 +18,9 @@ import (
 	"sync"
 
 	"github.com/PizenLabs/izen/internal/core/domain/evidence"
+	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 	providercap "github.com/PizenLabs/izen/internal/provider"
+	"github.com/PizenLabs/izen/internal/runtime/durable"
 )
 
 // StepOutcome is the bounded-step outcome registered by the staging layer.
@@ -60,11 +62,75 @@ type ProposalStagingBuffer struct {
 	// budget cancellation is classified as a partial step. Wiring it to the
 	// events bus publishes EventStepProactivelyTruncated.
 	emitTruncation func(ProactivelyTruncatedInfo)
+	state          *durable.TaskState
+	provider       *dprovider.ProviderMetadata
+	recovery       durable.RecoveryContext
+	observedTokens int
+	payloadLimit   int
+	reason         StepOutcomeReason
 }
 
 // NewProposalStagingBuffer opens an isolated staging buffer for one step.
 func NewProposalStagingBuffer(stepID string) *ProposalStagingBuffer {
 	return &ProposalStagingBuffer{stepID: stepID}
+}
+
+func (b *ProposalStagingBuffer) WithRecoveryContext(state *durable.TaskState, meta *dprovider.ProviderMetadata, recovery durable.RecoveryContext) *ProposalStagingBuffer {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.state, b.provider, b.recovery = state, meta, recovery
+	return b
+}
+
+func (b *ProposalStagingBuffer) WithObservedTokens(tokens int) *ProposalStagingBuffer {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if tokens > 0 {
+		b.observedTokens = tokens
+	}
+	return b
+}
+
+func (b *ProposalStagingBuffer) WithPayloadLimit(tokens int) *ProposalStagingBuffer {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.payloadLimit = tokens
+	return b
+}
+
+func (b *ProposalStagingBuffer) partialLocked() StagingDisposition {
+	b.finalized, b.discarded = true, true
+	b.outcome, b.reason = StepOutcomePartial, OutputCeilingReason
+	r := b.recovery
+	r.Phase, r.StepID, r.Reason = durable.RecoveryRequired, b.stepID, string(OutputCeilingReason)
+	r.StreamBytes = len(b.buf)
+	r.LastCleanByteOffset, r.LastCleanLine, r.LastCleanTokenOffset = 0, 0, 0
+	for i, value := range b.buf {
+		if value == '\n' {
+			r.LastCleanByteOffset = i + 1
+			r.LastCleanLine++
+		}
+	}
+	r.LastCleanTokenOffset = estimateChunkTokens(b.buf[:r.LastCleanByteOffset])
+	r.ObservedTokens = b.observedTokens
+	if r.ObservedTokens <= 0 && b.guard != nil {
+		r.ObservedTokens = int(b.guard.EstimatedTokens.Load())
+	}
+	if r.ObservedTokens <= 0 {
+		r.ObservedTokens = estimateChunkTokens(b.buf)
+	}
+	b.buf = nil
+	if b.state != nil {
+		b.state.RecoveryContext = r
+	}
+	if b.provider != nil {
+		b.provider.RecordOutputLimit(dprovider.OutputLimit{Value: r.ObservedTokens, Source: dprovider.LimitObserved})
+	}
+	return b.dispositionLocked()
+}
+
+func (b *ProposalStagingBuffer) dispositionLocked() StagingDisposition {
+	return StagingDisposition{Outcome: b.outcome, Discarded: b.discarded, NeedsContinuation: b.outcome == StepOutcomePartial, Reason: b.reason}
 }
 
 // WithTokenGuard binds a proactive stream token ceiling guard to the buffer.
@@ -160,7 +226,12 @@ func (b *ProposalStagingBuffer) Write(p []byte) (int, error) {
 // EstimatedTokensSnapshot reports the current guard token estimate (0 without a
 // guard). It is for telemetry/assertion; the enforcing read lives in the guard.
 func (b *ProposalStagingBuffer) EstimatedTokensSnapshot() int64 {
-	if b == nil || b.guard == nil {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.guard == nil {
 		return 0
 	}
 	return b.guard.EstimatedTokens.Load()
@@ -224,22 +295,16 @@ func (b *ProposalStagingBuffer) Finalize(finishReason string, truncated bool) St
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.finalized {
-		return StagingDisposition{Outcome: b.outcome, Discarded: b.discarded, NeedsContinuation: b.outcome == StepOutcomePartial}
+		return b.dispositionLocked()
+	}
+	if truncated || (b.guard != nil && b.guard.Cancelled()) ||
+		(b.payloadLimit > 0 && estimateChunkTokens(b.buf) > b.payloadLimit) {
+		return b.partialLocked()
 	}
 	b.finalized = true
-	// Transport truncation forces Partial regardless of the reason string.
-	if truncated {
-		b.buf = nil
-		b.discarded = true
-		b.outcome = StepOutcomePartial
-		return StagingDisposition{Outcome: StepOutcomePartial, NeedsContinuation: true, Discarded: true}
-	}
 	switch {
 	case outcome.IsPartial() || isLengthReason(finishReason):
-		b.buf = nil
-		b.discarded = true
-		b.outcome = StepOutcomePartial
-		return StagingDisposition{Outcome: StepOutcomePartial, NeedsContinuation: true, Discarded: true}
+		return b.partialLocked()
 	case outcome == providercap.StreamComplete:
 		proposal := string(b.buf)
 		b.outcome = StepOutcomeComplete
@@ -288,14 +353,11 @@ func (b *ProposalStagingBuffer) FinalizeErr(err error) StagingDisposition {
 // flushed from memory and the optional hook emits EventStepProactivelyTruncated.
 func (b *ProposalStagingBuffer) finalizeProactive() StagingDisposition {
 	b.mu.Lock()
-	proactive := false
-	if !b.finalized {
-		b.finalized = true
-		b.discarded = true
-		b.buf = nil
-		b.outcome = StepOutcomePartial
-		proactive = true
+	proactive := !b.finalized
+	if proactive {
+		b.partialLocked()
 	}
+	disposition := b.dispositionLocked()
 	stepID := b.stepID
 	emit := b.emitTruncation
 	var estimated int64
@@ -315,19 +377,14 @@ func (b *ProposalStagingBuffer) finalizeProactive() StagingDisposition {
 			Budget:          budget,
 		})
 	}
-	return StagingDisposition{
-		Outcome:           StepOutcomePartial,
-		NeedsContinuation: true,
-		Discarded:         true,
-		Reason:            ProactiveBudgetReason,
-	}
+	return disposition
 }
 
 func (b *ProposalStagingBuffer) finalizeFailed() StagingDisposition {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.finalized {
-		return StagingDisposition{Outcome: b.outcome, Discarded: b.discarded, NeedsContinuation: b.outcome == StepOutcomePartial}
+		return b.dispositionLocked()
 	}
 	b.finalized = true
 	b.discarded = true

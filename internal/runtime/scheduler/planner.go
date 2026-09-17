@@ -49,6 +49,9 @@ type ContextSlice struct {
 	BudgetRemaining int
 	SystemProtocol  string
 	InputTokens     int
+	Strategy        StepStrategy
+	StepBudget      int
+	Instructions    string
 }
 
 // MaxEvidencePerSlice bounds the evidence tail carried per step.
@@ -98,6 +101,9 @@ func (p *ContextPlanner) Assemble(objective string, state TaskStateSnapshot, ste
 		LatestEvidence:  tail,
 		BudgetRemaining: state.RemainingBudget,
 		SystemProtocol:  sys,
+		Strategy:        step.Strategy,
+		StepBudget:      step.StepBudget,
+		Instructions:    strategyInstructions(step.Strategy),
 	}
 	s.InputTokens = estimateSliceTokens(s)
 	return s
@@ -125,6 +131,7 @@ func estimateSliceTokens(s ContextSlice) int {
 	toks += len(s.TargetAST)/4 + 8
 	toks += len(s.StateDigest)/4 + 4
 	toks += len(s.SystemProtocol)/4 + 6
+	toks += len(s.Instructions)/4 + len(s.Strategy)/4 + 4
 	for _, e := range s.LatestEvidence {
 		toks += len(e.Kind)/4 + len(e.Subject)/4 + len(e.Digest)/4 + 8
 		// Detail is truncated to a fixed cap so one verbose evidence item
@@ -147,6 +154,10 @@ func (s ContextSlice) RenderPrompt() string {
 	b.WriteString("OBJECTIVE: " + s.Objective + "\n")
 	b.WriteString("STEP: " + s.StepID + " TARGETS: " + strings.Join(s.Targets, ",") + "\n")
 	b.WriteString("STATE: " + s.StateDigest + " BUDGET_LEFT: " + itoa(s.BudgetRemaining) + "\n")
+	if s.Strategy != "" {
+		b.WriteString("STRATEGY: " + string(s.Strategy) + " STEP_BUDGET: " + itoa(s.StepBudget) + "\n")
+		b.WriteString(s.Instructions + "\n")
+	}
 	if s.TargetAST != "" {
 		b.WriteString("AST: " + s.TargetAST + "\n")
 	}
@@ -154,6 +165,21 @@ func (s ContextSlice) RenderPrompt() string {
 		b.WriteString("EVIDENCE [" + e.Kind + "] " + e.Subject + " " + e.Digest + "\n")
 	}
 	return b.String()
+}
+
+func strategyInstructions(strategy StepStrategy) string {
+	switch strategy {
+	case SKELETON_CREATE:
+		return "Propose only a minimal valid AST skeleton for the current target. Keep the entire target payload strictly below 200 tokens and within STEP_BUDGET. Include only essential declarations; defer implementation to bounded next expansions. Do not create files outside the proposal boundary."
+	case BOUNDED_EXPANSION:
+		return "Propose one bounded expansion of the existing baseline within STEP_BUDGET. Preserve existing valid structure, avoid a full rewrite, and defer remaining work to subsequent bounded steps."
+	case BOUNDED_PATCH:
+		return "Propose one bounded patch to the existing target within STEP_BUDGET. Preserve unrelated code and defer remaining work to subsequent bounded steps."
+	case DIRECT_CREATE:
+		return "Propose a complete valid target within STEP_BUDGET. Do not expand the declared target scope."
+	default:
+		return ""
+	}
 }
 
 func itoa(n int) string {

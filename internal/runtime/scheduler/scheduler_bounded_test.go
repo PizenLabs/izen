@@ -27,7 +27,7 @@ func TestScheduler_BoundedStepDecomposition(t *testing.T) {
 		TaskRemainingBudget: 8192,
 		RequestedStepBudget: 4096, // large request: provider cap must win
 		ReasoningMargin:     0,
-		Provider:            dprovider.DetectCapability("openrouter", "constrained-model", 1024, 32768, false, false),
+		Provider:            ptr(dprovider.DetectCapability("openrouter", "constrained-model", 1024, 32768, false, false)),
 		Type:                StepTypeMutation,
 	}
 	sched := NewStepScheduler()

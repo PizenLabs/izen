@@ -9,8 +9,10 @@ package scheduler
 
 import (
 	"fmt"
+	"reflect"
 
 	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
+	"github.com/PizenLabs/izen/internal/runtime/durable"
 )
 
 // StepType classifies the bounded work of one ExecutionStep.
@@ -49,6 +51,10 @@ type ExecutionStep struct {
 	StepBudget            int
 	Sequence              int
 	TotalSteps            int
+	Strategy              StepStrategy
+	Operation             string
+	StateFingerprint      string
+	BlockedReason         string
 }
 
 // TaskSpec is the durable task the scheduler decomposes. Task scope
@@ -72,9 +78,17 @@ type TaskSpec struct {
 	// (Invariant 3: never hardcoded by the engine).
 	ReasoningMargin int
 	// Provider advertises the model completion ceiling.
-	Provider dprovider.ProviderMetadata
+	Provider *dprovider.ProviderMetadata
 	// Type classifies every emitted step (default mutation).
-	Type StepType
+	Type              StepType
+	Operations        map[string]string
+	DiskSizes         map[string]int64
+	StateFingerprints map[string]string
+	History           map[string][]StepOutcome
+	State             *durable.TaskState
+	StepIndex         int
+	TargetASTs        map[string]string
+	LatestEvidence    []EvidenceItem
 }
 
 // StepScheduler decomposes durable tasks into bounded ExecutionSteps.
@@ -89,7 +103,11 @@ func (s *StepScheduler) EffectiveBudget(spec TaskSpec) int {
 	if req <= 0 {
 		req = spec.TotalEstimatedSize
 	}
-	return dprovider.EffectiveStepBudget(req, spec.Provider.MaxOutputTokens, spec.TaskRemainingBudget, spec.ReasoningMargin)
+	limit := 0
+	if spec.Provider != nil {
+		limit = spec.Provider.ResolvedOutputLimit().Value
+	}
+	return dprovider.EffectiveStepBudget(req, limit, spec.TaskRemainingBudget, spec.ReasoningMargin)
 }
 
 // Schedule partitions the durable target scope into sequential bounded
@@ -141,6 +159,11 @@ func (s *StepScheduler) Schedule(spec TaskSpec) []ExecutionStep {
 	}
 	for _, t := range targets {
 		sz := sizes[t]
+		if len(spec.Operations) > 0 {
+			flush()
+			steps = append(steps, strategyStep(spec, t, typ, budget, sz))
+			continue
+		}
 		if len(cur) > 0 && curSize+sz > budget {
 			flush()
 		}
@@ -175,6 +198,9 @@ func AcceptStep(scheduled, received ExecutionStep) error {
 			return fmt.Errorf("scheduler: executor mutated step %q target[%d]: scheduled %q, received %q",
 				scheduled.ID, i, scheduled.Targets[i], received.Targets[i])
 		}
+	}
+	if !reflect.DeepEqual(scheduled, received) {
+		return fmt.Errorf("scheduler: executor altered step %q fields", scheduled.ID)
 	}
 	return nil
 }

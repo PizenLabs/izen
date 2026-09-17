@@ -11,6 +11,27 @@
 // be hardcoded as architectural absolute limits.
 package provider
 
+import "sync"
+
+type LimitSource int
+
+const (
+	LimitUnknown LimitSource = iota
+	LimitPolicy
+	LimitAdvertised
+	LimitObserved
+)
+
+type OutputLimit struct {
+	Value  int
+	Source LimitSource
+}
+
+type outputLimitSession struct {
+	mu     sync.RWMutex
+	limits [4]int
+}
+
 // ProviderMetadata is the dynamic capability view of one model endpoint. It
 // is populated from provider metadata (OpenRouter /models, Ollama /api/show,
 // registry ModelDescriptor) with zero-means-unknown semantics.
@@ -30,12 +51,45 @@ type ProviderMetadata struct {
 	Provider string
 	// ModelID is the provider-resolved model identifier.
 	ModelID string
+
+	outputLimits *outputLimitSession
 }
 
 // IsConstrained reports whether the advertised output cap marks the model as
 // constrained (<= 1024). Zero/negative means unknown and is NOT constrained.
 func (m ProviderMetadata) IsConstrained() bool {
-	return m.MaxOutputTokens > 0 && m.MaxOutputTokens <= ConstrainedOutputThreshold
+	limit := m.ResolvedOutputLimit()
+	return limit.Value > 0 && limit.Value <= ConstrainedOutputThreshold
+}
+
+func (m ProviderMetadata) ResolvedOutputLimit() OutputLimit {
+	var limits [4]int
+	if m.outputLimits != nil {
+		m.outputLimits.mu.RLock()
+		limits = m.outputLimits.limits
+		m.outputLimits.mu.RUnlock()
+	}
+	if limits[LimitAdvertised] <= 0 && m.MaxOutputTokens > 0 {
+		limits[LimitAdvertised] = m.MaxOutputTokens
+	}
+	for source := LimitObserved; source > LimitUnknown; source-- {
+		if limits[source] > 0 {
+			return OutputLimit{Value: limits[source], Source: source}
+		}
+	}
+	return OutputLimit{}
+}
+
+func (m *ProviderMetadata) RecordOutputLimit(limit OutputLimit) {
+	if m == nil || limit.Value <= 0 || limit.Source <= LimitUnknown || limit.Source > LimitObserved {
+		return
+	}
+	if m.outputLimits == nil {
+		m.outputLimits = &outputLimitSession{}
+	}
+	m.outputLimits.mu.Lock()
+	m.outputLimits.limits[limit.Source] = limit.Value
+	m.outputLimits.mu.Unlock()
 }
 
 // DetectCapability builds ProviderMetadata from raw endpoint values. It
@@ -55,6 +109,7 @@ func DetectCapability(provider, modelID string, maxOutput, contextWindow int, re
 		ContextWindow:           contextWindow,
 		Provider:                provider,
 		ModelID:                 modelID,
+		outputLimits:            &outputLimitSession{},
 	}
 }
 
@@ -93,11 +148,12 @@ func effectiveStepBudget(requested, providerMaxOutput, taskRemaining, reasoningM
 		}
 		return DefaultRequestedStepBudget
 	}
+	floor := min(MinStepBudget, best)
 	if reasoningMargin > 0 {
 		best -= reasoningMargin
 	}
-	if best < MinStepBudget {
-		best = MinStepBudget
+	if best < floor {
+		best = floor
 	}
 	return best
 }
@@ -106,5 +162,5 @@ func effectiveStepBudget(requested, providerMaxOutput, taskRemaining, reasoningM
 // step budget from task-remaining tokens, provider metadata, requested step
 // complexity, and a caller-owned reasoning margin.
 func StepBudgetForTask(requestedComplexity, taskRemaining int, meta ProviderMetadata, reasoningMargin int) int {
-	return EffectiveStepBudget(requestedComplexity, meta.MaxOutputTokens, taskRemaining, reasoningMargin)
+	return EffectiveStepBudget(requestedComplexity, meta.ResolvedOutputLimit().Value, taskRemaining, reasoningMargin)
 }

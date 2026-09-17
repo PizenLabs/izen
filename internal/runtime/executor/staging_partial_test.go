@@ -1,12 +1,70 @@
 package executor
 
 import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/PizenLabs/izen/internal/core/domain/evidence"
+	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
+	"github.com/PizenLabs/izen/internal/runtime/durable"
 )
 
 // countingSink records workspace mutations for the isolation assertion.
+func TestProposalStaging_TaskStateOnlyPreservation(t *testing.T) {
+	for _, initial := range []string{"", "existing baseline\n"} {
+		t.Run(initial, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "index.html")
+			if err := os.WriteFile(path, []byte(initial), 0600); err != nil {
+				t.Fatal(err)
+			}
+			state := durable.TaskState{ID: "task", Status: durable.TaskRunning, ActiveTargetScope: []string{"index.html"}}
+			original := state
+			meta := dprovider.DetectCapability("test", "model", 4096, 0, false, false)
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			buffer := NewProposalStagingBuffer("step").WithRecoveryContext(&state, &meta, durable.RecoveryContext{Target: "index.html", Strategy: "DIRECT_CREATE"}).WithTokenGuard(NewStreamTokenGuard(1000, cancel))
+			clean := "<!doctype html>\n<html>\n"
+			if _, err := buffer.Write([]byte(clean)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := buffer.Write([]byte(strings.Repeat("x", 4000))); !errors.Is(err, ErrProactiveBudgetExceeded) {
+				t.Fatalf("guard: %v", err)
+			}
+			disp := buffer.FinalizeErr(context.Cause(ctx))
+			sink := &countingSink{}
+			if _, outcome, err := CommitGate(disp, evidence.VerdictPassed, sink); err != nil || outcome != StepOutcomePartial || sink.patches != 0 {
+				t.Fatalf("boundary: %v %v %+v", outcome, err, sink)
+			}
+			if disp.Reason != OutputCeilingReason || disp.Proposal != "" || buffer.Len() != 0 {
+				t.Fatalf("isolation: %+v", disp)
+			}
+			r := state.RecoveryContext
+			if r.Phase != durable.RecoveryRequired || r.LastCleanByteOffset != len(clean) || r.LastCleanLine != 2 || r.LastCleanTokenOffset == 0 {
+				t.Fatalf("metadata: %+v", r)
+			}
+			state.RecoveryContext = original.RecoveryContext
+			if !reflect.DeepEqual(state, original) {
+				t.Fatalf("task state changed: %+v", state)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != initial {
+				t.Fatalf("workspace changed: %q %v", data, err)
+			}
+			if got := meta.ResolvedOutputLimit(); got.Source != dprovider.LimitObserved || got.Value != r.ObservedTokens {
+				t.Fatalf("provenance: %+v", got)
+			}
+			if again := buffer.Finalize("stop", false); again != disp {
+				t.Fatalf("non-idempotent finalize: %+v", again)
+			}
+		})
+	}
+}
+
 type countingSink struct {
 	patches int
 	applied []string

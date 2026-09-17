@@ -49,7 +49,29 @@ type ExecutionCursor struct {
 }
 
 // TaskState is the materialized view persisted in snapshot.json.
+type RecoveryPhase string
+
+const (
+	RecoveryRequired    RecoveryPhase = "RECOVERY_REQUIRED"
+	BaselineEstablished RecoveryPhase = "BASELINE_ESTABLISHED"
+)
+
+type RecoveryContext struct {
+	Phase                RecoveryPhase `json:"phase,omitempty"`
+	StepID               string        `json:"stepId,omitempty"`
+	Target               string        `json:"target,omitempty"`
+	Reason               string        `json:"reason,omitempty"`
+	Strategy             string        `json:"strategy,omitempty"`
+	StateFingerprint     string        `json:"stateFingerprint,omitempty"`
+	ObservedTokens       int           `json:"observedTokens,omitempty"`
+	StreamBytes          int           `json:"streamBytes,omitempty"`
+	LastCleanLine        int           `json:"lastCleanLine,omitempty"`
+	LastCleanByteOffset  int           `json:"lastCleanByteOffset,omitempty"`
+	LastCleanTokenOffset int           `json:"lastCleanTokenOffset,omitempty"`
+}
+
 type TaskState struct {
+	RecoveryContext   RecoveryContext  `json:"recoveryContext,omitempty"`
 	ID                string           `json:"id"`
 	Intent            string           `json:"intent"`
 	ActiveTargetScope []string         `json:"activeTargetScope"`
