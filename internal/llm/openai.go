@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
+	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/httpx"
 )
@@ -126,6 +128,10 @@ type openAIMsgContent struct {
 	Content          string `json:"content"`
 	Reasoning        string `json:"reasoning,omitempty"`
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+	// Thinking carries OpenRouter's native delta.thinking / message.thinking
+	// field (Phase 6.4.5 Stream Delta Reasoning Invariant). It is treated as
+	// first-class reasoning progress alongside reasoning/reasoning_content.
+	Thinking string `json:"thinking,omitempty"`
 }
 
 type openAIDelta struct {
@@ -133,6 +139,21 @@ type openAIDelta struct {
 	Content          string `json:"content,omitempty"`
 	ReasoningContent string `json:"reasoning_content,omitempty"`
 	Reasoning        string `json:"reasoning,omitempty"`
+	// Thinking carries OpenRouter's native delta.thinking field (Phase 6.4.5
+	// Stream Delta Reasoning Invariant). Non-empty thinking tokens count as
+	// active stream progress and feed the unified stream accumulator.
+	Thinking string `json:"thinking,omitempty"`
+}
+
+// unifiedDeltaReasoning unifies the three OpenRouter SSE reasoning spellings
+// (reasoning_content, reasoning, thinking) into a single progress signal.
+// It delegates field ordering to deltaReasoningText so streaming and
+// non-streaming paths converge on the same fallback.
+func unifiedDeltaReasoning(d *openAIDelta) string {
+	if d == nil {
+		return ""
+	}
+	return deltaReasoningText(d.ReasoningContent, d.Reasoning, d.Thinking)
 }
 
 type openAIUsage struct {
@@ -235,7 +256,7 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 	content := ""
 	if openaiResp.Choices[0].Message != nil {
 		msg := openaiResp.Choices[0].Message
-		content = usableContent(msg.Content, msg.Reasoning, msg.ReasoningContent)
+		content = usableContent(msg.Content, msg.Reasoning, msg.ReasoningContent, msg.Thinking)
 	}
 	// Task 1: truncated payload handling — intercept BEFORE envelope parsing,
 	// but PRESERVE the canonical partial buffer. Universal Stream Outcome:
@@ -372,12 +393,29 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	outputChars := 0
 	truncated := false
 	reader := newOpenAIStreamReader(resp.Body)
+	reader.cancel = cancel
+	// Phase 6.4.5 unified stream accumulator: delta.reasoning, delta.thinking,
+	// and delta.content all feed one transport-agnostic live counter so
+	// reasoning-only streams count as progress (no false idle timeout) and
+	// partial telemetry survives interruption. Authoritative usage chunks
+	// always override the character fallback via SetAuthoritative.
+	accum := &dprovider.StreamAccumulator{}
+	promptChars := 0
+	for _, m := range body.Messages {
+		promptChars += len(m.Content)
+	}
+	accum.SetPromptEstimate(dprovider.EstimatePromptTokens(promptChars))
 
 	// resolveUsage returns the authoritative token counts when a usage chunk
-	// arrived, otherwise a character-count estimate of the output tokens.
+	// arrived, otherwise the unified accumulator snapshot (prompt estimate +
+	// content-chars/4 fallback). The accumulator is total: partial streams
+	// snapshot partial tokens even without a terminal usage frame.
 	resolveUsage := func() (int, int) {
 		if tokenIn > 0 || tokenOut > 0 {
 			return tokenIn, tokenOut
+		}
+		if p, c, known, _ := accum.Snapshot(); known {
+			return p, c
 		}
 		if outputChars > 0 {
 			return tokenIn, outputChars / 4
@@ -415,6 +453,10 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 			if chunk.Usage.PromptDetails != nil {
 				cacheRead = chunk.Usage.PromptDetails.CachedTokens
 			}
+			// Unified accumulator: authoritative usage always wins over
+			// estimates, but the live estimate is retained for partial
+			// streams that never deliver a terminal usage frame.
+			accum.SetAuthoritative(tokenIn, tokenOut)
 		}
 
 		// Task 1: intercept finish_reason == "length" BEFORE any envelope parsing.
@@ -423,17 +465,19 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		}
 		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
 			delta := chunk.Choices[0].Delta
-			// Reasoning content (thinking process) is routed to the reasoning
-			// pipeline only — it is never appended to the visible response. It
-			// is also retained so a reasoning-only stream (empty content) can
-			// fall back to the thinking text instead of yielding an empty
-			// response.
-			reasoningText := delta.ReasoningContent
-			if reasoningText == "" {
-				reasoningText = delta.Reasoning
-			}
+			// Stream Delta Reasoning Invariant (Phase 6.4.5): reasoning,
+			// thinking, and reasoning_content are unified into one progress
+			// signal. Non-empty reasoning tokens count as active stream
+			// progress (idle watchdog reset + accumulator) so reasoning
+			// models never trigger a false 15s timeout or 'empty response'
+			// error. Reasoning is routed to the reasoning pipeline only —
+			// never appended to visible content — and retained so a
+			// reasoning-only stream falls back to thinking text.
+			reasoningText := unifiedDeltaReasoning(delta)
 			if reasoningText != "" {
 				outputChars += len(reasoningText)
+				reader.noteTokens(len(reasoningText))
+				accum.AddReasoning(len(reasoningText))
 				reasoning.WriteString(reasoningText)
 				if req.ReasoningHandler != nil {
 					if err := req.ReasoningHandler(reasoningText); err != nil {
@@ -444,6 +488,8 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 			}
 			if delta.Content != "" {
 				outputChars += len(delta.Content)
+				reader.noteTokens(len(delta.Content))
+				accum.AddContent(len(delta.Content))
 				full.WriteString(delta.Content)
 				if handler != nil {
 					if err := handler(delta.Content); err != nil {
@@ -507,6 +553,15 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 type openAIStreamReader struct {
 	body   io.ReadCloser
 	reader *sseReader
+
+	cancel context.CancelFunc
+	// terminal marks that a finish_reason chunk was observed: the next
+	// ReadChunk terminates without waiting for [DONE].
+	terminal bool
+	// lifecycle tracks token emission for the zero-token idle watchdog.
+	lifecycle *dprovider.StreamLifecycle
+	idleStop  func()
+	startOnce sync.Once
 }
 
 type openAIChunk struct {

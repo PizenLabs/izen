@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 	"github.com/PizenLabs/izen/internal/llm"
 )
 
@@ -312,6 +313,11 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		closeTransport: p.closeIdleConnections,
 	}
 	sr.usage.markRequestStarted(time.Now())
+	// Phase 6.4.4 Optimistic Prompt Token Invariant: commit the estimated
+	// prompt count BEFORE entering the SSE chunk read loop so prompt cost
+	// is never lost on early stream cancellation. Authoritative usage
+	// chunks replace this estimate verbatim when they arrive.
+	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
 	sr.usage.recordTransport(stats.attempts, stats.rateLimitedRetries)
 	return &OpenRouterStreamResult{ReadCloser: sr, sr: sr}, nil
 }
@@ -1000,6 +1006,116 @@ type openrouterSSEReader struct {
 	// the next Read() call restores normal io.Reader semantics regardless
 	// of the caller's buffer size.
 	pending []byte
+
+	// lifecycle enforces the Stream Terminal Invariant (Phase 6.4.1).
+	lifecycle *dprovider.StreamLifecycle
+	idleStop  func()
+	startOnce sync.Once
+}
+
+func (s *openrouterSSEReader) armIdle() {
+	s.startOnce.Do(func() {
+		if s.lifecycle == nil {
+			s.lifecycle = dprovider.NewStreamLifecycle()
+		}
+		lc := s.lifecycle
+		s.idleStop = dprovider.ArmIdleDeadline(s.cancel, lc.TokensEmitted, lc.IsClosed)
+	})
+}
+
+func (s *openrouterSSEReader) stopIdle() {
+	if s.idleStop != nil {
+		stop := s.idleStop
+		s.idleStop = nil
+		stop()
+	}
+}
+
+// drainTrailingUsage implements the Phase 6.4.2 Bounded Usage Drain
+// (Telemetry Accuracy Invariant): after a terminal finish_reason, the
+// gateway frequently delivers the authoritative usage object as a trailing
+// usage-only SSE event (choices: []). Closing instantly would drop those
+// billed tokens from TaskState.TokenUsage and the UI footer. This polls
+// for one trailing event for up to dprovider.UsageDrainTimeout (50ms) and
+// records any usage found. Single-threaded and race-free: the stream's
+// only reader polls s.reader.Buffered() — no goroutine ever touches the
+// bufio reader concurrently. Best-effort: timeout, [DONE], EOF, or a parse
+// failure simply ends the drain and the terminal close proceeds.
+func (s *openrouterSSEReader) drainTrailingUsage() {
+	if s.reader == nil {
+		return
+	}
+	deadline := time.Now().Add(dprovider.UsageDrainTimeout)
+	for {
+		if n := s.reader.Buffered(); n > 0 {
+			// Only consume a COMPLETE buffered line: ReadString blocks
+			// for '\n', so a partial line with no further data would hang
+			// the drain past its bound. Peek never blocks for buffered
+			// bytes; an incomplete line keeps polling until the deadline.
+			// Blank separator lines (SSE events end with "\n\n") are
+			// skipped, not terminal: the usage event follows them.
+			peeked, err := s.reader.Peek(n)
+			if err != nil {
+				return
+			}
+			if !bytes.Contains(peeked, []byte{'\n'}) {
+				if !time.Now().Before(deadline) {
+					return
+				}
+				time.Sleep(2 * time.Millisecond)
+				continue
+			}
+			line, err := s.reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				continue
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				return
+			}
+			var chunk openrouterResponse
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				return
+			}
+			if chunk.Usage != nil {
+				s.finalUsage = chunk.Usage
+				s.usage.recordUsageFull(chunk.Usage.ProviderUsage())
+			}
+			return
+		}
+		if !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// closeTerminalOnFinish records a terminal finish_reason and tears the
+// channel down immediately (Stream Terminal Invariant): cancel context,
+// drain body, mark closed, complete usage. Pending bytes are preserved in
+// s.pending; callers flush them before returning EOF.
+func (s *openrouterSSEReader) closeTerminalOnFinish(reason string) {
+	s.finishReason = reason
+	s.usage.markCompleted(time.Now(), reason)
+	if s.lifecycle != nil {
+		s.lifecycle.MarkClosed()
+	}
+	s.stopIdle()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.closed = true
+	s.closeOnce.Do(func() {
+		_, _ = io.Copy(io.Discard, s.body)
+		_ = s.body.Close()
+	})
 }
 
 func (s *openrouterSSEReader) Read(p []byte) (int, error) {
@@ -1019,6 +1135,7 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 	if s.reader == nil {
 		s.reader = bufio.NewReader(s.body)
 	}
+	s.armIdle()
 
 	for {
 		line, err := s.reader.ReadString('\n')
@@ -1077,14 +1194,39 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 			s.usage.recordUsageFull(chunk.Usage.ProviderUsage())
 		}
 
+		// Telemetry Accuracy Invariant (Phase 6.4.2): usage-only chunks
+		// (len(choices) == 0 with a usage object — including a trailing
+		// usage event that follows finish_reason) MUST be captured into
+		// the usage tracker before the channel is torn down. The usage
+		// above is already recorded; skipping the choice logic preserves
+		// it downstream via Usage().
+		if dprovider.IsUsageOnlyChunk(len(chunk.Choices), chunk.Usage != nil) {
+			continue
+		}
+
 		if len(chunk.Choices) == 0 {
 			continue
 		}
 
-		if chunk.Choices[0].FinishReason != "" {
-			s.finishReason = chunk.Choices[0].FinishReason
-			s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
-			continue
+		// Stream Terminal Invariant (Phase 6.4.1): finish_reason != ""
+		// closes the output channel immediately — never wait for [DONE].
+		// Pending bytes (and think residue) are flushed first so no staged
+		// content is lost; the next Read then observes EOF.
+		// Phase 6.4.2 Bounded Usage Drain: before tearing down, allow up
+		// to 50ms for a trailing usage-only chunk so billed tokens are
+		// never dropped from TaskState.TokenUsage.
+		if dprovider.ShouldCloseOnFinishReason(chunk.Choices[0].FinishReason) {
+			if tail := s.think.takeResidue(); len(tail) > 0 {
+				s.pending = append(s.pending, tail...)
+			}
+			s.drainTrailingUsage()
+			s.closeTerminalOnFinish(chunk.Choices[0].FinishReason)
+			if len(s.pending) > 0 {
+				n := copy(p, s.pending)
+				s.pending = s.pending[n:]
+				return n, nil
+			}
+			return 0, io.EOF
 		}
 
 		if chunk.Choices[0].Delta != nil {
@@ -1105,15 +1247,22 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 			}
 			if reasoningText != "" {
 				s.usage.recordReasoning(len(reasoningText))
+				if s.lifecycle != nil {
+					s.lifecycle.NoteTokens(len(reasoningText))
+				}
 				out = append(out, ReasoningSentinel...)
 				out = append(out, reasoningText...)
 				out = append(out, ReasoningSentinel...)
 			}
 			if delta.Content != "" {
 				s.usage.recordOutput(len(delta.Content))
+				if s.lifecycle != nil {
+					s.lifecycle.NoteTokens(len(delta.Content))
+				}
 				out = append(out, s.think.write([]byte(delta.Content))...)
 			}
 			if len(out) > 0 {
+				s.stopIdle()
 				n := copy(p, out)
 				if n < len(out) {
 					s.pending = out[n:]
@@ -1140,6 +1289,10 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 				}
 				if len(all) > 0 {
 					s.usage.recordOutput(len(all))
+					if s.lifecycle != nil {
+						s.lifecycle.NoteTokens(len(all))
+					}
+					s.stopIdle()
 					n := copy(p, all)
 					if n < len(all) {
 						s.pending = all[n:]
@@ -1149,15 +1302,28 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 			}
 		}
 
-		if chunk.Choices[0].FinishReason != "" {
-			s.finishReason = chunk.Choices[0].FinishReason
-			continue
+		if dprovider.ShouldCloseOnFinishReason(chunk.Choices[0].FinishReason) {
+			if tail := s.think.takeResidue(); len(tail) > 0 {
+				s.pending = append(s.pending, tail...)
+			}
+			s.drainTrailingUsage()
+			s.closeTerminalOnFinish(chunk.Choices[0].FinishReason)
+			if len(s.pending) > 0 {
+				n := copy(p, s.pending)
+				s.pending = s.pending[n:]
+				return n, nil
+			}
+			return 0, io.EOF
 		}
 	}
 }
 
 func (s *openrouterSSEReader) Close() error {
 	s.closed = true
+	if s.lifecycle != nil {
+		s.lifecycle.MarkClosed()
+	}
+	s.stopIdle()
 	if s.cancel != nil {
 		s.cancel()
 	}

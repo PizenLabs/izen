@@ -522,6 +522,15 @@ func isBareMutationObjective(raw string) bool {
 }
 
 func (m *model) handleMessageContent(line string) tea.Cmd {
+	// ── Phase 6.4.5 Ledger Context Isolation ─────────────────────────
+	// A new explicit $prompt starts a fresh intent: clear ephemeral
+	// investigation context so stale forensic diagnostics (including
+	// synthetic 'package root (:0)' placeholders) never pollute the new
+	// prompt or subsequent plan synthesis. Explicit /investigate → /plan
+	// chaining still flows through the session ContextLedger SSOT.
+	if isNewExplicitPrompt(line) {
+		m.ClearForensicStateForNewPrompt()
+	}
 	// ── CASUAL CONVERSATION AUTO-UNWIND ─────────────────────────────
 	// Direct /plan-/investigate-/review-/build entry with casual chatter
 	// (e.g. "/plan hi" or a handoff landing on "hi") unwinds to
@@ -2416,6 +2425,14 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 	m.handoffCtx.ProposedFix = ""
 	m.handoffCtx.LastFailurePayload = ""
 	m.handoffCtx.TargetScope = ""
+	// ── Phase 6.4.5 Ledger Context Isolation ─────────────────────────
+	// Clear ephemeral forensic ledger state when transitioning out of
+	// investigate mode (or into a mode that does not explicitly chain
+	// forensic findings). Plan/investigate targets preserve the structured
+	// ledger via the session SSOT; all other targets drop the in-memory
+	// forensic pointer so stale diagnostics never leak into $prompt or
+	// plan synthesis prompts.
+	m.clearForensicStateOnInvestigateExit(targetMode.String())
 
 	// ── PROMPT BUFFER BLEEDING FIX ─────────────────────────────────────
 	// Clear the LLM dialog history on every mode transition so no stale

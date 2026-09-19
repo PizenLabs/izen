@@ -40,19 +40,19 @@ type EvidenceItem struct {
 // deliberately excludes conversation history: input tokens stay flat across
 // turns (no quadratic transcript accumulation).
 type ContextSlice struct {
-	Objective       string
-	StepID          string
-	Targets         []string
-	StateDigest     string
-	TargetAST       string
-	LatestEvidence  []EvidenceItem
-	BudgetRemaining int
-	SystemProtocol  string
-	InputTokens     int
-	Strategy        StepStrategy
-	StepBudget      int
-	Instructions    string
-	AvailableSymbols string
+	Objective            string
+	StepID               string
+	Targets              []string
+	StateDigest          string
+	TargetAST            string
+	LatestEvidence       []EvidenceItem
+	BudgetRemaining      int
+	SystemProtocol       string
+	InputTokens          int
+	Strategy             StepStrategy
+	StepBudget           int
+	Instructions         string
+	AvailableSymbols     string
 	RecoveryInstructions string
 }
 
@@ -164,8 +164,12 @@ func (s ContextSlice) RenderPrompt() string {
 	if s.TargetAST != "" {
 		b.WriteString("AST: " + s.TargetAST + "\n")
 	}
-	if s.AvailableSymbols != "" { b.WriteString(s.AvailableSymbols + "\n") }
-	if s.RecoveryInstructions != "" { b.WriteString(s.RecoveryInstructions + "\n") }
+	if s.AvailableSymbols != "" {
+		b.WriteString(s.AvailableSymbols + "\n")
+	}
+	if s.RecoveryInstructions != "" {
+		b.WriteString(s.RecoveryInstructions + "\n")
+	}
 	for _, e := range s.LatestEvidence {
 		b.WriteString("EVIDENCE [" + e.Kind + "] " + e.Subject + " " + e.Digest + "\n")
 	}

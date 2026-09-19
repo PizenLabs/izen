@@ -306,6 +306,11 @@ func (e *Engine) LastUsage() (input, output int) {
 // recordUsage commits provider-reported token usage. It is called on every
 // synthesis attempt, truncated or not, so the token metrics are never lost to
 // a finish_reason: "length" terminal event.
+//
+// Phase 6.4.5 Global UI Telemetry Binding: usage is ALSO published live to
+// the event bus as a ProviderUsageUpdate so the global footer view model
+// (↑X ↓Y) renders billed tokens in real time during plan.synthesize across
+// ALL system states — not just at the terminal planResultMsg commit.
 func (e *Engine) recordUsage(input, output int) {
 	if e == nil {
 		return
@@ -314,6 +319,19 @@ func (e *Engine) recordUsage(input, output int) {
 	e.lastInput = input
 	e.lastOutput = output
 	e.usageMu.Unlock()
+}
+
+// publishLiveUsage emits the provider-reported usage of one synthesis attempt
+// to the event bus for real-time footer binding. No-op when no bus is wired
+// or when both counts are zero (nothing billed, nothing to render).
+func (e *Engine) publishLiveUsage(model string, input, output int) {
+	if e == nil || e.bus == nil {
+		return
+	}
+	if input <= 0 && output <= 0 {
+		return
+	}
+	e.bus.Publish(events.NewProviderUsageUpdate("", model, input, output, 0))
 }
 
 // usageReader is implemented by stream results that report provider usage.
@@ -365,33 +383,38 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 		}
 		if resp != nil {
 			e.recordUsage(resp.TokenInput, resp.TokenOutput)
+			e.publishLiveUsage(req.Model, resp.TokenInput, resp.TokenOutput)
 		}
 		return resp, nil
 	}
 
-	// Reasoning sink: publishes each reasoning chunk to the event bus exactly
-	// as it streams in. reasoningPublished tracks whether any chunk was
-	// forwarded so the terminal IsComplete event is only emitted when there is
-	// an active thinking block to collapse.
+	// Reasoning sink: accumulates every reasoning chunk for the Phase 6.4.2
+	// Reasoning Content Fallback Invariant AND publishes each chunk to the
+	// event bus exactly as it streams in. reasoningPublished tracks whether
+	// any chunk was forwarded so the terminal IsComplete event is only
+	// emitted when there is an active thinking block to collapse.
+	// Providers that route reasoning via the request-level handler
+	// (OpenAI/Claude/Gemini/Ollama/Groq/...) are captured here;
+	// providers that embed sentinel markers in the raw stream (OpenRouter)
+	// are captured by the accumulateStream sink through the splitter —
+	// never double-counted, because those readers do not consult
+	// ReasoningHandler. The sink is ALWAYS wired (even with a nil bus) so
+	// handler-routed thinking text survives for the fallback below.
+	var handlerReasoning strings.Builder
 	reasoningPublished := false
-	var reasoningSink func(string)
-	if e.bus != nil {
-		reasoningSink = func(chunk string) {
-			if chunk == "" {
-				return
-			}
+	reasoningSink := func(chunk string) {
+		if chunk == "" {
+			return
+		}
+		handlerReasoning.WriteString(chunk)
+		if e.bus != nil {
 			reasoningPublished = true
 			e.bus.Publish(events.NewReasoningStream(chunk, false))
 		}
-		// Providers that route reasoning via the request-level handler
-		// (OpenAI/Claude/Gemini/Ollama/Groq/...). Providers that embed
-		// sentinel markers in the raw stream (OpenRouter) are captured by the
-		// accumulateStream sink through the splitter — never double-forwarded,
-		// because those readers do not consult ReasoningHandler.
-		req.ReasoningHandler = func(chunk string) error {
-			reasoningSink(chunk)
-			return nil
-		}
+	}
+	req.ReasoningHandler = func(chunk string) error {
+		reasoningSink(chunk)
+		return nil
 	}
 
 	req.Stream = true
@@ -406,12 +429,23 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 
 	content, reasoning, finishReason, input, output := accumulateStream(rawStream, reasoningSink)
 	e.recordUsage(input, output)
+	e.publishLiveUsage(req.Model, input, output)
 
+	// Reasoning Content Fallback Invariant (Phase 6.4.2): handler-routed
+	// thinking text (OpenAI/Ollama-compatible readers) never reaches the
+	// splitter's reasoning buffer — merge it here so a reasoning-only
+	// stream still synthesizes a plan instead of raising an empty
+	// response error. Sentinel-classified reasoning (OpenRouter) wins
+	// when both paths carried text.
+	if strings.TrimSpace(reasoning) == "" {
+		reasoning = handlerReasoning.String()
+	}
 	if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoning) != "" {
 		// Reasoning fallback: the model emitted only thinking content (a
-		// Mini/reasoning model with empty message content). Promote the
-		// reasoning text to the payload so plan synthesis succeeds instead of
-		// failing with "empty response from provider".
+		// Mini/reasoning model with empty message content, e.g. Nemotron
+		// reasoning variants). Promote the reasoning text to the payload
+		// so plan synthesis succeeds instead of failing with
+		// "empty response from provider".
 		content = reasoning
 	}
 
@@ -552,6 +586,13 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	if e == nil {
 		return nil, fmt.Errorf("plan engine: nil engine")
 	}
+
+	// ── Phase 6.4.5 Ledger Context Isolation ──────────────────────────
+	// Strip synthetic 'package root (:0)' placeholders from the forensic
+	// ledger before any signal classification or prompt injection. When no
+	// active build errors are present, stale empty-target coordinates from a
+	// prior /investigate run must never reach plan synthesis prompts.
+	ledgerContent = StripSyntheticPackageRootPlaceholders(ledgerContent)
 
 	// ── HEADLESS EVENT EMISSION ───────────────────────────────
 	// The plan engine is headless: every observable outcome is published to

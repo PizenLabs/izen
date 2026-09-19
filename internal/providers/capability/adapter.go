@@ -81,6 +81,7 @@ func (a *OpenRouterAdapter) Inspect(ctx context.Context) ([]ModelCapabilities, e
 	}
 	req.Header.Set("Authorization", "Bearer "+a.apiKey)
 	req.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
+	req.Header.Set("X-Title", "izen")
 	req.Header.Set("X-OpenRouter-Title", "izen")
 
 	resp, err := a.client.Do(req)

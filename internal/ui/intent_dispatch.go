@@ -6,8 +6,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	cmdreg "github.com/PizenLabs/izen/internal/domain/command"
 	intentdomain "github.com/PizenLabs/izen/internal/core/domain"
+	cmdreg "github.com/PizenLabs/izen/internal/domain/command"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/parser"
 )

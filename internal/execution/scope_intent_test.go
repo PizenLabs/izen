@@ -18,8 +18,8 @@ func TestScopeIntentPreservesPrompt(t *testing.T) {
 	gateway := NewIntentGateway(root)
 	for _, tc := range []struct {
 		input, prompt, directive string
-		scope domain.ScopeProvenance
-		strategy strategy.ExecutionStrategy
+		scope                    domain.ScopeProvenance
+		strategy                 strategy.ExecutionStrategy
 	}{
 		{"refactor @target.go", "refactor @target.go", "", domain.ScopeNone, strategy.TargetedReasoning},
 		{"$prompt inspect @target.go and refactor it", "inspect @target.go and refactor it", "prompt", domain.ScopeDynamic, strategy.TargetedMutation},

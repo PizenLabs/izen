@@ -77,7 +77,7 @@ func TestControl_ExplicitScopeDirectives(t *testing.T) {
 	gateway := execution.NewIntentGateway(".")
 	for _, tc := range []struct {
 		input string
-		want intentdomain.ScopeProvenance
+		want  intentdomain.ScopeProvenance
 	}{
 		{"$prompt refactor @target.go", intentdomain.ScopeDynamic},
 		{"/build$hot refactor @target.go", intentdomain.ScopeDeclared},

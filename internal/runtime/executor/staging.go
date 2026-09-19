@@ -69,7 +69,7 @@ type ProposalStagingBuffer struct {
 	payloadLimit   int
 	reason         StepOutcomeReason
 	symbolBaseline *SymbolBaseline
-	symbolTarget string
+	symbolTarget   string
 }
 
 // NewProposalStagingBuffer opens an isolated staging buffer for one step.
@@ -288,6 +288,7 @@ type StagingDisposition struct {
 	// the stream). It is empty for every other outcome.
 	Reason StepOutcomeReason
 }
+
 // RedundantSymbolReason is the deterministic StepOutcomeReason label
 // attached to a StepOutcomePartial produced by the redundancy gate: a new
 // private helper with >70% signature/structure similarity to an available
@@ -330,7 +331,9 @@ func (b *ProposalStagingBuffer) Finalize(finishReason string, truncated bool) St
 			r.Phase, r.Reason = durable.RecoveryRequired, string(RedundantSymbolReason)
 			r.ReuseTarget, r.ReuseSymbols = redundant.ExistingFile, []string{redundant.ExistingSymbol}
 			r.BaselineScope = b.symbolBaseline.Names()
-			if b.state != nil { b.state.RecoveryContext = r }
+			if b.state != nil {
+				b.state.RecoveryContext = r
+			}
 			return b.dispositionLocked()
 		}
 		b.outcome = StepOutcomeComplete

@@ -2,12 +2,64 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/PizenLabs/izen/internal/core/domain/evidence"
 	"github.com/PizenLabs/izen/internal/runtime/durable"
 	"github.com/PizenLabs/izen/internal/runtime/executor"
 )
+
+// ErrRecoveryHalted aborts the scheduler continuation loop when the
+// Zero-Delta Recovery Limit Invariant (Phase 6.4.1) trips: consecutive
+// OUTPUT_CEILING recovery attempts produced zero workspace mutations.
+// Callers MUST NOT retry the same step on this error; it signals a bounded
+// halt, not a transient failure. (Distinct from the autonomy package's
+// zero-trust matrix sentinel of the same name, which governs a different
+// recovery layer.)
+var ErrRecoveryHalted = errors.New("scheduler: recovery halted after consecutive zero-delta recoveries")
+
+// zeroDeltaHaltThreshold is the ConsecutiveZeroDeltas count at which the
+// continuation loop aborts. At most maxConsecutiveZeroDeltas (1) bounded
+// recovery turn is allowed: the first zero-delta OUTPUT_CEILING partial
+// continues, the second halts.
+const zeroDeltaHaltThreshold = 2
+
+// maxConsecutiveZeroDeltas documents the recovery budget: maximum
+// consecutive zero-delta recoveries allowed is 1.
+const maxConsecutiveZeroDeltas = zeroDeltaHaltThreshold - 1
+
+// PostStepEvaluation enforces the Zero-Delta Recovery Limit Invariant after
+// one bounded step completes:
+//
+//   - If the step outcome is StepOutcomePartial with the OUTPUT_CEILING
+//     reason and zero workspace mutations (patches == 0), the attempt made
+//     no progress: ConsecutiveZeroDeltas is incremented, and when it reaches
+//     zeroDeltaHaltThreshold the continuation loop MUST abort immediately
+//     with ErrRecoveryHalted.
+//   - On any successful nonzero workspace commit (patches > 0),
+//     ConsecutiveZeroDeltas resets to 0.
+//   - All other outcomes leave the counter untouched.
+//
+// It mutates state.RecoveryContext in place and is safe to call with a nil
+// state (no-op returning nil).
+func PostStepEvaluation(state *durable.TaskState, outcome StepOutcome, reason string, patches int) error {
+	if state == nil {
+		return nil
+	}
+	if outcome == StepOutcomePartial && reason == OutputCeilingReason && patches == 0 {
+		state.RecoveryContext.ConsecutiveZeroDeltas++
+		if state.RecoveryContext.ConsecutiveZeroDeltas >= zeroDeltaHaltThreshold {
+			return fmt.Errorf("%w: %d consecutive OUTPUT_CEILING recoveries with zero workspace mutations (max %d allowed)",
+				ErrRecoveryHalted, state.RecoveryContext.ConsecutiveZeroDeltas, maxConsecutiveZeroDeltas)
+		}
+		return nil
+	}
+	if patches > 0 {
+		state.RecoveryContext.ConsecutiveZeroDeltas = 0
+	}
+	return nil
+}
 
 type StreamResult struct {
 	FinishReason   string
@@ -54,9 +106,13 @@ func (s *StepScheduler) RunNext(ctx context.Context, spec TaskSpec, state *durab
 	target := step.Targets[0]
 	// TargetASTs are scheduler-owned workspace snapshots, never worker claims.
 	sources := make(map[string]string, len(spec.Targets))
-	for _, scopedTarget := range spec.Targets { sources[scopedTarget] = spec.TargetASTs[scopedTarget] }
+	for _, scopedTarget := range spec.Targets {
+		sources[scopedTarget] = spec.TargetASTs[scopedTarget]
+	}
 	baseline, err := executor.NewSymbolBaseline(sources)
-	if err != nil { return result, err }
+	if err != nil {
+		return result, err
+	}
 	recovery := durable.RecoveryContext{}
 	if state.RecoveryContext.Target == target {
 		recovery = state.RecoveryContext
@@ -109,6 +165,13 @@ func (s *StepScheduler) RunNext(ctx context.Context, spec TaskSpec, state *durab
 	result.NeedsContinuation = disposition.NeedsContinuation
 	if err != nil {
 		return result, err
+	}
+	// Zero-Delta Recovery Limit Invariant (Phase 6.4.1): a truncated
+	// response with zero file mutations consumes one recovery turn; the
+	// second consecutive zero-delta OUTPUT_CEILING halts the loop.
+	if haltErr := PostStepEvaluation(state, result.Outcome, result.Reason, result.Patches); haltErr != nil {
+		result.NeedsContinuation = false
+		return result, haltErr
 	}
 	if outcome == executor.StepOutcomeComplete && patches > 0 && recovery.Reason == string(executor.RedundantSymbolReason) {
 		state.RecoveryContext = durable.RecoveryContext{}

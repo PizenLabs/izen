@@ -169,7 +169,7 @@ func (m *model) executeAutonomyViaRuntime(trace autonomy.Trace) tea.Cmd {
 	}
 
 	req := execution.ExecuteRequest{
-		ScopeProvenance: m.sess.ScopeProvenance,
+		ScopeProvenance:  m.sess.ScopeProvenance,
 		Mode:             modes.ModeBuild.String(),
 		Prompt:           prompt,
 		Targets:          targets,
@@ -276,11 +276,11 @@ func (m *model) runStagedBuildViaRuntime() tea.Cmd {
 
 		req := execution.ExecuteRequest{
 			ScopeProvenance: m.sess.StagedScopeProvenance,
-			Mode:     modes.ModeBuild.String(),
-			Prompt:   prompt,
-			Targets:  targets,
-			Strategy: &profile,
-			Model:    m.getActiveModelName(),
+			Mode:            modes.ModeBuild.String(),
+			Prompt:          prompt,
+			Targets:         targets,
+			Strategy:        &profile,
+			Model:           m.getActiveModelName(),
 		}
 		return m.runRuntimeExecuteCmd(req)
 	}
@@ -321,11 +321,11 @@ func (m *model) runRuntimeTaskRequest(task *plan.Task) tea.Cmd {
 	targets := []string{task.Target}
 	req := execution.ExecuteRequest{
 		ScopeProvenance: m.sess.StagedScopeProvenance,
-		Mode:     modes.ModeBuild.String(),
-		Prompt:   prompt,
-		Targets:  targets,
-		Strategy: &profile,
-		Model:    m.getActiveModelName(),
+		Mode:            modes.ModeBuild.String(),
+		Prompt:          prompt,
+		Targets:         targets,
+		Strategy:        &profile,
+		Model:           m.getActiveModelName(),
 	}
 	return m.runRuntimeExecuteCmd(req)
 }
@@ -358,11 +358,11 @@ func (m *model) runRuntimePrompt(content string) tea.Cmd {
 	targets := resolvedTargetsForExecution(profile, nil)
 	req := execution.ExecuteRequest{
 		ScopeProvenance: m.sess.ScopeProvenance,
-		Mode:     modes.ModeBuild.String(),
-		Prompt:   content,
-		Targets:  targets,
-		Strategy: &profile,
-		Model:    m.getActiveModelName(),
+		Mode:            modes.ModeBuild.String(),
+		Prompt:          content,
+		Targets:         targets,
+		Strategy:        &profile,
+		Model:           m.getActiveModelName(),
 	}
 	return m.runRuntimeExecuteCmd(req)
 }

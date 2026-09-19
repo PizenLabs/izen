@@ -360,6 +360,80 @@ func ExtractConclusionFromLedger(ledger string) string {
 	return ""
 }
 
+// ── Phase 6.4.5 Forensic Ledger Isolation ────────────────────────────────
+//
+// Ledger Context Isolation Invariant: diagnostic outputs from /investigate
+// MUST NOT pollute subsequent $prompt or plan synthesis prompts. Plan context
+// must be clean unless explicitly chaining investigation steps.
+//
+// Synthetic 'package root (:0)' placeholders are emitted by forensic target
+// isolation when no file coordinate could be resolved (empty Target{File:"",
+// Line:0} rendered as a package-root coordinate). When no active build errors
+// are present in the workspace, those placeholders are stale noise — they must
+// be stripped from system prompt injections so a fresh $prompt after
+// /investigate never inherits them.
+
+// syntheticPackageRootRE matches synthetic forensic placeholders: any line
+// mentioning "package root" together with an empty (:0)/:0 coordinate.
+var syntheticPackageRootRE = regexp.MustCompile(`(?i)package\s+root.*\(:?0\)|\(:(0| )\)|package\s+root\s*\(?[^)]*:0[^)]*\)?`)
+
+// emptyTargetCoordRE matches empty target coordinates injected as system
+// prompt lines: TGT: with no file, TGT: :0, "- Target File:" empty, or a
+// bare "package root (:0)" instruction line.
+var emptyTargetCoordRE = regexp.MustCompile(`(?i)^\s*(TGT:\s*:?0?\s*|-\s*Target File:\s*(package\s+root)?\s*(\(:0\))?\s*|package\s+root\s*\(?:0\)?\)?\s*)$`)
+
+// HasActiveBuildErrors reports whether the ledger carries real build signal:
+// a compilation/dependency classification or a concrete file:line:col
+// coordinate. When true, forensic coordinates are preserved verbatim;
+// when false, synthetic placeholders are safe to strip.
+func HasActiveBuildErrors(ledger string) bool {
+	trimmed := strings.TrimSpace(ledger)
+	if trimmed == "" {
+		return false
+	}
+	if IsCompilationOrDependencyError(trimmed) {
+		return true
+	}
+	return coordinateRe.MatchString(trimmed)
+}
+
+// StripSyntheticPackageRootPlaceholders removes synthetic 'package root (:0)'
+// placeholder lines from a ledger/system-prompt injection when no active
+// build errors are present. When real build signal exists the input is
+// returned unchanged so genuine error coordinates are never lost.
+func StripSyntheticPackageRootPlaceholders(ledger string) string {
+	if strings.TrimSpace(ledger) == "" {
+		return ledger
+	}
+	if HasActiveBuildErrors(ledger) {
+		return ledger
+	}
+	lines := strings.Split(ledger, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		trimmed := strings.TrimSpace(ln)
+		if trimmed == "" {
+			kept = append(kept, ln)
+			continue
+		}
+		if emptyTargetCoordRE.MatchString(trimmed) {
+			continue
+		}
+		if syntheticPackageRootRE.MatchString(trimmed) {
+			continue
+		}
+		// Bare empty-coordinate fragments that survive as standalone lines.
+		lower := strings.ToLower(trimmed)
+		if lower == "(:0)" || lower == ":0" || lower == "package root" || lower == "package root (:0)" {
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	out := strings.Join(kept, "\n")
+	out = strings.TrimSpace(out)
+	return out
+}
+
 // FastTrackPrompt builds the lightweight shell-execution prompt used when the
 // user has 0 explicit TODOs but faces a dependency/compilation blocker. The
 // heavy architectural plan-generation loop is skipped in favour of an immediate,

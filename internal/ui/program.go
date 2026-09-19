@@ -354,6 +354,13 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventProviderFirstToken,
 		events.EventProviderStreamDelta,
 		events.EventProviderUsageUpdate,
+		// Phase 6.4.5 Global UI Telemetry Binding: interrupted-stream usage
+		// (context deadline / cancellation) carries billed partial tokens.
+		// It binds directly to the global footer view model (like
+		// ProviderUsageUpdate) so token metrics render continuously across
+		// ALL system states (plan, investigate, ask, execute) — never gated
+		// on a specific execution mode.
+		events.EventStreamUsage,
 		events.EventReasoningTelemetry,
 		events.EventProviderResponse,
 		events.EventArtifactProduced,

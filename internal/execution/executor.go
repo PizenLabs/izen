@@ -2149,7 +2149,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// window — the no-op semantics classifier evaluates the claim against
 		// the same bytes, never against the unseen remainder of the file.
 		judgedContent := original
-		windowStart, windowEnd := 1, strings.Count(original, "\n") + 1
+		windowStart, windowEnd := 1, strings.Count(original, "\n")+1
 		offsetRecovery := req.RecoveryAttempt > 0 && strings.Contains(req.Evidence, "AMBIGUOUS_ANCHOR")
 		if patchOnly {
 			system = boundedPatchSystemPrompt() + "\nSystem: You are strictly modifying ONE file: " + target + ". Do NOT output code or patches for any other files in this response."
@@ -2740,7 +2740,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 // reasoning.telemetry event on completion. The accumulated visible content and
 // the authoritative provider usage are returned; the authoritative artifact
 // always travels on the ExecutionResult afterwards.
-func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (string, ai.ProviderUsage, *ingestion.IngestionTrace, error) {
+func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (raw string, usage ai.ProviderUsage, trace *ingestion.IngestionTrace, err error) {
 	var reasoningStartedAt time.Time
 	var reasoningDuration time.Duration
 	var reasoningSeen bool
@@ -2758,11 +2758,25 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		}
 	}
 
+	var content strings.Builder
+	// reasoningBuf is the reasoning fallback ONLY for models that emit their
+	// whole answer inside reasoning_content. It is never published.
+	var reasoningBuf strings.Builder
 	// Reasoning chunks are consumed for telemetry ONLY — the verbatim text is
 	// never published to the bus or exposed to the presentation layer.
+	// Phase 6.4.2 Reasoning Content Fallback Invariant: handler-routed
+	// reasoning (OpenAI/Ollama-compatible readers, which never embed
+	// sentinel markers in the byte stream) is ALSO accumulated into
+	// reasoningBuf so a reasoning-only stream still yields a usable
+	// artifact instead of an empty-response error. OpenRouter-style readers
+	// never consult ReasoningHandler (they emit sentinel-wrapped bytes the
+	// classifier routes), so no chunk is ever double-counted.
 	req.Stream = true
-	req.ReasoningHandler = func(_ string) error {
+	req.ReasoningHandler = func(chunk string) error {
 		reasoningOpen()
+		if chunk != "" {
+			reasoningBuf.WriteString(chunk)
+		}
 		return nil
 	}
 
@@ -2879,10 +2893,127 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		g.UpdateUsage(model, u.PromptTokens, u.CompletionTokens, u.ReasoningTokens)
 	}
 
-	var content strings.Builder
-	// reasoningBuf is the reasoning fallback ONLY for models that emit their
-	// whole answer inside reasoning_content. It is never published.
-	var reasoningBuf strings.Builder
+	// snapshotUsage resolves the telemetry to report on error/timeout paths
+	// (Phase 6.4.2 Telemetry Accuracy Invariant): prefer the live
+	// authoritative-or-estimated tracker reading so billed tokens are never
+	// zeroed; when the provider reported nothing at all, fall back to a
+	// character-count estimate of what crossed the boundary (prompt request
+	// bytes + accumulated content), explicitly marked Estimated. Either way
+	// the caller records real counts instead of a silent zero.
+	snapshotUsage := func() ai.ProviderUsage {
+		if usageUp != nil {
+			if u := usageUp.Usage(); u.Known {
+				return u
+			}
+		}
+		if lastUsage.Known {
+			return lastUsage
+		}
+		out := ai.ProviderUsage{Known: true, Estimated: true}
+		promptChars := len(req.System)
+		for _, m := range req.Messages {
+			promptChars += len(m.Content)
+		}
+		if promptChars > 0 {
+			out.PromptTokens = promptChars / 4
+		}
+		if content.Len() > 0 {
+			out.CompletionTokens = content.Len() / 4
+		}
+		out.TotalTokens = out.PromptTokens + out.CompletionTokens
+		return out
+	}
+	// ── Phase 6.4.4 Always-Flush Telemetry & Live Token Accounting ────
+	// Optimistic Prompt Token Invariant: commit estimated prompt tokens to
+	// the session tracker BEFORE entering the SSE chunk read loop, so prompt
+	// cost is never lost on early stream cancellation. Only providers that
+	// expose a live usage tracker (OpenRouter/OpenAI and siblings, which
+	// seed a prompt estimate at dispatch) emit here — providers without a
+	// tracker stay "usage unknown", never a fabricated count.
+	// Always-Flush Invariant: the deferred flush below commits the live
+	// accumulator to the graph (TelemetryBus → TaskState.TokenUsage →
+	// UI ↑X ↓Y) even when ctx.Err() != nil or an error is returned.
+	if usageUp != nil {
+		// Optimistic prompt fires ONLY for estimated baselines (real
+		// providers at dispatch: Known+Estimated with prompt>0,
+		// completion==0). A fully authoritative usage already present at
+		// dispatch (repro mocks, cached streams) flows through the normal
+		// authoritative emitUsage path verbatim — emitting a prompt-only
+		// prefix first would shadow the billed 5883-token account behind a
+		// 2181/0 prefix on a size-1 bus channel.
+		if u := usageUp.Usage(); u.Known && u.Estimated && u.PromptTokens > 0 && g != nil {
+			g.UpdateUsage(model, u.PromptTokens, 0, 0)
+			if !lastUsage.Known {
+				lastUsage = ai.ProviderUsage{Known: true, Estimated: true, PromptTokens: u.PromptTokens}
+			} else if lastUsage.PromptTokens == 0 {
+				lastUsage.PromptTokens = u.PromptTokens
+			}
+		}
+	}
+	// Always-Flush: every exit path (success, failure, timeout, cancel)
+	// commits whatever the live accumulator observed. The deferred read
+	// happens AFTER the return values are set, so it observes the final
+	// partial content even when the SSE loop bailed on ctx deadline before
+	// any usage chunk. On success with genuinely unknown usage (no tracker,
+	// no counts) nothing is flushed — "unknown" stays unknown, never a
+	// fabricated zero. On error/timeout the character fallback applies so
+	// billed partial work is never silently zeroed.
+	defer func() {
+		var live ai.ProviderUsage
+		hasLive := false
+		if usageUp != nil {
+			if u := usageUp.Usage(); u.Known {
+				live = u
+				hasLive = true
+			} else if lastUsage.Known {
+				live = lastUsage
+				hasLive = true
+			}
+		} else if lastUsage.Known {
+			live = lastUsage
+			hasLive = true
+		}
+		if hasLive {
+			if live.PromptTokens != 0 || live.CompletionTokens != 0 {
+				needsFlush := err != nil || ctx.Err() != nil
+				if !needsFlush {
+					if live.PromptTokens != lastUsage.PromptTokens ||
+						live.CompletionTokens != lastUsage.CompletionTokens ||
+						live.ReasoningTokens != lastUsage.ReasoningTokens {
+						needsFlush = true
+					}
+				}
+				if needsFlush && g != nil {
+					g.UpdateUsage(model, live.PromptTokens, live.CompletionTokens, live.ReasoningTokens)
+					lastUsage = live
+					if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+						usage = live
+					}
+				}
+				return
+			}
+			return
+		}
+		// No live tracker data: only error/timeout paths fall back to the
+		// character estimate; success with unknown usage stays unknown.
+		if err == nil && ctx.Err() == nil {
+			return
+		}
+		fallback := snapshotUsage()
+		if !fallback.Known {
+			return
+		}
+		if fallback.PromptTokens == 0 && fallback.CompletionTokens == 0 {
+			return
+		}
+		if g != nil {
+			g.UpdateUsage(model, fallback.PromptTokens, fallback.CompletionTokens, fallback.ReasoningTokens)
+			lastUsage = fallback
+			if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+				usage = fallback
+			}
+		}
+	}()
 	firstToken := false
 	runeBuf := stream.NewRuneBuffer()
 	classifier := stream.NewClassifier()
@@ -2935,7 +3066,7 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 			}
-			return content.String(), lastUsage, nil, cerr
+			return content.String(), snapshotUsage(), nil, cerr
 		}
 		n, rerr := rawStream.Read(buf)
 		if n > 0 {
@@ -2974,16 +3105,16 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 				if streamCb != nil {
 					streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 				}
-				return content.String(), lastUsage, nil, cerr
+				return content.String(), snapshotUsage(), nil, cerr
 			}
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: rerr})
 			}
-			return content.String(), lastUsage, nil, rerr
+			return content.String(), snapshotUsage(), nil, rerr
 		}
 	}
 
-	usage := lastUsage
+	usage = lastUsage
 	if usageUp != nil {
 		if u := usageUp.Usage(); u.Known {
 			usage = u
@@ -3008,13 +3139,15 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	// every transformation in an IngestionTrace before the payload reaches the
 	// L1 Execution Gate / artifact parser.
 	rawVisible := content.String()
-	trace, procErr := ingestion.Process(rawVisible)
+	ingTrace, procErr := ingestion.Process(rawVisible)
+	trace = ingTrace
 	visible := ai.VisibleCompletion(trace.NormalizedPayload)
 	if strings.TrimSpace(visible) == "" && reasoningBuf.Len() > 0 {
 		// The entire visible completion was reasoning: ingest the reasoning
 		// text as the raw artifact so forensic traceability survives.
 		reasoningRaw := reasoningBuf.String()
-		trace, procErr = ingestion.Process(reasoningRaw)
+		ingTrace2, procErr2 := ingestion.Process(reasoningRaw)
+		trace, procErr = ingTrace2, procErr2
 		visible = ai.VisibleCompletion(trace.NormalizedPayload)
 	}
 	if streamCb != nil {

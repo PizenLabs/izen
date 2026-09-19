@@ -73,6 +73,15 @@ type RecoveryContext struct {
 	ReuseTarget          string        `json:"reuseTarget,omitempty"`
 	ReuseSymbols         []string      `json:"reuseSymbols,omitempty"`
 	BaselineScope        []string      `json:"baselineScope,omitempty"`
+	// ConsecutiveZeroDeltas counts consecutive OUTPUT_CEILING recovery
+	// attempts that produced zero workspace mutations (Phase 6.4.1
+	// Zero-Delta Recovery Limit Invariant). It is incremented by the
+	// scheduler's PostStepEvaluation on every StepOutcomePartial with
+	// OUTPUT_CEILING reason and zero patches, and reset to 0 on any
+	// successful nonzero workspace commit. When it reaches
+	// zeroDeltaHaltThreshold the continuation loop aborts with
+	// ErrRecoveryHalted instead of looping indefinitely.
+	ConsecutiveZeroDeltas int `json:"consecutiveZeroDeltas,omitempty"`
 }
 
 type TaskState struct {
@@ -85,6 +94,67 @@ type TaskState struct {
 	Cursor            *ExecutionCursor       `json:"cursor"`
 	LastCheckpointID  string                 `json:"lastCheckpointId"`
 	Status            TaskStatus             `json:"status"`
+	// TokenUsage is the always-flushed cumulative telemetry for the task
+	// (Phase 6.4.4 Always-Flush Telemetry Invariant). Every consumed prompt
+	// or completion token is committed here via CommitUsage immediately —
+	// on success, failure, or timeout — so a timed-out stream retains all
+	// partial tokens and the UI footer (↑X ↓Y) never shows stale counts.
+	TokenUsage TaskTokenUsage `json:"tokenUsage,omitempty"`
+}
+
+// TaskTokenUsage is the durable cumulative token accounting for one task.
+// PromptTokens/CompletionTokens accumulate monotonically across turns;
+// Estimated is true when the last commit carried a character-count fallback
+// rather than authoritative provider usage.
+type TaskTokenUsage struct {
+	PromptTokens     int  `json:"promptTokens,omitempty"`
+	CompletionTokens int  `json:"completionTokens,omitempty"`
+	TotalTokens      int  `json:"totalTokens,omitempty"`
+	Estimated        bool `json:"estimated,omitempty"`
+	Turns            int  `json:"turns,omitempty"`
+}
+
+// CommitUsage always-flushes consumed tokens into the durable totals. It is
+// additive and never zeroes: zero/negative inputs are ignored, and a fresh
+// turn's live counts accumulate onto the session totals. The estimated flag
+// latches true when any commit was estimated and clears only when an
+// authoritative commit arrives.
+func (s *TaskState) CommitUsage(prompt, completion int, estimated bool) {
+	if s == nil {
+		return
+	}
+	if prompt < 0 {
+		prompt = 0
+	}
+	if completion < 0 {
+		completion = 0
+	}
+	if prompt == 0 && completion == 0 {
+		return
+	}
+	s.TokenUsage.PromptTokens += prompt
+	s.TokenUsage.CompletionTokens += completion
+	s.TokenUsage.TotalTokens = s.TokenUsage.PromptTokens + s.TokenUsage.CompletionTokens
+	if estimated {
+		s.TokenUsage.Estimated = true
+	} else if prompt > 0 || completion > 0 {
+		// An authoritative commit clears the estimated latch: provider truth
+		// replaced the fallback.
+		s.TokenUsage.Estimated = false
+	}
+	s.TokenUsage.Turns++
+}
+
+// ResetTurnUsage clears per-turn live state so a cancelled request never
+// leaks stale counts into the next command. Session totals in TokenUsage
+// are preserved — only the caller's live mirrors reset.
+func ResetTurnUsage(prompt, completion *int) {
+	if prompt != nil {
+		*prompt = 0
+	}
+	if completion != nil {
+		*completion = 0
+	}
 }
 
 // EventType is the closed set of ledger event types.

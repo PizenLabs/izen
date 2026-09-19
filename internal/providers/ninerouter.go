@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 )
 
 // NineRouterProvider talks to 9Router, a local smart gateway that exposes an
@@ -254,6 +256,8 @@ func (p *NineRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 
 	sr := &ninerouterSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
 	sr.usage.markRequestStarted(time.Now())
+	// Phase 6.4.4 Optimistic Prompt Token Invariant.
+	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
 	return &NineRouterStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -394,6 +398,45 @@ type ninerouterSSEReader struct {
 	// the remainder here and draining it on the next Read() call restores
 	// normal io.Reader semantics regardless of the caller's buffer size.
 	pending []byte
+
+	// lifecycle enforces the Stream Terminal Invariant (Phase 6.4.1).
+	lifecycle *dprovider.StreamLifecycle
+	idleStop  func()
+	startOnce sync.Once
+}
+
+func (s *ninerouterSSEReader) armIdle() {
+	s.startOnce.Do(func() {
+		if s.lifecycle == nil {
+			s.lifecycle = dprovider.NewStreamLifecycle()
+		}
+		lc := s.lifecycle
+		s.idleStop = dprovider.ArmIdleDeadline(s.cancel, lc.TokensEmitted, lc.IsClosed)
+	})
+}
+
+func (s *ninerouterSSEReader) stopIdle() {
+	if s.idleStop != nil {
+		stop := s.idleStop
+		s.idleStop = nil
+		stop()
+	}
+}
+
+// closeTerminal records a terminal finish_reason and tears the channel
+// down immediately so the UI timer stops at once.
+func (s *ninerouterSSEReader) closeTerminal(reason string) {
+	s.finishReason = reason
+	s.usage.markCompleted(time.Now(), reason)
+	if s.lifecycle != nil {
+		s.lifecycle.MarkClosed()
+	}
+	s.stopIdle()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	_, _ = io.Copy(io.Discard, s.body)
+	s.closed = true
 }
 
 func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
@@ -410,6 +453,7 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 	if s.reader == nil {
 		s.reader = bufio.NewReader(s.body)
 	}
+	s.armIdle()
 
 	for {
 		line, err := s.reader.ReadString('\n')
@@ -455,10 +499,34 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 			continue
 		}
 
-		if chunk.Choices[0].FinishReason != "" {
-			s.finishReason = chunk.Choices[0].FinishReason
-			s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
-			continue
+		// Stream Terminal Invariant (Phase 6.4.1): finish_reason != ""
+		// closes the output channel immediately — never wait for [DONE].
+		if dprovider.ShouldCloseOnFinishReason(chunk.Choices[0].FinishReason) {
+			if chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {
+				content := chunk.Choices[0].Delta.Content
+				s.finishReason = chunk.Choices[0].FinishReason
+				s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
+				s.usage.recordOutput(len(content))
+				if s.lifecycle != nil {
+					s.lifecycle.NoteTokens(len(content))
+				}
+				s.stopIdle()
+				n := copy(p, content)
+				if n < len(content) {
+					s.pending = []byte(content)[n:]
+				}
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				if s.cancel != nil {
+					s.cancel()
+				}
+				_, _ = io.Copy(io.Discard, s.body)
+				s.closed = true
+				return n, nil
+			}
+			s.closeTerminal(chunk.Choices[0].FinishReason)
+			return 0, io.EOF
 		}
 
 		if chunk.Choices[0].Delta != nil {
@@ -473,9 +541,16 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 			}
 			if reasoningText != "" {
 				s.usage.recordReasoning(len(reasoningText))
+				if s.lifecycle != nil {
+					s.lifecycle.NoteTokens(len(reasoningText))
+				}
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(reasoningText); err != nil {
 						s.closed = true
+						if s.lifecycle != nil {
+							s.lifecycle.MarkClosed()
+						}
+						s.stopIdle()
 						return 0, err
 					}
 				}
@@ -483,6 +558,10 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 			}
 			if delta.Content != "" {
 				s.usage.recordOutput(len(delta.Content))
+				if s.lifecycle != nil {
+					s.lifecycle.NoteTokens(len(delta.Content))
+				}
+				s.stopIdle()
 				n := copy(p, delta.Content)
 				if n < len(delta.Content) {
 					s.pending = []byte(delta.Content)[n:]
@@ -514,15 +593,19 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 			}
 		}
 
-		if chunk.Choices[0].FinishReason != "" {
-			s.finishReason = chunk.Choices[0].FinishReason
-			continue
+		if dprovider.ShouldCloseOnFinishReason(chunk.Choices[0].FinishReason) {
+			s.closeTerminal(chunk.Choices[0].FinishReason)
+			return 0, io.EOF
 		}
 	}
 }
 
 func (s *ninerouterSSEReader) Close() error {
 	s.closed = true
+	if s.lifecycle != nil {
+		s.lifecycle.MarkClosed()
+	}
+	s.stopIdle()
 	if s.cancel != nil {
 		s.cancel()
 	}

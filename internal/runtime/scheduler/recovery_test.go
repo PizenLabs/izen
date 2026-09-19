@@ -159,21 +159,72 @@ func TestRecovery_StrategyMutationOnTruncation(t *testing.T) {
 func TestRecovery_RepeatedCeilingBlocks(t *testing.T) {
 	spec, state, sink := recoverySpec(t)
 	scheduler := NewStepScheduler()
-	for _, want := range []StepStrategy{DIRECT_CREATE, SKELETON_CREATE} {
-		result, err := scheduler.RunNext(t.Context(), spec, state, streamWorker("package main\nfunc broken(", "length", 980), evidence.VerdictPassed, sink)
-		if err != nil || result.Step.Strategy != want || result.Outcome != StepOutcomePartial {
-			t.Fatalf("attempt %s: %+v, %v", want, result, err)
-		}
+	// First OUTPUT_CEILING with zero mutations consumes the single bounded
+	// recovery turn (Zero-Delta Recovery Limit Invariant: max 1 allowed).
+	first, err := scheduler.RunNext(t.Context(), spec, state, streamWorker("package main\nfunc broken(", "length", 980), evidence.VerdictPassed, sink)
+	if err != nil || first.Step.Strategy != DIRECT_CREATE || first.Outcome != StepOutcomePartial {
+		t.Fatalf("attempt DIRECT_CREATE: %+v, %v", first, err)
+	}
+	if state.RecoveryContext.ConsecutiveZeroDeltas != 1 {
+		t.Fatalf("zero-delta counter = %d, want 1", state.RecoveryContext.ConsecutiveZeroDeltas)
+	}
+	// Second consecutive zero-delta OUTPUT_CEILING halts the continuation
+	// loop immediately with ErrRecoveryHalted (bounded recovery exhausted).
+	second, err := scheduler.RunNext(t.Context(), spec, state, streamWorker("package main\nfunc broken(", "length", 980), evidence.VerdictPassed, sink)
+	if !errors.Is(err, ErrRecoveryHalted) || second.Outcome != StepOutcomePartial || second.Patches != 0 {
+		t.Fatalf("attempt SKELETON_CREATE: %+v, %v", second, err)
+	}
+	if state.RecoveryContext.ConsecutiveZeroDeltas != 2 {
+		t.Fatalf("zero-delta counter = %d, want 2", state.RecoveryContext.ConsecutiveZeroDeltas)
+	}
+	if second.NeedsContinuation {
+		t.Fatalf("halted step must not request continuation: %+v", second)
 	}
 	called := false
 	worker := func(context.Context, ExecutionStep, ContextSlice, *executor.ProposalStagingBuffer) (StreamResult, error) {
 		called = true
 		return StreamResult{}, nil
 	}
-	_, err := scheduler.RunNext(t.Context(), spec, state, worker, evidence.VerdictPassed, sink)
+	_, err = scheduler.RunNext(t.Context(), spec, state, worker, evidence.VerdictPassed, sink)
 	var noProgress *NoProgressError
 	if !errors.As(err, &noProgress) || called || sink.calls != 0 || noProgress.Strategy != SKELETON_CREATE {
 		t.Fatalf("repeat not blocked: %v, worker=%v, calls=%d", err, called, sink.calls)
+	}
+}
+
+// TestRecovery_ZeroDeltaHaltAndReset pins the Zero-Delta Recovery Limit
+// Invariant directly against PostStepEvaluation: consecutive OUTPUT_CEILING
+// zero-mutation partials halt at the threshold, a nonzero commit resets the
+// counter, and non-ceiling partials never increment it.
+func TestRecovery_ZeroDeltaHaltAndReset(t *testing.T) {
+	spec, state, sink := recoverySpec(t)
+	scheduler := NewStepScheduler()
+	// Two truncated responses with zero file mutations: at most one bounded
+	// recovery turn before gracefully halting with ErrRecoveryHalted.
+	if _, err := scheduler.RunNext(t.Context(), spec, state, streamWorker("package main\nfunc broken(", "length", 980), evidence.VerdictPassed, sink); err != nil {
+		t.Fatalf("first zero-delta: %v", err)
+	}
+	if _, err := scheduler.RunNext(t.Context(), spec, state, streamWorker("package main\nfunc broken(", "length", 980), evidence.VerdictPassed, sink); !errors.Is(err, ErrRecoveryHalted) {
+		t.Fatalf("second zero-delta must halt: %v", err)
+	}
+	// A successful nonzero workspace commit resets the counter.
+	state.RecoveryContext.ConsecutiveZeroDeltas = 1
+	if err := PostStepEvaluation(state, StepOutcomeComplete, "", 1); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	if state.RecoveryContext.ConsecutiveZeroDeltas != 0 {
+		t.Fatalf("counter = %d, want 0 after nonzero commit", state.RecoveryContext.ConsecutiveZeroDeltas)
+	}
+	// Non-ceiling partials (e.g. REDUNDANT_SYMBOL) never increment.
+	if err := PostStepEvaluation(state, StepOutcomePartial, "REDUNDANT_SYMBOL", 0); err != nil {
+		t.Fatalf("non-ceiling: %v", err)
+	}
+	if state.RecoveryContext.ConsecutiveZeroDeltas != 0 {
+		t.Fatalf("counter = %d, want 0 for non-ceiling partial", state.RecoveryContext.ConsecutiveZeroDeltas)
+	}
+	// Nil state is a safe no-op.
+	if err := PostStepEvaluation(nil, StepOutcomePartial, OutputCeilingReason, 0); err != nil {
+		t.Fatalf("nil state: %v", err)
 	}
 }
 

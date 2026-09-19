@@ -10,9 +10,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 )
 
 type OllamaProvider struct {
@@ -34,6 +36,28 @@ func NewOllamaProvider(baseURL, apiKey, model string) *OllamaProvider {
 
 func (p *OllamaProvider) Name() string {
 	return "ollama"
+}
+
+// ErrNamespacedModelID is the deterministic error returned when a
+// vendor-prefixed (OpenRouter-style vendor/model) ID reaches the local
+// Ollama driver. Such IDs (e.g. thinkingmachines/..., nvidia/...) can never
+// execute locally; rejecting them BEFORE any network call upholds the
+// Provider Routing Isolation Invariant — the dispatcher must route model
+// strings directly to their registered driver without speculative trial
+// calls to secondary (local Ollama) endpoints.
+var ErrNamespacedModelID = errors.New("ollama: provider/model mismatch: vendor-prefixed model ID does not belong to the local driver")
+
+// rejectNamespacedModel fails fast when model carries a vendor namespace
+// (vendor/model). Local Ollama IDs never contain a slash; anything with one
+// is a cross-provider ID that must never be trial-executed locally.
+func rejectNamespacedModel(model string) error {
+	m := strings.TrimSpace(model)
+	for i := 0; i < len(m); i++ {
+		if m[i] == '/' && i > 0 && i+1 < len(m) {
+			return fmt.Errorf("%w: model %q must be routed to its namespaced provider, not ollama", ErrNamespacedModelID, model)
+		}
+	}
+	return nil
 }
 
 type ollamaMessage struct {
@@ -161,6 +185,11 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	if model == "" {
 		return nil, fmt.Errorf("ollama: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
+	// Provider Routing Isolation: never trial-execute a namespaced
+	// (vendor/model) ID against the local endpoint.
+	if err := rejectNamespacedModel(model); err != nil {
+		return nil, err
+	}
 
 	msgs := p.buildMessages(req)
 
@@ -275,6 +304,11 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	if model == "" {
 		return nil, fmt.Errorf("ollama: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
+	// Provider Routing Isolation: never trial-execute a namespaced
+	// (vendor/model) ID against the local endpoint.
+	if err := rejectNamespacedModel(model); err != nil {
+		return nil, err
+	}
 
 	msgs := p.buildMessages(req)
 
@@ -331,6 +365,8 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 
 	sr := &sseReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
 	sr.usage.markRequestStarted(time.Now())
+	// Phase 6.4.4 Optimistic Prompt Token Invariant.
+	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
 	return &StreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -366,10 +402,107 @@ type sseReader struct {
 
 	// usage tracks cumulative token accounting (see streamUsageTracker).
 	usage streamUsageTracker
+
+	// lifecycle enforces the Stream Terminal Invariant (Phase 6.4.1).
+	lifecycle *dprovider.StreamLifecycle
+	idleStop  func()
+	startOnce sync.Once
 }
 
 func (s *sseReader) Usage() ai.ProviderUsage {
 	return s.usage.Usage()
+}
+
+func (s *sseReader) armIdle() {
+	s.startOnce.Do(func() {
+		if s.lifecycle == nil {
+			s.lifecycle = dprovider.NewStreamLifecycle()
+		}
+		lc := s.lifecycle
+		s.idleStop = dprovider.ArmIdleDeadline(s.cancel, lc.TokensEmitted, lc.IsClosed)
+	})
+}
+
+func (s *sseReader) stopIdle() {
+	if s.idleStop != nil {
+		stop := s.idleStop
+		s.idleStop = nil
+		stop()
+	}
+}
+
+// drainTrailingUsage implements the Phase 6.4.2 Bounded Usage Drain
+// (Telemetry Accuracy Invariant): after a terminal finish_reason, allow up
+// to dprovider.UsageDrainTimeout (50ms) for a trailing usage-only SSE event
+// (choices: []) so billed tokens land in the usage tracker before teardown.
+// Single-threaded polling over s.reader.Buffered() — no concurrent reads.
+func (s *sseReader) drainTrailingUsage() {
+	if s.reader == nil {
+		return
+	}
+	deadline := time.Now().Add(dprovider.UsageDrainTimeout)
+	for {
+		if n := s.reader.Buffered(); n > 0 {
+			// Only consume a COMPLETE buffered line (see openrouter
+			// drainTrailingUsage): a partial line must keep polling
+			// until the deadline rather than blocking past it.
+			peeked, err := s.reader.Peek(n)
+			if err != nil {
+				return
+			}
+			if !bytes.Contains(peeked, []byte{'\n'}) {
+				if !time.Now().Before(deadline) {
+					return
+				}
+				time.Sleep(2 * time.Millisecond)
+				continue
+			}
+			line, err := s.reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				continue
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				return
+			}
+			var chunk ollamaResponse
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				return
+			}
+			if chunk.Usage != nil {
+				s.finalUsage = chunk.Usage
+				s.usage.recordUsageFull(chunk.Usage.ProviderUsage())
+			}
+			return
+		}
+		if !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// closeTerminal records a terminal finish_reason and tears the channel
+// down immediately so the UI timer stops at once.
+func (s *sseReader) closeTerminal(reason string) {
+	s.finishReason = reason
+	s.usage.markCompleted(time.Now(), reason)
+	if s.lifecycle != nil {
+		s.lifecycle.MarkClosed()
+	}
+	s.stopIdle()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	_, _ = io.Copy(io.Discard, s.body)
+	s.closed = true
 }
 
 func (s *sseReader) Read(p []byte) (int, error) {
@@ -380,6 +513,7 @@ func (s *sseReader) Read(p []byte) (int, error) {
 	if s.reader == nil {
 		s.reader = bufio.NewReader(s.body)
 	}
+	s.armIdle()
 
 	for {
 		line, err := s.reader.ReadString('\n')
@@ -421,14 +555,46 @@ func (s *sseReader) Read(p []byte) (int, error) {
 			s.usage.recordUsageFull(chunk.Usage.ProviderUsage())
 		}
 
+		// Telemetry Accuracy Invariant (Phase 6.4.2): usage-only chunks
+		// (len(choices) == 0 with usage) carry the authoritative billing
+		// counts and MUST be captured before teardown.
+		if dprovider.IsUsageOnlyChunk(len(chunk.Choices), chunk.Usage != nil) {
+			continue
+		}
+
 		if len(chunk.Choices) == 0 {
 			continue
 		}
 
-		if chunk.Choices[0].FinishReason != "" {
-			s.finishReason = chunk.Choices[0].FinishReason
-			s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
-			continue
+		// Stream Terminal Invariant (Phase 6.4.1): finish_reason != ""
+		// closes the output channel immediately — never wait for [DONE].
+		// Phase 6.4.2 Bounded Usage Drain: allow up to 50ms for a
+		// trailing usage-only chunk before tearing down.
+		if dprovider.ShouldCloseOnFinishReason(chunk.Choices[0].FinishReason) {
+			if chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content != "" {
+				content := chunk.Choices[0].Delta.Content
+				s.finishReason = chunk.Choices[0].FinishReason
+				s.usage.markCompleted(time.Now(), chunk.Choices[0].FinishReason)
+				s.usage.recordOutput(len(content))
+				if s.lifecycle != nil {
+					s.lifecycle.NoteTokens(len(content))
+				}
+				s.stopIdle()
+				n := copy(p, content)
+				s.drainTrailingUsage()
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				if s.cancel != nil {
+					s.cancel()
+				}
+				_, _ = io.Copy(io.Discard, s.body)
+				s.closed = true
+				return n, nil
+			}
+			s.drainTrailingUsage()
+			s.closeTerminal(chunk.Choices[0].FinishReason)
+			return 0, io.EOF
 		}
 
 		if chunk.Choices[0].Delta != nil {
@@ -443,9 +609,16 @@ func (s *sseReader) Read(p []byte) (int, error) {
 			}
 			if reasoningText != "" {
 				s.usage.recordReasoning(len(reasoningText))
+				if s.lifecycle != nil {
+					s.lifecycle.NoteTokens(len(reasoningText))
+				}
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(reasoningText); err != nil {
 						s.closed = true
+						if s.lifecycle != nil {
+							s.lifecycle.MarkClosed()
+						}
+						s.stopIdle()
 						return 0, err
 					}
 				}
@@ -453,20 +626,23 @@ func (s *sseReader) Read(p []byte) (int, error) {
 			}
 			if d.Content != "" {
 				s.usage.recordOutput(len(d.Content))
+				if s.lifecycle != nil {
+					s.lifecycle.NoteTokens(len(d.Content))
+				}
+				s.stopIdle()
 				n := copy(p, d.Content)
 				return n, nil
 			}
-		}
-
-		if chunk.Choices[0].FinishReason != "" {
-			s.finishReason = chunk.Choices[0].FinishReason
-			continue
 		}
 	}
 }
 
 func (s *sseReader) Close() error {
 	s.closed = true
+	if s.lifecycle != nil {
+		s.lifecycle.MarkClosed()
+	}
+	s.stopIdle()
 	if s.cancel != nil {
 		s.cancel()
 	}

@@ -157,7 +157,9 @@ func (e *FileExecutor) Commit(proposal ProposedMutation, backup *FileBackup) err
 	// Symbol hygiene is meaningful only when its baseline can be indexed;
 	// artifact/syntax validation of the result remains a separate gate.
 	if baseline, indexErr := NewSymbolBaseline(map[string]string{targetPath: base}); indexErr == nil {
-		if redundant := baseline.Check(targetPath, final); redundant != nil { return redundant }
+		if redundant := baseline.Check(targetPath, final); redundant != nil {
+			return redundant
+		}
 	}
 
 	mode := fs.FileMode(backup.FileMode)

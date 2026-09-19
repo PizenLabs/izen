@@ -2019,9 +2019,13 @@ func materializeOffsetPatch(original, raw string, first, last int) (string, bool
 			}
 			var err error
 			start, err = strconv.Atoi(bounds[0])
-			if err != nil { return "", false }
+			if err != nil {
+				return "", false
+			}
 			end, err = strconv.Atoi(bounds[1])
-			if err != nil { return "", false }
+			if err != nil {
+				return "", false
+			}
 			header = i
 		}
 	}
