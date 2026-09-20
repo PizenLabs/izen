@@ -9,6 +9,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/core/classifier"
+	intentdomain "github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/core/workflow"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
@@ -41,6 +42,13 @@ import (
 // driver is not wired (harness), the legacy single-shot executor path runs.
 func (m *model) executeAutonomyViaDriver(trace autonomy.Trace) tea.Cmd {
 	if m.autonomousDriver == nil {
+		// The driver bridge falls back to the single-shot runtime path even
+		// when nothing is wired: provenance binding must happen BEFORE the
+		// runtime seam so an unauthorized harness fallback still surfaces the
+		// original "execution runtime not wired" admission error.
+		if m.autonomy != nil && m.autonomy.Authority(autonomy.RequiredCapabilities(autonomy.IntentModification)) {
+			m.bindScopeProvenance(intentdomain.ScopeDynamic)
+		}
 		return m.executeAutonomyViaRuntime(trace)
 	}
 	prompt := trace.Input

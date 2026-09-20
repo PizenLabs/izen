@@ -18,6 +18,7 @@ import (
 	"github.com/PizenLabs/izen/internal/changeset"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/authorization"
+	"github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/domain/capability/policy"
 	"github.com/PizenLabs/izen/internal/events"
@@ -26,6 +27,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/retrieval"
+	runtimeexecutor "github.com/PizenLabs/izen/internal/runtime/executor"
 )
 
 // ── RuntimeExecutor (Steps 1-3 of the authority migration) ─────────────────
@@ -73,7 +75,12 @@ type StreamCallback func(StreamEvent)
 
 // ExecuteRequest is a user execution submitted to the runtime.
 type ExecuteRequest struct {
-	// RequestID correlates every lifecycle event of this execution. Empty
+	// ScopeProvenance records how mutation scope was authorized for this
+	// request: ScopeDynamic ($prompt), ScopeDeclared ($hot), or ScopeNone
+	// (plain conversational input). ScopeNone requests are compile-locked to
+	// read-only actions and can never carry a mutation plan.
+	ScopeProvenance domain.ScopeProvenance
+	// RequestID correlates this execution across events and proofs; empty
 	// yields a deterministic auto-generated ID.
 	RequestID string
 	// SessionID is the originating session correlation (INV-SESSION-10). When
@@ -764,6 +771,16 @@ var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejec
 // trigger a duplicate LLM call (max 1 API request).
 var ErrNonRetryableArtifactError = errors.New("executor: non-retryable artifact error — ambiguous anchors require line-offset")
 
+// ErrAmbiguousAnchorContinuation requests one bounded scheduler continuation
+// with explicit line-offset evidence, never an identical executor-side retry.
+var ErrAmbiguousAnchorContinuation = errors.New("executor: AMBIGUOUS_ANCHOR: ambiguous anchor requires explicit line-offset bounds")
+
+// IsAmbiguousAnchorContinuation reports whether err is the typed recoverable
+// ambiguous-anchor continuation sentinel.
+func IsAmbiguousAnchorContinuation(err error) bool {
+	return err != nil && errors.Is(err, ErrAmbiguousAnchorContinuation)
+}
+
 // ErrHallucinatedAnchorError is the sentinel for N=0 hallucinated anchor
 // failures (strings.Count == 0). It is the zero-match counterpart to the
 // ambiguous (N>1) sentinel and is handled by one strict automatic retry.
@@ -773,6 +790,31 @@ var ErrHallucinatedAnchorError = errors.New("executor: hallucinated anchor — z
 // already consumed its single retry and must not open a full-file fallback.
 var ErrPhysicalOutputBudgetBreach = errors.New("executor: Physical Output Budget Breach")
 
+// AmbiguousAnchorFallbackLimit is the file-size ceiling under which an
+// ambiguous-anchor patch failure recovers via full-document replacement
+// instead of surfacing an error (Phase 6.4: 5120 bytes = 5 KB).
+const AmbiguousAnchorFallbackLimit = 5120
+
+// isAmbiguousAnchorContinuationEligible reports whether the target file is
+// small enough for the safe full-document fallback.
+func isAmbiguousAnchorContinuationEligible(original string) bool {
+	return len(original) < AmbiguousAnchorFallbackLimit
+}
+
+// recoverSmallFileAmbiguousAnchor never promotes a REPLACE snippet to a file.
+// A closed full-file envelope and the normal content gate are both required.
+func recoverSmallFileAmbiguousAnchor(original, raw, target string, gate func(string, string) (string, error)) (string, bool) {
+	if !isAmbiguousAnchorContinuationEligible(original) {
+		return "", false
+	}
+	candidate, ok := extractCompleteDocument(raw, target)
+	if !ok {
+		return "", false
+	}
+	normalized, err := gate(target, candidate)
+	return normalized, err == nil && normalized != ""
+}
+
 // IsNonRetryableArtifactError reports whether err is a non-retryable
 // artifact failure (ambiguous anchors without line-offset context).
 func IsNonRetryableArtifactError(err error) bool {
@@ -781,6 +823,12 @@ func IsNonRetryableArtifactError(err error) bool {
 	}
 	if errors.Is(err, ErrNonRetryableArtifactError) || errors.Is(err, ErrHallucinatedAnchorError) {
 		return true
+	}
+	// A typed recoverable continuation (Phase 6.4) is NEVER non-retryable:
+	// the scheduler recovers it via full-file fallback or a line-offset
+	// continuation turn.
+	if errors.Is(err, ErrAmbiguousAnchorContinuation) {
+		return false
 	}
 	// Ambiguous anchor is non-retryable unless the error already carries
 	// line-offset injection.
@@ -1977,6 +2025,16 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	if modelErr != nil {
 		return nil, nil, nil, nil, modelErr
 	}
+	sources := make(map[string]string, len(targets))
+	for _, target := range targets {
+		if data, ok := x.getSnapshotContent(target); ok {
+			sources[target] = string(data)
+		}
+	}
+	symbolBaseline, symbolErr := runtimeexecutor.NewSymbolBaseline(sources)
+	if symbolErr != nil {
+		return nil, nil, nil, nil, fmt.Errorf("executor: scope symbol baseline: %w", symbolErr)
+	}
 
 	patches := make([]*Patch, 0, len(targets))
 	invs := make([]ModelInvocation, 0, len(targets))
@@ -2015,6 +2073,21 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	} else {
 		if maxOut == 0 || maxOut > 800 {
 			maxOut = 800
+		}
+	}
+	// Constrained Output Budget Invariant: models capped at max_output <= 1024
+	// (or ":free" free-tier IDs) force max_tokens = min(requested, 980) and
+	// DISABLE FULL_REWRITE entirely, forcing SEARCH_REPLACE output.
+	// The numeric guard is gated on provider-style model IDs (vendor/model)
+	// so a strategy-derived 1024 budget for mock/local providers does not
+	// misfire — only provider-advertised caps are constrained.
+	constrained := ModelProfile{OutputTokenCap: profile.MaxOutputTokens, ModelID: model}.IsConstrained()
+	if constrained {
+		if maxOut <= 0 || maxOut > ConstrainedMaxTokens {
+			maxOut = ConstrainedMaxTokens
+		}
+		if !patchOnly {
+			patchOnly = true
 		}
 	}
 	for _, target := range targets {
@@ -2076,6 +2149,8 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// window — the no-op semantics classifier evaluates the claim against
 		// the same bytes, never against the unseen remainder of the file.
 		judgedContent := original
+		windowStart, windowEnd := 1, strings.Count(original, "\n")+1
+		offsetRecovery := req.RecoveryAttempt > 0 && strings.Contains(req.Evidence, "AMBIGUOUS_ANCHOR")
 		if patchOnly {
 			system = boundedPatchSystemPrompt() + "\nSystem: You are strictly modifying ONE file: " + target + ". Do NOT output code or patches for any other files in this response."
 			outputContract = "search_replace"
@@ -2115,7 +2190,18 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			user = buildBoundedPatchUserPrompt(req.Prompt, req.Evidence, target, window)
 			contextBytes = len(window.content)
 			judgedContent = window.content
+			windowStart, windowEnd = window.startLine, window.endLine
+			if offsetRecovery {
+				var numbered strings.Builder
+				numbered.WriteString("\nExplicit line-offset source (prefixes are metadata, not SEARCH bytes):\n")
+				for i, line := range strings.Split(window.content, "\n") {
+					fmt.Fprintf(&numbered, "L%d: %s\n", window.startLine+i, line)
+				}
+				user += numbered.String()
+				system += "\nFor this line-offset continuation, head SEARCH with <<<<<<< SEARCH line-offset=<start>-<end>; use absolute inclusive line numbers from the numbered window."
+			}
 		}
+		user += "\n" + symbolBaseline.Context()
 		disableReasoning := false
 		if patchOnly {
 			// Reasoning models spend the SHARED output budget on hidden
@@ -2191,6 +2277,22 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			return nil, invs, nil, trace, gate
 		}
 
+		// TRANSPORT-VERBATIM VIEW: ingestion may lift the fenced document (or a
+		// wrapped patch block) out of a mixed payload. The line-offset
+		// materializer and the Phase 6.4 complete-document fallback must
+		// examine the EXACT bytes the worker produced — the IngestionTrace
+		// preserves them unmutated.
+		verbatim := raw
+		if trace != nil && trace.RawOutput != "" {
+			verbatim = trace.RawOutput
+		}
+		if offsetRecovery || strings.Contains(verbatim, "<<<<<<< SEARCH line-offset=") {
+			materialized, ok := materializeOffsetPatch(original, verbatim, windowStart, windowEnd)
+			if !ok {
+				return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: invalid or missing exact line-offset bounds", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
+			}
+			verbatim = materialized
+		}
 		var modified string
 		if patchOnly {
 			// NO-OP SENTINEL (pre-validation): a model that answers
@@ -2217,43 +2319,37 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// response can NEVER satisfy this contract — rejecting it here is
 			// what makes recovery semantically different from the initial
 			// full-artifact attempt instead of a relabeled retry.
-			patched, ok := ExtractBoundedPatch(original, raw)
+			patched, ok := ExtractBoundedPatch(original, verbatim)
 			if !ok {
-				// Circuit breaker: if the SEARCH anchor match is 0 (hallucinated)
-				// or >1 (ambiguous) without line-offset, fail fast without
-				// invoking RMAH retry. This prevents duplicate LLM calls.
-				// N=0 → HallucinatedAnchorError: [1] Fall back to full-file + [2] Re-prompt full text
-				// N>1 → NonRetryable (ambiguous): [1] Inject line-offset + [2] full-file fallback
-				if strings.Contains(raw, "<<<<<<< SEARCH") && !strings.Contains(strings.ToLower(raw), "line-offset") {
-					if blocks := ParseSearchReplaceBlocks(raw); len(blocks) > 0 {
-						for _, b := range blocks {
-							if b.search != "" {
-								if cnt := strings.Count(original, b.search); cnt != 1 {
-									if cnt == 0 {
-										return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — SEARCH matches 0 regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
-									}
-									return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: ambiguous anchor — SEARCH matches %d regions — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, cnt)
-								}
-								// Also check trimmed match via ResolveAnchors path.
-								if _, _, aerr := func() (int, int, error) {
-									lines := strings.Split(b.search, "\n")
-									return ResolveAnchors(lines, original)
-								}(); aerr != nil {
-									if errors.Is(aerr, ErrAmbiguousAnchor) {
-										return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %w — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, aerr)
-									}
-									if errors.Is(aerr, ErrFormatRejected) {
-										// Zero-match via ResolveAnchors (format rejected = not found)
-										lower := strings.ToLower(aerr.Error())
-										if strings.Contains(lower, "anchor not found") || strings.Contains(lower, "empty search") {
-											return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: hallucinated anchor — zero match — %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, aerr)
-										}
-									}
-								}
-							}
-						}
+				// Check every anchor before considering a complete-document fallback:
+				// a zero match in any block must never be hidden by an ambiguous one.
+				ambiguous := false
+				for _, b := range ParseSearchReplaceBlocks(verbatim) {
+					cnt := strings.Count(original, b.search)
+					if b.search == "" || cnt == 0 {
+						return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: SEARCH matches zero regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
 					}
+					ambiguous = ambiguous || cnt > 1
 				}
+				if ambiguous {
+					candidate, recovered := recoverSmallFileAmbiguousAnchor(original, verbatim, target, x.artifactGate)
+					if !recovered {
+						return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
+					}
+					// Materialize the validated complete document as an exact
+					// full-span SEARCH/REPLACE envelope so the ordinary
+					// validator/authorization/budget/mutation flow applies.
+					verbatim = "<<<<<<< SEARCH\n" + original + "\n=======\n" + candidate + "\n>>>>>>> REPLACE"
+					patched, ok = ExtractBoundedPatch(original, verbatim)
+				}
+			}
+			if ok {
+				modified = patched
+				// compileDiff and the raw-patch validator must see the envelope
+				// that actually produced the candidate (full-span after a
+				// complete-document fallback).
+				raw = verbatim
+			} else {
 				// RMAH Tier 2 fallback: free-tier models may return raw code
 				// fences instead of SEARCH/REPLACE blocks. Attempt the RMAH
 				// pipeline (Tier 1 already failed via ExtractBoundedPatch;
@@ -2280,15 +2376,12 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 						if strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor") {
 							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %s", ErrHallucinatedAnchorError, ErrArtifactRejected, target, detail)
 						}
-						if strings.Contains(lower, "ambiguous anchor") && !strings.Contains(lower, "line-offset") {
-							detail += " — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization"
-							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %s", ErrNonRetryableArtifactError, ErrArtifactRejected, target, detail)
+						if strings.Contains(lower, "ambiguous anchor") {
+							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
 						}
 					}
 					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, detail)
 				}
-			} else {
-				modified = patched
 			}
 		} else {
 			modified = ResolveModifiedContent(original, raw)
@@ -2321,13 +2414,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		if patchOnly && x != nil && x.artifactValidator != nil {
 			if _, err := x.artifactValidator.ValidateArtifact([]byte(raw), target); err != nil {
 				if errors.Is(err, ErrAmbiguousAnchor) {
-					lower := strings.ToLower(err.Error())
-					if !strings.Contains(lower, "line-offset") {
-						// Non-retryable ambiguous anchor — circuit breaker.
-						wrapped := fmt.Errorf("%w: %w: %s: %w — [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrNonRetryableArtifactError, ErrArtifactRejected, target, err)
-						return nil, invs, nil, trace, wrapped
-					}
-					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+					return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
 				}
 				if errors.Is(err, ErrScopeViolation) {
 					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
@@ -2356,6 +2443,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			return nil, invs, nil, trace, gateErr
 		}
 		modified = normalized
+		if redundant := symbolBaseline.Check(target, modified); redundant != nil {
+			return nil, invs, nil, trace, fmt.Errorf("%w: %w", ErrArtifactRetryableRejected, redundant)
+		}
 		patches = append(patches, &Patch{
 			ID:       fmt.Sprintf("%s-patch-%d", requestID, len(patches)+1),
 			File:     target,
@@ -2650,7 +2740,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 // reasoning.telemetry event on completion. The accumulated visible content and
 // the authoritative provider usage are returned; the authoritative artifact
 // always travels on the ExecutionResult afterwards.
-func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (string, ai.ProviderUsage, *ingestion.IngestionTrace, error) {
+func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (raw string, usage ai.ProviderUsage, trace *ingestion.IngestionTrace, err error) {
 	var reasoningStartedAt time.Time
 	var reasoningDuration time.Duration
 	var reasoningSeen bool
@@ -2668,11 +2758,25 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		}
 	}
 
+	var content strings.Builder
+	// reasoningBuf is the reasoning fallback ONLY for models that emit their
+	// whole answer inside reasoning_content. It is never published.
+	var reasoningBuf strings.Builder
 	// Reasoning chunks are consumed for telemetry ONLY — the verbatim text is
 	// never published to the bus or exposed to the presentation layer.
+	// Phase 6.4.2 Reasoning Content Fallback Invariant: handler-routed
+	// reasoning (OpenAI/Ollama-compatible readers, which never embed
+	// sentinel markers in the byte stream) is ALSO accumulated into
+	// reasoningBuf so a reasoning-only stream still yields a usable
+	// artifact instead of an empty-response error. OpenRouter-style readers
+	// never consult ReasoningHandler (they emit sentinel-wrapped bytes the
+	// classifier routes), so no chunk is ever double-counted.
 	req.Stream = true
-	req.ReasoningHandler = func(_ string) error {
+	req.ReasoningHandler = func(chunk string) error {
 		reasoningOpen()
+		if chunk != "" {
+			reasoningBuf.WriteString(chunk)
+		}
 		return nil
 	}
 
@@ -2789,10 +2893,127 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		g.UpdateUsage(model, u.PromptTokens, u.CompletionTokens, u.ReasoningTokens)
 	}
 
-	var content strings.Builder
-	// reasoningBuf is the reasoning fallback ONLY for models that emit their
-	// whole answer inside reasoning_content. It is never published.
-	var reasoningBuf strings.Builder
+	// snapshotUsage resolves the telemetry to report on error/timeout paths
+	// (Phase 6.4.2 Telemetry Accuracy Invariant): prefer the live
+	// authoritative-or-estimated tracker reading so billed tokens are never
+	// zeroed; when the provider reported nothing at all, fall back to a
+	// character-count estimate of what crossed the boundary (prompt request
+	// bytes + accumulated content), explicitly marked Estimated. Either way
+	// the caller records real counts instead of a silent zero.
+	snapshotUsage := func() ai.ProviderUsage {
+		if usageUp != nil {
+			if u := usageUp.Usage(); u.Known {
+				return u
+			}
+		}
+		if lastUsage.Known {
+			return lastUsage
+		}
+		out := ai.ProviderUsage{Known: true, Estimated: true}
+		promptChars := len(req.System)
+		for _, m := range req.Messages {
+			promptChars += len(m.Content)
+		}
+		if promptChars > 0 {
+			out.PromptTokens = promptChars / 4
+		}
+		if content.Len() > 0 {
+			out.CompletionTokens = content.Len() / 4
+		}
+		out.TotalTokens = out.PromptTokens + out.CompletionTokens
+		return out
+	}
+	// ── Phase 6.4.4 Always-Flush Telemetry & Live Token Accounting ────
+	// Optimistic Prompt Token Invariant: commit estimated prompt tokens to
+	// the session tracker BEFORE entering the SSE chunk read loop, so prompt
+	// cost is never lost on early stream cancellation. Only providers that
+	// expose a live usage tracker (OpenRouter/OpenAI and siblings, which
+	// seed a prompt estimate at dispatch) emit here — providers without a
+	// tracker stay "usage unknown", never a fabricated count.
+	// Always-Flush Invariant: the deferred flush below commits the live
+	// accumulator to the graph (TelemetryBus → TaskState.TokenUsage →
+	// UI ↑X ↓Y) even when ctx.Err() != nil or an error is returned.
+	if usageUp != nil {
+		// Optimistic prompt fires ONLY for estimated baselines (real
+		// providers at dispatch: Known+Estimated with prompt>0,
+		// completion==0). A fully authoritative usage already present at
+		// dispatch (repro mocks, cached streams) flows through the normal
+		// authoritative emitUsage path verbatim — emitting a prompt-only
+		// prefix first would shadow the billed 5883-token account behind a
+		// 2181/0 prefix on a size-1 bus channel.
+		if u := usageUp.Usage(); u.Known && u.Estimated && u.PromptTokens > 0 && g != nil {
+			g.UpdateUsage(model, u.PromptTokens, 0, 0)
+			if !lastUsage.Known {
+				lastUsage = ai.ProviderUsage{Known: true, Estimated: true, PromptTokens: u.PromptTokens}
+			} else if lastUsage.PromptTokens == 0 {
+				lastUsage.PromptTokens = u.PromptTokens
+			}
+		}
+	}
+	// Always-Flush: every exit path (success, failure, timeout, cancel)
+	// commits whatever the live accumulator observed. The deferred read
+	// happens AFTER the return values are set, so it observes the final
+	// partial content even when the SSE loop bailed on ctx deadline before
+	// any usage chunk. On success with genuinely unknown usage (no tracker,
+	// no counts) nothing is flushed — "unknown" stays unknown, never a
+	// fabricated zero. On error/timeout the character fallback applies so
+	// billed partial work is never silently zeroed.
+	defer func() {
+		var live ai.ProviderUsage
+		hasLive := false
+		if usageUp != nil {
+			if u := usageUp.Usage(); u.Known {
+				live = u
+				hasLive = true
+			} else if lastUsage.Known {
+				live = lastUsage
+				hasLive = true
+			}
+		} else if lastUsage.Known {
+			live = lastUsage
+			hasLive = true
+		}
+		if hasLive {
+			if live.PromptTokens != 0 || live.CompletionTokens != 0 {
+				needsFlush := err != nil || ctx.Err() != nil
+				if !needsFlush {
+					if live.PromptTokens != lastUsage.PromptTokens ||
+						live.CompletionTokens != lastUsage.CompletionTokens ||
+						live.ReasoningTokens != lastUsage.ReasoningTokens {
+						needsFlush = true
+					}
+				}
+				if needsFlush && g != nil {
+					g.UpdateUsage(model, live.PromptTokens, live.CompletionTokens, live.ReasoningTokens)
+					lastUsage = live
+					if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+						usage = live
+					}
+				}
+				return
+			}
+			return
+		}
+		// No live tracker data: only error/timeout paths fall back to the
+		// character estimate; success with unknown usage stays unknown.
+		if err == nil && ctx.Err() == nil {
+			return
+		}
+		fallback := snapshotUsage()
+		if !fallback.Known {
+			return
+		}
+		if fallback.PromptTokens == 0 && fallback.CompletionTokens == 0 {
+			return
+		}
+		if g != nil {
+			g.UpdateUsage(model, fallback.PromptTokens, fallback.CompletionTokens, fallback.ReasoningTokens)
+			lastUsage = fallback
+			if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+				usage = fallback
+			}
+		}
+	}()
 	firstToken := false
 	runeBuf := stream.NewRuneBuffer()
 	classifier := stream.NewClassifier()
@@ -2845,7 +3066,7 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 			}
-			return content.String(), lastUsage, nil, cerr
+			return content.String(), snapshotUsage(), nil, cerr
 		}
 		n, rerr := rawStream.Read(buf)
 		if n > 0 {
@@ -2884,16 +3105,16 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 				if streamCb != nil {
 					streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: cerr})
 				}
-				return content.String(), lastUsage, nil, cerr
+				return content.String(), snapshotUsage(), nil, cerr
 			}
 			if streamCb != nil {
 				streamCb(StreamEvent{RequestID: requestID, Kind: "error", Err: rerr})
 			}
-			return content.String(), lastUsage, nil, rerr
+			return content.String(), snapshotUsage(), nil, rerr
 		}
 	}
 
-	usage := lastUsage
+	usage = lastUsage
 	if usageUp != nil {
 		if u := usageUp.Usage(); u.Known {
 			usage = u
@@ -2918,13 +3139,15 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	// every transformation in an IngestionTrace before the payload reaches the
 	// L1 Execution Gate / artifact parser.
 	rawVisible := content.String()
-	trace, procErr := ingestion.Process(rawVisible)
+	ingTrace, procErr := ingestion.Process(rawVisible)
+	trace = ingTrace
 	visible := ai.VisibleCompletion(trace.NormalizedPayload)
 	if strings.TrimSpace(visible) == "" && reasoningBuf.Len() > 0 {
 		// The entire visible completion was reasoning: ingest the reasoning
 		// text as the raw artifact so forensic traceability survives.
 		reasoningRaw := reasoningBuf.String()
-		trace, procErr = ingestion.Process(reasoningRaw)
+		ingTrace2, procErr2 := ingestion.Process(reasoningRaw)
+		trace, procErr = ingTrace2, procErr2
 		visible = ai.VisibleCompletion(trace.NormalizedPayload)
 	}
 	if streamCb != nil {

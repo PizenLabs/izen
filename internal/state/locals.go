@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/PizenLabs/izen/internal/pkg/atomicio"
 )
 
 const (
@@ -82,7 +84,9 @@ func WriteRuntimeMeta(root string, meta RuntimeMeta) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	// Atomic temp+rename: concurrent izen processes must never observe a
+	// truncated runtime.meta.
+	return atomicio.WriteFileAtomic(path, data, 0644)
 }
 
 func LoadRuntimeMeta(root string) (*RuntimeMeta, error) {

@@ -680,10 +680,9 @@ func mustRead(t *testing.T, root, name string) string {
 	return string(data)
 }
 
-// TestRecovery_AmbiguousAnchorCircuitBreaker verifies the fail-fast circuit
-// breaker: a mock LLM returning an ambiguous SEARCH (single line that matches
-// multiple regions) must halt at Attempt 1 without firing Attempt 2, and the
-// token counter must stop at Attempt 1 totals.
+// TestRecovery_AmbiguousAnchorCircuitBreaker preserves the one-call boundary:
+// ambiguous snippets request a scoped continuation rather than retrying the
+// same anchors or being classified as a terminal artifact error.
 func TestRecovery_AmbiguousAnchorCircuitBreaker(t *testing.T) {
 	root := t.TempDir()
 	// Baseline with repeated "bar" lines so SEARCH "bar" is ambiguous.
@@ -713,15 +712,8 @@ func TestRecovery_AmbiguousAnchorCircuitBreaker(t *testing.T) {
 		Target:    "note.txt",
 		Strategy:  &profile,
 	})
-	// Execution must fail with an artifact error (ambiguous anchor).
-	if err == nil {
-		t.Fatalf("expected error for ambiguous anchor, got nil (res=%+v)", res)
-	}
-	if !errors.Is(err, ErrArtifactRejected) && !errors.Is(err, ErrNonRetryableArtifactError) {
-		// Also accept wrapped ErrAmbiguousAnchor.
-		if !errors.Is(err, ErrAmbiguousAnchor) {
-			t.Fatalf("err = %v, want ErrArtifactRejected or ErrNonRetryableArtifactError", err)
-		}
+	if !errors.Is(err, ErrAmbiguousAnchorContinuation) {
+		t.Fatalf("err = %v, want scoped anchor continuation", err)
 	}
 	// Circuit breaker: only ONE provider call despite having a second response queued.
 	if mock.callCount != 1 {
@@ -736,22 +728,99 @@ func TestRecovery_AmbiguousAnchorCircuitBreaker(t *testing.T) {
 			t.Fatalf("Completed tokens = %d/%d, want 700/600 (Attempt 1 only)", res.Completed.InputTokens, res.Completed.OutputTokens)
 		}
 	}
-	// The error message must contain the DecisionSurface options.
-	lower := ""
+	if IsNonRetryableArtifactError(err) {
+		t.Fatalf("continuation classified as terminal: %v", err)
+	}
+	if got := mustRead(t, root, "note.txt"); got != repeated {
+		t.Fatalf("ambiguous snippet changed workspace: %q", got)
+	}
+}
+
+// TestExecutor_AmbiguousAnchorFullFileFallback (Phase 6.4): a small
+// ambiguous-anchor response only recovers when the worker also supplied a
+// complete path-tagged document; the workspace must actually change.
+func TestExecutor_AmbiguousAnchorFullFileFallback(t *testing.T) {
+	root := t.TempDir()
+	duplicate := "alpha\nbeta\nalpha\nbeta\nalpha\n"
+	updated := "alpha\nbeta\ngamma\nbeta\nalpha\n"
+	writeTarget(t, root, "note.txt", duplicate)
+	document := "```txt:note.txt\n" + updated + "```\n"
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\nalpha\n=======\ngamma\n>>>>>>>\n" + document,
+		Usage:   ai.ProviderUsage{PromptTokens: 700, CompletionTokens: 600, TotalTokens: 1300, Known: true},
+	}}}
+	x := testExecutor(t, root, mock, events.NewBus(events.DefaultBufferSize))
+	profile := strategy.ExecutionStrategyProfile{
+		Strategy:       strategy.TargetedMutation,
+		ModelRequired:  true,
+		StrategyReason: "test ambiguous full-file fallback",
+		Artifact:       strategy.ArtifactContract{Kind: "search_replace", Bounded: true},
+	}
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		RequestID: "r-ambiguous-fallback",
+		Mode:      "build",
+		Prompt:    "replace the first alpha with gamma",
+		Target:    "note.txt",
+		Strategy:  &profile,
+	})
 	if err != nil {
-		lower = err.Error()
+		t.Fatalf("Execute: %v", err)
 	}
-	if res != nil && res.Err != nil {
-		lower = res.Err.Error()
+	if res.PendingPatchID == "" {
+		t.Fatal("expected staged patch from validated complete document")
 	}
-	if !strings.Contains(strings.ToLower(lower), "line-offset") && !strings.Contains(strings.ToLower(lower), "full-file") {
-		t.Fatalf("error should contain DecisionSurface options [1] line-offset [2] full-file, got: %q", lower)
+	if got := mustRead(t, root, "note.txt"); got != duplicate {
+		t.Fatal("workspace changed before approval")
 	}
-	// The error must be classified as NonRetryable.
-	if err != nil && !IsNonRetryableArtifactError(err) {
-		// Also check res.Err
-		if res == nil || res.Err == nil || !IsNonRetryableArtifactError(res.Err) {
-			t.Fatalf("ambiguous anchor error must be classified as NonRetryableArtifactError, got %v", err)
-		}
+	if _, err := x.Approve(context.Background(), res.PendingPatchID); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if got := mustRead(t, root, "note.txt"); got != updated {
+		t.Fatalf("full-file fallback did not apply: %q", got)
+	}
+	if mock.callCount != 1 {
+		t.Fatalf("provider calls = %d, want 1", mock.callCount)
+	}
+}
+
+// TestExecutor_AmbiguousAnchorLargeFileRequiresContinuation keeps every
+// unsafe path closed: a >= 5 KB ambiguous target without a complete document
+// must surface the typed continuation error, never a snippet replacement.
+func TestExecutor_AmbiguousAnchorLargeFileRequiresContinuation(t *testing.T) {
+	root := t.TempDir()
+	duplicate := strings.Repeat("alpha\nbeta\n", 460)
+	writeTarget(t, root, "note.txt", duplicate)
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\nalpha\n=======\ngamma\n>>>>>>>",
+		Usage:   ai.ProviderUsage{PromptTokens: 700, CompletionTokens: 600, TotalTokens: 1300, Known: true},
+	}}}
+	x := testExecutor(t, root, mock, events.NewBus(events.DefaultBufferSize))
+	profile := strategy.ExecutionStrategyProfile{
+		Strategy:       strategy.TargetedMutation,
+		ModelRequired:  true,
+		StrategyReason: "test large ambiguous continuation",
+		Artifact:       strategy.ArtifactContract{Kind: "search_replace", Bounded: true},
+	}
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		RequestID: "r-ambiguous-continuation",
+		Mode:      "build",
+		Prompt:    "replace alpha with gamma",
+		Target:    "note.txt",
+		Strategy:  &profile,
+	})
+	if !errors.Is(err, ErrAmbiguousAnchorContinuation) {
+		t.Fatalf("err = %v, want typed continuation", err)
+	}
+	if IsNonRetryableArtifactError(err) {
+		t.Fatal("continuation must not be terminal nonretryable")
+	}
+	if res == nil || res.Err == nil || !errors.Is(res.Err, ErrAmbiguousAnchorContinuation) {
+		t.Fatalf("res.Err = %v, want typed continuation", res)
+	}
+	if got := mustRead(t, root, "note.txt"); got != duplicate {
+		t.Fatal("unauthorized snippet mutated the workspace")
+	}
+	if mock.callCount != 1 {
+		t.Fatalf("provider calls = %d, want 1", mock.callCount)
 	}
 }

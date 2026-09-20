@@ -1,9 +1,9 @@
 package git
 
 import (
-	"context"
-	"os/exec"
 	"strings"
+
+	giteng "github.com/PizenLabs/izen/internal/git"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -200,46 +200,19 @@ func (p *Panel) Render(width int) string {
 	return gitPanelBorder.Width(width).Render(strings.TrimSuffix(b.String(), "\n"))
 }
 
-// ListStatus parses `git status --porcelain` into staged/unstaged paths.
-// Non-repos and empty repos return empty slices (never an error outward).
+// ListStatus splits `git status --porcelain` into staged/unstaged paths via the
+// git.Engine seam. Non-repos and empty repos return empty slices (never an
+// error outward).
 func ListStatus(dir string) (staged, unstaged []string) {
 	if dir == "" {
 		dir = "."
 	}
-	cmd := exec.CommandContext(context.Background(), "git", "status", "--porcelain")
-	cmd.Dir = dir
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, nil
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if len(line) < 4 {
-			continue
-		}
-		x, y := line[0], line[1]
-		path := strings.TrimSpace(line[3:])
-		// Handle renames: "R  old -> new" — take the new path.
-		if idx := strings.Index(path, " -> "); idx >= 0 {
-			path = path[idx+4:]
-		}
-		if path == "" {
-			continue
-		}
-		switch {
-		case x != ' ' && x != '?':
-			staged = append(staged, path)
-		case y != ' ':
-			unstaged = append(unstaged, path)
-		case x == '?':
-			unstaged = append(unstaged, path)
-		}
-	}
-	return staged, unstaged
+	return giteng.NewEngine(dir).StatusPaths()
 }
 
-// GetDiff returns the live diff preview for path: `git diff --cached` when
-// staged, else `git diff --`. Broken diffs surface as errors (rendered as a
-// muted line, never a panic).
+// GetDiff returns the live diff preview for path: the staged diff
+// (`git diff --cached`) when staged, else the working-tree diff. Broken diffs
+// surface as errors (rendered as a muted line, never a panic).
 func GetDiff(dir, path string, staged bool) (string, error) {
 	if path == "" {
 		return "", nil
@@ -247,19 +220,11 @@ func GetDiff(dir, path string, staged bool) (string, error) {
 	if dir == "" {
 		dir = "."
 	}
-	var args []string
+	eng := giteng.NewEngine(dir)
 	if staged {
-		args = []string{"diff", "--cached", "--", path}
-	} else {
-		args = []string{"diff", "--", path}
+		return eng.DiffCachedFile(path)
 	}
-	cmd := exec.CommandContext(context.Background(), "git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil && len(out) == 0 {
-		return "", err
-	}
-	return string(out), nil
+	return eng.DiffFile(path)
 }
 
 func truncateLines(s string, max int) string {

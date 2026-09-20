@@ -10,9 +10,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 )
 
 type ClaudeProvider struct {
@@ -300,6 +302,8 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 
 	sr := &claudeSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
 	sr.usage.markRequestStarted(time.Now())
+	// Phase 6.4.4 Optimistic Prompt Token Invariant.
+	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
 	return &ClaudeStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -342,6 +346,48 @@ type claudeSSEReader struct {
 
 	// usage tracks cumulative token accounting (see streamUsageTracker).
 	usage streamUsageTracker
+
+	// lifecycle enforces the Stream Terminal Invariant (Phase 6.4.1).
+	lifecycle *dprovider.StreamLifecycle
+	idleStop  func()
+	startOnce sync.Once
+}
+
+func (s *claudeSSEReader) armIdle() {
+	s.startOnce.Do(func() {
+		if s.lifecycle == nil {
+			s.lifecycle = dprovider.NewStreamLifecycle()
+		}
+		lc := s.lifecycle
+		s.idleStop = dprovider.ArmIdleDeadline(s.cancel, lc.TokensEmitted, lc.IsClosed)
+	})
+}
+
+func (s *claudeSSEReader) stopIdle() {
+	if s.idleStop != nil {
+		stop := s.idleStop
+		s.idleStop = nil
+		stop()
+	}
+}
+
+// closeTerminal records a terminal stop reason and tears the channel down
+// immediately (Stream Terminal Invariant) so the UI timer stops at once
+// even when the trailing message_stop frame never arrives.
+func (s *claudeSSEReader) closeTerminal(stopReason string) {
+	if stopReason != "" {
+		s.finishReason = stopReason
+	}
+	s.usage.markCompleted(time.Now(), claudeStopReason(s.finishReason))
+	if s.lifecycle != nil {
+		s.lifecycle.MarkClosed()
+	}
+	s.stopIdle()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	_, _ = io.Copy(io.Discard, s.body)
+	s.closed = true
 }
 
 func (s *claudeSSEReader) Read(p []byte) (int, error) {
@@ -352,6 +398,7 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 	if s.reader == nil {
 		s.reader = bufio.NewReader(s.body)
 	}
+	s.armIdle()
 
 	for {
 		line, err := s.reader.ReadString('\n')
@@ -394,9 +441,16 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 			// handler only — never emitted into the response stream.
 			if event.Delta.Type == "thinking_delta" && event.Delta.Thinking != "" {
 				s.usage.recordReasoning(len(event.Delta.Thinking))
+				if s.lifecycle != nil {
+					s.lifecycle.NoteTokens(len(event.Delta.Thinking))
+				}
 				if s.reasoningHandler != nil {
 					if err := s.reasoningHandler(event.Delta.Thinking); err != nil {
 						s.closed = true
+						if s.lifecycle != nil {
+							s.lifecycle.MarkClosed()
+						}
+						s.stopIdle()
 						return 0, err
 					}
 				}
@@ -404,6 +458,10 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 			}
 			if event.Delta.Text != "" {
 				s.usage.recordOutput(len(event.Delta.Text))
+				if s.lifecycle != nil {
+					s.lifecycle.NoteTokens(len(event.Delta.Text))
+				}
+				s.stopIdle()
 				n := copy(p, event.Delta.Text)
 				return n, nil
 			}
@@ -415,17 +473,14 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 				s.finalUsage.OutputTokens = event.Usage.OutputTokens
 				s.usage.recordOutputTokens(event.Usage.OutputTokens)
 			}
-			if event.Delta != nil && event.Delta.StopReason != "" {
-				s.finishReason = event.Delta.StopReason
-				s.usage.markCompleted(time.Now(), claudeStopReason(event.Delta.StopReason))
+			if event.Delta != nil && dprovider.ShouldCloseOnFinishReason(event.Delta.StopReason) {
+				// Stream Terminal Invariant: a parsed stop_reason closes
+				// the channel immediately — never wait for message_stop.
+				s.closeTerminal(event.Delta.StopReason)
+				return 0, io.EOF
 			}
 		case "message_stop":
-			if s.cancel != nil {
-				s.cancel()
-			}
-			_, _ = io.Copy(io.Discard, s.body)
-			s.closed = true
-			s.usage.markCompleted(time.Now(), claudeStopReason(s.finishReason))
+			s.closeTerminal("")
 			return 0, io.EOF
 		}
 	}
@@ -433,6 +488,10 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 
 func (s *claudeSSEReader) Close() error {
 	s.closed = true
+	if s.lifecycle != nil {
+		s.lifecycle.MarkClosed()
+	}
+	s.stopIdle()
 	if s.cancel != nil {
 		s.cancel()
 	}

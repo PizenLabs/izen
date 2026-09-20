@@ -2519,10 +2519,21 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// per-delta activity line (noise); the state is kept truthful.
 		m.setStage("model", m.getActiveModelName(), stageStreaming)
 	case events.ProviderUsageUpdatePayload:
-		// Authoritative provider-reported usage during the live stream — only
-		// real counts reach the indicator, never a character-count estimate.
+		// Phase 6.4.4 UI & Task State Synchronization: the UI token counter
+		// (↑X ↓Y) binds DIRECTLY to TaskState.TokenUsage updates emitted by
+		// the TelemetryBus. The live turn mirrors (streamBaseInputTokens /
+		// streamLiveTokens) advance in real time from this event, so a
+		// timed-out stream retains prompt + partial completion tokens and
+		// the footer never shows stale counts.
 		m.setStage("model", p.Model, stageStreaming)
 		m.setStageMetrics(0, 0, p.OutputTokens)
+		if p.InputTokens > 0 {
+			m.streamBaseInputTokens = p.InputTokens
+		}
+		if total := p.OutputTokens + p.ReasoningTokens; total > m.streamLiveTokens {
+			m.streamLiveTokens = total
+		}
+		m.markUsageKnown()
 		m.logRuntimeDetail("[runtime] provider usage: %d in / %d out", p.InputTokens, p.OutputTokens)
 	case events.ReasoningTelemetryPayload:
 		// Reasoning TELEMETRY only (duration + token count). Raw chain-of-
@@ -2627,9 +2638,22 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	case events.StreamUsagePayload:
 		// "Explicit Over Implicit": an interrupted LLM stream reports its
 		// partial token usage so consumed tokens never vanish from telemetry.
+		// Phase 6.4.4 Always-Flush: the partial counts also bind directly to
+		// the live footer mirrors so a timed-out stream immediately reflects
+		// prompt + partial completion tokens (matching the provider
+		// dashboard) instead of stale previous-command counts.
 		statusWord := "interrupted"
 		if !p.Interrupted {
 			statusWord = "finished"
+		}
+		if p.InputTokens > 0 {
+			m.streamBaseInputTokens = p.InputTokens
+		}
+		if p.OutputTokens > m.streamLiveTokens {
+			m.streamLiveTokens = p.OutputTokens
+		}
+		if p.InputTokens > 0 || p.OutputTokens > 0 {
+			m.markUsageKnown()
 		}
 		m.logActivity("[stream] %s: %s tok input + %s tok output (%s)", statusWord,
 			status.FormatTokens(p.InputTokens), status.FormatTokens(p.OutputTokens), truncateForActivity(p.Reason))

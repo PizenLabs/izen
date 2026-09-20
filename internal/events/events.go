@@ -1273,6 +1273,13 @@ const (
 	EventToolBatchStarted      = "task.tool_batch.started"
 	EventToolChunk             = "task.tool_chunk"
 	EventToolBatchCompleted    = "task.tool_batch.completed"
+	// EventStepProactivelyTruncated is emitted when the ProposalStagingBuffer
+	// proactively cancels a worker step because the real-time stream token
+	// estimate hit TriggerCeiling BEFORE the provider signalled finish_reason=
+	// length. The step is classified StepOutcomePartial and the scheduler
+	// continues with a fresh step; it is NOT a task-level failure and never an
+	// abort.
+	EventStepProactivelyTruncated = "execution.step.proactively_truncated"
 	// ── CONTEXT WINDOW COMPACTION LIFECYCLE (context/compactor) ──────
 	// Emitted by the context-window compaction engine around every Compact
 	// run so the UI stays a pure projection of the event stream.
@@ -1299,6 +1306,29 @@ func NewToolChunk(id string, chunk []byte) DomainEvent {
 }
 func NewToolBatchCompleted(ids []string, results interface{}) DomainEvent {
 	return newEvent(EventToolBatchCompleted, ToolBatchCompletedPayload{ToolIDs: append([]string(nil), ids...), Results: results})
+}
+
+// StepProactivelyTruncatedPayload carries the guard state at the moment the
+// ProposalStagingBuffer proactively cancelled a worker step. EstimatedTokens is
+// the real-time stream token estimate that crossed TriggerCeiling; Budget is
+// the EffectiveStepBudget ceiling the step was bounded by.
+type StepProactivelyTruncatedPayload struct {
+	StepID          string
+	EstimatedTokens int
+	TriggerCeiling  int
+	Budget          int
+}
+
+// NewStepProactivelyTruncated publishes that a worker step was proactively
+// truncated at the staging buffer boundary because the stream token estimate
+// crossed the trigger ceiling before the provider signalled finish_reason=length.
+func NewStepProactivelyTruncated(stepID string, estimatedTokens, triggerCeiling, budget int) DomainEvent {
+	return newEvent(EventStepProactivelyTruncated, StepProactivelyTruncatedPayload{
+		StepID:          stepID,
+		EstimatedTokens: estimatedTokens,
+		TriggerCeiling:  triggerCeiling,
+		Budget:          budget,
+	})
 }
 
 // TaskStartedPayload carries a task execution start. TaskID links the event

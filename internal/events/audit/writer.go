@@ -2,9 +2,11 @@ package audit
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/events"
 )
@@ -36,7 +38,8 @@ type AuditLogger struct {
 	start    atomic.Bool
 	dropped  atomic.Uint64
 	accepted atomic.Uint64
-	writeErr atomic.Value // stores the first error from the disk worker
+	written  atomic.Uint64 // envelopes the disk worker has attempted (ok or fail)
+	writeErr atomic.Value  // stores the first error from the disk worker
 
 	// sessionID returns the active session id to stamp onto every persisted
 	// record (INV-SESSION-10). It is resolved at event-handling time — the
@@ -140,14 +143,61 @@ func (l *AuditLogger) Accepted() uint64 {
 	return l.accepted.Load()
 }
 
-// Flush pushes buffered NDJSON lines to the underlying file without stopping
-// the logger. It is the observability seam for operators and tests that must
-// read the audit log while the process is still running.
+// Flush is the synchronous durability seam: it blocks until every accepted
+// envelope has been attempted by the disk worker, then flushes + fsyncs the
+// underlying NDJSON file. It returns the first write/flush error encountered
+// (worker error takes precedence) and MUST NOT be swallowed: audit
+// persistence failure structurally invalidates execution success
+// (ErrAuditPersistenceFailed in internal/runtime/orchestrator).
+//
+// It never stops the logger and is safe to call from signal handlers, defer
+// chains, and session finalization paths.
 func (l *AuditLogger) Flush() error {
 	if l == nil || l.store == nil {
 		return nil
 	}
-	return l.store.Flush()
+	// Drain: wait until the worker has attempted every accepted envelope.
+	// accepted counts pushes; written counts worker attempts; their gap is
+	// the pending backlog (channel + in-flight write).
+	deadline := time.Now().Add(5 * time.Second)
+	for l.accepted.Load() > l.written.Load() {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// Also wait for the channel itself to empty (covers a racing handle push
+	// that incremented accepted after the last check).
+	deadline = time.Now().Add(2 * time.Second)
+	for len(l.ch) > 0 {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// Give the worker one final scheduling quantum to finish an in-flight
+	// bufio write before we flush it.
+	time.Sleep(5 * time.Millisecond)
+	if err := l.store.Flush(); err != nil {
+		if werr := l.Err(); werr != nil {
+			return fmt.Errorf("audit flush: %w (worker: %w)", err, werr)
+		}
+		return err
+	}
+	if werr := l.Err(); werr != nil {
+		return fmt.Errorf("audit: persisted flush ok but worker reported: %w", werr)
+	}
+	return nil
+}
+
+// InjectWriteError arms a deterministic I/O failure on the underlying store
+// (simulated disk write error / read-only permission on events.ndjson). It is
+// the adversarial seam for audit-persistence-failure tests. Pass nil to clear.
+func (l *AuditLogger) InjectWriteError(err error) {
+	if l == nil || l.store == nil {
+		return
+	}
+	l.store.InjectWriteError(err)
 }
 
 // Path returns the NDJSON log file path, or "" when the logger is nil.
@@ -218,6 +268,7 @@ func (l *AuditLogger) run() {
 			if err := l.store.Write(env); err != nil && l.writeErr.Load() == nil {
 				l.writeErr.Store(err)
 			}
+			l.written.Add(1)
 		case <-l.done:
 			for {
 				select {
@@ -225,6 +276,7 @@ func (l *AuditLogger) run() {
 					if err := l.store.Write(env); err != nil && l.writeErr.Load() == nil {
 						l.writeErr.Store(err)
 					}
+					l.written.Add(1)
 				default:
 					return
 				}

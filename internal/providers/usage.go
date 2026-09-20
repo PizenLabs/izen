@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 )
 
 // streamUsageTracker accumulates cumulative token accounting for an SSE stream
@@ -22,9 +23,14 @@ type streamUsageTracker struct {
 	reasoningTokens  int
 	totalTokens      int
 	hasAuthoritative bool
-	outputChars      int
-	reasoningChars   int
-	interrupted      bool
+	// promptEstimate is the optimistic prompt-token baseline registered as
+	// soon as the HTTP request is dispatched (Phase 6.4.4 Optimistic Prompt
+	// Token Invariant). It is reported until an authoritative usage chunk
+	// replaces it, so prompt cost is never lost on early cancellation.
+	promptEstimate int
+	outputChars    int
+	reasoningChars int
+	interrupted    bool
 	// httpAttempts counts every transport round-trip a single logical
 	// invocation performed (Phase 7 P5 retry forensics: 429 backoff and the
 	// 400 reasoning-schema retry add attempts, never new invocations).
@@ -72,6 +78,7 @@ func (t *streamUsageTracker) recordUsageFull(u ai.ProviderUsage) {
 	t.hasAuthoritative = true
 	// Discard character-count estimate so Usage() never double-counts.
 	// The authoritative provider usage is the single source of truth.
+	t.promptEstimate = 0
 	t.outputChars = 0
 	t.reasoningChars = 0
 }
@@ -83,6 +90,7 @@ func (t *streamUsageTracker) SetUsage(prompt, completion int) {
 	t.completionTokens = completion
 	t.totalTokens = prompt + completion
 	t.hasAuthoritative = true
+	t.promptEstimate = 0
 	t.outputChars = 0
 	t.reasoningChars = 0
 }
@@ -100,6 +108,36 @@ func (t *streamUsageTracker) recordInputTokens(n int) {
 func (t *streamUsageTracker) recordOutputTokens(n int) {
 	t.completionTokens = n
 	t.hasAuthoritative = true
+}
+
+// recordPromptEstimate registers the optimistic prompt-token baseline as
+// soon as the HTTP request is dispatched, BEFORE the SSE chunk read loop
+// (Phase 6.4.4 Optimistic Prompt Token Invariant). It never overwrites an
+// authoritative prompt count and never marks the tracker authoritative —
+// it only ensures a timed-out or cancelled stream still reports the prompt
+// cost the provider billed.
+func (t *streamUsageTracker) recordPromptEstimate(n int) {
+	if n <= 0 {
+		return
+	}
+	if t.hasAuthoritative {
+		return
+	}
+	if t.promptEstimate == 0 {
+		t.promptEstimate = n
+	}
+}
+
+// EstimatePromptTokensForRequest derives the optimistic prompt baseline
+// from request characters (system + messages) using the shared chars/4
+// heuristic owned by dprovider.StreamAccumulator, so every layer converges
+// on the same number.
+func EstimatePromptTokensForRequest(system string, messages []ai.Message) int {
+	chars := len(system)
+	for _, m := range messages {
+		chars += len(m.Content)
+	}
+	return dprovider.EstimatePromptTokens(chars)
 }
 
 // recordTransport surfaces retry forensics on the usage record (Phase 7 P5):
@@ -158,10 +196,17 @@ func (t *streamUsageTracker) markCompleted(now time.Time, finishReason string) {
 }
 
 // Usage returns the authoritative provider usage when a usage chunk arrived;
-// otherwise it reports the output as an ESTIMATE derived from the character
-// count that actually streamed (chars/4). Either way Known is true so the
-// renderer can display a count; a genuinely unknown usage (no bytes, no chunk)
-// returns Known=false.
+// otherwise it reports live tokens as an ESTIMATE derived from what was
+// actually consumed: the optimistic prompt baseline (registered at dispatch)
+// plus the output character fallback (chars/4 over content streamed so far).
+// Either way Known is true so the renderer can display a count; a genuinely
+// unknown usage (no estimate, no bytes, no chunk) returns Known=false.
+//
+// Phase 6.4.4 Real-Time Live Streaming Usage Invariant: completion counters
+// update per emitted chunk and never depend on a terminal usage frame — a
+// stream aborted before the final usage event still snapshots partial
+// tokens. Phase 6.4.4 Optimistic Prompt Token Invariant: prompt cost is
+// present from dispatch, even with zero output bytes.
 func (t *streamUsageTracker) Usage() ai.ProviderUsage {
 	u := ai.ProviderUsage{
 		RequestStartedAt:   t.requestStartedAt,
@@ -183,17 +228,15 @@ func (t *streamUsageTracker) Usage() ai.ProviderUsage {
 		}
 		return u
 	}
-	if t.outputChars > 0 {
-		// Interrupted before the usage chunk: the provider billed output that
-		// never got a final usage event. Report the character estimate with
-		// the Estimated flag so telemetry never zeroes billed work while
-		// still being explicit that the count is an estimate, not provider
-		// truth. Input tokens are unknown and stay 0 (Known input is only set
-		// by an authoritative chunk).
+	if t.outputChars > 0 || t.promptEstimate > 0 {
+		// Live estimate: prompt baseline + output chars actually streamed.
+		// Reported with Estimated=true so telemetry never zeroes billed
+		// work while staying explicit that the count is not provider truth.
 		u.Known = true
 		u.Estimated = true
+		u.PromptTokens = t.promptEstimate
 		u.CompletionTokens = t.outputChars / 4
-		u.TotalTokens = u.CompletionTokens
+		u.TotalTokens = u.PromptTokens + u.CompletionTokens
 		return u
 	}
 	return u
@@ -220,4 +263,9 @@ func openAICompatibleUsage(prompt, completion, total int) ai.ProviderUsage {
 
 // Estimated reports whether Usage returned a character-count estimate rather
 // than the authoritative provider-reported counts.
-func (t *streamUsageTracker) Estimated() bool { return !t.hasAuthoritative && t.outputChars > 0 }
+func (t *streamUsageTracker) Estimated() bool {
+	return !t.hasAuthoritative && (t.outputChars > 0 || t.promptEstimate > 0)
+}
+
+// PromptEstimate reports the optimistic prompt baseline (0 when none).
+func (t *streamUsageTracker) PromptEstimate() int { return t.promptEstimate }

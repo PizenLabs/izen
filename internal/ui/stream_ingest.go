@@ -69,6 +69,11 @@ func (m *model) ingestThinkingToken(sanitized string) {
 // set verbatim, the live estimate is floored by it, an authoritative prompt
 // count replaces the t=0 chars/4 estimate, and the reasoning split backs the
 // compact thought summary.
+//
+// Phase 6.4.5 Global UI Telemetry Binding: usage events bind directly to the
+// global footer view model (live turn mirrors + usage-known flag) so token
+// metrics render continuously across ALL system states (plan, investigate,
+// ask, execute) — never gated on a specific execution mode.
 func (m *model) ingestStreamUsage(input, output, reasoning int) {
 	m.setStageMetrics(0, 0, output)
 	if total := output + reasoning; total > m.streamLiveTokens {
@@ -76,6 +81,9 @@ func (m *model) ingestStreamUsage(input, output, reasoning int) {
 	}
 	if input > 0 {
 		m.streamBaseInputTokens = input
+	}
+	if input > 0 || output > 0 || reasoning > 0 {
+		m.markUsageKnown()
 	}
 	if m.thinkingBuffer != nil && reasoning > 0 {
 		m.thinkingBuffer.SetReasoningTokens(reasoning)

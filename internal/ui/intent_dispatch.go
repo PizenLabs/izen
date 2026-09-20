@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	intentdomain "github.com/PizenLabs/izen/internal/core/domain"
 	cmdreg "github.com/PizenLabs/izen/internal/domain/command"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/parser"
@@ -136,6 +137,9 @@ func hasExecutionDirective(ast *parser.IntentAST) bool {
 //  3. Directives dispatch through the execution gateway or the mode-scoped
 //     legacy handlers.
 func (m *model) dispatchASTIntent(ast *parser.IntentAST, line string) tea.Cmd {
+	if hasExecutionDirective(ast) {
+		m.bindScopeProvenance(ast.ScopeProvenance)
+	}
 	var cmds []tea.Cmd
 
 	// ── 1. WORKSPACE TRANSITION (presentation only, never for execution) ──
@@ -281,6 +285,7 @@ func hasDirective(ast *parser.IntentAST, name string) bool {
 // compatibility path when the decision runtime is not wired (headless/test
 // harnesses).
 func (m *model) routePromptDirective(rawInput string) tea.Cmd {
+	m.bindScopeProvenance(intentdomain.ScopeDynamic)
 	m.cancelStaleAgentOps()
 	rawInput = strings.TrimSpace(rawInput)
 	if rawInput == "" {
@@ -305,4 +310,21 @@ func (m *model) routePromptDirective(rawInput string) tea.Cmd {
 	}
 
 	return m.runPromptExecution(rawInput)
+}
+
+// bindScopeProvenance replaces, rather than accumulates, input authorization.
+func (m *model) bindScopeProvenance(scope intentdomain.ScopeProvenance) {
+	if m.sess != nil {
+		m.sess.ScopeProvenance = scope
+		if !scope.AllowsMutation() {
+			m.sess.StagedScopeProvenance = intentdomain.ScopeNone
+		}
+	}
+	if !scope.AllowsMutation() {
+		m.planApproved = false
+		m.pendingBuildAllowAlways = false
+		if m.orch != nil {
+			m.orch.ClearAuthorizedPlan()
+		}
+	}
 }

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/pkg/atomicio"
 )
 
@@ -121,8 +122,16 @@ func (s *TaskStore) Open() error {
 	return nil
 }
 
-// CreateTask appends TASK_CREATED and materializes the task.
+// CreateTask appends TASK_CREATED and materializes the task. Legacy
+// three-argument shape: tasks created without an explicit provenance carry
+// the read-only zero value (ScopeNone).
 func (s *TaskStore) CreateTask(id, intent string, scope []string) (*TaskState, error) {
+	return s.CreateTaskWithProvenance(id, intent, scope, domain.ScopeNone)
+}
+
+// CreateTaskWithProvenance appends TASK_CREATED carrying the authorization
+// provenance so the durable TaskState inherits the grant that created it.
+func (s *TaskStore) CreateTaskWithProvenance(id, intent string, scope []string, provenance domain.ScopeProvenance) (*TaskState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if strings.TrimSpace(id) == "" {
@@ -130,13 +139,14 @@ func (s *TaskStore) CreateTask(id, intent string, scope []string) (*TaskState, e
 	}
 	if err := s.withLock(func() error {
 		return s.appendLocked(newEvent(id, EventTaskCreated, map[string]any{
-			"intent": intent,
-			"scope":  scope,
+			"intent":     intent,
+			"scope":      scope,
+			"provenance": int(provenance),
 		}))
 	}); err != nil {
 		return nil, err
 	}
-	s.apply(newEvent(id, EventTaskCreated, map[string]any{"intent": intent, "scope": scope}))
+	s.apply(newEvent(id, EventTaskCreated, map[string]any{"intent": intent, "scope": scope, "provenance": int(provenance)}))
 	// Re-read canonical state (apply is idempotent for TASK_CREATED
 	// only on first creation; guard against double-apply by replay
 	// consistency: if task already existed, keep original).
@@ -721,6 +731,9 @@ func (s *TaskStore) apply(ev LedgerEvent) {
 			}
 			if v, ok := ev.Payload["intent"].(string); ok {
 				t.Intent = v
+			}
+			if pv, ok := ev.Payload["provenance"].(float64); ok {
+				t.ScopeProvenance = domain.ScopeProvenance(uint8(pv))
 			}
 			t.ActiveTargetScope = payloadStrings(ev.Payload["scope"])
 			s.tasks[ev.TaskID] = t

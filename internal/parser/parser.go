@@ -3,6 +3,7 @@ package parser
 import (
 	"strings"
 
+	intentdomain "github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/domain/command"
 )
 
@@ -141,12 +142,22 @@ func parseTokens(toks []Token, reg *command.Registry, defaultWS command.Workspac
 		}
 	}
 
+	scope := intentdomain.ScopeNone
+	for _, d := range dirs {
+		switch d.Name {
+		case "prompt":
+			scope = intentdomain.ScopeDynamic
+		case "hot":
+			scope = intentdomain.ScopeDeclared
+		}
+	}
 	return &IntentAST{
-		Workspace:      effective,
-		GlobalCommands: globals,
-		Directives:     dirs,
-		Scopes:         scopes,
-		Goal:           strings.Join(words, " "),
+		ScopeProvenance: scope,
+		Workspace:       effective,
+		GlobalCommands:  globals,
+		Directives:      dirs,
+		Scopes:          scopes,
+		Goal:            strings.Join(words, " "),
 	}, nil
 }
 

@@ -336,4 +336,17 @@ func (m *model) primeHandoffFromLedger(mode modes.Mode) {
 	if m.handoffLedgerContent != "" && m.handoffCtx.ProposedFix == "" {
 		m.handoffCtx.ProposedFix = m.handoffLedgerContent
 	}
+
+	// ── Phase 6.4.5 Ledger Context Isolation ─────────────────────────
+	// Strip synthetic 'package root (:0)' placeholders from the re-primed
+	// handoff when no active build errors are present, so a fresh mode
+	// entry never inherits stale empty-target instructions from a prior
+	// /investigate run. Real error coordinates are preserved verbatim.
+	m.handoffLedgerContent = stripSyntheticPlaceholdersFromHandoff(m.handoffLedgerContent)
+	if m.handoffCtx.ProposedFix != "" {
+		m.handoffCtx.ProposedFix = stripSyntheticPlaceholdersFromHandoff(m.handoffCtx.ProposedFix)
+	}
+	if m.handoffCtx.LastFailurePayload != "" {
+		m.handoffCtx.LastFailurePayload = stripSyntheticPlaceholdersFromHandoff(m.handoffCtx.LastFailurePayload)
+	}
 }

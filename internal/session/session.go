@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
+	intentdomain "github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/domain"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -20,6 +21,8 @@ type Message struct {
 
 // Session represents a user session.
 type Session struct {
+	ScopeProvenance       intentdomain.ScopeProvenance `json:"scope_provenance"`
+	StagedScopeProvenance intentdomain.ScopeProvenance `json:"staged_scope_provenance"`
 	// SessionID is a stable identity for the session record. It is assigned at
 	// creation and preserved across persists; a recovered session re-derives
 	// it from the raw-history/checkpoint ladder when the record is lost.
@@ -251,7 +254,9 @@ func (s *Session) TestRunLogPath() string {
 
 // StageTaskList stores a markdown-parsed task list in the session and persists to disk.
 func (s *Session) StageTaskList(tasks *[]plan.Task) {
+	s.StagedScopeProvenance = s.ScopeProvenance
 	if tasks == nil {
+		s.StagedScopeProvenance = intentdomain.ScopeNone
 		s.CurrentTasks = nil
 	} else {
 		s.CurrentTasks = *tasks
@@ -261,6 +266,7 @@ func (s *Session) StageTaskList(tasks *[]plan.Task) {
 
 // ClearTasks removes the current task list from the session and persists to disk.
 func (s *Session) ClearTasks() {
+	s.StagedScopeProvenance = intentdomain.ScopeNone
 	s.CurrentTasks = nil
 	_ = s.Save()
 }
@@ -272,6 +278,7 @@ func (s *Session) UnstageTaskList() {
 	if s == nil {
 		return
 	}
+	s.StagedScopeProvenance = intentdomain.ScopeNone
 	s.CurrentTasks = nil
 }
 

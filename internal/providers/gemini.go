@@ -10,9 +10,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 )
 
 type GeminiProvider struct {
@@ -306,6 +308,8 @@ func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 
 	sr := &geminiSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
 	sr.usage.markRequestStarted(time.Now())
+	// Phase 6.4.4 Optimistic Prompt Token Invariant.
+	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
 	return &GeminiStreamResult{ReadCloser: sr, sr: sr}, nil
 }
 
@@ -348,16 +352,63 @@ type geminiSSEReader struct {
 
 	// usage tracks cumulative token accounting (see streamUsageTracker).
 	usage streamUsageTracker
+
+	// lifecycle enforces the Stream Terminal Invariant (Phase 6.4.1).
+	lifecycle *dprovider.StreamLifecycle
+	idleStop  func()
+	startOnce sync.Once
+	// terminalSeen marks that a finishReason chunk was observed: the next
+	// Read terminates even if the transport never delivers a closer.
+	terminalSeen bool
+}
+
+func (s *geminiSSEReader) armIdle() {
+	s.startOnce.Do(func() {
+		if s.lifecycle == nil {
+			s.lifecycle = dprovider.NewStreamLifecycle()
+		}
+		lc := s.lifecycle
+		s.idleStop = dprovider.ArmIdleDeadline(s.cancel, lc.TokensEmitted, lc.IsClosed)
+	})
+}
+
+func (s *geminiSSEReader) stopIdle() {
+	if s.idleStop != nil {
+		stop := s.idleStop
+		s.idleStop = nil
+		stop()
+	}
+}
+
+// closeTerminal records a terminal finish reason and tears the channel
+// down immediately so the UI timer stops at once.
+func (s *geminiSSEReader) closeTerminal(reason string) {
+	s.finishReason = reason
+	s.usage.markCompleted(time.Now(), finishReasonLabel([]geminiCandidate{{FinishReason: reason}}))
+	if s.lifecycle != nil {
+		s.lifecycle.MarkClosed()
+	}
+	s.stopIdle()
+	if s.cancel != nil {
+		s.cancel()
+	}
+	_, _ = io.Copy(io.Discard, s.body)
+	s.closed = true
 }
 
 func (s *geminiSSEReader) Read(p []byte) (int, error) {
 	if s.closed {
 		return 0, io.EOF
 	}
+	if s.terminalSeen {
+		s.closeTerminal(s.finishReason)
+		return 0, io.EOF
+	}
 
 	if s.reader == nil {
 		s.reader = bufio.NewReader(s.body)
 	}
+	s.armIdle()
 
 	for {
 		line, err := s.reader.ReadString('\n')
@@ -390,9 +441,14 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 		}
 
 		if len(event.Candidates) > 0 {
-			if event.Candidates[0].FinishReason != "" {
+			// Stream Terminal Invariant (Phase 6.4.1): a parsed
+			// finishReason closes the channel — emit any content in this
+			// chunk now, then terminate on the next Read without waiting
+			// for a further transport frame.
+			if dprovider.ShouldCloseOnFinishReason(event.Candidates[0].FinishReason) {
 				s.finishReason = event.Candidates[0].FinishReason
 				s.usage.markCompleted(time.Now(), finishReasonLabel(event.Candidates))
+				s.terminalSeen = true
 			}
 			for _, part := range event.Candidates[0].Content.Parts {
 				// Thought parts carry reasoning content and must be routed
@@ -400,9 +456,16 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 				// visible response.
 				if part.Thought {
 					s.usage.recordReasoning(len(part.Text))
+					if s.lifecycle != nil {
+						s.lifecycle.NoteTokens(len(part.Text))
+					}
 					if s.reasoningHandler != nil {
 						if err := s.reasoningHandler(part.Text); err != nil {
 							s.closed = true
+							if s.lifecycle != nil {
+								s.lifecycle.MarkClosed()
+							}
+							s.stopIdle()
 							return 0, err
 						}
 					}
@@ -410,9 +473,19 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 				}
 				if part.Text != "" {
 					s.usage.recordOutput(len(part.Text))
+					if s.lifecycle != nil {
+						s.lifecycle.NoteTokens(len(part.Text))
+					}
+					s.stopIdle()
 					n := copy(p, part.Text)
 					return n, nil
 				}
+			}
+			// Content-free terminal chunk (finishReason only): terminate
+			// immediately so the UI timer stops at once.
+			if s.terminalSeen {
+				s.closeTerminal(s.finishReason)
+				return 0, io.EOF
 			}
 		}
 
@@ -430,6 +503,10 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 
 func (s *geminiSSEReader) Close() error {
 	s.closed = true
+	if s.lifecycle != nil {
+		s.lifecycle.MarkClosed()
+	}
+	s.stopIdle()
 	if s.cancel != nil {
 		s.cancel()
 	}

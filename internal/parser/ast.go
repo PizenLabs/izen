@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 
+	intentdomain "github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/domain/command"
 )
 
@@ -61,6 +62,7 @@ type ASTMetadata struct {
 // workspace, global commands, directives, scopes, and the natural-language
 // goal.
 type IntentAST struct {
+	ScopeProvenance intentdomain.ScopeProvenance
 	// Workspace is the effective workflow context. When the input carries no
 	// /workspace marker, this defaults to WorkspaceAsk (the read-only context).
 	Workspace command.WorkspaceType

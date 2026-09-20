@@ -54,6 +54,11 @@ func buildRunModel(t *testing.T, provider ai.Provider, tasks []plan.Task, fileCo
 	// routes through the RuntimeExecutor, which owns provider invocation,
 	// patch creation, the approval gate, apply and verification.
 	m.gateway = execution.NewIntentGateway(".")
+	authorized, err := m.intentFromInput("$hot implement @index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.bindScopeProvenance(authorized.ScopeProvenance)
 	m.executor = execution.NewRuntimeExecutor(".", m.cfg, provider, nil, "")
 	m.sess.StageTaskList(&tasks)
 	driveIntoBuildPhase(t, m)

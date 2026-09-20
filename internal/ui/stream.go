@@ -21,16 +21,54 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/provider"
+	"github.com/PizenLabs/izen/internal/providers/capability"
+	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/workspace"
 )
 
-// askCodingMaxTokens is the explicit max_tokens output budget for technical /
-// coding prompts issued from the interactive stream. 4096 keeps long
-// code-generation answers clear of the completion ceiling (finish_reason
-// "length"); casual chat keeps its own smaller budget via
-// gateway.CasualChatMaxTokens.
+// askCodingMaxTokens is the fallback max_tokens output budget for technical /
+// coding prompts when provider capabilities are unknown. The effective budget
+// is dynamically derived via ASKBudgetResolver from ProviderCapabilities;
+// this constant is only the unknown-ceiling fallback, never a global
+// semantic invariant.
 const askCodingMaxTokens = 4096
+
+// resolveASKMaxTokens derives the effective ASK output budget dynamically
+// from provider/model capabilities via ASKBudgetResolver. High-output paid
+// models yield expanded budgets (>1000 tokens); constrained providers
+// (OutputTokenCap <= 1024) clamp reasoning/visible allocations.
+func resolveASKMaxTokens(providerName, modelID, content string) int {
+	reasoningEffort := capability.SupportsEffortWithProvider(providerName, modelID)
+	caps := provider.ProviderCapabilities{
+		OutputTokenCap:          capability.MaxOutputTokensFor(providerName, modelID),
+		SupportsReasoningBudget: reasoningEffort,
+		SupportsReasoningEffort: reasoningEffort,
+		ContextWindow:           capability.ContextWindowFor(modelID),
+		Provider:                providerName,
+		ModelID:                 modelID,
+	}
+	class := runtimeOrchestrator.ModelClassStandard
+	if caps.OutputTokenCap >= 16384 {
+		class = runtimeOrchestrator.ModelClassHighOutput
+	} else if caps.IsConstrained() {
+		class = runtimeOrchestrator.ModelClassConstrained
+	}
+	complexity := runtimeOrchestrator.TaskComplexityMedium
+	lower := strings.ToLower(content)
+	if strings.Contains(lower, "delete file") || strings.Contains(lower, "rewrite") || len(content) > 500 {
+		complexity = runtimeOrchestrator.TaskComplexityHigh
+	} else if len(content) < 50 {
+		complexity = runtimeOrchestrator.TaskComplexityLow
+	}
+	r := runtimeOrchestrator.NewASKBudgetResolver()
+	got := r.ResolveMaxTokens(caps, class, complexity)
+	if got <= 0 {
+		return askCodingMaxTokens
+	}
+	return got
+}
 
 // Stream context lifecycle (decoupled TTFT vs active-stream deadlines).
 //
@@ -112,15 +150,10 @@ func sanitizeCasualMessageContent(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// debugLogPayload writes the exact outgoing LLM payload to
-// .izen/debug/payload.log so we can prove what the model actually receives on
-// each /ask turn. This is purely diagnostic — it appends one JSON line per
-// streamCmd invocation and never affects the runtime path.
+// debugLogPayload enqueues the exact outgoing LLM payload for
+// .izen/debug/payload.log via the async non-blocking telemetry channel so the
+// UI thread never blocks on disk I/O. This is purely diagnostic.
 func debugLogPayload(content string, msgs []ai.Message) {
-	dir := filepath.Join(".izen", "debug")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
 	// Capture only the final user message and the last 4 history turns to
 	// keep the log compact and focused on ordering/duplication evidence.
 	last := msgs
@@ -141,12 +174,7 @@ func debugLogPayload(content string, msgs []ai.Message) {
 		return
 	}
 	data = append(data, '\n')
-	f, err := os.OpenFile(filepath.Join(dir, "payload.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	defer func() { _ = f.Close() }()
-	_, _ = f.Write(data)
+	enqueueTelemetryWrite(getDebugLogDir(), "payload.log", data)
 }
 
 // injectObjectiveContext prefixes the active human-confirmed objective frame
@@ -395,11 +423,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	}
 
 	var systemPrompt string
-	// Technical / coding prompts carry an explicit 4096-token output budget
-	// so long answers complete without hitting the provider's completion
-	// ceiling (finish_reason "length") — never rely on provider defaults
-	// (often ~1500-2048 tokens) for code generation.
-	maxTokens := askCodingMaxTokens
+	// Dynamic ASK budgeting: the output budget is derived via
+	// ASKBudgetResolver from ProviderCapabilities (OutputTokenCap,
+	// SupportsReasoningBudget/Effort), ModelClass, and TaskComplexity —
+	// never a hardcoded global invariant. High-output models yield expanded
+	// detail budgets; constrained providers clamp to prevent exhaustion.
+	maxTokens := resolveASKMaxTokens(m.getActiveProviderName(), m.getActiveModelName(), content)
 
 	// INVARIANT 2: DYNAMIC SYSTEM PROMPT TIERING
 	if isCasual {

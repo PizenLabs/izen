@@ -2001,6 +2001,49 @@ func IsNoOpBoundedPatchResponse(raw string) bool {
 // It is the artifact boundary for the search_replace contract (truncation
 // recovery): a verbose or truncated response can never masquerade as the
 // mutation.
+// materializeOffsetPatch proves both the explicit line range and exact source
+// bytes before converting an offset edit to the ordinary validated contract.
+func materializeOffsetPatch(original, raw string, first, last int) (string, bool) {
+	const prefix = "<<<<<<< SEARCH line-offset="
+	lines := strings.Split(raw, "\n")
+	header := -1
+	start, end := 0, 0
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "<<<<<<< SEARCH") {
+			if header >= 0 || !strings.HasPrefix(strings.TrimSpace(line), prefix) {
+				return "", false
+			}
+			bounds := strings.Split(strings.TrimPrefix(strings.TrimSpace(line), prefix), "-")
+			if len(bounds) != 2 {
+				return "", false
+			}
+			var err error
+			start, err = strconv.Atoi(bounds[0])
+			if err != nil {
+				return "", false
+			}
+			end, err = strconv.Atoi(bounds[1])
+			if err != nil {
+				return "", false
+			}
+			header = i
+		}
+	}
+	source := strings.Split(original, "\n")
+	if header < 0 || start < first || end > last || start < 1 || end < start || end > len(source) {
+		return "", false
+	}
+	lines[header] = "<<<<<<< SEARCH"
+	blocks := ParseSearchReplaceBlocks(strings.Join(lines, "\n"))
+	if len(blocks) != 1 || blocks[0].search != strings.Join(source[start-1:end], "\n") {
+		return "", false
+	}
+	parts := append([]string(nil), source[:start-1]...)
+	parts = append(parts, strings.Split(blocks[0].replace, "\n")...)
+	parts = append(parts, source[end:]...)
+	return "<<<<<<< SEARCH\n" + original + "\n=======\n" + strings.Join(parts, "\n") + "\n>>>>>>> REPLACE", true
+}
+
 func ExtractBoundedPatch(original, raw string) (string, bool) {
 	input := SanitizeBoundedPatchResponse(raw)
 	if input == "" || original == "" {
@@ -3214,6 +3257,52 @@ func SanitizeRawCodeBlock(content string) string {
 		result = append(result, line)
 	}
 	return strings.TrimSpace(strings.Join(result, "\n"))
+}
+
+// extractCompleteDocument accepts only a closed, path-tagged full-file envelope.
+// SEARCH/REPLACE bodies and unlabelled code fences are not full-file authority,
+// regardless of their size. The caller must still validate the document.
+func extractCompleteDocument(raw, target string) (string, bool) {
+	lines := strings.Split(raw, "\n")
+	start := -1
+	closing := ""
+	inPatch := false
+	var candidate string
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if start >= 0 {
+			if trimmed != closing {
+				continue
+			}
+			files := patch.ParseCodeFences(strings.Join(lines[start:i+1], "\n"))
+			if len(files) != 1 || filepath.Clean(files[0].Path) != filepath.Clean(target) || candidate != "" {
+				return "", false
+			}
+			candidate = files[0].Content
+			start = -1
+			continue
+		}
+		if trimmed == "<<<<<<< SEARCH" {
+			inPatch = true
+		}
+		if inPatch {
+			if strings.HasPrefix(trimmed, ">>>>>>>") {
+				inPatch = false
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "=== FILE:") {
+			start, closing = i, "=== END"
+		} else if strings.HasPrefix(trimmed, "```") {
+			if _, _, ok := patch.ParseFileHeader(strings.TrimPrefix(trimmed, "```")); ok {
+				start, closing = i, "```"
+			}
+		}
+	}
+	if start >= 0 || strings.TrimSpace(candidate) == "" || isPatchArtifactContent(candidate) {
+		return "", false
+	}
+	return candidate, true
 }
 
 // ExtractNewFileContent resolves the complete content for a brand-new (missing

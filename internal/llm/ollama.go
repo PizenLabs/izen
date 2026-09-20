@@ -41,6 +41,24 @@ func (c *OllamaClient) Name() string {
 	return "ollama"
 }
 
+// ErrOllamaNamespacedModel is returned when a vendor-prefixed
+// (OpenRouter-style vendor/model) ID reaches the local Ollama client.
+// Provider Routing Isolation Invariant: such IDs must route directly to
+// their namespaced driver — never trial-executed against local endpoints.
+var ErrOllamaNamespacedModel = errors.New("ollama: provider/model mismatch: vendor-prefixed model ID does not belong to the local driver")
+
+// rejectOllamaNamespacedModel fails fast on vendor-namespaced model IDs
+// (e.g. thinkingmachines/..., nvidia/...) before any local HTTP call.
+func rejectOllamaNamespacedModel(model string) error {
+	m := strings.TrimSpace(model)
+	for i := 0; i < len(m); i++ {
+		if m[i] == '/' && i > 0 && i+1 < len(m) {
+			return fmt.Errorf("%w: model %q must be routed to its namespaced provider, not ollama", ErrOllamaNamespacedModel, model)
+		}
+	}
+	return nil
+}
+
 func (c *OllamaClient) buildMessages(req PromptRequest) []openAIMessage {
 	msgs := make([]openAIMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
@@ -57,6 +75,10 @@ func (c *OllamaClient) resolveModel(override string) string {
 }
 
 func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) (LLMResponse, error) {
+	// Provider Routing Isolation: never trial-execute a namespaced ID locally.
+	if err := rejectOllamaNamespacedModel(c.resolveModel(req.Model)); err != nil {
+		return LLMResponse{}, err
+	}
 	body := openAIReq{
 		Model:       c.resolveModel(req.Model),
 		Messages:    c.buildMessages(req),
@@ -110,7 +132,12 @@ func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 
 	text := ""
 	if openaiResp.Choices[0].Message != nil {
-		text = openaiResp.Choices[0].Message.Content
+		msg := openaiResp.Choices[0].Message
+		// Reasoning Content Fallback Invariant (Phase 6.4.2) + Stream Delta
+		// Reasoning Invariant (Phase 6.4.5): thinking-heavy models may emit
+		// the answer in reasoning/thinking fields with empty content —
+		// synthesize from reasoning instead of returning empty.
+		text = usableContent(msg.Content, msg.Reasoning, msg.ReasoningContent, msg.Thinking)
 	}
 	text = SanitizeOutput(text)
 
@@ -141,6 +168,10 @@ func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 }
 
 func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {
+	// Provider Routing Isolation: never trial-execute a namespaced ID locally.
+	if err := rejectOllamaNamespacedModel(c.resolveModel(req.Model)); err != nil {
+		return LLMResponse{}, err
+	}
 	body := openAIReq{
 		Model:       c.resolveModel(req.Model),
 		Messages:    c.buildMessages(req),
@@ -186,6 +217,7 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	}
 
 	var full strings.Builder
+	var reasoning strings.Builder
 	tokenIn, tokenOut := 0, 0
 	reader := newOpenAIStreamReader(resp.Body)
 
@@ -208,15 +240,25 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 
 		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
 			delta := chunk.Choices[0].Delta
-			if delta.ReasoningContent != "" {
+			// Reasoning Content Fallback Invariant (Phase 6.4.2) + Stream
+			// Delta Reasoning Invariant (Phase 6.4.5): retain thinking text
+			// (all three reasoning spellings) so a reasoning-only stream
+			// still yields a payload below and counts as stream progress.
+			reasoningText := unifiedDeltaReasoning(delta)
+			if reasoningText != "" {
+				// Stream progress: reasoning/thinking tokens reset the idle
+				// watchdog so thinking-heavy streams never false-trigger it.
+				reader.noteTokens(len(reasoningText))
+				reasoning.WriteString(reasoningText)
 				if req.ReasoningHandler != nil {
-					if err := req.ReasoningHandler(delta.ReasoningContent); err != nil {
+					if err := req.ReasoningHandler(reasoningText); err != nil {
 						cancel()
 						return LLMResponse{}, err
 					}
 				}
 			}
 			if delta.Content != "" {
+				reader.noteTokens(len(delta.Content))
 				full.WriteString(delta.Content)
 				if handler != nil {
 					if err := handler(delta.Content); err != nil {
@@ -239,8 +281,14 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		tokenOut = full.Len() / 4
 	}
 
+	content := full.String()
+	if strings.TrimSpace(content) == "" {
+		// Reasoning fallback: the model emitted only thinking content.
+		content = stripThinkingTags(reasoning.String())
+	}
+
 	return LLMResponse{
-		Content:      SanitizeOutput(full.String()),
+		Content:      SanitizeOutput(content),
 		TokenInput:   tokenIn,
 		TokenOutput:  tokenOut,
 		TotalCostUSD: 0,

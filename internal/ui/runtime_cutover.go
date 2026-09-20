@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	intentdomain "github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/modes"
@@ -78,6 +79,30 @@ func (m *model) runRuntimeExecuteCmd(req execution.ExecuteRequest) tea.Cmd {
 //  4. The RuntimeExecutor owns provider invocation, patch creation, the
 //     approval gate, apply, verification and the canonical lifecycle events.
 func (m *model) executeAutonomyViaRuntime(trace autonomy.Trace) tea.Cmd {
+	if m.gateway == nil || m.executor == nil {
+		// Runtime boundary not wired (harness): an autonomy-decided mutation
+		// must never silently drop, but no legacy provider path may run either.
+		// The executor is the only production mutation authority. This check
+		// precedes the scope gate so the wiring failure is always surfaced.
+		m.push(roleError, "execution runtime not wired — cannot execute the decided mutation")
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
+	// ── SCOPE PROVENANCE BINDING ─────────────────────────────────────
+	// Autonomy escalation is the runtime's human authorization boundary: a
+	// granted mutation proposal carries an authorized capability grant even
+	// though no $prompt/$hot directive literal was typed — the grant binds
+	// as ScopeDynamic before dispatch.
+	if m.sess == nil {
+		return m.runGatedLine(trace.Input)
+	}
+	if m.autonomy != nil && m.autonomy.Authority(autonomy.RequiredCapabilities(autonomy.IntentModification)) {
+		m.bindScopeProvenance(intentdomain.ScopeDynamic)
+	}
+	if !m.sess.ScopeProvenance.AllowsMutation() {
+		return m.runGatedLine(trace.Input)
+	}
 	prompt := trace.Input
 	if m.autonomyHotfix {
 		m.autonomyHotfix = false
@@ -144,6 +169,7 @@ func (m *model) executeAutonomyViaRuntime(trace autonomy.Trace) tea.Cmd {
 	}
 
 	req := execution.ExecuteRequest{
+		ScopeProvenance:  m.sess.ScopeProvenance,
 		Mode:             modes.ModeBuild.String(),
 		Prompt:           prompt,
 		Targets:          targets,
@@ -194,6 +220,10 @@ func resolvedTargetsForExecution(profile strategy.ExecutionStrategyProfile, fall
 // is deliberately no caller-side execution path that could mutate outside
 // the runtime boundary.
 func (m *model) runStagedBuildViaRuntime() tea.Cmd {
+	if m.sess == nil || !m.sess.StagedScopeProvenance.AllowsMutation() {
+		m.push(roleError, intentdomain.ScopeAuthorizationError)
+		return nil
+	}
 	tasks := m.sess.CurrentTasks
 	if len(tasks) == 0 {
 		m.push(roleStatus, "no tasks staged — use /plan first")
@@ -245,11 +275,12 @@ func (m *model) runStagedBuildViaRuntime() tea.Cmd {
 		m.lastExecutionStrategy = profile
 
 		req := execution.ExecuteRequest{
-			Mode:     modes.ModeBuild.String(),
-			Prompt:   prompt,
-			Targets:  targets,
-			Strategy: &profile,
-			Model:    m.getActiveModelName(),
+			ScopeProvenance: m.sess.StagedScopeProvenance,
+			Mode:            modes.ModeBuild.String(),
+			Prompt:          prompt,
+			Targets:         targets,
+			Strategy:        &profile,
+			Model:           m.getActiveModelName(),
 		}
 		return m.runRuntimeExecuteCmd(req)
 	}
@@ -268,6 +299,10 @@ func (m *model) runStagedBuildViaRuntime() tea.Cmd {
 // execution target set and the executor owns provider, patch, approval gate,
 // apply and verification.
 func (m *model) runRuntimeTaskRequest(task *plan.Task) tea.Cmd {
+	if m.sess == nil || !m.sess.StagedScopeProvenance.AllowsMutation() {
+		m.push(roleError, intentdomain.ScopeAuthorizationError)
+		return nil
+	}
 	if m.gateway == nil || m.executor == nil || task == nil {
 		m.push(roleError, "execution runtime not wired — cannot execute the mutation task")
 		m.refreshViewportContent()
@@ -285,11 +320,12 @@ func (m *model) runRuntimeTaskRequest(task *plan.Task) tea.Cmd {
 	m.lastExecutionStrategy = profile
 	targets := []string{task.Target}
 	req := execution.ExecuteRequest{
-		Mode:     modes.ModeBuild.String(),
-		Prompt:   prompt,
-		Targets:  targets,
-		Strategy: &profile,
-		Model:    m.getActiveModelName(),
+		ScopeProvenance: m.sess.StagedScopeProvenance,
+		Mode:            modes.ModeBuild.String(),
+		Prompt:          prompt,
+		Targets:         targets,
+		Strategy:        &profile,
+		Model:           m.getActiveModelName(),
 	}
 	return m.runRuntimeExecuteCmd(req)
 }
@@ -299,6 +335,9 @@ func (m *model) runRuntimeTaskRequest(task *plan.Task) tea.Cmd {
 // handleMessageContent path (legacy reclassification inside an
 // autonomy-decided workspace).
 func (m *model) runRuntimePrompt(content string) tea.Cmd {
+	if m.sess == nil || !m.sess.ScopeProvenance.AllowsMutation() {
+		return m.runGatedLine(content)
+	}
 	if m.gateway == nil || m.executor == nil {
 		// FAIL CLOSED: without the admission gateway and the RuntimeExecutor
 		// there is deliberately no caller-side execution path.
@@ -318,11 +357,12 @@ func (m *model) runRuntimePrompt(content string) tea.Cmd {
 	}
 	targets := resolvedTargetsForExecution(profile, nil)
 	req := execution.ExecuteRequest{
-		Mode:     modes.ModeBuild.String(),
-		Prompt:   content,
-		Targets:  targets,
-		Strategy: &profile,
-		Model:    m.getActiveModelName(),
+		ScopeProvenance: m.sess.ScopeProvenance,
+		Mode:            modes.ModeBuild.String(),
+		Prompt:          content,
+		Targets:         targets,
+		Strategy:        &profile,
+		Model:           m.getActiveModelName(),
 	}
 	return m.runRuntimeExecuteCmd(req)
 }

@@ -95,6 +95,31 @@ func (l *Logger) LogPipeline(entry PipelineEntry) error {
 	return l.append(state.LocalPath(l.root, state.AuditDir, "pipeline.log"), data)
 }
 
+// Flush is the synchronous durability seam for the legacy sync logger.
+// Every append opens, writes, and closes its file, so all records are already
+// durable once append returns; Flush fsyncs the audit directory entry so a
+// newly created events file is itself durable. It MUST NOT be swallowed:
+// callers bind its error into the Truthful State Transition evaluation
+// (ErrAuditPersistenceFailed in internal/runtime/orchestrator).
+func (l *Logger) Flush() error {
+	if l == nil {
+		return fmt.Errorf("audit: nil logger")
+	}
+	dir := state.LocalPath(l.root, state.AuditDir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("audit flush mkdir: %w", err)
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("audit flush open dir: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("audit flush sync: %w", err)
+	}
+	return nil
+}
+
 func (l *Logger) append(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -107,10 +132,14 @@ func (l *Logger) append(path string, data []byte) error {
 		return fmt.Errorf("audit open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
-	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("audit write: %w", err)
-	}
-	if _, err := f.Write([]byte("\n")); err != nil {
+	// Single write(2) of payload+newline: O_APPEND single writes are atomic
+	// across OS processes for small records, so concurrent izen processes
+	// never interleave bytes within a JSON line. Two separate writes (data,
+	// then "\n") would admit interleaving and corrupt the ndjson trail.
+	line := make([]byte, 0, len(data)+1)
+	line = append(line, data...)
+	line = append(line, '\n')
+	if _, err := f.Write(line); err != nil {
 		return fmt.Errorf("audit write: %w", err)
 	}
 	return nil
