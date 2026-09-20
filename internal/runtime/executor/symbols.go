@@ -94,10 +94,7 @@ func (b *SymbolBaseline) Check(target, content string) *RedundantSymbolError {
 	if b == nil {
 		return nil
 	}
-	proposed, err := indexSymbols(target, content)
-	if err != nil {
-		return nil // syntax validation remains the artifact gate's responsibility
-	}
+	proposed, _ := indexSymbols(target, content)
 	for _, candidate := range proposed {
 		if candidate.Exported || candidate.Kind != symbol.SymbolFunction || len(candidate.body) == 0 {
 			continue
@@ -173,6 +170,7 @@ func indexSymbols(path, source string) ([]indexedSymbol, error) {
 			}
 			// Canonicalize local bindings through AST object identity. Global
 			// calls, member names, types, operators and literals retain meaning.
+			//nolint:staticcheck // SA1019: ast.Object identity is used deliberately for lexical binding grouping
 			names := map[*ast.Object]string{}
 			ast.Inspect(fn, func(n ast.Node) bool {
 				if id, ok := n.(*ast.Ident); ok && id.Obj != nil && id.Obj.Kind == ast.Var {

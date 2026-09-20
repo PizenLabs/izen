@@ -12,7 +12,7 @@ const (
 	ScopeDeclared                 // $hot: the user declares a bounded mutation scope.
 )
 
-const ScopeAuthorizationError = "State Error: mutation plan requires scope authorization via $prompt or $hot"
+const ScopeAuthorizationError = "state error: mutation plan requires scope authorization via $prompt or $hot"
 
 func (s ScopeProvenance) AllowsMutation() bool {
 	return s == ScopeDynamic || s == ScopeDeclared
