@@ -419,11 +419,15 @@ var _ tea.Msg = shellChunkMsg{}
 // shellExitMsg is the terminal event of the streaming shell pipeline. It
 // carries the process exit code and elapsed time so the running exec entry
 // flips to a completed "(exit N · Xs)" line and the shimmer dock clears.
+// denied marks a Phase 1 authorization denial: no process ever spawned, and
+// the handler must surface err as an authorization failure (never as a
+// successful execution).
 type shellExitMsg struct {
 	cmd      string
 	exitCode int
 	elapsed  time.Duration
 	err      error
+	denied   bool
 }
 
 var _ tea.Msg = shellExitMsg{}

@@ -271,7 +271,18 @@ func (m *model) handleInput(line string) tea.Cmd {
 		}
 
 		m.push(roleSystem, "$ "+shellCmd)
-		out, err := execShell(shellCmd)
+		// ── PHASE 1 GLOBAL EXECUTION BOUNDARY ────────────────────────
+		// "!" is an explicit human shell-execution intent: it mints a grant
+		// for ONLY this exact command (never file mutation, never another
+		// command). Without the grant nothing reaches the OS shell.
+		grant, authErr := m.authorizeShellExecution(shellCmd, ShellClassExecute, "! typed")
+		if authErr != nil {
+			m.push(roleError, providers.SanitizeAPIError(authErr))
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
+			return nil
+		}
+		out, err := m.execShellGranted(context.Background(), grant)
 		if err != nil {
 			m.push(roleError, providers.SanitizeAPIError(err))
 		}
@@ -2639,6 +2650,20 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 				err:      fmt.Errorf("[BLOCKED BY FIREWALL] %s", reason),
 			}
 		}
+		// ── PHASE 1 GLOBAL EXECUTION BOUNDARY ─────────────────────────
+		// The staged SHELL_EXEC step crosses the same shell authorization
+		// boundary as every other shell path: the interactive approval above
+		// (or a prior Allow-Always) is the human event, and this grant binds
+		// the exact step command — nothing else may execute in its place.
+		shellGrant, shellAuthErr := m.authorizeShellExecution(task.Target, ShellClassExecute,
+			fmt.Sprintf("approved SHELL_EXEC step %d", task.StepNum))
+		if shellAuthErr != nil {
+			return buildResultMsg{
+				output:   "",
+				exitCode: -1,
+				err:      fmt.Errorf("shell exec authorization failed: %w", shellAuthErr),
+			}
+		}
 
 		// ── CANCELLATION-COMPLETE SHELL EXECUTION ─────────────────────
 		// The subprocess runs under the active operation context so Ctrl+C /
@@ -2646,10 +2671,14 @@ func (m *model) runBuildShellExec(task *plan.Task) tea.Cmd {
 		// The shell stage is recorded as a real execution stage on the
 		// operation telemetry so its latency is attributed truthfully.
 		m.setStage("shell", task.Target, stageRunning)
-		result, err := runner.RunContext(m.operationContext(), task.Target)
+		result, err := runner.RunGranted(m.operationContext(), shellGrant, task.Target)
 		m.setStage("shell", task.Target, stageDone)
 		output := ""
 		exitCode := 0
+		if result != nil {
+			exitCode = result.ExitCode
+		}
+		m.recordShellEvidence(shellGrant, 0, exitCode, err)
 		if result != nil {
 			output = result.Stdout
 			if result.Stderr != "" {
@@ -2968,7 +2997,23 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 		}
 		runner := execExecutionRunner(".")
 		cmd := "go test -v " + target
-		result, err := runner.RunContext(m.operationContext(), cmd)
+		// ── PHASE 1 GLOBAL EXECUTION BOUNDARY ─────────────────────────
+		// A test binary is executable code: $test mints a per-operation
+		// human grant for ONLY this bounded invocation (target validated
+		// against shell-metachar injection, workspace-confined, evidenced).
+		// It grants zero file-mutation authority and never leaves the
+		// test-execution class. Without the grant nothing executes.
+		testGrant, testAuthErr := m.authorizeTestExecution("go test -v", target, "$test typed")
+		if testAuthErr != nil {
+			return testResultMsg{
+				output: testAuthErr.Error(),
+				passed: false,
+				failed: 0,
+				total:  0,
+				err:    testAuthErr,
+			}
+		}
+		result, err := runner.RunGranted(m.operationContext(), testGrant, cmd)
 		output := ""
 		passed := true
 		failedCount := 0
@@ -3025,6 +3070,8 @@ func (m *model) runTestEngine(target string) tea.Cmd {
 			}
 		}
 
+		m.recordShellEvidence(testGrant, 0, testExitCode(result, err), err)
+
 		return testResultMsg{
 			output: output,
 			passed: passed,
@@ -3051,7 +3098,18 @@ func (m *model) runBuildEngine(target string) tea.Cmd {
 		}
 		runner := execExecutionRunner(".")
 		cmd := "go build " + target
-		result, err := runner.RunContext(m.operationContext(), cmd)
+		// ── PHASE 1 GLOBAL EXECUTION BOUNDARY ─────────────────────────
+		// A build invocation compiles and links executable code: $run mints
+		// a per-operation human grant for ONLY this bounded invocation.
+		buildGrant, buildAuthErr := m.authorizeTestExecution("go build", target, "$run typed")
+		if buildAuthErr != nil {
+			return buildResultMsg{
+				output:   buildAuthErr.Error(),
+				exitCode: -1,
+				err:      buildAuthErr,
+			}
+		}
+		result, err := runner.RunGranted(m.operationContext(), buildGrant, cmd)
 		output := ""
 		exitCode := 0
 
@@ -3071,6 +3129,8 @@ func (m *model) runBuildEngine(target string) tea.Cmd {
 				exitCode = 1
 			}
 		}
+
+		m.recordShellEvidence(buildGrant, 0, exitCode, err)
 
 		return buildResultMsg{
 			output:   output,
@@ -3438,7 +3498,17 @@ func (m *model) runLogCmd(traceData string) tea.Cmd {
 			runner := execExecutionRunner(".")
 			var output string
 			if traceData != "" {
-				out, err := runner.RunContext(m.operationContext(), traceData)
+				// ── PHASE 1 GLOBAL EXECUTION BOUNDARY ─────────────────
+				// $log with free text executes it as a shell command: the
+				// typed text is an explicit human shell intent, so it mints
+				// a per-operation grant (mode + firewall admitted, exact
+				// command bound). Without the grant nothing executes.
+				logGrant, logAuthErr := m.authorizeShellExecution(traceData, ShellClassExecute, "$log typed")
+				if logAuthErr != nil {
+					return logInputMsg{err: logAuthErr}
+				}
+				out, err := runner.RunGranted(m.operationContext(), logGrant, logGrant.Command)
+				m.recordShellEvidence(logGrant, 0, testExitCode(out, err), err)
 				if err != nil {
 					return logInputMsg{err: err}
 				}
@@ -3884,7 +3954,15 @@ func (m *model) runEnvCmd() tea.Cmd {
 			b.WriteString("  [SYSTEM ENVIRONMENT DIAGNOSTICS]\n")
 			b.WriteString("═══════════════════════════════════════════\n")
 
-			goVer, _ := execShell("go version")
+			goVer := ""
+			// ── PHASE 1 GLOBAL EXECUTION BOUNDARY ─────────────────────────
+			// Even read-only diagnostics cross the shell boundary as
+			// inspect-class grants: explicit provenance, exact-command binding,
+			// workspace confinement and evidence. Denial degrades to an empty
+			// field (diagnostics stay best-effort, never fail-closed loud).
+			if envGrant, envErr := m.authorizeShellExecution("go version", ShellClassInspect, "$env typed"); envErr == nil {
+				goVer, _ = m.execShellGranted(context.Background(), envGrant)
+			}
 			goVer = strings.TrimSpace(goVer)
 			fmt.Fprintf(&b, "  Go Version : %s\n", goVer)
 
@@ -3897,7 +3975,10 @@ func (m *model) runEnvCmd() tea.Cmd {
 				fmt.Fprintf(&b, "  Git Commit : %s\n", hash)
 			}
 
-			statusOut, _ := execShell("git status --short")
+			statusOut := ""
+			if statusGrant, statusErr := m.authorizeShellExecution("git status --short", ShellClassInspect, "$env typed"); statusErr == nil {
+				statusOut, _ = m.execShellGranted(context.Background(), statusGrant)
+			}
 			if strings.TrimSpace(statusOut) != "" {
 				b.WriteString("  Git Dirt   :\n")
 				for _, line := range strings.Split(strings.TrimRight(statusOut, "\n"), "\n") {
@@ -3938,7 +4019,22 @@ func (m *model) runTraceCmd(target string) tea.Cmd {
 			}()
 			runner := execExecutionRunner(".")
 			cmd := "go test -run=" + target + " -v -race 2>&1"
-			result, err := runner.Run(cmd)
+			// ── PHASE 1 GLOBAL EXECUTION BOUNDARY ─────────────────────
+			// $trace executes a test binary under the race detector: the
+			// -run value is validated against shell-metachar injection and
+			// the bounded invocation is evidenced like every test path.
+			traceGrant, traceAuthErr := m.authorizeTestExecution("go test -run", target, "$trace typed")
+			if traceAuthErr != nil {
+				return traceResultMsg{
+					output: traceAuthErr.Error(),
+					target: target,
+					passed: false,
+					failed: 0,
+					total:  0,
+					err:    traceAuthErr,
+				}
+			}
+			result, err := runner.RunGranted(m.operationContext(), traceGrant, cmd)
 
 			output := ""
 			passed := true
@@ -3970,6 +4066,8 @@ func (m *model) runTraceCmd(target string) tea.Cmd {
 				output = err.Error()
 				passed = false
 			}
+
+			m.recordShellEvidence(traceGrant, 0, testExitCode(result, err), err)
 
 			return traceResultMsg{
 				output: output,
@@ -4209,19 +4307,6 @@ func (m *model) shellFirewall(cmd string) (bool, string) {
 	}
 
 	return false, ""
-}
-
-func execShell(cmd string) (string, error) {
-	shell := capabilities.NewExecShell(0)
-	res, err := shell.Execute(context.Background(), cmd)
-	out := res.Stdout
-	if res.Stderr != "" {
-		if out != "" {
-			out += "\n"
-		}
-		out += res.Stderr
-	}
-	return out, err
 }
 
 func (m *model) analyzeObjectiveCmd(obj *domain.Objective) tea.Cmd {

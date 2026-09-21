@@ -429,6 +429,17 @@ type pendingMutation struct {
 }
 
 // RuntimeExecutor is the runtime-owned execution boundary.
+//
+// PHASE 1 AUTHORIZATION BOUNDARY (P0-2): this type is the SINGLE canonical
+// production mutation authority — the one component that owns the semantic
+// decision "this authorized execution may now produce side effects". It is
+// wired exactly once by the composition root
+// (internal/runtime/compose.Compose) and consumed by the TUI
+// (m.executor.Execute), the autonomy adapter and the headless handlers. The
+// same-named types in internal/runtime/executor (unreachable coordinator,
+// Case C) and internal/runtime/scopeguard (subordinate idempotency cursor,
+// Case B) are NOT authorities; the convergence is pinned behaviorally by
+// TestPhase1_SingleProductionExecutionAuthority.
 type RuntimeExecutor struct {
 	root      string
 	cfg       *config.Config

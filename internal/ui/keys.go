@@ -1294,6 +1294,21 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 	// ── Proposed shell command checkpoint ──────────────────────────────
 	if m.proposedShellCmd != "" {
 		cmd := m.proposedShellCmd
+		// ── PHASE 1 GLOBAL EXECUTION BOUNDARY (synchronous UX gate) ──
+		// The model-proposed command reaches the shell ONLY through the
+		// human's Enter: authorize synchronously so a denial surfaces
+		// immediately with no spinner. streamShellCmd re-verifies inside
+		// its worker as the fail-closed backstop.
+		if _, authErr := m.authorizeShellExecution(cmd, ShellClassExecute, "proposed-shell"); authErr != nil {
+			m.proposedShellCmd = ""
+			m.ti.SetValue("")
+			m.ti.Reset()
+			m.syncInputFromTI()
+			m.push(roleError, fmt.Sprintf("shell execution denied: %v", authErr))
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
+			return m, nil
+		}
 		m.proposedShellCmd = ""
 		m.ti.SetValue("")
 		m.ti.Reset()
