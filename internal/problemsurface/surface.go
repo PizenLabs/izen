@@ -1,4 +1,4 @@
-package changesurface
+package problemsurface
 
 import (
 	"path/filepath"
@@ -8,7 +8,7 @@ import (
 	"github.com/PizenLabs/izen/internal/understanding"
 )
 
-// Certainty classifies how strongly a candidate relates to the intent.
+// Certainty classifies how strongly a reference relates to the problem.
 type Certainty string
 
 const (
@@ -30,58 +30,76 @@ const (
 
 func (s Status) String() string { return string(s) }
 
-// Candidate is one repository area plausibly relevant to mutation.
-// It carries provenance and certainty, never authorization and never
-// a mutation operation.
-type Candidate struct {
-	Path      string    `json:"path"`
+// Reference is one evidence-backed area relevant to understanding/
+// investigation/problem solving. It is informational only: no
+// authorization, no mutation, no execution semantics.
+type Reference struct {
+	// Path is the workspace-relative file or directory, or a symbolic
+	// reference (e.g. package name, config key) when backed by evidence.
+	Path string `json:"path"`
+	// Kind is the coarse category ("file", "directory", "symbol",
+	// "package", "config", "test", "ci", "log", etc). Domain-neutral;
+	// never invents domain-specific objects without evidence.
+	Kind string `json:"kind"`
+	// Certainty is DIRECT, RELATED, or UNKNOWN.
 	Certainty Certainty `json:"certainty"`
-	Reason    string    `json:"reason"`
-	Evidence  []string  `json:"evidence,omitempty"`
+	// Reason is the human-readable derivation justification.
+	Reason string `json:"reason"`
+	// Evidence carries the supporting signal keys.
+	Evidence []string `json:"evidence,omitempty"`
 }
 
-// ChangeSurface is the canonical, evidence-backed mutation-target surface:
-// the subset of the problem-relevant surface that is currently evidenced
-// as a candidate for mutation. Read-only and informational: it cannot
-// authorize mutation and cannot express a mutation operation.
-type ChangeSurface struct {
+// ProblemSurface is the domain-neutral, evidence-backed area relevant to
+// understanding/investigation/problem solving. It may reference files,
+// directories, symbols, packages, tests, configuration, CI artifacts,
+// logs, profiles, dependency relationships, runtime observations — but
+// only when those references are actually backed by evidence.
+//
+// ProblemSurface is informational and read-only. It carries no
+// authorization, capability, mutation, execution, retry, continuation,
+// or model selection semantics.
+//
+// Invariants:
+//   - No invented targets: every reference must be evidence-backed.
+//   - Stale understanding → unusable surface (digest binding).
+type ProblemSurface struct {
 	Status              Status      `json:"status"`
-	Candidates          []Candidate `json:"candidates,omitempty"`
+	References          []Reference `json:"references,omitempty"`
 	Evidence            []string    `json:"evidence,omitempty"`
 	UnderstandingDigest string      `json:"understanding_digest"`
 	IntentSummary       string      `json:"intent_summary"`
 	UnresolvedReason    string      `json:"unresolved_reason,omitempty"`
 }
 
-func (s ChangeSurface) DigestMatches(u understanding.ProjectUnderstanding) bool {
+// DigestMatches reports whether the surface was derived from the given
+// understanding instance.
+func (s ProblemSurface) DigestMatches(u understanding.ProjectUnderstanding) bool {
 	return s.UnderstandingDigest != "" && s.UnderstandingDigest == u.Digest
 }
 
-// Derive computes the ChangeSurface for intent against an evidence-backed
-// ProjectUnderstanding. explicitTargets are user-referenced concrete
-// targets; only targets present in repository evidence become DIRECT
-// candidates — anything else is dropped, never invented.
-// The derivation is domain-neutral: it matches intent tokens against
-// evidence-backed paths/components/languages without web-specific
-// keyword rules. Web-specific derivation lives in internal/adapters/web.
-func Derive(intent string, explicitTargets []string, u understanding.ProjectUnderstanding) ChangeSurface {
-	surface := ChangeSurface{
+// Derive computes the ProblemSurface for intent against an
+// evidence-backed ProjectUnderstanding. ExplicitTargets are user-
+// referenced concrete targets (e.g. @cmd/worker); only targets present
+// in repository evidence become DIRECT references — anything else is
+// dropped, never invented.
+func Derive(intent string, explicitTargets []string, u understanding.ProjectUnderstanding) ProblemSurface {
+	surface := ProblemSurface{
 		UnderstandingDigest: u.Digest,
 		IntentSummary:       truncateIntent(intent),
 	}
 	if !u.Valid() {
 		surface.Status = StatusUnresolved
-		surface.UnresolvedReason = "project understanding is unavailable or stale; refusing to fabricate targets"
+		surface.UnresolvedReason = "project understanding is unavailable or stale; refusing to fabricate references"
 		return surface
 	}
 	if u.Kind == understanding.KindUnknown {
 		surface.Status = StatusUnresolved
-		surface.UnresolvedReason = "project understanding is UNKNOWN; refusing to fabricate targets"
+		surface.UnresolvedReason = "project understanding is UNKNOWN; refusing to fabricate references"
 		return surface
 	}
 
 	known := knownPaths(u)
-	var candidates []Candidate
+	var refs []Reference
 	var provenance []string
 
 	// 1. Explicit user targets backed by repository evidence → DIRECT.
@@ -92,8 +110,10 @@ func Derive(intent string, explicitTargets []string, u understanding.ProjectUnde
 			continue
 		}
 		if match, ok := lookupKnown(known, t); ok {
-			candidates = append(candidates, Candidate{
+			kind := kindForPath(match, u)
+			refs = append(refs, Reference{
 				Path:      match,
+				Kind:      kind,
 				Certainty: CertaintyDirect,
 				Reason:    "explicitly referenced target present in repository evidence",
 				Evidence:  []string{"target:" + match},
@@ -102,7 +122,7 @@ func Derive(intent string, explicitTargets []string, u understanding.ProjectUnde
 		}
 	}
 
-	// 2. Generic token matching against evidenced paths/components/languages.
+	// 2. Intent-tokens matched against evidenced paths/components/languages → DIRECT/RELATED.
 	lower := strings.ToLower(intent)
 	tokens := tokenize(lower)
 	for _, tok := range tokens {
@@ -111,25 +131,31 @@ func Derive(intent string, explicitTargets []string, u understanding.ProjectUnde
 		}
 		for p := range known {
 			if strings.Contains(strings.ToLower(p), tok) {
+				// Avoid duplicating explicit targets at same certainty
+				kind := kindForPath(p, u)
 				cert := CertaintyRelated
+				// If token is a component name or language, treat as DIRECT for that path
 				if isComponentToken(tok, u) || isLanguageToken(tok, u) {
 					cert = CertaintyDirect
 				}
-				candidates = append(candidates, Candidate{
+				refs = append(refs, Reference{
 					Path:      p,
+					Kind:      kind,
 					Certainty: cert,
-					Reason:    "intent token '" + tok + "' matches evidence-backed path " + p,
+					Reason:    "intent token '" + tok + "' matches evidence-backed reference " + p,
 					Evidence:  []string{"intent:" + tok, "structure:" + p},
 				})
 				provenance = append(provenance, "intent:"+tok, "structure:"+p)
 			}
 		}
+		// Component name matches
 		for _, c := range u.Components {
 			if strings.Contains(strings.ToLower(c.Name), tok) {
 				for _, p := range c.Paths {
 					if known[p] {
-						candidates = append(candidates, Candidate{
+						refs = append(refs, Reference{
 							Path:      p,
+							Kind:      kindForPath(p, u),
 							Certainty: CertaintyDirect,
 							Reason:    "intent references component " + c.Name,
 							Evidence:  []string{"component:" + c.Name, "structure:" + p},
@@ -141,66 +167,27 @@ func Derive(intent string, explicitTargets []string, u understanding.ProjectUnde
 		}
 	}
 
-	candidates = dedupeCandidates(candidates)
-	if len(candidates) == 0 {
+	refs = dedupeReferences(refs)
+	if len(refs) == 0 {
+		// 3. Broad intents over EXISTING yield RELATED component-level surface.
 		if u.Kind == understanding.KindExisting && isBroadIntent(lower) {
-			candidates = componentSurface(u, known)
+			refs = componentReferences(u, known)
 			provenance = append(provenance, "intent:broad")
 		}
-	} else if u.Kind == understanding.KindExisting && isBroadIntent(lower) && !isNarrowIntent(lower) && len(candidates) < 3 {
-		// Supplement broad intents that matched too narrowly: merge
-		// component-level surface to ensure bounded multi-file
-		// representation without inventing targets. Narrow intents
-		// (e.g. title change) are kept single-file.
-		supp := componentSurface(u, known)
-		// Merge without duplicating existing paths
-		existing := map[string]bool{}
-		for _, c := range candidates {
-			existing[c.Path] = true
-		}
-		for _, c := range supp {
-			if !existing[c.Path] {
-				candidates = append(candidates, c)
-				provenance = append(provenance, c.Evidence...)
-				existing[c.Path] = true
-				if len(candidates) >= 6 {
-					break
-				}
-			}
-		}
-		candidates = dedupeCandidates(candidates)
 	}
 
 	switch {
-	case len(candidates) == 0:
+	case len(refs) == 0:
 		surface.Status = StatusUnresolved
-		surface.UnresolvedReason = "no evidence-backed relationship between intent and repository structure; refusing to fabricate targets"
-	case hasDirect(candidates):
+		surface.UnresolvedReason = "no evidence-backed relationship between intent and repository structure; refusing to fabricate references"
+	case hasDirect(refs):
 		surface.Status = StatusResolved
 	default:
 		surface.Status = StatusPartial
 	}
-	surface.Candidates = candidates
+	surface.References = refs
 	surface.Evidence = uniqueSorted(provenance)
 	return surface
-}
-
-// DeriveFromProblemSurface derives a mutation-only ChangeSurface from a
-// broader ProblemSurface. It filters the problem surface to file/
-// directory references that are plausible mutation targets, preserving
-// the no-invented-targets invariant. This is the preferred narrow
-// transformation: ProblemSurface ⊇ ChangeSurface.
-func DeriveFromProblemSurface(intent string, ps interface {
-	GetReferences() []Candidate
-	GetDigest() string
-	GetStatus() Status
-}, u understanding.ProjectUnderstanding) ChangeSurface {
-	// Generic fallback: if the problem surface has no direct file
-	// references, derive generically. This overload keeps the core
-	// dependency direction correct: changesurface may depend on
-	// problemsurface contracts, not vice versa. Here we keep a minimal
-	// generic bridge without hard import cycle.
-	return Derive(intent, nil, u)
 }
 
 // ── helpers ──
@@ -226,6 +213,9 @@ func knownPaths(u understanding.ProjectUnderstanding) map[string]bool {
 			}
 		}
 	}
+	// Also index evidence-backed file paths from component evidence where
+	// the structure ID may not have been emitted as EvidenceStructure but
+	// the component still carries it.
 	return known
 }
 
@@ -246,7 +236,38 @@ func lookupKnown(known map[string]bool, target string) (string, bool) {
 	return best, best != ""
 }
 
+func kindForPath(p string, u understanding.ProjectUnderstanding) string {
+	low := strings.ToLower(p)
+	// Heuristic kind from path + understanding evidence
+	if strings.Contains(low, "cmd/") || strings.Contains(low, "internal/") {
+		return "package"
+	}
+	if strings.HasSuffix(low, ".go") || strings.HasSuffix(low, ".rs") || strings.HasSuffix(low, ".py") {
+		return "file"
+	}
+	if strings.HasSuffix(low, "/") || !strings.Contains(filepath.Base(p), ".") {
+		// directory-like
+		// Check if it's a known component directory
+		for _, c := range u.Components {
+			for _, cp := range c.Paths {
+				if cp == p {
+					return "directory"
+				}
+			}
+		}
+		return "directory"
+	}
+	if strings.Contains(low, "test") || strings.Contains(low, "spec") {
+		return "test"
+	}
+	if strings.Contains(low, "config") || strings.HasSuffix(low, ".yml") || strings.HasSuffix(low, ".yaml") || strings.HasSuffix(low, ".json") || strings.HasSuffix(low, ".toml") {
+		return "config"
+	}
+	return "file"
+}
+
 func tokenize(lower string) []string {
+	// Simple whitespace + punctuation tokenization, filtered to alphanumerics
 	var tokens []string
 	var cur strings.Builder
 	for _, r := range lower {
@@ -262,6 +283,7 @@ func tokenize(lower string) []string {
 	if cur.Len() >= 2 {
 		tokens = append(tokens, cur.String())
 	}
+	// Deduplicate
 	seen := map[string]bool{}
 	var out []string
 	for _, t := range tokens {
@@ -288,45 +310,35 @@ func isLanguageToken(tok string, u understanding.ProjectUnderstanding) bool {
 			return true
 		}
 	}
-	extMap := map[string]bool{"go": true, "py": true, "rs": true, "js": true, "ts": true, "html": true, "css": true, "java": true, "sql": true}
+	// also check extension tokens
+	extMap := map[string]bool{"go": true, "py": true, "rs": true, "js": true, "ts": true, "html": true, "css": true}
 	return extMap[strings.ToLower(tok)]
 }
 
 func isBroadIntent(lower string) bool {
-	for _, w := range []string{
-		"review", "explore", "overview", "summarize", "summary", "explain", "audit", "survey", "understand",
-		"investigate", "analyze", "analysis", "refactor", "redesign", "overhaul", "revamp", "rework", "restructure",
-		"fix", "repair", "optimize", "improve", "update", "change", "modify", "rebuild", "migrate", "cleanup",
-		"race", "deadlock", "leak", "memory", "latency", "performance", "flaky", "ci", "render", "bottleneck",
-		"portfolio", "website", "site", "homepage", "style", "script", "asset",
-	} {
+	for _, w := range []string{"review", "explore", "overview", "summarize", "summary", "explain", "audit", "survey", "understand", "investigate", "analyze", "analysis", "refactor", "redesign", "overhaul", "optimize", "fix", "debug", "profile", "benchmark", "race", "leak", "flaky", "latency", "render", "investigation"} {
 		if strings.Contains(lower, w) {
 			return true
 		}
 	}
-	return len(strings.Fields(lower)) >= 5
-}
-
-func isNarrowIntent(lower string) bool {
-	for _, kw := range []string{"one line", "small", "fix typo", "single file", "trivial", "title", "page title"} {
-		if strings.Contains(lower, kw) {
-			return true
-		}
+	// Also broad if intent is long (multiple sentences) suggesting investigation
+	if len(strings.Fields(lower)) >= 6 {
+		return true
 	}
 	return false
 }
 
-func componentSurface(u understanding.ProjectUnderstanding, known map[string]bool) []Candidate {
-	var out []Candidate
+func componentReferences(u understanding.ProjectUnderstanding, known map[string]bool) []Reference {
+	var out []Reference
 	seen := map[string]bool{}
 	add := func(p string) {
 		if p == "" || seen[p] || !known[p] {
 			return
 		}
 		seen[p] = true
-		out = append(out, Candidate{
-			Path: p, Certainty: CertaintyRelated,
-			Reason: "broad intent over an existing project; component-level surface", Evidence: []string{"intent:broad"},
+		out = append(out, Reference{
+			Path: p, Kind: kindForPath(p, u), Certainty: CertaintyRelated,
+			Reason: "broad intent over an existing project; component-level reference", Evidence: []string{"intent:broad"},
 		})
 	}
 	for _, c := range u.Components {
@@ -334,6 +346,7 @@ func componentSurface(u understanding.ProjectUnderstanding, known map[string]boo
 			add(p)
 		}
 	}
+	// Also add known structure evidence paths (bounded)
 	for p := range known {
 		if len(out) >= 12 {
 			break
@@ -347,25 +360,25 @@ func componentSurface(u understanding.ProjectUnderstanding, known map[string]boo
 	return out
 }
 
-func hasDirect(cands []Candidate) bool {
-	for _, c := range cands {
-		if c.Certainty == CertaintyDirect {
+func hasDirect(refs []Reference) bool {
+	for _, r := range refs {
+		if r.Certainty == CertaintyDirect {
 			return true
 		}
 	}
 	return false
 }
 
-func dedupeCandidates(in []Candidate) []Candidate {
+func dedupeReferences(in []Reference) []Reference {
 	seen := map[string]bool{}
-	var out []Candidate
-	for _, c := range in {
-		key := c.Path + "\x00" + string(c.Certainty)
+	var out []Reference
+	for _, r := range in {
+		key := r.Path + "\x00" + string(r.Certainty)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		out = append(out, c)
+		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Certainty != out[j].Certainty {

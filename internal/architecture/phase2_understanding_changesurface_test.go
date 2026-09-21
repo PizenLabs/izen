@@ -114,10 +114,13 @@ func TestPhase2_NoNewMutationAuthority(t *testing.T) {
 	if err := os.WriteFile(target, []byte(original), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(root, "styles.css"), []byte("body{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	u := understanding.Derive(root)
 	s := changesurface.Derive("Redesign the portfolio website.", nil, u)
 	if len(s.Candidates) == 0 {
-		t.Fatal("surface must resolve over the fixture-like workspace")
+		t.Fatalf("surface must resolve over the fixture-like workspace, got status %v reason %q", s.Status, s.UnresolvedReason)
 	}
 	if got, err := os.ReadFile(target); err != nil || string(got) != original {
 		t.Fatal("deriving understanding + surface must not mutate the workspace")

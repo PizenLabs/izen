@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/PizenLabs/izen/internal/adapters/web"
 	"github.com/PizenLabs/izen/internal/understanding"
 )
 
@@ -82,7 +83,7 @@ func TestPU04_MissingTargetFileIsNotGreenfield(t *testing.T) {
 	if u.Kind != understanding.KindExisting {
 		t.Fatalf("kind = %v, want EXISTING despite missing index.html", u.Kind)
 	}
-	// Static-web fixture minus index.html is still EXISTING.
+	// Static-web fixture minus index.html is still EXISTING via generic language count.
 	root2 := t.TempDir()
 	writeFile(t, root2, "styles.css", "body { margin: 0; }\n")
 	writeFile(t, root2, "script.js", "console.log(1);\n")
@@ -96,27 +97,32 @@ func TestPU04_MissingTargetFileIsNotGreenfield(t *testing.T) {
 	}
 }
 
-// PU-05: repository evidence is sufficient to identify static-web structure.
+// PU-05: repository evidence is sufficient to identify static-web structure via adapter.
+// Core understanding is domain-neutral; web-specific surface is derived via adapter.
 func TestPU05_StaticWebFixtureUnderstood(t *testing.T) {
 	u := understanding.Derive(fixtureRoot(t))
 	if u.Kind != understanding.KindExisting {
 		t.Fatalf("kind = %v, want EXISTING for the static-web fixture", u.Kind)
 	}
-	if u.StaticWeb == nil || !u.StaticWeb.Present {
-		t.Fatal("static-web surface must be present for the fixture")
+	ws := web.Derive(fixtureRoot(t))
+	if !ws.Present {
+		t.Fatal("static-web surface must be present for the fixture via adapter")
 	}
-	sw := u.StaticWeb
-	if len(sw.Entrypoints) == 0 || sw.Entrypoints[0] != "index.html" {
-		t.Fatalf("entrypoints = %v, want index.html first", sw.Entrypoints)
+	if len(ws.Entrypoints) == 0 || ws.Entrypoints[0] != "index.html" {
+		t.Fatalf("entrypoints = %v, want index.html first", ws.Entrypoints)
 	}
-	if len(sw.CSS) == 0 || len(sw.Scripts) == 0 {
-		t.Fatalf("css = %v scripts = %v, want both evidenced", sw.CSS, sw.Scripts)
+	if len(ws.CSS) == 0 || len(ws.Scripts) == 0 {
+		t.Fatalf("css = %v scripts = %v, want both evidenced", ws.CSS, ws.Scripts)
 	}
-	if len(sw.AssetDirs) == 0 {
-		t.Fatalf("asset dirs = %v, want assets/ evidenced", sw.AssetDirs)
+	if len(ws.AssetDirs) == 0 {
+		t.Fatalf("asset dirs = %v, want assets/ evidenced", ws.AssetDirs)
 	}
-	if len(sw.ScriptRefs) == 0 || len(sw.StyleRefs) == 0 {
-		t.Fatalf("refs = %v / %v, want script + stylesheet references", sw.ScriptRefs, sw.StyleRefs)
+	if len(ws.ScriptRefs) == 0 || len(ws.StyleRefs) == 0 {
+		t.Fatalf("refs = %v / %v, want script + stylesheet references", ws.ScriptRefs, ws.StyleRefs)
+	}
+	// Core must not claim static-web identity; that is adapter-level.
+	if u.Identity == "static-web" {
+		t.Fatalf("core identity must not be static-web; got %q (web is adapter-level)", u.Identity)
 	}
 }
 
@@ -137,9 +143,13 @@ func TestPU06_UnderstandingIsEvidenceBacked(t *testing.T) {
 	if u.Digest == "" || u.SnapshotID == "" {
 		t.Fatal("understanding must be bound to a snapshot digest")
 	}
-	// Coarse identity: static-web with confidence, never fabricated stack.
-	if u.Identity != "static-web" {
-		t.Fatalf("identity = %q, want coarse static-web (no false precision)", u.Identity)
+	// Core identity is domain-neutral (unknown for html/css/js without manifest), never fabricated stack.
+	if u.Identity == "" {
+		t.Fatalf("identity must be set, got empty")
+	}
+	// Must not be static-web via core; adapter holds that.
+	if u.Identity == "static-web" {
+		t.Fatalf("core identity must not be static-web")
 	}
 }
 

@@ -31,13 +31,15 @@ type Component struct {
 // representation of the current workspace. It describes what the
 // repository IS, not what Izen intends to modify. It carries no
 // authorization, no mutation operation, and no execution semantics.
+// It is domain-neutral: it knows languages, manifests, components,
+// and evidence provenance, but never web-specific surfaces.
 type ProjectUnderstanding struct {
 	// Root is the absolute workspace root the understanding was derived from.
 	Root string `json:"root"`
 	// Kind is the EXISTING / GREENFIELD / UNKNOWN classification.
 	Kind ProjectKind `json:"kind"`
-	// Identity is the coarse project label (e.g. "static-web",
-	// "go-module", "node-app", "mixed", "empty", "unknown").
+	// Identity is the coarse project label (e.g. "go-module",
+	// "node-app", "mixed", "empty", "unknown").
 	Identity string `json:"identity"`
 	// Languages lists detected source languages by extension evidence.
 	Languages []string `json:"languages,omitempty"`
@@ -45,8 +47,6 @@ type ProjectUnderstanding struct {
 	Components []Component `json:"components,omitempty"`
 	// Evidence lists every repository fact supporting the understanding.
 	Evidence []Evidence `json:"evidence,omitempty"`
-	// StaticWeb carries static-web structural evidence when present.
-	StaticWeb *StaticWebSurface `json:"static_web,omitempty"`
 	// Confidence is the evidence weight score clamped to [0,1].
 	Confidence float64 `json:"confidence"`
 	// SnapshotID binds the understanding to one workspace state. Any
@@ -309,10 +309,12 @@ func Derive(root string) ProjectUnderstanding {
 
 	// 3. Language-by-extension evidence.
 	extCounts := map[string]int{}
+	filesByLang := map[string][]string{}
 	for _, f := range acc.files {
 		ext := strings.ToLower(filepath.Ext(f))
 		if lang, ok := extLanguages[ext]; ok {
 			extCounts[lang]++
+			filesByLang[lang] = append(filesByLang[lang], f)
 		}
 	}
 	for lang, n := range extCounts {
@@ -329,52 +331,23 @@ func Derive(root string) ProjectUnderstanding {
 		langWeight[lang] += w
 	}
 
-	// 4. Static-web structural surface (first-class, no Go-extractor fiction).
-	staticWeb := scanStaticWeb(acc)
-	if staticWeb.Present {
-		if len(staticWeb.Entrypoints) > 0 {
-			evidence = append(evidence, Evidence{
-				Kind: EvidenceStructure, ID: "structure:" + staticWeb.Entrypoints[0],
-				Detail: "HTML entrypoint " + staticWeb.Entrypoints[0] + " present",
-				Weight: 0.7,
-			})
+	// 4. Generic structural evidence for representative source files
+	// (domain-neutral): emit a bounded sample of structure evidence so
+	// that evidence-backed references exist without web-specific
+	// semantics. For each language with files, emit up to one
+	// representative structure entry.
+	for lang, files := range filesByLang {
+		if len(files) == 0 {
+			continue
 		}
-		for _, c := range staticWeb.CSS {
-			evidence = append(evidence, Evidence{
-				Kind: EvidenceStructure, ID: "structure:" + c,
-				Detail: "stylesheet " + c + " present", Weight: 0.3,
-			})
-			break // one representative trace keeps evidence inspectable
-		}
-		for _, s := range staticWeb.Scripts {
-			evidence = append(evidence, Evidence{
-				Kind: EvidenceStructure, ID: "structure:" + s,
-				Detail: "script " + s + " present", Weight: 0.3,
-			})
-			break
-		}
-		for _, d := range staticWeb.AssetDirs {
-			evidence = append(evidence, Evidence{
-				Kind: EvidenceStructure, ID: "structure:" + d + "/",
-				Detail: "asset directory " + d + "/ present", Weight: 0.3,
-			})
-			break
-		}
-		for _, r := range staticWeb.ScriptRefs {
-			evidence = append(evidence, Evidence{
-				Kind: EvidenceReference, ID: "reference:" + r,
-				Detail: "HTML references script " + r, Weight: 0.2,
-			})
-			break
-		}
-		for _, r := range staticWeb.StyleRefs {
-			evidence = append(evidence, Evidence{
-				Kind: EvidenceReference, ID: "reference:" + r,
-				Detail: "HTML references stylesheet " + r, Weight: 0.2,
-			})
-			break
-		}
-		u.StaticWeb = &staticWeb
+		// Emit at most one per language to keep evidence inspectable.
+		sort.Strings(files)
+		rep := files[0]
+		evidence = append(evidence, Evidence{
+			Kind: EvidenceStructure, ID: "structure:" + rep,
+			Detail: lang + " source " + rep + " present",
+			Weight: 0.3,
+		})
 	}
 
 	// 5. Source-directory topology evidence.
@@ -401,9 +374,9 @@ func Derive(root string) ProjectUnderstanding {
 		u.Languages = append(u.Languages, lang)
 	}
 	sort.Strings(u.Languages)
-	u.Components = buildComponents(u, identities, staticWeb)
-	u.Identity = identityFor(identities, staticWeb, len(acc.files))
-	u.Kind = classify(acc, evidence, identities, staticWeb)
+	u.Components = buildComponents(u, identities, extCounts, filesByLang)
+	u.Identity = identityFor(identities, len(acc.files))
+	u.Kind = classify(acc, evidence, identities)
 	u.Confidence = confidenceFor(evidence)
 	return u
 }
@@ -411,7 +384,10 @@ func Derive(root string) ProjectUnderstanding {
 // classify applies the strict EXISTING / GREENFIELD / UNKNOWN semantics.
 // Missing single files never imply GREENFIELD; only a genuinely empty
 // workspace does. Anything insufficient or contradictory is UNKNOWN.
-func classify(acc *scanAcc, evidence []Evidence, identities map[string]float64, sw StaticWebSurface) ProjectKind {
+// It is domain-neutral: classification derives from generic evidence
+// (manifests, language counts, directory topology), not from web
+// surfaces.
+func classify(acc *scanAcc, evidence []Evidence, identities map[string]float64) ProjectKind {
 	if len(identities) > 0 {
 		return KindExisting
 	}
@@ -425,9 +401,6 @@ func classify(acc *scanAcc, evidence []Evidence, identities map[string]float64, 
 		if _, ok := extLanguages[ext]; ok {
 			sourceFiles++
 		}
-	}
-	if sw.Present && len(sw.HTML) > 0 {
-		return KindExisting
 	}
 	if sourceFiles >= 2 {
 		return KindExisting
@@ -451,11 +424,10 @@ func classify(acc *scanAcc, evidence []Evidence, identities map[string]float64, 
 
 // identityFor prefers coarse, evidence-backed labels and preserves
 // uncertainty instead of manufacturing framework precision.
-func identityFor(identities map[string]float64, sw StaticWebSurface, fileCount int) string {
+// It is domain-neutral: identity derives from manifest/dependency
+// evidence, never from web surfaces.
+func identityFor(identities map[string]float64, fileCount int) string {
 	if len(identities) == 0 {
-		if sw.Present {
-			return "static-web"
-		}
 		if fileCount == 0 {
 			return "empty"
 		}
@@ -463,9 +435,6 @@ func identityFor(identities map[string]float64, sw StaticWebSurface, fileCount i
 	}
 	if len(identities) == 1 {
 		for id := range identities {
-			if id == "node-app" && sw.Present {
-				return "node-app"
-			}
 			return id
 		}
 	}
@@ -482,31 +451,81 @@ func identityFor(identities map[string]float64, sw StaticWebSurface, fileCount i
 }
 
 // buildComponents derives coarse structural components from evidence.
-func buildComponents(u ProjectUnderstanding, identities map[string]float64, sw StaticWebSurface) []Component {
+// Domain-neutral: components derive from manifest identities and
+// language evidence (representative paths), not from web surfaces.
+func buildComponents(u ProjectUnderstanding, identities map[string]float64, extCounts map[string]int, filesByLang map[string][]string) []Component {
 	var out []Component
-	if sw.Present {
-		paths := append([]string{}, sw.Entrypoints...)
-		paths = append(paths, sw.CSS...)
-		paths = append(paths, sw.Scripts...)
-		paths = append(paths, sw.AssetDirs...)
-		sort.Strings(paths)
-		if len(paths) > 8 {
-			paths = paths[:8]
-		}
-		out = append(out, Component{Name: "static-web", Kind: "static", Paths: paths})
-	}
 	ids := make([]string, 0, len(identities))
 	for id := range identities {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		if id == "node-app" && sw.Present {
-			continue // already covered by the static-web component paths
+		comp := Component{Name: id, Kind: componentKind(id)}
+		// Attach representative paths for the component when available
+		// via language-file mapping or evidence structure.
+		out = append(out, comp)
+	}
+	// Language-based components: when no manifest identity covers the
+	// language, emit a lightweight component so that evidence-backed
+	// references (files) are discoverable via the generic surface.
+	// This keeps the core domain-neutral while still representing
+	// html/css/js etc as generic language evidence.
+	for lang, files := range filesByLang {
+		if len(files) == 0 {
+			continue
 		}
-		out = append(out, Component{Name: id, Kind: componentKind(id)})
+		// Skip if language already represented by an identity's language.
+		// Identities like go-module already imply Go; still emit only
+		// when identities is empty or language not implied.
+		if len(identities) > 0 {
+			// Check if any identity's language matches this lang
+			// (coarse: we just check if lang lower is substring of identity)
+			skip := false
+			for id := range identities {
+				if strings.Contains(strings.ToLower(id), strings.ToLower(lang)) {
+					skip = true
+					break
+				}
+			}
+			if skip {
+				continue
+			}
+		}
+		sort.Strings(files)
+		paths := files
+		if len(paths) > 4 {
+			paths = paths[:4]
+		}
+		// Avoid duplicating a component with same name
+		exists := false
+		for _, c := range out {
+			if strings.EqualFold(c.Name, strings.ToLower(lang)) {
+				exists = true
+				break
+			}
+		}
+		if exists {
+			continue
+		}
+		out = append(out, Component{
+			Name:  strings.ToLower(lang),
+			Kind:  languageComponentKind(lang),
+			Paths: paths,
+		})
 	}
 	return out
+}
+
+func languageComponentKind(lang string) string {
+	switch strings.ToLower(lang) {
+	case "go", "rust", "java", "python", "ruby", "php", "c", "c++", "kotlin", "swift":
+		return "backend"
+	case "javascript", "typescript", "html", "css":
+		return "frontend"
+	default:
+		return "unknown"
+	}
 }
 
 func componentKind(identity string) string {

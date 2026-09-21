@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/PizenLabs/izen/internal/adapters/web"
 	"github.com/PizenLabs/izen/internal/changesurface"
 	"github.com/PizenLabs/izen/internal/understanding"
 )
@@ -35,16 +36,22 @@ func containsPath(cands []changesurface.Candidate, path string) *changesurface.C
 }
 
 // CS-01: intent + Project Understanding can derive a Change Surface.
+// Generic surface must be domain-neutral; web-specific DIRECT is via adapter.
 func TestCS01_IntentDerivesSurface(t *testing.T) {
 	u := fixtureUnderstanding(t)
 	s := changesurface.Derive("Redesign the portfolio website.", nil, u)
-	if s.Status != changesurface.StatusResolved {
-		t.Fatalf("status = %v, want RESOLVED", s.Status)
+	if s.Status == changesurface.StatusUnresolved {
+		t.Fatalf("status = %v, want RESOLVED or PARTIAL for generic surface", s.Status)
 	}
-	if got := containsPath(s.Candidates, "index.html"); got == nil {
-		t.Fatalf("candidates = %v, want index.html", s.Candidates)
+	if len(s.Candidates) == 0 {
+		t.Fatalf("candidates = %v, want at least one evidence-backed candidate", s.Candidates)
+	}
+	// Web adapter should still yield DIRECT index.html for the same intent
+	ws := web.DeriveSurface("Redesign the portfolio website.", nil, u)
+	if got := containsPath(ws.Candidates, "index.html"); got == nil {
+		t.Fatalf("web adapter candidates = %v, want index.html", ws.Candidates)
 	} else if got.Certainty != changesurface.CertaintyDirect {
-		t.Fatalf("index.html certainty = %v, want DIRECT", got.Certainty)
+		t.Fatalf("web adapter index.html certainty = %v, want DIRECT", got.Certainty)
 	}
 }
 
