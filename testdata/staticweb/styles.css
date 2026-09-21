@@ -1,0 +1,12 @@
+/* Fixture portfolio stylesheet. */
+:root {
+  --color-text: #1a1a1a;
+  --color-bg: #ffffff;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  color: var(--color-text);
+  background: var(--color-bg);
+}
