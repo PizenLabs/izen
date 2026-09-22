@@ -1049,9 +1049,9 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	// Fast-track markdown checklists are exempt: local 7B models commonly
 	// truncate them and the salvage path above already tolerates that.
 	if resp.FinishReason == "length" {
-		e.emit(events.NewStepStarted(modelName, 1, stepState.maxTokens))
-		e.emit(events.NewStepExhausted(1, stepState.maxTokens, len(e.salvageValidTasks(resp.Content, problem, ledgerContent))))
-		e.emit(events.NewContinuationStarted(2, stepState.maxTokens))
+		e.emit(events.NewStepStarted(modelName, 1, stepState.maxOutputTokens()))
+		e.emit(events.NewStepExhausted(1, stepState.maxOutputTokens(), len(e.salvageValidTasks(resp.Content, problem, ledgerContent))))
+		e.emit(events.NewContinuationStarted(2, stepState.maxOutputTokens()))
 		return e.synthesizeBoundedContinuation(ctx, req, resp, problem, ledgerContent, stepState)
 	}
 

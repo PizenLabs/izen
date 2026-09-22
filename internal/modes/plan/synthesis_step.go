@@ -9,7 +9,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/discovery/recon"
 	"github.com/PizenLabs/izen/internal/events"
-	"github.com/PizenLabs/izen/internal/providers/capability"
+	"github.com/PizenLabs/izen/internal/llmstep"
 )
 
 // ── BOUNDED REASONING STEP CONTRACT ─────────────────────────────────────────
@@ -37,10 +37,10 @@ import (
 // parsing free-form log strings.
 
 const (
-	// planSynthesisRequestedMaxTokens is the default plan-synthesis output
-	// budget REQUESTED for unconstrained models. It is never a hard invariant:
-	// resolveSynthesisMaxTokens clamps it against the provider's real ceiling
-	// (constrained/free-tier models are capped at ~980).
+	// defaultMaxTokenRequest is the plan-synthesis output budget REQUESTED for
+	// unconstrained models. It is never a hard invariant: llmstep.ResolveMaxTokens
+	// clamps it against the provider's real ceiling (constrained/free-tier models
+	// are capped at ~980).
 	planSynthesisRequestedMaxTokens = 1536
 
 	// initialStepTaskBudget is the maximum number of atomic tasks a constrained
@@ -56,61 +56,38 @@ const (
 	// a bounded step commits NO state (STEP_INCOMPLETE → smaller scope).
 	stepTaskBudgetShrink = 2
 
-	// defaultMaxContinuationSteps is the request budget: the maximum number of
-	// bounded continuation steps a single plan synthesis may schedule after the
-	// initial OUTPUT_EXHAUSTED step.
-	defaultMaxContinuationSteps = 3
+	// defaultMaxContinuationSteps is the request budget for a plan synthesis:
+	// the maximum number of bounded continuation steps scheduled after the
+	// initial OUTPUT_EXHAUSTED step. It lives on the shared llmstep primitive;
+	// this alias keeps the plan contract self-documenting.
+	defaultMaxContinuationSteps = llmstep.DefaultMaxContinuationSteps
 )
 
 // resolveSynthesisMaxTokens derives the maximal safe output budget for plan
-// synthesis against a specific model. A model whose ceiling is unknown or
-// above the constrained threshold keeps the requested budget; a constrained or
-// free-tier model is clamped to its ceiling (980) so the request never asks
-// for a budget the provider must silently cut — the primary driver of
-// finish_reason="length" + blind same-scope retry. The second return reports
-// whether the model was classified as constrained.
+// synthesis against a specific model. It delegates to the SHARED bounded-step
+// budget resolution (llmstep.ResolveMaxTokens) so the executor, ask and plan
+// paths never ship a separate model-output-budget resolver. The second return
+// reports whether the model was classified as constrained.
 func resolveSynthesisMaxTokens(modelName string, requested int) (maxTokens int, constrained bool) {
-	vendor, model := splitModelVendor(modelName)
-	ceiling := capability.MaxOutputTokensFor(vendor, model)
-	if capability.IsFreeTierModelID(modelName) {
-		if ceiling <= 0 || ceiling > capability.ConstrainedOutputThreshold {
-			ceiling = capability.ConstrainedOutputThreshold
-		}
-		return capability.ClampMaxTokensForBudget(requested, ceiling), true
-	}
-	if ceiling > 0 && ceiling <= capability.ConstrainedOutputThreshold {
-		return capability.ClampMaxTokensForBudget(requested, ceiling), true
-	}
-	return requested, false
-}
-
-// splitModelVendor splits an OpenRouter-style "vendor/model:id" identifier
-// into its vendor prefix and bare model id. A bare identifier yields vendor ""
-// and the full string as the model.
-func splitModelVendor(modelID string) (vendor, model string) {
-	trimmed := strings.TrimSpace(modelID)
-	if i := strings.Index(trimmed, "/"); i >= 0 {
-		return strings.TrimSpace(trimmed[:i]), strings.TrimSpace(trimmed[i+1:])
-	}
-	return "", trimmed
+	return llmstep.ResolveMaxTokens(modelName, requested)
 }
 
 // synthesisStepState is the durable, bounded continuity state of one plan
 // synthesis run. It preserves the task identity (the active model), the
 // authority (the staged, validated tasks), the adaptive step budget, the
 // remaining request budget, and the committed atomic results — so each
-// continuation step advances work instead of replaying it.
+// continuation step advances work instead of replaying it. The ordinal /
+// request-budget lifecycle is owned by the shared llmstep.StepState; the
+// plan-specific adaptive task-budget and the staged task ledger stay here.
 type synthesisStepState struct {
-	modelName       string
-	constrained     bool
-	maxTokens       int
-	step            int
+	*stepCore
 	taskBudget      int
-	continuations   int
-	maxSteps        int
 	staged          []Task
 	baseUserContent string
 }
+
+// stepCore is the shared bounded-step lifecycle core of a plan synthesis.
+type stepCore struct{ ss *llmstep.StepState }
 
 func newSynthesisStepState(modelName string, constrained bool, maxTokens int) *synthesisStepState {
 	tb := 0
@@ -118,28 +95,29 @@ func newSynthesisStepState(modelName string, constrained bool, maxTokens int) *s
 		tb = initialStepTaskBudget
 	}
 	return &synthesisStepState{
-		modelName:   modelName,
-		constrained: constrained,
-		maxTokens:   maxTokens,
-		step:        1,
-		taskBudget:  tb,
-		maxSteps:    defaultMaxContinuationSteps,
+		stepCore:   &stepCore{ss: llmstep.NewStepState(modelName, constrained, maxTokens, defaultMaxContinuationSteps)},
+		taskBudget: tb,
 	}
 }
 
-func (s *synthesisStepState) canContinue() bool {
-	return s.continuations < s.maxSteps
-}
+// modelName exposes the bound model for telemetry.
+func (s *synthesisStepState) modelName() string { return s.ss.Model() }
 
-func (s *synthesisStepState) continuationsLeft() int {
-	return s.maxSteps - s.continuations
-}
+// stepOrdinal exposes the current 1-based bounded-step ordinal for telemetry.
+func (s *synthesisStepState) stepOrdinal() int { return s.ss.Ordinal() }
 
-// recordContinuation advances the step ordinal and the request-budget counter.
-func (s *synthesisStepState) recordContinuation() {
-	s.continuations++
-	s.step++
-}
+// canContinue reports whether the request budget admits another continuation.
+func (s *synthesisStepState) canContinue() bool { return s.ss.CanContinue() }
+
+// continuationsLeft returns the remaining request-budget steps.
+func (s *synthesisStepState) continuationsLeft() int { return s.ss.ContinuationsLeft() }
+
+// recordContinuation advances the step ordinal and request-budget counter.
+func (s *synthesisStepState) recordContinuation() { s.ss.Advance() }
+
+// maxOutputTokens exposes the capability-aware per-step output budget for
+// telemetry emission.
+func (s *synthesisStepState) maxOutputTokens() int { return s.ss.MaxTokens() }
 
 // shrinkBudget applies the adaptive granularity decrement and reports whether
 // the floor was not yet reached. A false return means the step cannot be made
@@ -363,11 +341,11 @@ func (e *Engine) commitStepState(step *synthesisStepState, problem, ledgerConten
 	if len(step.staged) == 0 {
 		return nil, &SynthesisError{
 			Kind: SynthesisOutputExhausted,
-			Step: step.step,
+			Step: step.stepOrdinal(),
 			Hint: "provider output ceiling exhausted and the minimal bounded step still produced no validated plan tasks; model cannot fit the plan in its output budget",
 		}
 	}
-	e.emit(events.NewStateCommitted(step.step, len(step.staged), "final.plan"))
+	e.emit(events.NewStateCommitted(step.stepOrdinal(), len(step.staged), "final.plan"))
 	return e.finalizeTasks(step.staged, problem, ledgerContent), nil
 }
 
@@ -392,10 +370,10 @@ func (e *Engine) synthesizeBoundedContinuation(ctx context.Context, baseReq ai.R
 	salvaged := e.salvageValidTasks(exhausted.Content, problem, ledgerContent)
 	if len(salvaged) > 0 {
 		step.staged = mergeTaskBatches(step.staged, salvaged)
-		e.emit(events.NewStateCommitted(step.step, len(step.staged), "step.batch"))
+		e.emit(events.NewStateCommitted(step.stepOrdinal(), len(step.staged), "step.batch"))
 		_ = e.store.SaveRawMarkdown("plan", exhausted.Content) //nolint:contextcheck // substrate wrapper manages its own context
 	} else {
-		e.emit(events.NewStateRejected(step.step, "exhausted buffer contained no validated atomic result"))
+		e.emit(events.NewStateRejected(step.stepOrdinal(), "exhausted buffer contained no validated atomic result"))
 	}
 
 	for step.canContinue() {
@@ -408,12 +386,12 @@ func (e *Engine) synthesizeBoundedContinuation(ctx context.Context, baseReq ai.R
 			if !step.shrinkBudget() {
 				return e.commitStepState(step, problem, ledgerContent) // fails with typed OUTPUT_EXHAUSTED
 			}
-			e.emit(events.NewBudgetRecalculated(step.step, prevMax, req.MaxTokens,
+			e.emit(events.NewBudgetRecalculated(step.stepOrdinal(), prevMax, req.MaxTokens,
 				fmt.Sprintf("task.batch.adjusted to %d", step.taskBudget)))
 		}
-		e.emit(events.NewContinuationScheduled(step.step, len(step.staged), step.continuationsLeft()))
-		e.emit(events.NewStepStarted(step.modelName, step.step, req.MaxTokens))
-		e.emit(events.NewContinuationStarted(step.step, req.MaxTokens))
+		e.emit(events.NewContinuationScheduled(step.stepOrdinal(), len(step.staged), step.continuationsLeft()))
+		e.emit(events.NewStepStarted(step.modelName(), step.stepOrdinal(), req.MaxTokens))
+		e.emit(events.NewContinuationStarted(step.stepOrdinal(), req.MaxTokens))
 
 		req.Messages[len(req.Messages)-1].Content = boundedContinuationAppend(step.baseUserContent, step.staged, step.taskBudget)
 
@@ -425,15 +403,15 @@ func (e *Engine) synthesizeBoundedContinuation(ctx context.Context, baseReq ai.R
 		if nextResp.FinishReason == "length" {
 			// Next bounded step also exhausted: commit validated results, keep
 			// advancing, or reschedule smaller when nothing validated.
-			e.emit(events.NewStepExhausted(step.step, nextResp.TokenOutput, 0))
+			e.emit(events.NewStepExhausted(step.stepOrdinal(), nextResp.TokenOutput, 0))
 			more := e.salvageValidTasks(nextResp.Content, problem, ledgerContent)
 			if len(more) == 0 {
-				e.emit(events.NewStateRejected(step.step, "bounded step committed no validated atomic result"))
+				e.emit(events.NewStateRejected(step.stepOrdinal(), "bounded step committed no validated atomic result"))
 				salvaged = nil
 				continue
 			}
 			step.staged = mergeTaskBatches(step.staged, more)
-			e.emit(events.NewStateCommitted(step.step, len(step.staged), "step.batch"))
+			e.emit(events.NewStateCommitted(step.stepOrdinal(), len(step.staged), "step.batch"))
 			_ = e.store.SaveRawMarkdown("plan", nextResp.Content) //nolint:contextcheck // substrate wrapper manages its own context
 			salvaged = more
 			continue
@@ -441,7 +419,7 @@ func (e *Engine) synthesizeBoundedContinuation(ctx context.Context, baseReq ai.R
 
 		// Natural stop: the model had room to complete — accept its plan,
 		// merged with the committed staged state.
-		e.emit(events.NewStepCompleted(step.step, len(step.staged), nextResp.FinishReason))
+		e.emit(events.NewStepCompleted(step.stepOrdinal(), len(step.staged), nextResp.FinishReason))
 		parsed := ParseJSONPlan(cleanLLMResponse(nextResp.Content))
 		if parsed.Valid && len(parsed.Tasks) > 0 {
 			var cands []Task
