@@ -28,6 +28,36 @@ func (m *model) runAutonomyRoutedCmd(objective string) tea.Cmd {
 	if m.autonomy == nil {
 		return m.handleMessageContent(objective)
 	}
+	// ── MODE AUTHORITY CEILING ────────────────────────────────────────
+	// Confidence is advisory, never authority: a bare objective typed in the
+	// /ask boundary (no $prompt/$hot execution marker) must never acquire
+	// execution semantics through classification, no matter how confident the
+	// classifier is. Reconcile the candidate against the current mode BEFORE
+	// dispatch: an ASK ceiling clamps every non-explicit objective to the
+	// read-only conversational path. Explicit execution surfaces ($prompt via
+	// routePromptDirective, $hot via routeHotfixThroughAutonomy) bypass this
+	// ceiling through runAutonomyRoutedCmdExplicit.
+	current := modes.ModeAsk
+	if m.resolver != nil {
+		current = m.resolver.Current()
+	}
+	if current == modes.ModeAsk && !hasExplicitExecutionAuthority(objective) {
+		r := reconciledSemanticRoute(current, objective, false)
+		_ = reconciliationTelemetry(r)
+		return m.handleMessageContent(objective)
+	}
+	trace := m.autonomy.Decide(objective)
+	return m.dispatchAutonomyTrace(trace)
+}
+
+// runAutonomyRoutedCmdExplicit is the explicit-execution-authority boundary
+// ($prompt/$hot). The caller has already established execution authority, so
+// the classifier's workspace stands under the existing authorization model and
+// the ASK ceiling does not apply.
+func (m *model) runAutonomyRoutedCmdExplicit(objective string) tea.Cmd {
+	if m.autonomy == nil {
+		return m.handleMessageContent(objective)
+	}
 	trace := m.autonomy.Decide(objective)
 	return m.dispatchAutonomyTrace(trace)
 }
@@ -47,7 +77,7 @@ func (m *model) routeHotfixThroughAutonomy(objective string) tea.Cmd {
 	}
 	m.autonomyHotfix = true
 	m.pendingHotfixObjective = objective
-	return m.runAutonomyRoutedCmd(objective)
+	return m.runAutonomyRoutedCmdExplicit(objective)
 }
 
 // dispatchAutonomyTrace projects a decision trace onto the execution layer. It

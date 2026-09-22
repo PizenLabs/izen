@@ -335,18 +335,26 @@ func (m *model) handleInput(line string) tea.Cmd {
 		switchCmd := m.runtimeSwitchCmd(mode)
 		if content != "" {
 			m.setMode(mode)
-			// ── /ask SINGLE DECISION AUTHORITY (§4) ────────────────────
-			// /ask is the explicit read-only chat boundary, so its content
-			// flows through the SAME autonomy decision authority as every other
-			// objective. A read-only /ask request (question, inspection,
-			// explanation) answers in the ask workspace as before; a mutation
-			// request typed into /ask ("/ask remove redundant content from
-			// @index.html") must NEVER silently execute or be answered as chat —
-			// the autonomy runtime classifies it as a mutation and returns a
-			// capability escalation proposal. The user authorizes the boundary;
-			// the runtime never re-asks for a mode command.
-			if mode == modes.ModeAsk && m.autonomy != nil {
-				return tea.Batch(m.runAutonomyRoutedCmd(content), switchCmd)
+			// ── /ask READ-ONLY BOUNDARY (mode authority dominates) ─────
+			// /ask is the canonical conversational read-only surface
+			// (READ/INSPECT/REASON/RESPOND). Its content never enters the
+			// autonomy decision runtime: the classifier is advisory only and
+			// high-confidence PLAN/BUILD candidates must not acquire
+			// execution semantics, proposals, or approval surfaces. Every
+			// /ask objective — questions, analysis, redesign requests —
+			// answers as read-only chat. Explicit execution stays explicit
+			// via /build $prompt/$hot, never via natural language in /ask.
+			if mode == modes.ModeAsk {
+				return tea.Batch(m.handleMessageContent(content), switchCmd)
+			}
+			// ── CONVERSATIONAL AUTO-RETURN (investigate/review/plan) ───
+			// A simple conversational/read-only question typed under an
+			// execution mode returns to the canonical /ask path instead of
+			// creating workflow/execution state.
+			if mode == modes.ModeInvestigate || mode == modes.ModeReview || mode == modes.ModePlan {
+				if shouldFallbackToAsk(content) {
+					return tea.Batch(m.fallbackToAsk(content), switchCmd)
+				}
 			}
 			return tea.Batch(m.handleMessageContent(content), switchCmd)
 		}
@@ -485,6 +493,21 @@ func (m *model) handleInput(line string) tea.Cmd {
 // for such input and the phase stays ask.
 func (m *model) routeFreeInput(line string) tea.Cmd {
 	if m.autonomy != nil {
+		// ── MODE AUTHORITY CEILING (/ask dominates classification) ─────
+		// Bare free-form input in the /ask boundary carries no execution
+		// marker and must never enter the autonomy decision runtime: the
+		// classifier is advisory only and confidence cannot raise the ASK
+		// read-only ceiling. This extends the historic bare-mutation mask to
+		// EVERY bare objective — planning/design phrasing ("redesign …")
+		// classified with high confidence previously escaped the mask,
+		// switched the workspace to Plan, and staged executable CREATE
+		// tasks via the intent compiler. Non-ASK modes keep autonomy
+		// routing (which already returns explanations to ASK via workspace
+		// selection); explicit $prompt/$hot markers bypass via their own
+		// directive paths before reaching here.
+		if m.resolver != nil && m.resolver.Current() == modes.ModeAsk && !hasFreeInputExecutionMarker(line) {
+			return m.handleMessageContent(line)
+		}
 		if !hasFreeInputExecutionMarker(line) && isBareMutationObjective(line) {
 			return m.handleMessageContent(line)
 		}
@@ -611,6 +634,13 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 
 	switch currentMode {
 	case modes.ModeInvestigate:
+		// ── CONVERSATIONAL AUTO-RETURN ──────────────────────────────
+		// A simple conversational/read-only question under /investigate
+		// returns to the canonical /ask path instead of creating
+		// investigation execution state.
+		if shouldFallbackToAsk(content) {
+			return m.fallbackToAsk(content)
+		}
 		if m.investigateInvocationCount >= maxInvestigateInvocations {
 			m.push(roleError, fmt.Sprintf("max investigate invocations (%d) reached", maxInvestigateInvocations))
 			m.push(roleSystem, infoStyle.Render("start a new session with /objective <desc> or restart"))
@@ -672,6 +702,12 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		m.investigateInvocationCount++
 		return m.runInvestigateCmd(content)
 	case modes.ModeReview:
+		// ── CONVERSATIONAL AUTO-RETURN ──────────────────────────────
+		// A simple conversational/read-only question under /review returns
+		// to the canonical /ask path instead of starting a review run.
+		if shouldFallbackToAsk(content) {
+			return m.fallbackToAsk(content)
+		}
 		trimmed := strings.TrimSpace(content)
 
 		target := ""
@@ -680,6 +716,15 @@ func (m *model) handleMessageContent(line string) tea.Cmd {
 		}
 		return m.runReviewCmd(target)
 	case modes.ModePlan:
+		// ── CONVERSATIONAL AUTO-RETURN (manual /plan usage only) ─────
+		// A simple conversational/read-only question typed directly into
+		// /plan returns to /ask. Handoff synthesis (investigate → plan)
+		// always owns genuine workflow material and never falls back.
+		if strings.TrimSpace(ctxpkg.SanitizeLedger(m.handoffLedgerContent)) == "" &&
+			strings.TrimSpace(m.handoffCtx.ProposedFix) == "" &&
+			shouldFallbackToAsk(content) {
+			return m.fallbackToAsk(content)
+		}
 		m.responseBuffer.Reset()
 
 		// ── STRUCTURAL ENGINE PATH (Handoff from /investigate) ──────────

@@ -58,11 +58,13 @@ func TestAutonomyValidationCase1ConversationDirectResponse(t *testing.T) {
 
 // TestAutonomyValidationCase2InspectRoutesToInvestigate pins Case 2:
 // "$prompt inspect @index.html" selects the INVESTIGATE workspace and executes
-// the evidence pipeline (no mutation capability).
+// the evidence pipeline (no mutation capability). The explicit $prompt surface
+// carries execution authority; bare text in /ask never reaches this path
+// (mode-authority ceiling: bare objectives stay in /ask read-only chat).
 func TestAutonomyValidationCase2InspectRoutesToInvestigate(t *testing.T) {
 	m := autonomyTestModel()
 
-	cmd := m.runAutonomyRoutedCmd("inspect @index.html")
+	cmd := m.routePromptDirective("inspect @index.html")
 	if cmd == nil {
 		t.Fatal("inspect objective must dispatch the investigate engine")
 	}
@@ -92,7 +94,7 @@ func TestAutonomyValidationCase3MutationProposalThenExecutes(t *testing.T) {
 
 	m := autonomyTestModel()
 
-	cmd := m.runAutonomyRoutedCmd("read @index.html and remove extra contents")
+	cmd := m.routePromptDirective("read @index.html and remove extra contents")
 	if cmd != nil {
 		t.Fatal("pre-grant mutation must return nil cmd and await the proposal")
 	}
@@ -144,7 +146,7 @@ func TestAutonomyValidationCase3MutationProposalThenExecutes(t *testing.T) {
 func TestAutonomyProposalKeyboardNavigation(t *testing.T) {
 	m := autonomyTestModel()
 
-	m.runAutonomyRoutedCmd("read @index.html and remove extra contents")
+	m.routePromptDirective("read @index.html and remove extra contents")
 	if m.pendingAutonomyProposal == nil {
 		t.Fatal("expected a pending proposal")
 	}
@@ -196,7 +198,7 @@ func TestAutonomyGrantNoRepeatedApproval(t *testing.T) {
 	m := autonomyTestModel()
 
 	// First request: ask_user (mutation not granted).
-	m.runAutonomyRoutedCmd("remove unused content from @index.html")
+	m.routePromptDirective("remove unused content from @index.html")
 	if m.pendingAutonomyProposal == nil {
 		t.Fatal("expected pending proposal on first mutation request")
 	}
@@ -205,7 +207,7 @@ func TestAutonomyGrantNoRepeatedApproval(t *testing.T) {
 	// Second request with the same objective: now auto-continues directly.
 	m.pendingAutonomyProposal = nil
 	m.resolver.Set(modes.ModeAsk)
-	cmd := m.runAutonomyRoutedCmd("remove unused content from @index.html")
+	cmd := m.routePromptDirective("remove unused content from @index.html")
 	if cmd == nil {
 		t.Fatal("post-grant mutation must execute without a repeated proposal")
 	}
@@ -321,8 +323,8 @@ func TestAutonomyConfirmationGateNoLoop(t *testing.T) {
 		}),
 	)
 
-	// Gate 1: capability authorization.
-	cmd := m.runAutonomyRoutedCmd("remove redundant content from @index.html")
+	// Gate 1: capability authorization (explicit $prompt authority).
+	cmd := m.routePromptDirective("remove redundant content from @index.html")
 	if cmd != nil {
 		t.Fatal("pre-grant mutation must await the proposal")
 	}
@@ -376,7 +378,7 @@ func TestAutonomyContextEvidenceLedger(t *testing.T) {
 	m.autonomy.GrantDefault(autonomy.CapRead, autonomy.CapAnalyze, autonomy.CapPropose, autonomy.CapMutate, autonomy.CapVerify)
 	m.resolver.Set(modes.ModeAsk)
 
-	cmd := m.runAutonomyRoutedCmd("read @index.html and remove extra contents")
+	cmd := m.routePromptDirective("read @index.html and remove extra contents")
 	if cmd == nil {
 		t.Fatal("post-grant mutation must execute")
 	}

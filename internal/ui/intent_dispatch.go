@@ -306,7 +306,7 @@ func (m *model) routePromptDirective(rawInput string) tea.Cmd {
 	// unified IntentGateway fallback preserves the engine-first behavior: the
 	// runtime (RuntimeExecutor) still decides the execution path.
 	if m.autonomy != nil {
-		return m.runAutonomyRoutedCmd(rawInput)
+		return m.runAutonomyRoutedCmdExplicit(rawInput)
 	}
 
 	return m.runPromptExecution(rawInput)
