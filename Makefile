@@ -2,7 +2,7 @@ BINARY_NAME=izen
 VERSION=0.2.0-rmah-wired
 BUILD_DIR=bin
 
-.PHONY: all build install test clean
+.PHONY: all build install test lint clean
 
 all: build
 
@@ -17,8 +17,12 @@ install:
 	@echo "Installation complete! Ensure '$(shell go env GOPATH)/bin' is in your PATH."
 
 test:
-	@echo "Running test suite..."
-	go test ./...
+	@echo "Running test suite (race, count=1)..."
+	go test -race -count=1 ./...
+
+lint:
+	@echo "Running golangci-lint (timeout 5m)..."
+	golangci-lint run --timeout=5m ./...
 
 clean:
 	@echo "Cleaning up..."
