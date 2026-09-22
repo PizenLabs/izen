@@ -186,6 +186,9 @@ func boundedContinuationAppend(base string, staged []Task, taskBudget int) strin
 // non-existent target rejection, archetype domain isolation), so a bounded step
 // commits only tasks that pass every gate the full retry loop enforces.
 func (e *Engine) groundCandidateTasks(candidates []Task, ledgerContent string) []Task {
+	if e == nil {
+		return candidates
+	}
 	candidates = AlignFileTargetWithErrors(candidates, ledgerContent)
 	candidates = FilterUnsolicitedPkgFiles(candidates, ledgerContent)
 	candidates = FilterUndefinedSymbolShellExec(candidates, ledgerContent)
@@ -204,6 +207,9 @@ func (e *Engine) groundCandidateTasks(candidates []Task, ledgerContent string) [
 // blocks) and that validated result is committed; anything unvalidated is never
 // committed. Returns nil when nothing validated exists (STEP_INCOMPLETE).
 func (e *Engine) salvageValidTasks(content, problem, ledgerContent string) []Task {
+	if e == nil {
+		return nil
+	}
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return nil
