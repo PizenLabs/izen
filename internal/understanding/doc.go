@@ -21,4 +21,12 @@
 // internal/language. Those systems remain authoritative in their own
 // domains; this package only consolidates their signals into one
 // inspectable understanding with an explicit lifecycle boundary.
+//
+// DEMOTION NOTICE (Phase 8 M7 — canonical runtime convergence): this
+// package is a derive-helper, NOT a production pipeline stage. The
+// canonical decomposition owner is execution/planner, consulted by
+// runtime/autonomy.Driver; no canonical runtime package imports this
+// Derive chain (pinned by TestDeriveChainHasNoCanonicalImporters). Do
+// not wire Derive into the production path without a proven ownership
+// gap review.
 package understanding

@@ -34,4 +34,14 @@
 // Design preference: pure derivation — Derive(intent, understanding,
 // changeSurface, options) deterministically returns a MutationPlan. No
 // filesystem mutation, no shell execution, no model invocation.
+//
+// DEMOTION NOTICE (Phase 8 M7 — canonical runtime convergence): this
+// package is a derive-helper, NOT a production pipeline stage. The
+// canonical decomposition owner is execution/planner, consulted by
+// runtime/autonomy.Driver; no canonical runtime package imports this
+// Derive chain (pinned by TestDeriveChainHasNoCanonicalImporters). The
+// only production-adjacent consumer is the pure stepadmission bridge
+// (CandidateFromMutationStep), itself consulted as a library by the
+// Driver — never as a runtime boundary. Do not wire Derive into the
+// production path without a proven ownership gap review.
 package mutationstrategy

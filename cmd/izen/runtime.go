@@ -104,6 +104,13 @@ func (e *semanticExtractorAdapter) Extract(ctx context.Context, system, prompt s
 // runRuntimeCommand implements `izen run`: it builds the V3 pipeline from the
 // shared configuration, routes the prompt through app.Pipeline.Run and prints
 // the capability, extraction, validation, planning and execution audit trail.
+//
+// PHASE 8 M5 — SINGLE-CYCLE CONTRACT (intentional, canonical): one
+// invocation performs one pipeline run and returns. Continuation requires
+// the caller to re-invoke (each run re-reads workspace state). The pipeline
+// shares the canonical execution authority, substrate confinement, and
+// guards with every other entry point; only the loop cardinality differs
+// from the TUI Driver path, by explicit contract rather than by accident.
 func runRuntimeCommand(args []string) error {
 	dir := "."
 	var targets []string

@@ -1,7 +1,22 @@
-// Package scheduler implements the StepScheduler and Ephemeral Context
-// Planner for Bounded Execution (Phase 6.2).
+// Package scheduler implements the demoted StepScheduler experiment
+// (Phase 8 M1 — canonical runtime convergence).
 //
-// Invariant 2 (Scheduler Ownership): step scope and step boundaries are
+// DEMOTION NOTICE: StepScheduler is NOT the production orchestration
+// authority. The canonical scheduler / orchestration owner is
+// runtime/autonomy.Driver (bounded loop; decomposition via
+// execution/planner; execution via execution.RuntimeExecutor). This
+// package has zero production importers and must never gain one: it is
+// retained as an architecture experiment holding tested pure logic
+// (EffectiveBudget, Schedule partitioning, AcceptStep validation) plus
+// the Phase 6.2 experiment suite. Pinned by
+// TestExperimentSchedulerHasNoProductionImporters.
+//
+// The old Invariant 2 below ("step scope strictly owned by StepScheduler
+// prior to authorization") is SUPERSEDED: step selection, admission, and
+// recovery entry are owned by the Driver and the RuntimeExecutor pipeline.
+// The AcceptStep validator remains available as a pure helper for tests.
+//
+// Invariant 2 (Scheduler Ownership, HISTORICAL): step scope and step boundaries are
 // strictly owned by StepScheduler prior to authorization. The Executor MUST
 // NOT alter, truncate, or mutate step targets — it accepts exact
 // ExecutionStep inputs via AcceptStep validation.

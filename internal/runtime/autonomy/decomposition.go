@@ -10,6 +10,7 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution/planner"
+	"github.com/PizenLabs/izen/internal/stepadmission"
 )
 
 // ── Boundary-2 expansion: Sub-task Decomposer & DAG Planner ─────────────────
@@ -673,6 +674,53 @@ func (d *Driver) stageDecomposition(ctx context.Context) bool {
 	if d.syntheticSubGoal != "" {
 		prompt = d.syntheticSubGoal + "\n" + prompt
 	}
+	// ── M6 PURE ADMISSION BOUND-CHECK (library, never a boundary) ──
+	// Consult stepadmission.AdmitStep as a pure bound-check BEFORE the
+	// expensive manifest/planner path. The Driver owns the verdict:
+	// ADMIT proceeds unchanged; REFINE narrows decomposition to the
+	// refined target subset (still parked at the human
+	// DECOMPOSITION_PROPOSAL — never a silent scope change); BLOCK,
+	// STALE, and AWAITING_APPROVAL skip decomposition and fall through
+	// to the explicit human re-scope park below (return false). No new
+	// loop, scheduler, or execution authority is introduced here.
+	//
+	// The freshness comparison runs only when the request carries a
+	// Boundary-5 lineage digest; otherwise no extra digest scan is
+	// performed and the check reduces to the budget bound-check.
+	var current string
+	if d.req.WorkspaceDigest != "" {
+		current = d.adapter.WorkspaceVersion([]string{target})
+	}
+	targetChanged := false
+	switch verdict := AdmitDriverStep(DriverAdmissionInput{
+		Targets:            []string{target},
+		Intent:             prompt,
+		StateDigest:        d.req.WorkspaceDigest,
+		CurrentFingerprint: current,
+		MaxOutputTokens:    effectiveMax,
+		AllowedScope:       d.req.Targets,
+	}); verdict.Action {
+	case stepadmission.ActionAdmit:
+		// Proceed to strategy-aware preflight unchanged.
+	case stepadmission.ActionRefine:
+		if verdict.RefinedStep == nil || len(verdict.RefinedStep.Targets) == 0 {
+			diagnosticf("[boundary2] admission REFINE without a refined subset: skipping decomposition (%s)", verdict.Reason)
+			return false
+		}
+		target = verdict.RefinedStep.Targets[0]
+		targetChanged = true
+		source, ok = d.adapter.ReadTargetFile(target)
+		if !ok || len(source) == 0 {
+			diagnosticf("[boundary2] admission-refined target %s unreadable: skipping decomposition", target)
+			return false
+		}
+		diagnosticf("[boundary2] admission REFINE: narrowing decomposition to %s (%s)", target, verdict.Reason)
+	default:
+		// BLOCK, STALE, AWAITING_APPROVAL: decomposition on this basis
+		// is pointless or unsafe — fall through to explicit re-scope.
+		diagnosticf("[boundary2] admission %s: skipping decomposition (%s)", verdict.Action, verdict.Reason)
+		return false
+	}
 	if d.bus != nil {
 		d.bus.Publish(events.NewPreflightStarted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, effectiveMax))
 	}
@@ -702,7 +750,10 @@ func (d *Driver) stageDecomposition(ctx context.Context) bool {
 		d.bus.Publish(events.NewPreflightCompleted(d.runRequestID, d.obs.ContractID, target, d.adapter.Root(), d.req.RecoveryStrategy, eval.EstimatedTokens, effectiveMax))
 	}
 	base := d.req.WorkspaceDigest
-	if base == "" {
+	if base == "" || targetChanged {
+		// Fresh digest for the (possibly refined) decomposition target:
+		// the Boundary-5 lineage of the original request must not be
+		// reused once admission narrowed the target.
 		base = d.adapter.WorkspaceVersion([]string{target})
 	}
 	// The preflight autonomy loop decides the DAG strategy through the Pass 1

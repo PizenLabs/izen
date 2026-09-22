@@ -37,6 +37,13 @@ inspects without applying, and anything else (including Enter) rejects it.
 // plane (preflight, proposal provider, terminal UI projection bridge, and
 // orchestrator) and executes one prompt through the deterministic control
 // loop.
+//
+// PHASE 8 M5 — SINGLE-CYCLE CONTRACT (intentional, canonical): one
+// invocation performs one cli.Stack cycle (Stack.Run) and returns.
+// Continuation requires the caller to re-invoke; the command never enters
+// autonomy.Driver and never loops internally. Authorization converges with
+// every other entry point (same guards, same approval [y/N]/i semantics);
+// only the loop cardinality differs, by explicit contract.
 func runOrchestrateCommand(args []string) error {
 	dir := "."
 	var prompt string

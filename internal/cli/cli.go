@@ -379,6 +379,16 @@ func DefaultViewport() diff.ViewportConfig {
 // It enforces the hard-gate invariant: if EvaluateBudgetGate returns
 // BudgetExceeded, the loop parks at the DecisionSurface with FULL_REWRITE
 // explicitly disabled, and never invokes the model.
+//
+// PHASE 8 M5 — SINGLE-CYCLE CONTRACT (intentional, canonical): Run performs
+// exactly ONE cycle (preflight → proposal → validate → snapshot → arm →
+// authorize → commit) and returns. It never loops on NeedsContinuation and
+// never enters autonomy.Driver: continuation requires the CALLER to
+// re-invoke Run (each invocation re-reads workspace state, so a second
+// cycle observes the first cycle's committed result). TUI multi-step flows
+// use Driver; headless flows use this single-cycle contract with the same
+// executor/substrate/guards (convergent authorization, divergent loop
+// cardinality — explicitly owned, not a rival scheduler).
 func (s *Stack) Run(ctx context.Context, root, prompt string) (*orchestrator.ExecutionResult, error) {
 	if s == nil {
 		return nil, errors.New("cli: nil stack")

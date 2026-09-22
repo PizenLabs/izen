@@ -4,21 +4,25 @@ import (
 	"github.com/PizenLabs/izen/internal/continuation"
 )
 
-// ContinuationIntegration traces one real execution path through the existing
-// runtime:
+// ContinuationIntegration traces one EXPERIMENT execution path through the
+// demoted scheduler (Phase 8 M1). It is NOT the production runtime — the
+// canonical production path is Driver → execution/planner → admission →
+// execution.RuntimeExecutor → Driver recovery matrix. This bridge exists
+// only so the experiment suite can exercise the Schedule/RunNext loop
+// against a stub worker without production wiring:
 //
 //	Task (ProblemSolvingPlan)
 //	  → bounded ExecutionStep (via Schedule)
-//	  → existing StepScheduler (admission)
-//	  → existing execution (via RunNext staging)
+//	  → experiment StepScheduler (NOT production admission)
+//	  → stub execution (via RunNext staging)
 //	  → outcome / evidence (StepResult)
 //	  → continuation.DeriveNextStep (pure proposal)
 //	  → next bounded StepProposal → next TaskSpec
 //
 // The function is minimal and observable: it takes the durable task snapshot
 // and the continuation decision and materializes the next TaskSpec that the
-// *existing* StepScheduler will schedule. It never creates a second scheduler,
-// second executor, or authorization grant.
+// experiment StepScheduler will schedule. It never creates a second
+// production scheduler, second executor, or authorization grant.
 //
 // It is intentionally a thin adapter; the authority remains with Schedule/
 // AcceptStep and the existing authorization boundary (outside this file).

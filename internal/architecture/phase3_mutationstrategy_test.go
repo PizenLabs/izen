@@ -48,16 +48,16 @@ func TestPhase3_CanonicalHomeExists(t *testing.T) {
 // ── PU/CS/Strategy boundary: mutationstrategy never authorizes ─────────
 
 var phase3ForbiddenImports = map[string]bool{
-	"github.com/PizenLabs/izen/internal/execution":           true,
-	"github.com/PizenLabs/izen/internal/core/authorization":  true,
-	"github.com/PizenLabs/izen/internal/boundary/scopeguard": true,
-	"github.com/PizenLabs/izen/internal/runtime/executor":    true,
-	"github.com/PizenLabs/izen/internal/runtime/scopeguard":  true,
-	"github.com/PizenLabs/izen/internal/runtime/scheduler":   true,
-	"github.com/PizenLabs/izen/internal/patch":               true,
-	"github.com/PizenLabs/izen/internal/provider":            true,
-	"github.com/PizenLabs/izen/internal/providers":           true,
-	"github.com/PizenLabs/izen/internal/llm":                 true,
+	"github.com/PizenLabs/izen/internal/execution":                         true,
+	"github.com/PizenLabs/izen/internal/core/authorization":                true,
+	"github.com/PizenLabs/izen/internal/boundary/scopeguard":               true,
+	"github.com/PizenLabs/izen/internal/runtime/executor":                  true,
+	"github.com/PizenLabs/izen/internal/runtime/scopeguard":                true,
+	"github.com/PizenLabs/izen/internal/architecture_experiment/scheduler": true,
+	"github.com/PizenLabs/izen/internal/patch":                             true,
+	"github.com/PizenLabs/izen/internal/provider":                          true,
+	"github.com/PizenLabs/izen/internal/providers":                         true,
+	"github.com/PizenLabs/izen/internal/llm":                               true,
 }
 
 var phase3ForbiddenIdents = map[string]bool{

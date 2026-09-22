@@ -24,6 +24,13 @@ type ToolSafety func(string) bool
 
 // Scheduler executes read-only runs concurrently and treats every mutating
 // call as a join barrier. Unknown tools are conservative and therefore serial.
+//
+// PHASE 8 M3 — authority clarification: this is a TOOL-DISPATCH helper
+// (fan-out for one batch of tool calls), NOT a step/orchestration
+// scheduler. Step selection, ordering, and recovery entry are owned by
+// runtime/autonomy.Driver; task decomposition is owned by
+// execution/planner. This type makes no scheduling decisions and must
+// never grow into a second orchestration owner.
 type Scheduler struct {
 	Bus            *events.Bus
 	MaxReadWorkers int

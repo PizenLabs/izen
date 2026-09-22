@@ -513,3 +513,52 @@ func evidenceFixture() diff.MutationEvidence {
 func viewportFixture() diff.ViewportConfig {
 	return diff.ViewportConfig{TermWidth: 100, TermHeight: 24, GutterWidth: 2, PrefixWidth: 1}
 }
+
+// TestStackRunIsSingleCycle pins Phase 8 M5: one Stack.Run performs exactly
+// one proposal-generation cycle and returns — no implicit continuation loop
+// runs in the background, and a second cycle requires explicit caller
+// re-invocation over re-read workspace state.
+func TestStackRunIsSingleCycle(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "README.md")
+	if err := os.WriteFile(path, []byte("# Old\n"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	llm := &stubLLM{content: "# Cycle one\n"}
+	stack := Wire(llm, dir, strings.NewReader("y\n"), &bytes.Buffer{})
+
+	if _, err := stack.Run(context.Background(), dir, "README.md"); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	firstCalls := llm.calls
+	if firstCalls == 0 {
+		t.Fatal("expected at least one proposal generation in the first cycle")
+	}
+
+	// No background continuation: provider calls must not grow after Run
+	// returned.
+	if llm.calls != firstCalls {
+		t.Fatalf("provider calls grew after Run returned (%d → %d): headless must not loop implicitly", firstCalls, llm.calls)
+	}
+
+	// Explicit caller re-invocation drives the second cycle over the
+	// committed state of the first.
+	llm.content = "# Cycle two\n"
+	stack2 := Wire(llm, dir, strings.NewReader("y\n"), &bytes.Buffer{})
+	if _, err := stack2.Run(context.Background(), dir, "README.md"); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if llm.calls <= firstCalls {
+		t.Fatalf("second Run issued no new proposal generation (%d → %d): continuation requires caller re-invocation", firstCalls, llm.calls)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(data) != "# Cycle two\n" {
+		t.Errorf("content = %q, want second-cycle result %q", string(data), "# Cycle two\n")
+	}
+}

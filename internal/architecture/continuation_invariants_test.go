@@ -16,7 +16,7 @@ func TestContinuationMustNotImportForbidden(t *testing.T) {
 	got := importsOfDir(t, root, "internal/continuation")
 	forbidden := []string{
 		moduleImport("internal/runtime/executor"),
-		moduleImport("internal/runtime/scheduler"),
+		moduleImport("internal/architecture_experiment/scheduler"),
 		moduleImport("internal/execution"),
 		moduleImport("internal/execution/scheduler"),
 		moduleImport("internal/core/domain/authorization"),
@@ -102,9 +102,12 @@ func TestCoreMustNotImportWebAdapterContinuation(t *testing.T) {
 	}
 }
 
-// TestNoSecondSchedulerOrExecutor pins §2.1, §2.2: there is exactly one
-// StepScheduler (internal/runtime/scheduler) and one execution authority
-// (internal/execution.RuntimeExecutor / internal/runtime/substrate).
+// TestNoSecondSchedulerOrExecutor pins Phase 8 M1 (canonical runtime
+// convergence): the canonical orchestration owner is autonomy.Driver
+// (internal/runtime/autonomy/driver.go) and the canonical execution
+// authority is internal/execution.RuntimeExecutor. The StepScheduler lives
+// ONLY as a demoted experiment at internal/architecture_experiment/
+// scheduler and must never return to internal/runtime/scheduler.
 func TestNoSecondSchedulerOrExecutor(t *testing.T) {
 	root := repoRoot(t)
 	forbiddenSchedulers := []string{
@@ -153,12 +156,17 @@ func TestNoSecondSchedulerOrExecutor(t *testing.T) {
 			}
 		}
 	}
-	// Positive: canonical scheduler and executor must still exist
-	if _, err := os.Stat(filepath.Join(root, "internal/runtime/scheduler/scheduler.go")); err != nil {
-		t.Error("architecture: canonical StepScheduler missing at internal/runtime/scheduler/scheduler.go")
+	// Positive: canonical orchestration owner and execution authority must
+	// still exist at their canonical homes.
+	if _, err := os.Stat(filepath.Join(root, "internal/runtime/autonomy/driver.go")); err != nil {
+		t.Error("architecture: canonical orchestration owner missing at internal/runtime/autonomy/driver.go (autonomy.Driver)")
 	}
 	if _, err := os.Stat(filepath.Join(root, "internal/execution/executor.go")); err != nil {
 		t.Error("architecture: canonical RuntimeExecutor missing at internal/execution/executor.go")
+	}
+	// Demotion: the old scheduler home must not return.
+	if _, err := os.Stat(filepath.Join(root, "internal/runtime/scheduler")); !os.IsNotExist(err) {
+		t.Error("architecture: internal/runtime/scheduler must not exist — StepScheduler is demoted to internal/architecture_experiment/scheduler (Phase 8 M1)")
 	}
 }
 
