@@ -2,7 +2,6 @@
 
 **Status:** Audit Complete — Report Before Large Changes (Read-Only, No Code Changed)  
 **Date:** 2026-08-29  
-**Auditor:** Muse Spark (OpenCode)  
 **Scope:** `logical content → rendered content → physical rows → terminal cells → selection hit-testing`  
 **Invariant Under Audit:**
 ```

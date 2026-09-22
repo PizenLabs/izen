@@ -3,7 +3,6 @@
 **Status:** Final
 **Date:** 2026-09-22
 **Scope:** Plan-synthesis output-ceiling handling (`finish_reason=length` → bounded continuation)
-**Author:** opencode repair session (verified against IZEN AUTHORITY INVARIANTS)
 
 ---
 
