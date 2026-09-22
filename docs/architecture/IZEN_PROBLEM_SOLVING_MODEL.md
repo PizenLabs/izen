@@ -178,10 +178,20 @@ Existing `AuthorizationEngine` remains the single mutation authorization boundar
 
 ## 8. Scheduler — How is authorized work scheduled and persisted?
 
-**Package:** `runtime/scheduler`
+> **SUPERSEDED (Phase 8 M1/M3 — canonical runtime convergence).** The
+> `runtime/scheduler.StepScheduler` described below is DEMOTED to
+> `internal/architecture_experiment/scheduler` (zero production importers,
+> pinned by `TestExperimentSchedulerHasNoProductionImporters`). The canonical
+> orchestration / scheduling owner is `runtime/autonomy.Driver` (bounded loop;
+> decomposition via `execution/planner`; execution via
+> `execution.RuntimeExecutor`; recovery via the Driver recovery matrix). The
+> historical description is retained for context; see
+> `PHASE_7_CANONICAL_RUNTIME_CONVERGENCE.md` §7–§8 for the canonical runtime.
+
+**Package (historical):** `runtime/scheduler` → now `internal/architecture_experiment/scheduler`
 **Question:** *How is authorized work scheduled and persisted?*
 
-Existing `StepScheduler` remains the canonical execution scheduler. It decomposes durable `TaskSpec` targets into bounded `ExecutionStep` instances, owns `EffectiveBudget`, enforces `AcceptStep` (scheduler owns step scope; executor must not alter it), and provides `StepOutcome` (`Pending`/`Complete`/`Partial`/`Failed`) + `RecoveryContext` continuation. No second scheduler exists: no `ProblemScheduler`, `AdaptiveScheduler`, `ReasoningScheduler`, or `MutationScheduler`.
+The demoted `StepScheduler` decomposed durable `TaskSpec` targets into bounded `ExecutionStep` instances, owned `EffectiveBudget`, enforced `AcceptStep`, and provided `StepOutcome` (`Pending`/`Complete`/`Partial`/`Failed`) + `RecoveryContext` continuation. No second production scheduler exists: step selection, ordering, and recovery entry are owned by `autonomy.Driver`; the experiment scheduler must never regain production authority.
 
 Future architecture:
 

@@ -64,9 +64,11 @@ func ContinuationToTaskSpec(
 	return next, true
 }
 
-// DeriveContinuation is a convenience used by tests and the runtime to show
-// the full path: compose a derivation input from task snapshot + scheduler
-// result + evidence and call the pure continuation layer.
+// DeriveContinuation is a convenience used by the experiment suite tests to
+// show the full path: compose a derivation input from task snapshot +
+// scheduler result + evidence and call the pure continuation layer. It has
+// zero production callers (pinned by
+// TestExperimentSchedulerHasNoProductionImporters).
 func DeriveContinuation(
 	taskSnap TaskStateSnapshot,
 	spec TaskSpec,

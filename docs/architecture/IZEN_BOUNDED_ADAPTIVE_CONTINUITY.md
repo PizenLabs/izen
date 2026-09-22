@@ -42,7 +42,15 @@ Governing principle:
 ## 2. Architectural Invariants (Hard)
 
 1. **No new execution authority.** `execution.RuntimeExecutor` + `runtime/substrate.Substrate` (composition root `internal/runtime/compose`) remain the sole mutation authority. `internal/runtime/executor.RuntimeExecutor` is the non-production control-plane coordinator (pinned by `TestPhase1_SingleProductionExecutionAuthority`).
-2. **No new scheduler.** `runtime/scheduler.StepScheduler` (`Schedule`, `EffectiveBudget`, `AcceptStep`, `StepOutcome`, `RecoveryContext`, `StateFingerprint`) remains the single scheduling substrate. No `AdaptiveScheduler` / `ContinuationScheduler` / `AgentScheduler` exists.
+2. **No second scheduler.** The canonical orchestration / scheduling owner is
+   `runtime/autonomy.Driver` (bounded loop; decomposition via
+   `execution/planner`; pinned by `TestSingleSchedulerType` +
+   `TestExperimentSchedulerHasNoProductionImporters`). The former
+   `runtime/scheduler.StepScheduler` (`Schedule`, `EffectiveBudget`,
+   `AcceptStep`, `StepOutcome`, `RecoveryContext`, `StateFingerprint`) is
+   DEMOTED to `internal/architecture_experiment/scheduler` (Phase 8 M1, zero
+   production importers) and must never regain production authority. No
+   `AdaptiveScheduler` / `ContinuationScheduler` / `AgentScheduler` exists.
 3. **Continuation ≠ authorization.** Continuation may propose `The next useful step appears to be X` but never `Therefore X is authorized`. It cannot mint grants, expand scope, add capabilities, bypass `$hot`, convert `$prompt` into write authority, or authorize writes/execution. Every mutation re-enters the existing authorization boundary.
 4. **Model output ≠ durable state.** Transcript, provider KV, hidden model memory are ephemeral. Durable state is execution evidence, observation events, workspace state, fingerprints, recovery context, task/step state, OCC, digests, verified artifacts. The model receives durable facts as context, but transcript is not truth.
 
