@@ -124,6 +124,14 @@ type Response struct {
 	TokenInput  int        `json:"token_input"`
 	TokenOutput int        `json:"token_output"`
 	ToolCalls   []ToolCall `json:"tool_calls,omitempty"` // Native LLM function calls from tool_calls finish_reason
+	// FinishReason is the provider's terminal finish_reason when one is
+	// observable ("stop", "length", "tool_calls", ...). Streaming consumers
+	// populate it from the stream's FinishReasonProvider; non-streaming
+	// consumers propagate ProviderUsage.FinishReason. A "length" value is the
+	// authoritative OUTPUT_EXHAUSTED signal — the response was cut off by the
+	// completion ceiling, not finished naturally — so callers can route bounded
+	// continuation instead of blind same-scope retry.
+	FinishReason string `json:"finish_reason,omitempty"`
 	// Usage is the authoritative provider-reported usage of this invocation.
 	// Known=false means the provider returned no usage metadata.
 	Usage ProviderUsage `json:"usage,omitempty"`

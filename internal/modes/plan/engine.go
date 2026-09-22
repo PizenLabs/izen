@@ -384,6 +384,9 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 		if resp != nil {
 			e.recordUsage(resp.TokenInput, resp.TokenOutput)
 			e.publishLiveUsage(req.Model, resp.TokenInput, resp.TokenOutput)
+			if resp.FinishReason == "" && resp.Usage.FinishReason != "" {
+				resp.FinishReason = resp.Usage.FinishReason
+			}
 		}
 		return resp, nil
 	}
@@ -464,19 +467,24 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 	// expired a microsecond after the last byte.
 	if attemptCtx.Err() != nil && finishReason != "stop" {
 		return &ai.Response{
-			Content:     content,
-			TokenInput:  input,
-			TokenOutput: output,
+			Content:      content,
+			TokenInput:   input,
+			TokenOutput:  output,
+			FinishReason: finishReason,
 		}, fmt.Errorf("%w: provider exceeded the %.0fs per-attempt budget", ErrPlanAttemptTimeout, planAttemptTimeout.Seconds())
 	}
 
 	// Truncation-aware response: the accumulated buffer is the canonical
 	// content. A zero-length buffer (genuinely no tokens emitted) is left empty
-	// so the caller can surface a proper "empty response" diagnostic.
+	// so the caller can surface a proper "empty response" diagnostic. The
+	// terminal finish_reason ("stop" / "length") is surfaced so the caller can
+	// distinguish a naturally-complete response from an OUTPUT_EXHAUSTED one
+	// and route bounded continuation instead of blind same-scope retry.
 	return &ai.Response{
-		Content:     content,
-		TokenInput:  input,
-		TokenOutput: output,
+		Content:      content,
+		TokenInput:   input,
+		TokenOutput:  output,
+		FinishReason: finishReason,
 	}, nil
 }
 
@@ -865,6 +873,17 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 
 	e.emit(events.NewIntentParsed("plan.synthesize", problem, 0.8))
 
+	// ── CAPABILITY-AWARE STEP BUDGET ──────────────────────────────────────
+	// Plan synthesis requests a conservative output budget, but the provider's
+	// ACTUAL ceiling (free-tier/constrained models clamp to ~980) is the binding
+	// constraint. The request max_tokens is clamped to that ceiling up front so
+	// the synthesis never asks for a budget the provider must silently cut —
+	// that mismatch is exactly what produces finish_reason="length" plus blind
+	// same-scope retries. Constrained models also receive a bounded-step
+	// instruction (fewer atomic tasks per response) so a full batch fits.
+	maxTokens, constrained := resolveSynthesisMaxTokens(modelName, planSynthesisRequestedMaxTokens)
+	stepState := newSynthesisStepState(modelName, constrained, maxTokens)
+
 	var req ai.Request
 	if fastTrack && len(fastPrompt) > 0 {
 		req = ai.Request{
@@ -880,7 +899,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 				},
 			},
 			Stream:    false,
-			MaxTokens: 1536,
+			MaxTokens: maxTokens,
 		}
 	} else {
 		// ── COMPACT SYNTHESIS SYSTEM PROMPT ──────────
@@ -921,6 +940,13 @@ FORBIDDEN COMMANDS: go, npm, cargo, pip, make.
 ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
 		}
 
+		// BOUNDED OUTPUT CONTRACT: constrained/free-tier models (capability
+		// ceiling ≤ 1024) must emit a small task batch per response or the JSON
+		// overflows the output ceiling and gets cut off mid-structure.
+		if constrained {
+			systemPrompt += boundedOutputInstruction(stepState.taskBudget)
+		}
+
 		// Extract the investigation conclusion so it can be injected as a
 		// high-priority override signal. The conclusion carries the resolved
 		// diagnosis (e.g. corrected dependency paths) that must take precedence
@@ -940,7 +966,7 @@ ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
 				},
 			},
 			Stream:    false,
-			MaxTokens: 1536,
+			MaxTokens: maxTokens,
 			ResponseFormat: &ai.ResponseFormat{
 				Type: "json_object",
 			},
@@ -957,6 +983,11 @@ ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
 [SYSTEM: UNDEFINED SYMBOL ERROR — CODE FIX ONLY]
 The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DEPS or shell execution tasks like go mod tidy. Generate ONLY a FILE_MUTATE / CODE_MOD task targeting the source file containing the error. No SHELL_EXEC, no environment setup, no dependency installation.`
 	}
+
+	// The bounded-step state anchors continuation prompts to the ORIGINAL user
+	// turn (rebuilt compactly each step via boundedContinuationAppend) so a
+	// long continuation can never accumulate duplicate instruction blocks.
+	stepState.baseUserContent = req.Messages[len(req.Messages)-1].Content
 
 	resp, err := e.complete(ctx, req)
 	if err != nil {
@@ -1006,6 +1037,22 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 			return nil, fmt.Errorf("plan engine: fast-track produced no runnable shell tasks (model returned: %s)", truncateForLog(resp.Content))
 		}
 		return ValidateShellExecCommands(clean, ledgerContent), nil
+	}
+
+	// ── OUTPUT EXHAUSTION → BOUNDED CONTINUATION ───────────────────────────
+	// finish_reason="length" means the provider hit its ACTUAL output ceiling
+	// mid-synthesis: the JSON is structurally incomplete (possibly silently
+	// auto-closed by ParseJSONPlan into a partial plan). Blind same-scope
+	// retries (below) re-issue the identical budget and fail identically.
+	// Instead, emit a step-exhausted signal and hand off to a SMALLER bounded
+	// continuation that commits only whatever was validly staged, then resumes.
+	// Fast-track markdown checklists are exempt: local 7B models commonly
+	// truncate them and the salvage path above already tolerates that.
+	if resp.FinishReason == "length" {
+		e.emit(events.NewStepStarted(modelName, 1, stepState.maxTokens))
+		e.emit(events.NewStepExhausted(1, stepState.maxTokens, len(e.salvageValidTasks(resp.Content, problem, ledgerContent))))
+		e.emit(events.NewContinuationStarted(2, stepState.maxTokens))
+		return e.synthesizeBoundedContinuation(ctx, req, resp, problem, ledgerContent, stepState)
 	}
 
 	// ── JSON PARSING — ELEVATED SILENT RETRY LOOP ──────────────────
