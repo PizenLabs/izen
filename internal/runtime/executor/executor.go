@@ -13,7 +13,21 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
-// RuntimeExecutor is the single Control Plane coordinator.
+// RuntimeExecutor is a Control Plane coordinator for the newer
+// guard→substrate pipeline. PHASE 1 AUTHORIZATION BOUNDARY (P0-2): this type
+// is NOT the production mutation authority — no production (non-test) call
+// site invokes RuntimeExecutor.Execute; the canonical production execution
+// authority is execution.RuntimeExecutor (internal/execution), wired by the
+// composition root (internal/runtime/compose) and consumed by the TUI,
+// autonomy and headless paths. This coordinator remains as a tested,
+// unreachable-from-production control-plane component: it must never gain a
+// production caller without an explicit authority-convergence review, a rule
+// pinned by TestPhase1_SingleProductionExecutionAuthority. The live
+// subordinate primitives in this package (FileExecutor, ProposalValidator,
+// SanitizeUntrustedPayload, MaterializeCandidateExported,
+// ValidateProviderModel) are execution PRIMITIVES, not authorities: they
+// perform no authorization decision of their own.
+//
 // It enforces the 6-clause formula binding: every mutation must invoke
 // CapabilityGuard.Evaluate before dispatching to Substrate.
 //

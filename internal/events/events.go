@@ -188,6 +188,23 @@ const (
 	// parsing log strings. It is the guarantee behind the invariant:
 	// awaiting_human ⇒ a renderable HumanBoundaryProposalMsg exists.
 	EventDecisionSurface = "decision.surface"
+
+	// ── BOUNDED REASONING STEP LIFECYCLE (plan synthesis, bounded continuity) ─
+	// These events make every bounded reasoning step observable: when a step
+	// starts, when it completes, when it is cut off by the provider's output
+	// ceiling (finish_reason="length" / OUTPUT_EXHAUSTED), and every
+	// continuation / atomic state commit / rejection / budget-recalc
+	// transition. They let projections distinguish OUTPUT_EXHAUSTED (a
+	// recoverable bounded step → continuation) from a failed task without
+	// parsing free-form log strings.
+	EventStepStarted           = "reasoning.step.started"
+	EventStepCompleted         = "reasoning.step.completed"
+	EventStepExhausted         = "reasoning.step.exhausted"
+	EventContinuationScheduled = "reasoning.continuation.scheduled"
+	EventContinuationStarted   = "reasoning.continuation.started"
+	EventStateCommitted        = "reasoning.state.committed"
+	EventStateRejected         = "reasoning.state.rejected"
+	EventBudgetRecalculated    = "reasoning.budget.recalculated"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -248,6 +265,76 @@ type ExecutionFailedPayload struct {
 	Classification FailureClassification
 	Error          string
 	Stage          string
+}
+
+// StepStartedPayload opens one bounded reasoning step. Model is the provider
+// model id; Step is the 1-based bounded-step ordinal; MaxOutputTokens is the
+// per-step output budget enforced for the call.
+type StepStartedPayload struct {
+	Model           string
+	Step            int
+	MaxOutputTokens int
+}
+
+// StepCompletedPayload closes a bounded reasoning step that produced a
+// parseable, validated result. TasksCommitted is the number of tasks this step
+// contributed to the durable accumulation.
+type StepCompletedPayload struct {
+	Step           int
+	TasksCommitted int
+	FinishReason   string
+}
+
+// StepExhaustedPayload records a step cut off by the provider's output ceiling
+// (finish_reason="length"). It is the authoritative OUTPUT_EXHAUSTED signal:
+// downstream projections use it to distinguish exhaustion from task failure.
+type StepExhaustedPayload struct {
+	Step          int
+	OutputTokens  int
+	SalvagedTasks int
+}
+
+// ContinuationScheduledPayload records that a bounded step was cut off and a
+// continuation was scheduled: durable validated state is preserved and the next
+// bounded step will advance it rather than replaying the same scope.
+type ContinuationScheduledPayload struct {
+	Step        int
+	StagedTasks int
+	Remaining   int // remaining request-budget steps
+}
+
+// ContinuationStartedPayload records the begin of a continuation bounded step.
+// NextMaxTokens is the re-budgeted (typically smaller) output ceiling.
+type ContinuationStartedPayload struct {
+	Step          int
+	NextMaxTokens int
+}
+
+// StateCommittedPayload records an atomic durable state commit: only validated
+// atomic results are committed; neither unvalidated partial output nor an
+// incomplete step is ever committed.
+type StateCommittedPayload struct {
+	Step  int
+	Tasks int
+	Kind  string // "step.batch" | "final.plan"
+}
+
+// StateRejectedPayload records that a bounded step produced no validated atomic
+// result and NO state was committed (StepIncomplete → NO STATE COMMIT). The
+// next step must be rescheduled at a smaller scope.
+type StateRejectedPayload struct {
+	Step   int
+	Reason string
+}
+
+// BudgetRecalculatedPayload records an output/request budget recalculation
+// between bounded steps (adaptive granularity: the step never re-plays its full
+// scope under a ceiling it already proved insufficient).
+type BudgetRecalculatedPayload struct {
+	Step          int
+	PrevMaxTokens int
+	NextMaxTokens int
+	Reason        string
 }
 
 // StageCompletedPayload carries the completion of a pipeline stage.
@@ -685,6 +772,82 @@ func NewExecutionFailed(classification FailureClassification, err error, stage s
 		Classification: classification,
 		Error:          msg,
 		Stage:          stage,
+	})
+}
+
+// NewStepStarted opens a bounded reasoning step with its enforced output budget.
+func NewStepStarted(model string, step, maxOutputTokens int) DomainEvent {
+	return newEvent(EventStepStarted, StepStartedPayload{
+		Model:           model,
+		Step:            step,
+		MaxOutputTokens: maxOutputTokens,
+	})
+}
+
+// NewStepCompleted closes a bounded reasoning step that committed a validated
+// result.
+func NewStepCompleted(step, tasksCommitted int, finishReason string) DomainEvent {
+	return newEvent(EventStepCompleted, StepCompletedPayload{
+		Step:           step,
+		TasksCommitted: tasksCommitted,
+		FinishReason:   finishReason,
+	})
+}
+
+// NewStepExhausted records a bounded step cut off by the provider output
+// ceiling (OUTPUT_EXHAUSTED), with any salvaged validated task count.
+func NewStepExhausted(step, outputTokens, salvagedTasks int) DomainEvent {
+	return newEvent(EventStepExhausted, StepExhaustedPayload{
+		Step:          step,
+		OutputTokens:  outputTokens,
+		SalvagedTasks: salvagedTasks,
+	})
+}
+
+// NewContinuationScheduled records that a bounded step was cut off and a
+// continuation was scheduled against the durable accumulated state.
+func NewContinuationScheduled(step, stagedTasks, remaining int) DomainEvent {
+	return newEvent(EventContinuationScheduled, ContinuationScheduledPayload{
+		Step:        step,
+		StagedTasks: stagedTasks,
+		Remaining:   remaining,
+	})
+}
+
+// NewContinuationStarted records the begin of a continuation bounded step under
+// a re-budgeted output ceiling.
+func NewContinuationStarted(step, nextMaxTokens int) DomainEvent {
+	return newEvent(EventContinuationStarted, ContinuationStartedPayload{
+		Step:          step,
+		NextMaxTokens: nextMaxTokens,
+	})
+}
+
+// NewStateCommitted records an atomic commit of validated state.
+func NewStateCommitted(step, tasks int, kind string) DomainEvent {
+	return newEvent(EventStateCommitted, StateCommittedPayload{
+		Step:  step,
+		Tasks: tasks,
+		Kind:  kind,
+	})
+}
+
+// NewStateRejected records that a bounded step committed NO state.
+func NewStateRejected(step int, reason string) DomainEvent {
+	return newEvent(EventStateRejected, StateRejectedPayload{
+		Step:   step,
+		Reason: reason,
+	})
+}
+
+// NewBudgetRecalculated records an adaptive output-budget recalculation between
+// bounded steps.
+func NewBudgetRecalculated(step, prevMaxTokens, nextMaxTokens int, reason string) DomainEvent {
+	return newEvent(EventBudgetRecalculated, BudgetRecalculatedPayload{
+		Step:          step,
+		PrevMaxTokens: prevMaxTokens,
+		NextMaxTokens: nextMaxTokens,
+		Reason:        reason,
 	})
 }
 

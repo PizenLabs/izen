@@ -2239,7 +2239,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if !m.activitySurfaceSealed && m.activityTree != nil {
 			m.activityTree.CompleteLastExec(msg.exitCode, msg.elapsed)
 		}
-		if !m.activitySurfaceSealed && msg.err != nil && msg.exitCode != 0 {
+		// ── PHASE 1 AUTHORIZATION DENIAL ──────────────────────────────
+		// A denied shell pipeline spawned no process: surface the denial
+		// explicitly as an authorization failure. It must never read as a
+		// successful execution.
+		if msg.denied && msg.err != nil {
+			m.push(roleError, fmt.Sprintf("shell execution denied: %v", msg.err))
+		} else if !m.activitySurfaceSealed && msg.err != nil && msg.exitCode != 0 {
 			m.push(roleSystem, dimmedStyle.Render(fmt.Sprintf(
 				"shell exited %d (%s)", msg.exitCode, formatElapsed(msg.elapsed))))
 		}

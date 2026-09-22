@@ -14,9 +14,10 @@ import (
 // time-drift at 0.0 tok/s while waiting for a terminal frame ([DONE]) that
 // may never arrive.
 //
-// Zero-Delta Recovery Limit Invariant is enforced in the scheduler
-// (internal/runtime/scheduler/continuation.go); this file owns the stream
-// side of the hardening: terminal detection + zero-token idle deadline.
+// Zero-Delta Recovery Limit Invariant is enforced in the demoted experiment
+// scheduler (internal/architecture_experiment/scheduler/continuation.go);
+// this file owns the stream side of the hardening: terminal detection +
+// zero-token idle deadline.
 
 // StreamIdleTimeout bounds how long a stream may wait for its terminal
 // frame while emitting zero tokens. If no tokens are emitted within this

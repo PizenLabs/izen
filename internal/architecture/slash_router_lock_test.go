@@ -28,7 +28,7 @@ func TestSlashRouterGuardPinnedStructurally(t *testing.T) {
 	root := repoRoot(t)
 
 	// 1. /new is a registered top-level command route in the registry.
-	regSrc := readFileOrSkip(t, filepath.Join(root, "pkg/domain/command/registry.go"))
+	regSrc := readFileOrSkip(t, filepath.Join(root, "internal/domain/command/registry.go"))
 	if !strings.Contains(regSrc, `Name: "new"`) {
 		t.Error("registry.go must register /new as a top-level command route")
 	}

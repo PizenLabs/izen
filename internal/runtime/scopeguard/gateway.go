@@ -186,6 +186,16 @@ type ReconcileAlias = durable.ReconcileDecision
 // ExecutionCursor. It NEVER accepts raw worker output: callers must pass
 // a GatewayResult with Decision == DecisionAllow (or a verified
 // REQUIRE_VERIFICATION), preserving Proposal != Execution.
+//
+// PHASE 1 AUTHORIZATION BOUNDARY (P0-2): this type is a SUBORDINATE
+// idempotency primitive (Case B), not a mutation authority. It executes only
+// caller-supplied Effect closures that already carry gateway authorization,
+// owns no provider invocation, no patch creation and no workspace-mutation
+// sink of its own; it is reachable only through RuntimeEngine, which has no
+// production wiring (the production mutation authority is
+// execution.RuntimeExecutor). It must never be mistaken for, or promoted to,
+// the canonical execution authority — a rule pinned by
+// TestPhase1_SingleProductionExecutionAuthority.
 type RuntimeExecutor struct {
 	store *durable.TaskStore
 	// workDir roots digest computation for ReconcilePendingCursors and

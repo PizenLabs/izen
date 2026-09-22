@@ -123,8 +123,10 @@ func TestAskModeHiKeepsDirectResponse(t *testing.T) {
 }
 
 // TestInvestigateShortPromptReachesEngine pins the commands.go fix: a short
-// admitted prompt in INVESTIGATE mode reaches the investigate engine instead
-// of the removed "describe what to investigate" early return.
+// admitted GENUINE investigation prompt in INVESTIGATE mode reaches the
+// investigate engine instead of the removed "describe what to investigate"
+// early return. Pure conversational prompts ("hi") instead auto-return to the
+// canonical /ask path (conversational auto-return contract).
 func TestInvestigateShortPromptReachesEngine(t *testing.T) {
 	prev := ActiveWorkerEngine
 	ActiveWorkerEngine = nil
@@ -140,12 +142,39 @@ func TestInvestigateShortPromptReachesEngine(t *testing.T) {
 	m.handoffCtx.LastFailurePayload = ""
 	m.handoffCtx.ProposedFix = ""
 
-	cmd := m.handleMessageContent("hi")
+	cmd := m.handleMessageContent("crash on startup")
 	if cmd == nil {
 		t.Fatal("short INVESTIGATE prompt returned nil — it must dispatch the investigate engine via the worker proposal path")
 	}
 	joined := recordsText(m)
 	if strings.Contains(joined, "No handoff context in ledger") {
 		t.Fatalf("short prompt hit the removed handoff early-return: %q", joined)
+	}
+}
+
+// TestInvestigateConversationalFallsBackToAsk pins the conversational
+// auto-return contract: a simple read-only question under /investigate returns
+// to /ask instead of creating investigation execution state.
+func TestInvestigateConversationalFallsBackToAsk(t *testing.T) {
+	prev := ActiveWorkerEngine
+	ActiveWorkerEngine = nil
+	defer func() { ActiveWorkerEngine = prev }()
+
+	m := gatedDispatchModel(t, &mockProvider{
+		responses: []*ai.Response{{Content: "x"}},
+	}, nil)
+	m.resolver.Set(modes.ModeInvestigate)
+	m.state = StateChat
+	m.sess.ContextLedger = nil
+	m.handoffLedgerContent = ""
+	m.handoffCtx.LastFailurePayload = ""
+	m.handoffCtx.ProposedFix = ""
+
+	m.handleMessageContent("hi")
+	if got := m.resolver.Current(); got != modes.ModeAsk {
+		t.Fatalf("conversational prompt in INVESTIGATE stayed /%s, want /ask fallback", got)
+	}
+	if m.investigateRunning {
+		t.Fatal("conversational fallback must not start the investigate engine")
 	}
 }

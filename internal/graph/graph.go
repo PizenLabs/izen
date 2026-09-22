@@ -19,9 +19,11 @@ import (
 )
 
 // TaskExecutor is the minimal execution contract ExecutionGraph drives.
-// Both *runtime.RuntimeEngine (canonical, STEP 3A) and the legacy
-// *kernel.Engine satisfy it, so callers program against the domain, not an
-// adapter package.
+// Any test double or engine adapter satisfying ExecuteTask may drive it;
+// the canonical production execution authority is execution.RuntimeExecutor
+// (wired by internal/runtime/compose) — *runtime.RuntimeEngine is a
+// test-only legacy engine (see Phase 8 M2 pin
+// TestPhase1_SingleProductionExecutionAuthority), not the canonical path.
 type TaskExecutor interface {
 	ExecuteTask(context.Context, domaintask.Executable) domaintask.TaskResult
 }

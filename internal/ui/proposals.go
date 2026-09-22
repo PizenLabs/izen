@@ -74,6 +74,13 @@ func sanitizeShellCmd(cmd string) (string, bool, string) {
 // streamShellCmd launches a shell command via the control-plane shell port
 // and streams its output as shellChunkMsg values. No direct os/exec in the
 // presentation layer – delegated to the substrate shell port.
+//
+// PHASE 1 GLOBAL EXECUTION BOUNDARY: the command crosses the shell
+// authorization boundary INSIDE the worker before any process spawns: without
+// a grant for this exact command the pipeline terminates with a denied
+// shellExitMsg and zero side effects. Callers SHOULD also authorize
+// synchronously at dispatch for immediate UX feedback; this gate is the
+// fail-closed backstop that no dispatch path can bypass.
 func (m *model) streamShellCmd(cmd string) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.shellCancel = cancel
@@ -89,8 +96,18 @@ func (m *model) streamShellCmd(cmd string) tea.Cmd {
 		defer cancel()
 		defer close(shellCh)
 		start := time.Now()
+		streamGrant, streamAuthErr := m.authorizeShellExecution(cmd, ShellClassExecute, "proposed-shell")
+		if streamAuthErr != nil {
+			shellCh <- shellExitMsg{cmd: cmd, exitCode: -1, elapsed: time.Since(start), err: streamAuthErr, denied: true}
+			return
+		}
+		if cmd != streamGrant.Command {
+			shellCh <- shellExitMsg{cmd: cmd, exitCode: -1, elapsed: time.Since(start), err: fmt.Errorf("shell execution refused: command escapes its authorization grant"), denied: true}
+			return
+		}
 		shell := capabilities.NewExecShell(0)
-		res, err := shell.Execute(ctx, cmd)
+		res, err := shell.ExecuteIn(ctx, streamGrant.WorkspaceRoot, streamGrant.Command)
+		m.recordShellEvidence(streamGrant, time.Since(start), res.ExitCode, err)
 		if res.Stdout != "" {
 			shellCh <- shellChunkMsg{text: res.Stdout}
 		}

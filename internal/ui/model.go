@@ -419,11 +419,15 @@ var _ tea.Msg = shellChunkMsg{}
 // shellExitMsg is the terminal event of the streaming shell pipeline. It
 // carries the process exit code and elapsed time so the running exec entry
 // flips to a completed "(exit N · Xs)" line and the shimmer dock clears.
+// denied marks a Phase 1 authorization denial: no process ever spawned, and
+// the handler must surface err as an authorization failure (never as a
+// successful execution).
 type shellExitMsg struct {
 	cmd      string
 	exitCode int
 	elapsed  time.Duration
 	err      error
+	denied   bool
 }
 
 var _ tea.Msg = shellExitMsg{}
@@ -2490,6 +2494,31 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			p.Attempts, selfHealOutputSuffix(p.Output))
 	case events.StageCompletedPayload:
 		m.logActivity("[stage] %s completed (%s)", p.Stage, p.Summary)
+	// ── BOUNDED REASONING CONTINUITY (plan synthesis repair) ─────
+	// Output-exhaustion telemetry: the provider hit its ACTUAL output
+	// ceiling mid-synthesis. Each line surfaces one hop of the
+	// smaller-bounded-step continuation so a free-tier truncation is
+	// visible instead of silently retried blind.
+	case events.StepStartedPayload:
+		m.logActivity("[plan:step] %d started (budget %d tokens)", p.Step, p.MaxOutputTokens)
+	case events.StepCompletedPayload:
+		m.logActivity("[plan:step] %d completed: %d task(s) committed (%s)", p.Step, p.TasksCommitted, p.FinishReason)
+	case events.StepExhaustedPayload:
+		m.logActivity("[plan:step] %d exhausted at %d tokens (salvaged %d task(s))", p.Step, p.OutputTokens, p.SalvagedTasks)
+	case events.ContinuationScheduledPayload:
+		m.logActivity("[plan:cont] scheduled step %d with %d staged task(s), %d remaining", p.Step, p.StagedTasks, p.Remaining)
+	case events.ContinuationStartedPayload:
+		m.logActivity("[plan:cont] step %d started (budget %d tokens)", p.Step, p.NextMaxTokens)
+	case events.StateCommittedPayload:
+		m.logActivity("[plan:state] committed %d task(s) at step %d (%s)", p.Tasks, p.Step, p.Kind)
+	case events.StateRejectedPayload:
+		m.logActivity("[plan:state] step %d committed nothing: %s", p.Step, p.Reason)
+	case events.BudgetRecalculatedPayload:
+		if p.PrevMaxTokens != p.NextMaxTokens {
+			m.logActivity("[plan:budget] step %d: %d → %d tokens (%s)", p.Step, p.PrevMaxTokens, p.NextMaxTokens, p.Reason)
+		} else {
+			m.logActivity("[plan:budget] step %d %s", p.Step, p.Reason)
+		}
 	case events.ExecutionStartedPayload:
 		m.logRuntimeDetail("[runtime] execution started: %s (mode %s)", truncateForActivity(p.Prompt), p.Mode)
 	case events.StrategySelectedPayload:

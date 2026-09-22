@@ -26,6 +26,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/ingestion"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
+	"github.com/PizenLabs/izen/internal/llmstep"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	runtimeexecutor "github.com/PizenLabs/izen/internal/runtime/executor"
 )
@@ -429,6 +430,17 @@ type pendingMutation struct {
 }
 
 // RuntimeExecutor is the runtime-owned execution boundary.
+//
+// PHASE 1 AUTHORIZATION BOUNDARY (P0-2): this type is the SINGLE canonical
+// production mutation authority — the one component that owns the semantic
+// decision "this authorized execution may now produce side effects". It is
+// wired exactly once by the composition root
+// (internal/runtime/compose.Compose) and consumed by the TUI
+// (m.executor.Execute), the autonomy adapter and the headless handlers. The
+// same-named types in internal/runtime/executor (unreachable coordinator,
+// Case C) and internal/runtime/scopeguard (subordinate idempotency cursor,
+// Case B) are NOT authorities; the convergence is pinned behaviorally by
+// TestPhase1_SingleProductionExecutionAuthority.
 type RuntimeExecutor struct {
 	root      string
 	cfg       *config.Config
@@ -1200,7 +1212,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// model.invoked, NO provider.response and NO artifact.produced — a failed
 	// execution must never emit a misleading success artifact.
 	if profile.Strategy != strategy.TargetedMutation {
-		content, inv, ingTrace, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
+		content, invs, ingTrace, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
 		if ingTrace != nil {
 			res.IngestionTrace = ingTrace
 		}
@@ -1215,15 +1227,26 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 				setProofGraph(res, g)
 				return x.finalizeResult(res), nil
 			}
+			// A bounded-step OUTPUT_EXHAUSTED after the read-only continuation
+			// budget is consumed is a recoverable typed condition (never a
+			// silent success, never ASK → PLAN); its invocation evidence still
+			// travels with the attempt.
+			if len(invs) > 0 {
+				res.ModelCalls = append(res.ModelCalls, invs...)
+				res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, invs...)
+			}
 			g.FailExecution(events.FailureRecoverable, err, "executor.model")
 			res.Err = err
-			res.Proof.Outcome = OutcomeFailed
+			res.Proof.Outcome = OutcomeTruncated
+			if !isOutputExhausted(err) {
+				res.Proof.Outcome = OutcomeFailed
+			}
 			res.Proof.FinishedAt = time.Now()
 			setProofGraph(res, g)
 			return x.finalizeResult(res), err
 		}
-		res.ModelCalls = append(res.ModelCalls, inv)
-		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, inv)
+		res.ModelCalls = append(res.ModelCalls, invs...)
+		res.Proof.ModelInvocations = append(res.Proof.ModelInvocations, invs...)
 		res.ArtifactKind = artifactKindFor(profile)
 		res.Content = content
 		g.CompleteArtifact(res.ArtifactKind, firstTarget(targets))
@@ -2065,24 +2088,32 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	// deterministic and the recovery matrix can re-derive the ceiling from
 	// the same source.
 	maxOut := effectiveMaxOutput(req.MaxOutputTokens, &profile)
-	// Hard API token caps: mutation/build = 1200; ask/plan/read-only = 800.
-	if profile.Strategy == strategy.TargetedMutation {
-		if maxOut == 0 || maxOut > 1200 {
-			maxOut = 1200
-		}
-	} else {
-		if maxOut == 0 || maxOut > 800 {
-			maxOut = 800
+	// Capability-aware step budget: when neither the request nor the strategy
+	// profile carries an explicit output budget, substitute the per-mode
+	// REQUESTED default. These are requests, NEVER capability claims — the
+	// shared bounded-step resolution (llmstep.ResolveMaxTokens) clamps the
+	// effective budget against the provider's ACTUAL ceiling, so no invocation
+	// asks for a budget the provider must silently cut. A hardcoded API token
+	// cap (unchanged for every provider) is gone: the only binding constraint
+	// is the model's real max_output plus the requested scope.
+	requested := maxOut
+	if requested == 0 {
+		if profile.Strategy == strategy.TargetedMutation {
+			requested = llmstep.DefaultMutationRequestedTokens
+		} else {
+			requested = llmstep.DefaultAskRequestedTokens
 		}
 	}
+	var llmConstrained bool
+	maxOut, llmConstrained = llmstep.ResolveMaxTokens(model, requested)
 	// Constrained Output Budget Invariant: models capped at max_output <= 1024
 	// (or ":free" free-tier IDs) force max_tokens = min(requested, 980) and
 	// DISABLE FULL_REWRITE entirely, forcing SEARCH_REPLACE output.
-	// The numeric guard is gated on provider-style model IDs (vendor/model)
-	// so a strategy-derived 1024 budget for mock/local providers does not
-	// misfire — only provider-advertised caps are constrained.
-	constrained := ModelProfile{OutputTokenCap: profile.MaxOutputTokens, ModelID: model}.IsConstrained()
-	if constrained {
+	// Both the capability-derived classification (llmstep) and the
+	// strategy-derived classification (ModelProfile against the profile budget)
+	// gate the artifact shape.
+	profileConstrained := ModelProfile{OutputTokenCap: profile.MaxOutputTokens, ModelID: model}.IsConstrained()
+	if llmConstrained || profileConstrained {
 		if maxOut <= 0 || maxOut > ConstrainedMaxTokens {
 			maxOut = ConstrainedMaxTokens
 		}
@@ -2656,17 +2687,33 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 	return raw, nil
 }
 
-// invokeReadOnly performs the single bounded provider invocation for read-only
+// invokeReadOnly performs the bounded provider invocation(s) for read-only
 // strategies (targeted_reasoning, direct_response, multi_file_planning,
-// repository_investigation). It returns the produced content; no mutation path
-// and no approval surface exist. Event semantics (Phase 4): model.invoked is
-// emitted before the provider call; provider.response is emitted only after a
-// successful response; a failure returns an error and emits neither — the
-// artifact can never precede the response that produced it. The response is
-// owned by the runtime and never reaches the UI raw.
-func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) (content string, inv ModelInvocation, trace *ingestion.IngestionTrace, err error) {
+// repository_investigation). No mutation path and no approval surface exist.
+//
+// BOUNDED STEP CONTRACT (universal): the output budget is capability-derived
+// (llmstep.ResolveMaxTokens), never a hardcoded cap. When the provider cuts
+// the response at its real ceiling (finish_reason="length" →
+// OUTPUT_EXHAUSTED), this path does NOT fail terminally and does NOT re-run
+// the same full-scope prompt: it preserves the compact ResponseState
+// (already-delivered summaries, pending topics, evidence refs) and schedules a
+// bounded continuation under the SAME read-only authority — ASK never becomes
+// PLAN, no plan staging and no grant/approval ever appear. The sequence is
+// bounded by the shared request budget (llmstep.DefaultMaxContinuationSteps);
+// only when the budget is consumed with no delivered state does it return the
+// typed OUTPUT_EXHAUSTED condition instead of a silent success.
+//
+// Event semantics (Phase 4): model.invoked is emitted before each provider
+// call; provider.response after each response carrying real usage (an
+// exhausted-at-the-gate call is a completed, billed provider response with a
+// truncated payload — its authoritative usage never vanishes); an artifact
+// can never precede the response that produced it. Every continuation
+// transition is published as reasoning.step.*/reasoning.continuation.*/reasoning.state.*
+// domain events so projections can distinguish OUTPUT_EXHAUSTED from a failed
+// invocation without parsing log strings.
+func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) (content string, invs []ModelInvocation, trace *ingestion.IngestionTrace, err error) {
 	if x.provider == nil {
-		return "", inv, nil, fmt.Errorf("executor: no provider configured for read-only invocation")
+		return "", nil, nil, fmt.Errorf("executor: no provider configured for read-only invocation")
 	}
 
 	var b strings.Builder
@@ -2690,42 +2737,138 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	b.WriteString("\n### USER REQUEST\n")
 	b.WriteString(req.Prompt)
 	b.WriteString("\n")
+	baseTurn := b.String()
 
 	model, modelErr := x.resolveModel(req)
 	if modelErr != nil {
-		return "", inv, nil, modelErr
+		return "", nil, nil, modelErr
 	}
-	maxRead := effectiveMaxOutput(req.MaxOutputTokens, &profile)
-	// Hard cap for read-only / ask / plan: 800 tokens max.
-	if maxRead == 0 || maxRead > 800 {
-		maxRead = 800
+
+	// ── Capability-aware step budget ─────────────────────────────────────
+	// requested = request/strategy budget, or the read-only requested default;
+	// effective = clamped against the model's real max_output ceiling.
+	requested := effectiveMaxOutput(req.MaxOutputTokens, &profile)
+	if requested == 0 {
+		requested = llmstep.DefaultAskRequestedTokens
 	}
-	aiReq := ai.Request{
-		Model:     model,
-		System:    readOnlySystemPrompt(profile.Strategy),
-		Messages:  []ai.Message{{Role: "user", Content: b.String()}},
-		MaxTokens: maxRead,
+	maxRead, constrained := llmstep.ResolveMaxTokens(model, requested)
+
+	step := llmstep.NewStepState(model, constrained, maxRead, llmstep.DefaultMaxContinuationSteps)
+	// Compact continuation state: the ONLY context a continuation rebuilds
+	// from. Never the transcript, never the whole conversation.
+	rs := llmstep.NewResponseState(req.Prompt, "findings / needed adjustments / reason / optional concise example")
+
+	var accumulated strings.Builder
+	for {
+		userTurn := baseTurn
+		if step.Ordinal() > 1 {
+			userTurn = llmstep.ContinuationUserTurn(baseTurn, step.Committed(), rs.PendingTopics, rs.ResponseFormat, step.MaxTokens())
+		}
+		aiReq := ai.Request{
+			Model:     model,
+			System:    readOnlySystemPrompt(profile.Strategy),
+			Messages:  []ai.Message{{Role: "user", Content: userTurn}},
+			MaxTokens: step.MaxTokens(),
+		}
+		x.emit(events.NewStepStarted(model, step.Ordinal(), step.MaxTokens()))
+		if step.Ordinal() > 1 {
+			x.emit(events.NewContinuationStarted(step.Ordinal(), step.MaxTokens()))
+		}
+		// model.invoked is emitted when the invocation BEGINS — before the
+		// provider call — so the event stream truthfully records the start.
+		g.BeginModel(model)
+
+		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
+		if itrace != nil {
+			trace = itrace
+		}
+		// Billed invocation evidence for EVERY attempt: an exhausted-at-the-gate
+		// call is a completed provider response whose payload was cut by the
+		// provider — its authoritative usage is recorded, never dropped.
+		inv := ModelInvocation{Model: model}
+		if usage.Known {
+			inv.Known = true
+			inv.TokenInput = usage.PromptTokens
+			inv.TokenOutput = usage.CompletionTokens
+			inv.CachedTokens = usage.CachedTokens
+			inv.ReasoningTokens = usage.ReasoningTokens
+		}
+		inv.FinishReason = usage.FinishReason
+		if callErr == nil || isOutputExhausted(callErr) {
+			// The provider responded (payload possibly truncated at the gate);
+			// provider.response carries the authoritative usage.
+			g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
+		}
+		invs = append(invs, inv)
+
+		if callErr != nil {
+			if !isOutputExhausted(callErr) {
+				return accumulated.String(), invs, trace, fmt.Errorf("executor: read-only invocation: %w", callErr)
+			}
+			// OUTPUT_EXHAUSTED: a recoverable bounded-step condition, never an
+			// immediate terminal error.
+			x.emit(events.NewStepExhausted(step.Ordinal(), usage.CompletionTokens, len(step.Committed())))
+			if !step.CanContinue() {
+				if accumulated.Len() > 0 {
+					// Request budget consumed but delivered state exists: return
+					// the accumulated answer — a bounded read-only response is
+					// never a terminal failure for a non-empty delivered result.
+					x.emit(events.NewStateCommitted(step.Ordinal(), len(step.Committed()), "read_only.final"))
+					rs.Complete()
+					return accumulated.String(), invs, trace, nil
+				}
+				// Nothing delivered and no budget: typed OUTPUT_EXHAUSTED —
+				// recoverable, distinct from a failed invocation, never a
+				// silent success.
+				return "", invs, trace, fmt.Errorf("executor: read-only invocation: %w",
+					&llmstep.OutputExhaustedError{
+						Step: step.Ordinal(),
+						Hint: "provider output ceiling exhausted and the read-only continuation budget is consumed with no delivered state",
+					})
+			}
+			// Schedule the continuation: compact state preserved, scope and
+			// authority STABLE, only the step objective/budget advance.
+			step.Advance()
+			rs.AdvanceCursor()
+			x.emit(events.NewStateRejected(step.Ordinal()-1, "exhausted buffer committed no new validated state"))
+			x.emit(events.NewContinuationScheduled(step.Ordinal(), len(step.Committed()), step.ContinuationsLeft()))
+			continue
+		}
+
+		// Natural completion: the model had room to finish — accept it.
+		if accumulated.Len() > 0 {
+			accumulated.WriteString("\n\n")
+		}
+		accumulated.WriteString(raw)
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			step.RecordDelivered(trimmed)
+			rs.AddAnswered(trimmed)
+			rs.AddFinding(trimmed)
+		}
+		x.emit(events.NewStateCommitted(step.Ordinal(), len(step.Committed()), "step.batch"))
+		x.emit(events.NewStepCompleted(step.Ordinal(), len(step.Committed()), usage.FinishReason))
+		rs.Complete()
+		return accumulated.String(), invs, trace, nil
 	}
-	// model.invoked is emitted when the invocation BEGINS — before the provider
-	// call — so the event stream truthfully records the invocation start.
-	g.BeginModel(model)
-	raw, usage, trace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
-	if callErr != nil {
-		return "", inv, trace, fmt.Errorf("executor: read-only invocation: %w", callErr)
+}
+
+// isOutputExhausted reports whether err is the bounded-step OUTPUT_EXHAUSTED
+// condition raised at the executor output gate (Boundary 3) — a recoverable
+// finish_reason="length" exhaustion rather than a failed invocation. It
+// matches the local OutputGateError / ErrPayloadTruncated sentinels and the
+// shared llmstep condition so every path routes one recovery policy.
+func isOutputExhausted(err error) bool {
+	if err == nil {
+		return false
 	}
-	inv.Model = model
-	if usage.Known {
-		inv.Known = true
-		inv.TokenInput = usage.PromptTokens
-		inv.TokenOutput = usage.CompletionTokens
-		inv.CachedTokens = usage.CachedTokens
-		inv.ReasoningTokens = usage.ReasoningTokens
+	var gate *OutputGateError
+	if errors.As(err, &gate) && gate.Outcome == CanonicalOutputExhausted {
+		return true
 	}
-	inv.FinishReason = usage.FinishReason
-	// provider.response is emitted ONLY on a successful response — the
-	// authoritative usage travels here. No artifact may precede it.
-	g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
-	return raw, inv, trace, nil
+	if errors.Is(err, ErrPayloadTruncated) {
+		return true
+	}
+	return llmstep.IsOutputExhausted(err)
 }
 
 // invokeStream executes one bounded provider invocation through a live

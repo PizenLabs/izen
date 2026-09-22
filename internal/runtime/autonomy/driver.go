@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/continuation"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
@@ -954,7 +955,25 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				continue
 			case autonomy.OutcomeWorkspaceDrift:
 				// Boundary-5: the mutation geometry moved between attempts.
+				// ── M6 PURE CONTINUATION CONFIRMATION (library, not runtime) ──
+				// Confirm the halt through the pure transition function: with
+				// caller-observed drift it must agree this is STALE. The
+				// recovery matrix below remains the decision owner — the abort
+				// is taken regardless; a disagreement is a bug signal, logged
+				// for forensics, never a second decision path.
 				// Terminate as a permanent abort — never verified as execution.
+				if cont := DeriveDriverContinuation(DriverContinuationInput{
+					Objective:        d.prompt,
+					Targets:          append([]string(nil), d.req.Targets...),
+					StateFingerprint: d.req.WorkspaceDigest,
+					HasStaleState:    true,
+					PreviousOutcome:  driverOutcomeToStepOutcome(obs.Outcome),
+					AllowedScope:     append([]string(nil), d.req.Targets...),
+					ProviderCeiling:  obs.MaxOutputTokens,
+				}); cont.Action != continuation.ActionStale {
+					diagnosticf("[boundary5] continuation library disagrees on drift: action=%s reason=%s (matrix abort still taken)",
+						cont.Action, cont.Reason)
+				}
 				if _, err := d.step(ctx, autonomy.LoopDecision{
 					Action: autonomy.LoopAbort,
 					Reason: "workspace drift — stale run aborted before execution",

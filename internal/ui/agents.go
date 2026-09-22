@@ -368,7 +368,17 @@ type reviewTestExecutor struct {
 
 func (e *reviewTestExecutor) RunDynamicTests() (bool, string, error) {
 	runner := execExecutionRunner(".")
-	result, err := runner.RunContext(e.m.operationContext(), "go test -v ./...")
+	// ── PHASE 1 GLOBAL EXECUTION BOUNDARY ─────────────────────────────
+	// The composite review pipeline executes a test binary on the human's
+	// /review invocation: that invocation is the human execution intent, and
+	// this grant binds ONLY this bounded "go test -v ./..." run (validated,
+	// workspace-confined, evidenced). It grants zero mutation authority.
+	dynGrant, dynAuthErr := e.m.authorizeTestExecution("go test -v", "./...", "/review composite")
+	if dynAuthErr != nil {
+		return false, dynAuthErr.Error(), dynAuthErr
+	}
+	result, err := runner.RunGranted(e.m.operationContext(), dynGrant, dynGrant.Command)
+	e.m.recordShellEvidence(dynGrant, 0, testExitCode(result, err), err)
 	if err != nil && result == nil {
 		return false, err.Error(), err
 	}
