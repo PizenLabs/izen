@@ -193,7 +193,7 @@ func (e *Engine) groundCandidateTasks(candidates []Task, ledgerContent string) [
 	candidates = FilterUnsolicitedPkgFiles(candidates, ledgerContent)
 	candidates = FilterUndefinedSymbolShellExec(candidates, ledgerContent)
 	candidates = FilterNonExistentMutationTargets(candidates, e.rootPath)
-	if e != nil && e.vanillaWeb {
+	if e.vanillaWeb {
 		candidates = EnforceFrontendDomainIsolation(candidates)
 		candidates = SanitizeTasksForArchetype(candidates, recon.VANILLA_WEB)
 	}
