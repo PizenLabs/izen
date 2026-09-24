@@ -10,9 +10,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/httpx"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 type AnthropicClient struct {
@@ -53,12 +55,13 @@ type anthropicReq struct {
 }
 
 type anthropicResp struct {
-	ID      string             `json:"id"`
-	Type    string             `json:"type"`
-	Role    string             `json:"role"`
-	Content []anthropicContent `json:"content"`
-	Model   string             `json:"model"`
-	Usage   *anthropicUsage    `json:"usage"`
+	ID         string             `json:"id"`
+	Type       string             `json:"type"`
+	Role       string             `json:"role"`
+	Content    []anthropicContent `json:"content"`
+	Model      string             `json:"model"`
+	StopReason string             `json:"stop_reason,omitempty"`
+	Usage      *anthropicUsage    `json:"usage"`
 }
 
 type anthropicUsage struct {
@@ -75,8 +78,9 @@ type anthropicStreamEvent struct {
 }
 
 type anthropicDelta struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type       string `json:"type"`
+	Text       string `json:"text"`
+	StopReason string `json:"stop_reason,omitempty"`
 	// Thinking carries the reasoning process text for thinking_delta events
 	// (the Anthropic native equivalent of reasoning_content).
 	Thinking string `json:"thinking"`
@@ -159,7 +163,6 @@ func (c *AnthropicClient) GenerateResponse(ctx context.Context, req PromptReques
 		return LLMResponse{}, fmt.Errorf("anthropic: do: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -195,6 +198,14 @@ func (c *AnthropicClient) GenerateResponse(ctx context.Context, req PromptReques
 		TokenOutput:      tokenOut,
 		CacheWriteTokens: cacheWrite,
 		CacheReadTokens:  cacheRead,
+		FinishReason:     claudeResp.StopReason,
+	}
+	if protocol.IsOutputTruncatedReason(claudeResp.StopReason) {
+		llmResp.Truncated = true
+		if c.bus != nil {
+			c.bus.Publish(events.NewProviderUsageUpdate("", c.resolveModel(req.Model), tokenIn, tokenOut, 0))
+		}
+		return llmResp, protocol.NewOutputTruncated("anthropic", claudeResp.StopReason)
 	}
 	if c.bus != nil {
 		c.bus.Publish(events.NewProviderUsageUpdate("", c.resolveModel(req.Model), tokenIn, tokenOut, 0))
@@ -242,7 +253,6 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 		return LLMResponse{}, fmt.Errorf("anthropic: do: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -259,7 +269,6 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 		event, err := reader.ReadEvent()
 		if errors.Is(err, io.EOF) {
 			cancel()
-			_, _ = io.Copy(io.Discard, resp.Body)
 			break
 		}
 		if err != nil {
@@ -302,9 +311,27 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 			if event.Usage != nil {
 				tokenOut = event.Usage.OutputTokens
 			}
+			if event.Delta != nil && event.Delta.StopReason != "" {
+				// Anthropic may announce the terminal stop in message_delta
+				// before message_stop. Return immediately so the HTTP body is
+				// closed by the defer without waiting for another frame.
+				cancel()
+				response := LLMResponse{
+					Content:          SanitizeOutput(full.String()),
+					TokenInput:       tokenIn,
+					TokenOutput:      tokenOut,
+					CacheWriteTokens: cacheWrite,
+					CacheReadTokens:  cacheRead,
+					FinishReason:     event.Delta.StopReason,
+				}
+				if protocol.IsOutputTruncatedReason(event.Delta.StopReason) {
+					response.Truncated = true
+					return response, protocol.NewOutputTruncated("anthropic", event.Delta.StopReason)
+				}
+				return response, nil
+			}
 		case "message_stop":
 			cancel()
-			_, _ = io.Copy(io.Discard, resp.Body)
 			return LLMResponse{
 				Content:          SanitizeOutput(full.String()),
 				TokenInput:       tokenIn,
@@ -316,7 +343,6 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 	}
 
 	cancel()
-	_, _ = io.Copy(io.Discard, resp.Body)
 	return LLMResponse{
 		Content:          SanitizeOutput(full.String()),
 		TokenInput:       tokenIn,
@@ -331,8 +357,10 @@ func (c *AnthropicClient) resolveModel(override string) string {
 }
 
 type anthropicStreamReader struct {
-	body   io.ReadCloser
-	reader *bufio.Reader
+	body      io.ReadCloser
+	reader    *bufio.Reader
+	closed    bool
+	closeOnce sync.Once
 }
 
 func newAnthropicStreamReader(body io.ReadCloser) *anthropicStreamReader {
@@ -343,9 +371,13 @@ func newAnthropicStreamReader(body io.ReadCloser) *anthropicStreamReader {
 }
 
 func (r *anthropicStreamReader) ReadEvent() (anthropicStreamEvent, error) {
+	if r.closed {
+		return anthropicStreamEvent{}, io.EOF
+	}
 	for {
 		line, err := r.reader.ReadString('\n')
 		if err != nil {
+			_ = r.Close()
 			return anthropicStreamEvent{}, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -359,11 +391,32 @@ func (r *anthropicStreamReader) ReadEvent() (anthropicStreamEvent, error) {
 		}
 
 		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			_ = r.Close()
+			return anthropicStreamEvent{}, io.EOF
+		}
 
 		var event anthropicStreamEvent
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			continue
 		}
+		if (event.Type == "message_delta" && event.Delta != nil && event.Delta.StopReason != "") || event.Type == "message_stop" {
+			_ = r.Close()
+		}
 		return event, nil
 	}
+}
+
+func (r *anthropicStreamReader) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.closed = true
+	var err error
+	r.closeOnce.Do(func() {
+		if r.body != nil {
+			err = r.body.Close()
+		}
+	})
+	return err
 }

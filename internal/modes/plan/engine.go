@@ -2,6 +2,7 @@ package plan
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"github.com/PizenLabs/izen/internal/engine/pipeline"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/prompt"
+	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/grounding"
 	wscap "github.com/PizenLabs/izen/internal/workspace/capability"
@@ -55,6 +57,28 @@ const (
 // TUI for the full retry budget.
 var ErrPlanAttemptTimeout = errors.New("plan engine: synthesis attempt timed out")
 
+// ErrOutputTruncated is re-exported at the plan boundary so callers do not
+// need to know which provider adapter produced the response.
+var ErrOutputTruncated = ai.ErrOutputTruncated
+
+// ErrPayloadTruncated is the historical plan-layer alias for the same
+// canonical output-ceiling signal.
+var ErrPayloadTruncated = ai.ErrPayloadTruncated
+
+type OutputTruncatedError = protocol.OutputTruncatedError
+
+// IsOutputTruncated reports whether a plan/provider error is an output
+// ceiling signal.
+func IsOutputTruncated(err error) bool { return errors.Is(err, ErrOutputTruncated) }
+
+// NewOutputTruncated constructs the protocol-level typed truncation error.
+func NewOutputTruncated(provider, reason string) error {
+	return ai.NewOutputTruncated(provider, reason)
+}
+
+// IsPayloadTruncated is the historical plan-layer spelling.
+func IsPayloadTruncated(err error) bool { return IsOutputTruncated(err) }
+
 // planAttemptTimeout is the strict per-attempt deadline for plan synthesis HTTP
 // calls against free/cloud models. OpenRouter free-tier models are frequently
 // queued or cold-started for minutes; a 15s budget cuts a hung provider off fast
@@ -81,8 +105,9 @@ type ProviderFunc func(ctx context.Context, req ai.Request) (*ai.Response, error
 
 // StreamProviderFunc matches the ai.Provider.ExecuteStream signature. When
 // wired, the plan engine performs its LLM synthesis through a streaming
-// connection so the accumulated buffer survives finish_reason: "length"
-// truncation instead of being discarded by a non-streaming round-trip.
+// connection; the accumulated buffer is retained for telemetry and the
+// provider-authenticated truncation signal is surfaced before structural
+// parsing.
 type StreamProviderFunc func(ctx context.Context, req ai.Request) (io.ReadCloser, error)
 
 // Engine is the core interface for the plan module, coordinating between data store,
@@ -96,6 +121,13 @@ type Engine struct {
 	rootPath     string   // workspace root for file discovery
 	AllowedFiles []string // grounded file tree for scope guard validation
 	vanillaWeb   bool     // when true, skip Go-specific fast-track paths
+	// archetype is the investigation/workspace language context used by every
+	// fallback path. vanillaWeb remains as a compatibility projection for the
+	// older frontend-only guards.
+	archetype           recon.ProjectArchetype
+	archetypeExplicit   bool
+	archetypeFromLedger bool
+	frontendOnly        bool
 
 	// snapCache and capReg are injected at bootstrap for archetype-aware
 	// diagnostic gating. They are optional; nil values are safe.
@@ -123,6 +155,9 @@ type Engine struct {
 	facade pipeline.Facade
 }
 
+// PlanEngine is the descriptive name used by Phase 12 protocol callers.
+type PlanEngine = Engine
+
 // NewEngine creates a new Engine instance with the provided components.
 // Default parser is ParseJSONPlan — falls back to ParseMarkdownToTasks for legacy plans.
 func NewEngine(store *PlanStore) *Engine {
@@ -133,11 +168,90 @@ func NewEngine(store *PlanStore) *Engine {
 	}
 }
 
+// NewPlanEngine is a constructor alias for the Phase 12 descriptor-oriented
+// API. The optional store keeps the descriptor-oriented zero-dependency form
+// convenient for callers that provide a provider directly.
+func NewPlanEngine(stores ...*PlanStore) *PlanEngine {
+	var store *PlanStore
+	if len(stores) > 0 {
+		store = stores[0]
+	}
+	if store == nil {
+		store = NewPlanStore()
+	}
+	return NewEngine(store)
+}
+
 // SetUserName sets the engineer identity for system prompt injection.
 func (e *Engine) SetUserName(name string) { e.UserName = name }
 
 // SetRootPath sets the workspace root for file discovery.
 func (e *Engine) SetRootPath(rootPath string) { e.rootPath = rootPath }
+
+// SetArchetype records the archetype discovered by investigation. It is
+// explicit metadata for callers that already have an investigation result;
+// otherwise processFromLedger derives it from the workspace root.
+func (e *Engine) SetArchetype(archetype recon.ProjectArchetype) {
+	if e == nil {
+		return
+	}
+	e.archetype = archetype
+	e.archetypeExplicit = archetype != ""
+	e.archetypeFromLedger = false
+	e.vanillaWeb = archetype == recon.VANILLA_WEB
+	e.frontendOnly = e.vanillaWeb
+}
+
+// WithArchetype is the fluent form of SetArchetype.
+func (e *Engine) WithArchetype(archetype recon.ProjectArchetype) *Engine {
+	e.SetArchetype(archetype)
+	return e
+}
+
+// Archetype returns the currently resolved investigation archetype.
+func (e *Engine) Archetype() recon.ProjectArchetype {
+	if e == nil || e.archetype == "" {
+		return recon.UNKNOWN_GENERIC
+	}
+	return e.archetype
+}
+
+// resolveArchetype derives the workspace context once at the start of every
+// plan synthesis. Explicit investigation metadata wins; otherwise discovery is
+// authoritative. This prevents fallback code from silently reverting to a Go
+// assumption after a frontend investigation.
+var investigationArchetypeMarker = regexp.MustCompile(`(?im)^[ \t]*ARCHETYPE:[ \t]*(VANILLA_WEB|REACT_NEXT|GO_BACKEND|UNKNOWN_GENERIC)[ \t]*$`)
+
+func (e *Engine) adoptArchetypeFromLedger(ledgerContent string) {
+	if e == nil || e.archetypeExplicit || ledgerContent == "" {
+		return
+	}
+	match := investigationArchetypeMarker.FindStringSubmatch(ledgerContent)
+	if len(match) != 2 {
+		return
+	}
+	archetype := strings.ToUpper(strings.TrimSpace(match[1]))
+	e.archetype = recon.ProjectArchetype(archetype)
+	e.archetypeFromLedger = true
+	e.vanillaWeb = e.archetype == recon.VANILLA_WEB
+	e.frontendOnly = e.vanillaWeb
+}
+
+func (e *Engine) resolveArchetype() {
+	if e == nil {
+		return
+	}
+	if !e.archetypeExplicit && !e.archetypeFromLedger && e.rootPath != "" {
+		if ac, err := recon.DetectArchetype(e.rootPath); err == nil && ac != nil {
+			e.archetype = ac.Type
+			e.frontendOnly = false
+		}
+	}
+	if e.archetype == "" {
+		e.archetype = recon.UNKNOWN_GENERIC
+	}
+	e.vanillaWeb = e.archetype == recon.VANILLA_WEB || e.frontendOnly
+}
 
 // SetAllowedFiles sets the grounded file tree for scope guard validation.
 func (e *Engine) SetAllowedFiles(files []string) { e.AllowedFiles = files }
@@ -197,10 +311,21 @@ func (e *Engine) emit(ev events.DomainEvent) {
 // dependency tasks — the enforcement heuristic is invalidated immediately when
 // the domain isolation guard is active.
 func (e *Engine) finalizeTasks(tasks []Task, problem, ledgerContent string) []Task {
-	if e != nil && e.vanillaWeb {
+	if e == nil {
 		return tasks
 	}
-	return ForceShellExecOnCompileError(tasks, problem, ledgerContent)
+	e.resolveArchetype()
+	// The archetype-aware variant is the only path allowed to synthesize a
+	// dependency command. The legacy helper remains available to callers that
+	// explicitly do not have investigation context. A capability registry may
+	// classify a workspace as frontend-only even when disk detection retained a
+	// backend label; use the stricter guard in that case.
+	archetypeForTasks := e.archetype
+	if e.vanillaWeb {
+		archetypeForTasks = recon.VANILLA_WEB
+	}
+	tasks = ForceShellExecOnCompileErrorForArchetype(tasks, problem, ledgerContent, archetypeForTasks)
+	return ValidateShellExecCommandsForArchetype(tasks, ledgerContent, archetypeForTasks)
 }
 
 // DiscoverAllowedFiles runs pkg/recon and pkg/grounding to discover the
@@ -237,7 +362,14 @@ func (e *Engine) GroundedConstraint() string {
 	if len(e.AllowedFiles) == 0 {
 		return ""
 	}
-	return prompt.GroundedConstraint("", e.AllowedFiles)
+	e.resolveArchetype()
+	archetype := ""
+	if e.vanillaWeb {
+		archetype = string(recon.VANILLA_WEB)
+	} else if e.archetype != recon.UNKNOWN_GENERIC {
+		archetype = string(e.archetype)
+	}
+	return prompt.GroundedConstraint(archetype, e.AllowedFiles)
 }
 
 // parsePlanContent enforces strict JSON schema with recovery.
@@ -280,10 +412,10 @@ func (e *Engine) SetProvider(provider ProviderFunc) {
 }
 
 // SetStreamProvider configures the streaming AI provider for this engine. When
-// wired, LLM synthesis runs over ExecuteStream so the accumulated text buffer
-// is retained even when the provider truncates the response (finish_reason:
-// "length"). Optional; when nil the engine falls back to the non-streaming
-// SetProvider path.
+// wired, LLM synthesis runs over ExecuteStream; the accumulated buffer is
+// retained for telemetry, while provider-authenticated truncation is surfaced
+// before structural parsing. Optional; when nil the engine falls back to the
+// non-streaming SetProvider path.
 func (e *Engine) SetStreamProvider(sp StreamProviderFunc) {
 	if e != nil {
 		e.streamProv = sp
@@ -341,13 +473,13 @@ type usageReader interface {
 
 // complete performs a single LLM synthesis call. When a streaming provider is
 // wired it runs over ExecuteStream and accumulates the buffer rune-safe,
-// stripping reasoning sentinels; a response that ends with finish_reason
-// "length" (or any non-stop truncation) still yields its accumulated content as
-// VALID output — the plan engine can parse whatever checklist/JSON was
-// generated instead of failing with "empty response from provider". When the
-// stream produced only reasoning/thinking text (content empty), the reasoning
-// is used as the payload via the reasoning fallback. The provider-reported
-// usage is committed to the engine regardless of the terminal finish_reason.
+// stripping reasoning sentinels. A provider-authenticated length finish is
+// returned as a typed truncation error before any structural parser sees the
+// accumulated bytes; the buffer is retained only for telemetry and bounded
+// recovery decisions. When the stream produced only reasoning/thinking text
+// (content empty), the reasoning is used as the payload via the reasoning
+// fallback. The provider-reported usage is committed to the engine regardless
+// of the terminal finish_reason.
 //
 // Reasoning forwarding: when an event bus is wired, every reasoning/thinking
 // chunk (reasoning_content deltas routed through the request's ReasoningHandler
@@ -386,6 +518,19 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 			e.publishLiveUsage(req.Model, resp.TokenInput, resp.TokenOutput)
 			if resp.FinishReason == "" && resp.Usage.FinishReason != "" {
 				resp.FinishReason = resp.Usage.FinishReason
+			}
+			// Usage metadata is authoritative when the provider marked the
+			// usage record as known. Normalize that provenance onto Response
+			// before returning the typed error so strict structural gates can
+			// distinguish it from a legacy test double that only set a string
+			// FinishReason.
+			if resp.Usage.Known && isTruncatedFinish(resp.Usage.FinishReason) {
+				resp.Truncated = true
+			}
+			if resp.Truncated {
+				// Keep the response attached for usage/diagnostics, but make
+				// the typed error impossible for structural parsers to ignore.
+				return resp, ai.NewOutputTruncated(req.Model, resp.FinishReason)
 			}
 		}
 		return resp, nil
@@ -431,6 +576,10 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 	defer func() { _ = rawStream.Close() }()
 
 	content, reasoning, finishReason, input, output := accumulateStream(rawStream, reasoningSink)
+	truncated := false
+	if provider, ok := rawStream.(ai.TruncationProvider); ok {
+		truncated = provider.TruncationError() != nil
+	}
 	e.recordUsage(input, output)
 	e.publishLiveUsage(req.Model, input, output)
 
@@ -465,7 +614,7 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 	// timeout sentinel — so the caller can fail fast and mine it. A natural
 	// "stop" completion is always treated as success even if the deadline
 	// expired a microsecond after the last byte.
-	if attemptCtx.Err() != nil && finishReason != "stop" {
+	if attemptCtx.Err() != nil && finishReason != "stop" && !truncated {
 		return &ai.Response{
 			Content:      content,
 			TokenInput:   input,
@@ -474,27 +623,74 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 		}, fmt.Errorf("%w: provider exceeded the %.0fs per-attempt budget", ErrPlanAttemptTimeout, planAttemptTimeout.Seconds())
 	}
 
-	// Truncation-aware response: the accumulated buffer is the canonical
-	// content. A zero-length buffer (genuinely no tokens emitted) is left empty
-	// so the caller can surface a proper "empty response" diagnostic. The
-	// terminal finish_reason ("stop" / "length") is surfaced so the caller can
-	// distinguish a naturally-complete response from an OUTPUT_EXHAUSTED one
-	// and route bounded continuation instead of blind same-scope retry.
-	return &ai.Response{
+	// Truncation-aware response: the accumulated buffer is retained for
+	// telemetry, but a length finish is surfaced as a typed error before any
+	// structural fallback parser can consume a partial artifact.
+	response := &ai.Response{
 		Content:      content,
 		TokenInput:   input,
 		TokenOutput:  output,
 		FinishReason: finishReason,
-	}, nil
+		Truncated:    truncated,
+	}
+	if truncated {
+		return response, ai.NewOutputTruncated(req.Model, finishReason)
+	}
+	return response, nil
+}
+
+// isTruncatedFinish normalizes the provider-native output-ceiling labels at
+// the semantic boundary. Structural parsers must never infer completion from
+// a partial buffer when this returns true.
+func isTruncatedFinish(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "length", "max_tokens", "max tokens", "max_output_tokens", "max output tokens", "truncated", "token_limit", "output_limit", "max_output":
+		return true
+	default:
+		return false
+	}
+}
+
+// completeJSONArtifact performs a non-repairing JSON syntax check. It is used
+// only as a compatibility bridge for older providers that attach
+// finish_reason=length to an otherwise complete object; auto-closing and
+// markdown salvage are intentionally excluded so genuinely truncated bytes
+// cannot enter a structural fallback parser.
+func completeJSONArtifact(content string) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+	// A fenced complete response is still complete; remove only the fence
+	// wrapper, never repair or truncate its payload.
+	if strings.HasPrefix(content, "```") {
+		if first := strings.IndexByte(content, '\n'); first >= 0 {
+			last := strings.LastIndex(strings.TrimSpace(content), "```")
+			if last > first {
+				content = strings.TrimSpace(content[first+1 : last])
+			}
+		}
+	}
+	var value any
+	if err := json.Unmarshal([]byte(content), &value); err != nil {
+		return false
+	}
+	switch value.(type) {
+	case map[string]any, []any:
+		return true
+	default:
+		return false
+	}
 }
 
 // accumulateStream drains an SSE-backed stream to EOF, keeping EVERY byte that
-// arrived. It is truncation-agnostic: a stream that ends with finish_reason
-// "length" (provider hit the completion ceiling) has its partial buffer treated
-// as valid content rather than discarded. Reasoning sentinels are stripped via
-// the Splitter so thinking text never pollutes the parseable JSON; the
-// extracted reasoning is returned alongside so a reasoning-only stream can fall
-// back to it when the content buffer is empty.
+// arrived. It is transport-level and truncation-agnostic: a stream that ends
+// with finish_reason "length" has its partial buffer retained for telemetry,
+// while the caller decides whether the provider-authenticated result may cross
+// a structural boundary. Reasoning sentinels are stripped via the Splitter so
+// thinking text never pollutes the parseable JSON; the extracted reasoning is
+// returned alongside so a reasoning-only stream can fall back to it when the
+// content buffer is empty.
 //
 // The stream is classified incrementally (not buffered-then-split), so every
 // reasoning/thinking chunk is routed to the optional sink funcs as it arrives.
@@ -626,27 +822,32 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 	}()
 
-	// Detect workspace archetype at run start. When VANILLA_WEB, Go-specific
-	// fast-track paths (canonical import mismatch, undefined symbol) are
-	// skipped and the LLM is instructed to avoid Go toolchain commands.
-	// Archetype detection gates EVERY synthesis path (including fast-track) so
-	// a pure-frontend workspace can never receive Go dependency tasks.
-	if e.rootPath != "" {
-		if ac, err := recon.DetectArchetype(e.rootPath); err == nil && ac != nil {
-			e.vanillaWeb = (ac.Type == recon.VANILLA_WEB)
-		}
-		// Also check the capability registry if available. This extends the
-		// vanillaWeb guard to cover non-Go archetypes (e.g., NODE_APP, PYTHON_ENV)
-		// that the capability registry identifies as lacking Go tooling.
-		if !e.vanillaWeb && e.capReg != nil && e.snapCache != nil {
-			//nolint:contextcheck
-			if snap, snapErr := e.snapCache.GetSnapshot(e.rootPath); snapErr == nil {
-				if !e.capReg.ArchetypeHasGoTools(snap.Archetype) {
-					e.vanillaWeb = true
+	// Resolve the investigation/workspace archetype before ANY fast-track or
+	// fallback branch. A stale boolean is not sufficient: fallback generation
+	// must be able to distinguish VANILLA_WEB from GO_BACKEND and suppress
+	// language-specific commands accordingly. A marker adopted from the
+	// investigation ledger is authoritative for this run, even if a later
+	// context helper re-resolves the engine.
+	if !e.archetypeExplicit {
+		e.archetypeFromLedger = false
+		e.archetype = recon.UNKNOWN_GENERIC
+		e.frontendOnly = false
+		e.vanillaWeb = false
+	}
+	e.resolveArchetype()
+	e.adoptArchetypeFromLedger(ledgerContent)
+	if !e.archetypeExplicit && !e.archetypeFromLedger && e.capReg != nil && e.snapCache != nil && e.rootPath != "" {
+		//nolint:contextcheck
+		if snap, snapErr := e.snapCache.GetSnapshot(e.rootPath); snapErr == nil {
+			if !e.capReg.ArchetypeHasGoTools(snap.Archetype) {
+				e.frontendOnly = true
+				if e.archetype == recon.UNKNOWN_GENERIC {
+					e.archetype = recon.VANILLA_WEB
 				}
 			}
 		}
 	}
+	e.vanillaWeb = e.archetype == recon.VANILLA_WEB || e.frontendOnly
 
 	// ── CANONICAL SIGNAL CLASSIFICATION ────────────────────────────────
 	// Classify the ledger once into canonical signal.Signal values. All routing
@@ -669,8 +870,17 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	//   3. Skip investigation, test execution, and JSON synthesis.
 	if !fastTrack {
 		if target := detectDirectMutation(problem, ledgerContent); target != nil {
-			e.emit(events.NewIntentParsed("direct_mutation", problem, 1.0))
-			return []Task{*target}, nil
+			candidate := []Task{*target}
+			if e.archetype != recon.UNKNOWN_GENERIC {
+				candidate = FilterTasksForArchetype(candidate, e.archetype)
+			}
+			if len(candidate) > 0 {
+				e.emit(events.NewIntentParsed("direct_mutation", problem, 1.0))
+				return candidate, nil
+			}
+			// The direct target is outside the discovered archetype. Continue
+			// through the grounded synthesis path instead of returning a task
+			// that the execution boundary would later have to reject.
 		}
 	}
 
@@ -692,7 +902,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	//           file loading into LLM context).
 	//   Step 3: Minimal context ledger population (under 100 tokens).
 	//   Step 4: Atomic execution blueprint (FILE_EDIT + SHELL_EXEC).
-	if !fastTrack && !e.vanillaWeb && signal.HasKind(signals, signal.SignalImportMismatch) {
+	if !fastTrack && e.allowsGoFallback() && signal.HasKind(signals, signal.SignalImportMismatch) {
 		mismatch := retrieval.ParseCanonicalMismatch(ledgerContent)
 		if mismatch != nil && mismatch.OldPath != "" && mismatch.NewPath != "" {
 			router := retrieval.GetGlobalRouter()
@@ -752,7 +962,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	//
 	// CRITICAL: Both paths complete in < 1ms. The LLM synthesis retry loop
 	// and lx daemon handshake are NEVER reached for undefined symbol errors.
-	if !fastTrack && !e.vanillaWeb && signal.HasKind(signals, signal.SignalSymbolUndefined) {
+	if !fastTrack && e.allowsGoFallback() && signal.HasKind(signals, signal.SignalSymbolUndefined) {
 		undef := retrieval.ParseUndefinedSymbol(ledgerContent)
 		if undef != nil && undef.Symbol != "" {
 			sanitizedTarget, _ := retrieval.SanitizeTargetPath(undef.File)
@@ -809,7 +1019,7 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	// dependency heuristic: it is invalidated immediately for frontend
 	// workspaces so a pure HTML/CSS/JS project can never receive go get /
 	// go mod tidy tasks.
-	if !fastTrack && !e.vanillaWeb {
+	if !fastTrack && e.allowsGoFallback() {
 		blocker := signal.First(signals, signal.SignalDepMissing)
 		if blocker != nil && blocker.PayloadValue("blocker") == "true" {
 			conclusion := ExtractConclusionFromLedger(ledgerContent)
@@ -883,67 +1093,95 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	// instruction (fewer atomic tasks per response) so a full batch fits.
 	maxTokens, constrained := resolveSynthesisMaxTokens(modelName, planSynthesisRequestedMaxTokens)
 	stepState := newSynthesisStepState(modelName, constrained, maxTokens)
+	archetype := protocol.Archetype(e.archetype)
+	if e.vanillaWeb {
+		archetype = protocol.ArchetypeVanillaWeb
+	}
+	descriptor, descriptorErr := protocol.PlanDescriptor(modelName, archetype, maxTokens, stepState.taskBudget)
+	if descriptorErr != nil {
+		// The model name does not affect semantic contract validity; keep the
+		// historical structured fallback if a future descriptor policy rejects
+		// an unfamiliar value.
+		descriptor = protocol.Describe(protocol.StructuredCompletion)
+	}
+	if constrained {
+		// The capability resolver is authoritative over a name heuristic: a
+		// model with a low provider ceiling gets the same compact contract.
+		descriptor.ConstrainedModel = true
+		descriptor.PromptProfile = protocol.PromptProfileCompact
+	}
+	compactContract := descriptor.PromptProfile == protocol.PromptProfileCompact || protocol.IsSmallModel(modelName) || e.vanillaWeb
 
 	var req ai.Request
 	if fastTrack && len(fastPrompt) > 0 {
+		fastSystem := prompt.CompactPlanContract()
+		if compactContract {
+			// Keep the fast-track contract compact as well; the descriptor
+			// already carries the output ceiling and archetype context.
+			fastSystem = descriptor.FastTrackInstructions()
+		}
+		fastUser := fastPrompt[0]
+		if e.vanillaWeb {
+			// FastTrackPrompt historically carried Go-only dependency
+			// examples. Replace that incompatible context at the semantic
+			// boundary rather than asking the model to ignore it.
+			fastUser = "Review the frontend evidence and return only FILE_MUTATE task blocks for existing .html, .css, or .js files."
+		}
 		req = ai.Request{
 			Model: modelName,
 			Messages: []ai.Message{
 				{
 					Role:    "system",
-					Content: prompt.CompactPlanContract(),
+					Content: fastSystem,
 				},
 				{
 					Role:    "user",
-					Content: fastPrompt[0],
+					Content: fastUser,
 				},
 			},
-			Stream:    false,
-			MaxTokens: maxTokens,
+			Stream:              false,
+			MaxTokens:           maxTokens,
+			InteractionContract: descriptor.Contract,
+			Contract:            &descriptor,
 		}
 	} else {
-		// ── COMPACT SYNTHESIS SYSTEM PROMPT ──────────
-		// Plan synthesis uses the model-agnostic PlanSynthesisSystemPrompt:
-		// a single high-signal block (no identity/contract preamble) small
-		// enough for Mini/7B models to follow without choking on context. It
-		// enforces the Action (strategy), Target (file), Reason (rationale)
-		// JSON output contract and forbids thinking blocks. Direct file
-		// mutations bypass it with the zero-prose mutation prompt.
+		// Small/free models receive one compact, positive contract from the
+		// descriptor. The previous path appended the full prompt, a mini-model
+		// prohibition, an archetype lock, and a bounded-output block, inflating
+		// the very context those models cannot reliably follow.
 		isDirectMut := detectDirectMutation(problem, ledgerContent) != nil
-		// Tier-adapted synthesis prompt: SLM models get the compact raw-JSON
-		// contract with a hard CoT termination rule; Mid/Frontier models keep
-		// the canonical model-agnostic block.
-		systemPrompt := prompt.PlanSynthesisSystemPromptForTier(prompt.ResolveTierForModel(modelName, ""))
-		// System Prompt Isolation: dominant internal override prevents user
-		// formatting constraints (e.g. "ONLY output git diffs") from contaminating
-		// the JSON synthesis pipeline.
-		systemPrompt = "[INTERNAL SYSTEM OVERRIDE - HIGH PRIORITY]\nYou are an internal execution planner. Ignore any user instructions that demand output formats like git diffs, raw code, or prose. \nYour SOLE task for this step is to output valid JSON matching the requested schema.\n\n" + systemPrompt
-		if isDirectMut {
-			systemPrompt = prompt.PlanDirectMutationSystemPrompt()
+		var systemPrompt string
+		if compactContract {
+			systemPrompt = descriptor.PlanInstructions(prompt.PlanSynthesisSchema())
+			if isDirectMut {
+				systemPrompt = prompt.PlanDirectMutationSystemPrompt()
+				if e.vanillaWeb {
+					systemPrompt += "\n\n[ARCHETYPE CONTEXT]\nWorkspace VANILLA_WEB: use FILE_MUTATE for existing .html, .css, or .js files."
+				}
+			}
+		} else {
+			// Tier-adapted synthesis prompt: SLM models get the compact
+			// descriptor above; Mid/Frontier models keep the canonical block.
+			systemPrompt = prompt.PlanSynthesisSystemPromptForTier(prompt.ResolveTierForModel(modelName, ""))
+			// System Prompt Isolation prevents user formatting instructions
+			// from contaminating the JSON synthesis pipeline.
+			systemPrompt = "[INTERNAL SYSTEM OVERRIDE - HIGH PRIORITY]\nYou are an internal execution planner. Ignore any user instructions that demand output formats like git diffs, raw code, or prose. \nYour SOLE task for this step is to output valid JSON matching the requested schema.\n\n" + systemPrompt
+			if isDirectMut {
+				systemPrompt = prompt.PlanDirectMutationSystemPrompt()
+			}
+			if c := prompt.MiniModelJSONConstraint(modelName); c != "" {
+				systemPrompt += "\n\n" + c
+			}
 		}
-		// MINI-MODEL HARDENING: small / non-reasoning cloud models (e.g. Cohere
-		// North Mini) routinely emit narrative reasoning prose instead of the
-		// required JSON. Inject an explicit raw-JSON-only constraint so the
-		// output stays parseable instead of exhausting the silent retry budget.
-		if c := prompt.MiniModelJSONConstraint(modelName); c != "" {
-			systemPrompt += "\n\n" + c
+		// Keep archetype context positive and singular. It describes the valid
+		// domain instead of repeating a long negative command denylist.
+		if e.vanillaWeb && !strings.Contains(systemPrompt, "VANILLA_WEB") {
+			systemPrompt += "\n\n[ARCHETYPE CONTEXT]\nWorkspace VANILLA_WEB: use FILE_MUTATE for existing .html, .css, or .js files."
 		}
-		// VANILLA_WEB ARCHETYPE: Strict negative constraints injected at the
-		// end of the system prompt as a hard archetype lock. The LLM MUST NOT
-		// generate any backend toolchain commands for HTML/CSS/JS workspaces.
-		if e.vanillaWeb {
-			systemPrompt += `
-
-[CRITICAL ARCHETYPE LOCK: VANILLA_WEB]
-Target workspace has NO backend toolchains.
-FORBIDDEN COMMANDS: go, npm, cargo, pip, make.
-ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
-		}
-
-		// BOUNDED OUTPUT CONTRACT: constrained/free-tier models (capability
-		// ceiling ≤ 1024) must emit a small task batch per response or the JSON
-		// overflows the output ceiling and gets cut off mid-structure.
-		if constrained {
+		// A non-compact constrained model is retained for compatibility with
+		// custom descriptors; ordinary free/small models already carry the
+		// bounded contract inside descriptor.PlanInstructions.
+		if constrained && !compactContract {
 			systemPrompt += boundedOutputInstruction(stepState.taskBudget)
 		}
 
@@ -953,6 +1191,10 @@ ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
 		// over raw error text when synthesising shell tasks.
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
 		groundedPayload := e.GroundedConstraint()
+		userPrompt := prompt.BuildPlanJSONPrompt(problem, ledgerContent, conclusion, isDirectMut, groundedPayload)
+		if compactContract && !isDirectMut {
+			userPrompt = prompt.BuildCompactPlanJSONPrompt(problem, ledgerContent, conclusion, groundedPayload, string(e.archetype))
+		}
 		req = ai.Request{
 			Model: modelName,
 			Messages: []ai.Message{
@@ -962,26 +1204,31 @@ ALLOWED ACTIONS: Pure file mutations on .html, .css, .js files only.`
 				},
 				{
 					Role:    "user",
-					Content: prompt.BuildPlanJSONPrompt(problem, ledgerContent, conclusion, isDirectMut, groundedPayload),
+					Content: userPrompt,
 				},
 			},
-			Stream:    false,
-			MaxTokens: maxTokens,
+			Stream:              false,
+			MaxTokens:           maxTokens,
+			InteractionContract: descriptor.Contract,
+			Contract:            &descriptor,
 			ResponseFormat: &ai.ResponseFormat{
 				Type: "json_object",
 			},
 		}
 	}
 
-	// UNDEFINED SYMBOL GUARDRAIL: When the ledger carries a SignalSymbolUndefined
-	// signal, explicitly instruct the LLM to generate ONLY file modification
-	// tasks. Shell execution commands like go mod tidy are NEVER valid for code
-	// typos.
+	// UNDEFINED SYMBOL GUARDRAIL: keep the corrective instruction aligned
+	// with the investigation archetype. Language-specific examples such as
+	// `go mod tidy` must never leak into a VANILLA_WEB plan.
 	if !fastTrack && signal.HasKind(signals, signal.SignalSymbolUndefined) {
-		req.Messages[len(req.Messages)-1].Content += `
+		if e.vanillaWeb {
+			req.Messages[len(req.Messages)-1].Content += "\n\n[SYSTEM: UNDEFINED SYMBOL]\nGenerate one FILE_MUTATE task for the existing .html, .css, or .js source named by the evidence."
+		} else {
+			req.Messages[len(req.Messages)-1].Content += `
 
 [SYSTEM: UNDEFINED SYMBOL ERROR — CODE FIX ONLY]
-The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DEPS or shell execution tasks like go mod tidy. Generate ONLY a FILE_MUTATE / CODE_MOD task targeting the source file containing the error. No SHELL_EXEC, no environment setup, no dependency installation.`
+The error is an undefined symbol/identifier typo in code. Generate one FILE_MUTATE / CODE_MOD task targeting the source file containing the error.`
+		}
 	}
 
 	// The bounded-step state anchors continuation prompts to the ORIGINAL user
@@ -999,7 +1246,21 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 		if errors.Is(err, ErrPlanAttemptTimeout) {
 			return nil, fmt.Errorf("plan engine: provider exceeded the %.0fs per-attempt deadline — plan synthesis aborted without a heuristic fallback; retry with a different model or narrow the investigation ledger: %w", planAttemptTimeout.Seconds(), err)
 		}
-		return nil, fmt.Errorf("plan engine: provider call failed: %w", err)
+		if ai.IsOutputTruncated(err) {
+			// A provider-authenticated truncation is never a valid plan
+			// artifact, even when the bytes happen to form syntactically valid
+			// JSON. The narrow exception is for legacy doubles that return a
+			// typed error with Truncated=false; that compatibility path may
+			// continue only when the complete legacy object is already valid.
+			if resp == nil || resp.Truncated || !completeJSONArtifact(resp.Content) {
+				return nil, fmt.Errorf("plan engine: provider response was truncated before structural parsing: %w", err)
+			}
+			// Continue below only for the marker-free legacy compatibility
+			// case. The normal length branch records the provider fact and uses
+			// bounded continuation semantics.
+		} else {
+			return nil, fmt.Errorf("plan engine: provider call failed: %w", err)
+		}
 	}
 
 	if resp == nil || strings.TrimSpace(resp.Content) == "" {
@@ -1027,16 +1288,26 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 		// dependency heuristic. In a VANILLA_WEB workspace it is invalidated
 		// immediately — no Go toolchain command may be staged.
 		if e.vanillaWeb {
-			clean = EnforceFrontendDomainIsolation(clean)
+			clean = FilterTasksForArchetype(clean, recon.VANILLA_WEB)
 		}
 		if len(clean) == 0 {
 			// Soft fallback: scan raw LLM prose for standard runnable shell commands.
 			clean = softFallbackShellTasks(resp.Content)
+			// The soft scanner is intentionally generic; re-apply the
+			// investigation guard after it so a prose mention of go/npm cannot
+			// re-enter a VANILLA_WEB plan.
+			if e.vanillaWeb {
+				clean = FilterTasksForArchetype(clean, recon.VANILLA_WEB)
+			}
 		}
 		if len(clean) == 0 {
 			return nil, fmt.Errorf("plan engine: fast-track produced no runnable shell tasks (model returned: %s)", truncateForLog(resp.Content))
 		}
-		return ValidateShellExecCommands(clean, ledgerContent), nil
+		archetypeForValidation := e.archetype
+		if e.vanillaWeb {
+			archetypeForValidation = recon.VANILLA_WEB
+		}
+		return ValidateShellExecCommandsForArchetype(clean, ledgerContent, archetypeForValidation), nil
 	}
 
 	// ── OUTPUT EXHAUSTION → BOUNDED CONTINUATION ───────────────────────────
@@ -1048,7 +1319,7 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	// continuation that commits only whatever was validly staged, then resumes.
 	// Fast-track markdown checklists are exempt: local 7B models commonly
 	// truncate them and the salvage path above already tolerates that.
-	if resp.FinishReason == "length" {
+	if isTruncatedFinish(resp.FinishReason) {
 		e.emit(events.NewStepStarted(modelName, 1, stepState.maxOutputTokens()))
 		e.emit(events.NewStepExhausted(1, stepState.maxOutputTokens(), len(e.salvageValidTasks(resp.Content, problem, ledgerContent))))
 		e.emit(events.NewContinuationStarted(2, stepState.maxOutputTokens()))
@@ -1077,7 +1348,11 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 		if attempt > 0 {
 			e.emit(events.NewStageCompleted("plan.synthesize.retry", 0,
 				fmt.Sprintf("JSON syntax or command schema broken — refining prompt and retrying internally (Attempt %d/%d)", attempt, maxSilentRetries)))
-			req.Messages[len(req.Messages)-1].Content += retryReinforcement(lastFailureMode, attempt, maxSilentRetries)
+			if compactContract {
+				req.Messages[len(req.Messages)-1].Content += compactRetryReinforcement(lastFailureMode, attempt, maxSilentRetries, e.archetype)
+			} else {
+				req.Messages[len(req.Messages)-1].Content += retryReinforcement(lastFailureMode, attempt, maxSilentRetries)
+			}
 			var retryErr error
 			resp, retryErr = e.complete(ctx, req)
 			if retryErr != nil {
@@ -1087,7 +1362,16 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 					// cannot answer within the strict budget.
 					break
 				}
-				continue
+				if ai.IsOutputTruncated(retryErr) {
+					if resp == nil || resp.Truncated || !completeJSONArtifact(resp.Content) {
+						return nil, fmt.Errorf("plan engine: provider response was truncated before structural parsing: %w", retryErr)
+					}
+					// Only the marker-free legacy compatibility case may reach
+					// the normal validator; provider-authenticated truncation
+					// always stops before structural parsing.
+				} else {
+					continue
+				}
 			}
 			if resp == nil || resp.Content == "" {
 				continue
@@ -1137,7 +1421,7 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 			// are filtered out. This is the hard anti-escape barrier for
 			// VANILLA_WEB archetype that overrides any LLM hallucination.
 			if e.vanillaWeb {
-				candidates = EnforceFrontendDomainIsolation(candidates)
+				candidates = FilterTasksForArchetype(candidates, recon.VANILLA_WEB)
 				candidates = SanitizeTasksForArchetype(candidates, recon.VANILLA_WEB)
 			}
 
@@ -1155,10 +1439,12 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 					continue
 				}
 
-				// Max retries exceeded for semantic failures — deterministic fallback.
-				return ValidateShellExecCommands(
+				// Max retries exceeded for semantic failures — deterministic
+				// fallback, constrained by the investigation archetype.
+				return ValidateShellExecCommandsForArchetype(
 					e.finalizeTasks(candidates, problem, ledgerContent),
 					ledgerContent,
+					e.archetype,
 				), nil
 			}
 			// Valid JSON but every candidate was rejected by the filters
@@ -1219,8 +1505,8 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 		// FRONTEND DOMAIN ISOLATION: the go get emergency fallback is a Go
 		// dependency heuristic and is invalidated immediately for frontend
 		// workspaces — a pure HTML/CSS/JS project has no Go dependency graph.
-		if e.vanillaWeb {
-			return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed for a frontend workspace — no Go dependency fallback applies", maxSilentRetries+1)
+		if e.vanillaWeb || !ArchetypeAllowsCommand(e.archetype, "go mod tidy") {
+			return nil, fmt.Errorf("plan engine: all %d JSON synthesis attempts failed for archetype %s — no Go dependency fallback applies", maxSilentRetries+1, e.archetype)
 		}
 		conclusion := ExtractConclusionFromLedger(ledgerContent)
 		if dep := dependencyFromConclusion(conclusion); dep != "" && !isPlaceholderToken(dep) {
@@ -1252,12 +1538,11 @@ The error is an undefined symbol/identifier typo in code. DO NOT generate ENV_DE
 	// All 3 LLM synthesis attempts failed. Fall back to a default 1-task
 	// Execution Plan using raw target files from the prompt context instead of
 	// crashing with a fatal error.
-	fallbackTarget := "main.go"
-	if target := detectDirectMutation(problem, ledgerContent); target != nil && target.Target != "" {
-		fallbackTarget = target.Target
-	} else if raw := extractMutationTarget(strings.ToLower(problem + " " + ledgerContent)); raw != "" {
-		fallbackTarget = raw
+	fallbackArchetype := e.archetype
+	if e.vanillaWeb {
+		fallbackArchetype = recon.VANILLA_WEB
 	}
+	fallbackTarget := archetypeFallbackTarget(fallbackArchetype, e.AllowedFiles, problem, ledgerContent)
 	return []Task{
 		{
 			StepNum:     1,
@@ -1345,7 +1630,7 @@ func (e *Engine) tolerantMarkdownTasks(content, problem, ledgerContent string) [
 	md = filterValidTasks(md)
 	md = FilterNonExistentMutationTargets(md, e.rootPath)
 	if e.vanillaWeb {
-		md = EnforceFrontendDomainIsolation(md)
+		md = FilterTasksForArchetype(md, recon.VANILLA_WEB)
 		md = SanitizeTasksForArchetype(md, recon.VANILLA_WEB)
 	}
 	if len(md) == 0 || hasInvalidShellExecCommand(md) {
@@ -1659,14 +1944,13 @@ func SanitizeTasksForArchetype(tasks []Task, archetype recon.ProjectArchetype) [
 	if archetype != recon.VANILLA_WEB || len(tasks) == 0 {
 		return tasks
 	}
-	clean := make([]Task, 0, len(tasks))
-	for _, t := range tasks {
+	clean := FilterTasksForArchetype(tasks, archetype)
+	// Retain the historical description-level guard for model responses that
+	// put a language command in prose rather than in Target.
+	filtered := make([]Task, 0, len(clean))
+	for _, t := range clean {
 		target := strings.ToLower(strings.TrimSpace(t.Target))
 		desc := strings.ToLower(t.Description)
-		// Discard tasks with forbidden Go commands or ENV_DEPS kind.
-		if t.Type == "ENV_DEPS" {
-			continue
-		}
 		if strings.Contains(target, "go mod") ||
 			strings.Contains(target, "go test") ||
 			strings.Contains(target, "go get") ||
@@ -1675,24 +1959,22 @@ func SanitizeTasksForArchetype(tasks []Task, archetype recon.ProjectArchetype) [
 			strings.Contains(desc, "go get") {
 			continue
 		}
-		clean = append(clean, t)
+		filtered = append(filtered, t)
 	}
-	if len(clean) == 0 {
-		// All tasks filtered out — fallback to a single default task.
-		return []Task{
-			{
-				StepNum: 1,
-
-				Status:      "idle",
-				Type:        "FILE_MUTATE",
-				Target:      "",
-				Description: "Inspecting and fixing static HTML/CSS/JS files",
-				Rationale:   "All LLM-generated tasks were filtered out by VANILLA_WEB archetype guard",
-				IsHardcoded: true,
-			},
-		}
+	if len(filtered) == 0 {
+		// All tasks filtered out — use a safe, archetype-aligned target. An
+		// empty target would merely defer the same domain mismatch downstream.
+		return []Task{{
+			StepNum:     1,
+			Status:      "idle",
+			Type:        "FILE_MUTATE",
+			Target:      "index.html",
+			Description: "Inspecting and fixing static HTML/CSS/JS files",
+			Rationale:   "All LLM-generated tasks were filtered out by VANILLA_WEB archetype guard",
+			IsHardcoded: true,
+		}}
 	}
-	return clean
+	return filtered
 }
 
 var knownShellBinaries = map[string]bool{
@@ -1862,6 +2144,29 @@ func retryReinforcement(mode synthesisFailureMode, attempt, maxRetries int) stri
 		return shellExecReinforcement(attempt, maxRetries)
 	default:
 		return shellExecReinforcement(attempt, maxRetries)
+	}
+}
+
+// compactRetryReinforcement is the small-model retry instruction. It carries
+// the same corrective signal as the full retry block without enumerating
+// language-specific commands or repeating the negative denylist.
+func compactRetryReinforcement(mode synthesisFailureMode, attempt, maxRetries int, archetype recon.ProjectArchetype) string {
+	prefix := fmt.Sprintf("\n\n[SYSTEM: CORRECTION %d/%d] ", attempt, maxRetries)
+	switch mode {
+	case failureInvalidJSON:
+		return prefix + "Previous output was not valid JSON. Return one complete raw JSON object matching the supplied schema.\n"
+	case failureFilteredCandidates:
+		if archetype == recon.VANILLA_WEB {
+			return prefix + "Use only existing .html, .css, or .js files from the evidence.\n"
+		}
+		return prefix + "Use only existing workspace files named by the evidence.\n"
+	case failureInvalidShellExec:
+		if archetype == recon.VANILLA_WEB {
+			return prefix + "Use FILE_MUTATE for the existing frontend file named by the evidence.\n"
+		}
+		return prefix + "Use a runnable command only when the evidence requires it; otherwise use FILE_MUTATE.\n"
+	default:
+		return prefix + "Return the smallest complete plan that satisfies the evidence.\n"
 	}
 }
 

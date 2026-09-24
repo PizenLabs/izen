@@ -224,18 +224,20 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		req.MaxOutputTokens = effectiveMax
 	}
 	execReq := execution.ExecuteRequest{
-		RequestID:        req.RequestID,
-		Mode:             "autonomy",
-		Prompt:           prompt,
-		Target:           req.Target,
-		Targets:          req.Targets,
-		Strategy:         strategyPtr,
-		Intent:           req.Intent,
-		IntentConfidence: req.IntentConfidence,
-		TargetConfidence: req.TargetConfidence,
-		Scope:            req.Scope,
-		Evidence:         req.Evidence,
-		StreamCallback:   req.StreamCallback,
+		RequestID:           req.RequestID,
+		Mode:                "autonomy",
+		Prompt:              prompt,
+		Target:              req.Target,
+		Targets:             req.Targets,
+		Strategy:            strategyPtr,
+		Intent:              req.Intent,
+		IntentConfidence:    req.IntentConfidence,
+		TargetConfidence:    req.TargetConfidence,
+		Scope:               req.Scope,
+		InteractionContract: req.InteractionContract,
+		Contract:            req.Contract,
+		Evidence:            req.Evidence,
+		StreamCallback:      req.StreamCallback,
 		// Explicit TargetModel: resolved from the active Workspace Target at
 		// execution time. The executor enforces verbatim pass-through and
 		// rejects empty models locally with ErrUnassignedTargetModel.

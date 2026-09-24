@@ -234,7 +234,6 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		return nil, fmt.Errorf("ollama: do request: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -291,12 +290,18 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		usage.FirstTokenAt = usage.CompletedAt
 	}
 
-	return &ai.Response{
-		Content:     content,
-		TokenInput:  tokenIn,
-		TokenOutput: tokenOut,
-		Usage:       usage,
-	}, nil
+	response := &ai.Response{
+		Content:      content,
+		TokenInput:   tokenIn,
+		TokenOutput:  tokenOut,
+		FinishReason: ollamaResp.Choices[0].FinishReason,
+		Truncated:    isOutputLength(ollamaResp.Choices[0].FinishReason),
+		Usage:        usage,
+	}
+	if isOutputLength(ollamaResp.Choices[0].FinishReason) {
+		return response, ai.NewOutputTruncated("ollama", ollamaResp.Choices[0].FinishReason)
+	}
+	return response, nil
 }
 
 func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
@@ -358,7 +363,6 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		return nil, NewProviderError("ollama", resp.StatusCode, respBody)
 	}
@@ -389,6 +393,13 @@ func (r *StreamResult) FinishReason() string {
 		return r.sr.finishReason
 	}
 	return ""
+}
+
+func (r *StreamResult) TruncationError() error {
+	if r == nil {
+		return nil
+	}
+	return streamTruncationError("ollama", r.FinishReason())
 }
 
 type sseReader struct {
@@ -498,11 +509,8 @@ func (s *sseReader) closeTerminal(reason string) {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
 	s.closed = true
+	_ = closeSSERequest(s.cancel, s.body, nil)
 }
 
 func (s *sseReader) Read(p []byte) (int, error) {
@@ -518,9 +526,24 @@ func (s *sseReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.usage.markInterrupted()
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" {
+				s.closed = true
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				s.stopIdle()
+				s.usage.markCompleted(time.Now(), s.finishReason)
+				_ = closeSSERequest(s.cancel, s.body, nil)
+				return 0, io.EOF
 			}
+			s.usage.markInterrupted()
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
+			s.closed = true
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -536,12 +559,13 @@ func (s *sseReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
-			if s.cancel != nil {
-				s.cancel()
-			}
-			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
 			s.usage.markCompleted(time.Now(), s.finishReason)
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, io.EOF
 		}
 
@@ -585,11 +609,8 @@ func (s *sseReader) Read(p []byte) (int, error) {
 				if s.lifecycle != nil {
 					s.lifecycle.MarkClosed()
 				}
-				if s.cancel != nil {
-					s.cancel()
-				}
-				_, _ = io.Copy(io.Discard, s.body)
 				s.closed = true
+				_ = closeSSERequest(s.cancel, s.body, nil)
 				return n, nil
 			}
 			s.drainTrailingUsage()
@@ -638,16 +659,15 @@ func (s *sseReader) Read(p []byte) (int, error) {
 }
 
 func (s *sseReader) Close() error {
+	if s.closed {
+		return nil
+	}
 	s.closed = true
 	if s.lifecycle != nil {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
-	return s.body.Close()
+	return closeSSERequest(s.cancel, s.body, nil)
 }
 
 // ── Local SLM Bridge ──────────────────────────────────────────────────────────
@@ -703,7 +723,6 @@ func (p *OllamaProvider) Generate(ctx context.Context, system, prompt string) (s
 		return "", fmt.Errorf("ollama generate: connection failed: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 

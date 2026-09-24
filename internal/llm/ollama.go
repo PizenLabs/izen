@@ -112,7 +112,6 @@ func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		return LLMResponse{}, fmt.Errorf("ollama: do: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -207,7 +206,6 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		return LLMResponse{}, fmt.Errorf("ollama: do: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -225,7 +223,6 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		chunk, err := reader.ReadChunk()
 		if errors.Is(err, io.EOF) {
 			cancel()
-			_, _ = io.Copy(io.Discard, resp.Body)
 			break
 		}
 		if err != nil {
@@ -271,7 +268,6 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	}
 
 	cancel()
-	_, _ = io.Copy(io.Discard, resp.Body)
 	if tokenIn == 0 && tokenOut == 0 {
 		promptLen := 0
 		for _, m := range req.Messages {

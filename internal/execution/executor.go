@@ -27,6 +27,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/llmstep"
+	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	runtimeexecutor "github.com/PizenLabs/izen/internal/runtime/executor"
 )
@@ -134,6 +135,11 @@ type ExecuteRequest struct {
 	IntentConfidence float64
 	TargetConfidence float64
 	Scope            string
+	// InteractionContract and Contract carry the Phase 12 G2 semantic
+	// interaction metadata to the provider boundary. They are descriptive
+	// metadata only; admission and authorization remain here.
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 	// Evidence is the authoritative bounded evidence ledger compiled for the
 	// target set (structural findings, redundancy ledger). It is authoritative
 	// evidence; the full-file context the runtime reads is supporting context
@@ -920,7 +926,20 @@ func (e *NoOpClaimError) Error() string {
 // Unwrap preserves errors.Is(err, ErrNoOpMutation) for detection sites.
 func (e *NoOpClaimError) Unwrap() error { return ErrNoOpMutation }
 
-var ErrOutputTruncated = errors.New("executor: model output truncated")
+// ErrOutputTruncated is the canonical output-ceiling sentinel shared by the
+// provider boundary and the executor output gate.
+var ErrOutputTruncated = protocol.ErrOutputTruncated
+
+// IsOutputTruncated reports whether an execution/provider error carries the
+// canonical output-ceiling signal.
+func IsOutputTruncated(err error) bool { return errors.Is(err, ErrOutputTruncated) }
+
+// NewOutputTruncated constructs the protocol-level typed truncation error.
+func NewOutputTruncated(provider, reason string) error {
+	return protocol.NewOutputTruncated(provider, reason)
+}
+
+type OutputTruncatedError = protocol.OutputTruncatedError
 
 // openRouterStyleModelIDRe matches OpenRouter's vendor/model schema — the same
 // schema OpenRouter itself requires for every model ID. A model carrying a
@@ -1008,6 +1027,19 @@ func (x *RuntimeExecutor) resolveModel(req ExecuteRequest) (string, error) {
 // mutation it stops at the approval gate and returns PendingPatchID; the
 // caller resolves it via Approve/Reject.
 func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*ExecutionResult, error) {
+	// G2 metadata is normalized at the canonical boundary so every caller
+	// (including legacy direct tests) carries the same semantic descriptor.
+	if req.InteractionContract == "" {
+		intent := req.Intent
+		if intent == "" {
+			intent = req.Prompt
+		}
+		req.InteractionContract = protocol.SelectInteractionContract(intent, req.Mode)
+	}
+	if req.Contract == nil {
+		descriptor := protocol.Describe(req.InteractionContract)
+		req.Contract = &descriptor
+	}
 	requestID := req.RequestID
 	if requestID == "" {
 		requestID = x.nextID()
@@ -2254,10 +2286,12 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		log.Printf("[execution] request=%s attempt=%d target=%s strategy=%s artifact_kind=%s output_contract=%s context_bytes=%d prompt_bytes=%d max_output=%d reasoning=%s recovery=%s",
 			requestID, attempt, target, profile.Strategy, profile.Artifact.Kind, outputContract, contextBytes, len(user), maxOut, reasoningMode, recoveryLabel)
 		aiReq := ai.Request{
-			Model:     model,
-			System:    system,
-			Messages:  []ai.Message{{Role: "user", Content: user}},
-			MaxTokens: maxOut,
+			Model:               model,
+			System:              system,
+			Messages:            []ai.Message{{Role: "user", Content: user}},
+			MaxTokens:           maxOut,
+			InteractionContract: req.InteractionContract,
+			Contract:            req.Contract,
 		}
 		if disableReasoning {
 			aiReq.Reasoning = &ai.ReasoningConfig{Disabled: true}
@@ -2659,11 +2693,14 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 	user.WriteString("```\n")
 	user.Write(targetContent)
 	user.WriteString("\n```\n")
+	manifestDescriptor := protocol.Describe(protocol.StructuredCompletion)
 	req := ai.Request{
-		Model:     model,
-		System:    x.manifestSystemPromptFor(),
-		Messages:  []ai.Message{{Role: "user", Content: user.String()}},
-		MaxTokens: manifestPassMaxTokens,
+		Model:               model,
+		System:              x.manifestSystemPromptFor(),
+		Messages:            []ai.Message{{Role: "user", Content: user.String()}},
+		MaxTokens:           manifestPassMaxTokens,
+		InteractionContract: manifestDescriptor.Contract,
+		Contract:            &manifestDescriptor,
 		// The manifest is a tiny JSON object; a hidden reasoning pass would
 		// spend the bounded output budget before any JSON appears.
 		Reasoning: &ai.ReasoningConfig{Disabled: true},
@@ -2674,6 +2711,13 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 	}
 	if resp == nil {
 		return "", fmt.Errorf("executor: manifest pass returned an empty response")
+	}
+	// An adapter-authenticated truncation must stop before the manifest
+	// parser sees even a syntactically complete-looking object. Keep the
+	// legacy usage-only length fixture on its historical raw-bytes path; the
+	// explicit provenance bit is the fail-closed signal.
+	if resp.Truncated {
+		return "", fmt.Errorf("executor: manifest pass response was truncated: %w", resp.OutputError())
 	}
 	raw := strings.TrimSpace(resp.Content)
 	// A manifest is a TINY minified JSON payload; a response that still exceeds
@@ -2765,10 +2809,12 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 			userTurn = llmstep.ContinuationUserTurn(baseTurn, step.Committed(), rs.PendingTopics, rs.ResponseFormat, step.MaxTokens())
 		}
 		aiReq := ai.Request{
-			Model:     model,
-			System:    readOnlySystemPrompt(profile.Strategy),
-			Messages:  []ai.Message{{Role: "user", Content: userTurn}},
-			MaxTokens: step.MaxTokens(),
+			Model:               model,
+			System:              readOnlySystemPrompt(profile.Strategy),
+			Messages:            []ai.Message{{Role: "user", Content: userTurn}},
+			MaxTokens:           step.MaxTokens(),
+			InteractionContract: req.InteractionContract,
+			Contract:            req.Contract,
 		}
 		x.emit(events.NewStepStarted(model, step.Ordinal(), step.MaxTokens()))
 		if step.Ordinal() > 1 {
@@ -2965,9 +3011,18 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			}
 			streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: usage.FinishReason, Usage: usage})
 		}
-		// Task 1: intercept truncated payload BEFORE ingestion.
-		if NormalizeFinishReason(usage.FinishReason) == CanonicalOutputExhausted {
-			gate := &OutputGateError{Outcome: CanonicalOutputExhausted, Target: "", FinishReason: usage.FinishReason}
+		// Task 1: intercept truncated payload BEFORE ingestion. The explicit
+		// Response.Truncated marker is authoritative even when a legacy
+		// adapter omitted Usage.FinishReason.
+		finishReason := usage.FinishReason
+		if finishReason == "" {
+			finishReason = resp.FinishReason
+		}
+		if resp.Truncated || NormalizeFinishReason(finishReason) == CanonicalOutputExhausted {
+			if finishReason == "" {
+				finishReason = "length"
+			}
+			gate := &OutputGateError{Outcome: CanonicalOutputExhausted, Target: "", FinishReason: finishReason}
 			return "", usage, nil, errors.Join(gate, ErrPayloadTruncated)
 		}
 		// Transport normalization: preserve the raw response and record every
@@ -3233,10 +3288,10 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		if rerr == io.EOF {
 			flushStream()
 			reasoningClose()
-			// Body already closed synchronously inside openrouterSSEReader.Read
-			// on [DONE]; this explicit Close is the ZERO-DEFER guarantee that
-			// the HTTP session is torn down BEFORE any budget/classifier/event
-			// post-processing below. Keep-Alive is preserved via Discard+Close.
+			// Body already closed synchronously inside the SSE reader on
+			// [DONE]/terminal finish; this explicit Close is the zero-defer
+			// guarantee that the HTTP session is torn down BEFORE any
+			// budget/classifier/event post-processing below.
 			closeStream()
 			break
 		}
@@ -3261,6 +3316,23 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	if usageUp != nil {
 		if u := usageUp.Usage(); u.Known {
 			usage = u
+		}
+	}
+	// A stream adapter may expose authoritative truncation independently of
+	// its usage record. Honor that signal before ingestion or artifact
+	// parsing; legacy readers that only expose FinishReason retain the
+	// historical compatibility behavior.
+	if truncating, ok := rawStream.(ai.TruncationProvider); ok {
+		if truncErr := truncating.TruncationError(); truncErr != nil {
+			finishReason := usage.FinishReason
+			if finishReason == "" {
+				finishReason = "length"
+			}
+			if streamCb != nil {
+				streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: finishReason, Usage: usage})
+			}
+			gate := &OutputGateError{Outcome: CanonicalOutputExhausted, Target: "", FinishReason: finishReason}
+			return "", usage, nil, errors.Join(gate, truncErr, ErrPayloadTruncated)
 		}
 	}
 	// Reasoning telemetry: duration + provider-reported token count only.

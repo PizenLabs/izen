@@ -14,8 +14,15 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/loop"
+	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
+
+func interactionMetadata(prompt, mode string) (protocol.InteractionContract, *protocol.ContractDescriptor) {
+	contract := protocol.SelectInteractionContract(prompt, mode)
+	descriptor := protocol.Describe(contract)
+	return contract, &descriptor
+}
 
 // ErrInvalidProposalIntent is returned when a proposal intent fails the
 // zero-call validation barrier. The caller must re-render the DecisionSurface
@@ -291,12 +298,15 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// never guesses a target. A clarification boundary parks BEFORE any
 	// execution — no model call, no mutation.
 	d.resolved = d.adapter.Resolve(objective)
+	interaction, interactionDescriptor := interactionMetadata(objective, "build")
 	d.req = autonomy.LoopRequest{
-		RequestID:       d.runRequestID,
-		Prompt:          objective,
-		Targets:         d.resolved.Targets,
-		StreamCallback:  d.streamCb,
-		WorkspaceDigest: d.adapter.WorkspaceVersion(d.resolved.Targets),
+		RequestID:           d.runRequestID,
+		Prompt:              objective,
+		Targets:             d.resolved.Targets,
+		StreamCallback:      d.streamCb,
+		WorkspaceDigest:     d.adapter.WorkspaceVersion(d.resolved.Targets),
+		InteractionContract: interaction,
+		Contract:            interactionDescriptor,
 	}
 	// Adaptive heuristic (Task 1): bypass FULL_REWRITE for large targets
 	// or small model budgets; force BOUNDED_PATCH as initial strategy.
@@ -465,10 +475,13 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
 		return d.term(), errors.New("autonomy: clarify requires a parked clarification boundary")
 	}
+	interaction, interactionDescriptor := interactionMetadata(d.prompt, "build")
 	d.req = autonomy.LoopRequest{
-		Prompt:          d.prompt,
-		Targets:         []string{target},
-		WorkspaceDigest: d.adapter.WorkspaceVersion([]string{target}),
+		Prompt:              d.prompt,
+		Targets:             []string{target},
+		WorkspaceDigest:     d.adapter.WorkspaceVersion([]string{target}),
+		InteractionContract: interaction,
+		Contract:            interactionDescriptor,
 	}
 	d.obs = d.contextObservation()
 	d.loop.ReleaseHuman("target specified: " + target)

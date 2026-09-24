@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	domain "github.com/PizenLabs/izen/internal/core/domain"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // ErrUnassignedTargetModel is returned when an invocation request carries no
@@ -18,11 +19,13 @@ var ErrUnassignedTargetModel = errors.New("execution: no model assigned to targe
 // moment of prompt admission. Workers MUST NOT maintain independent model
 // configuration state or resolve model IDs via fallback constants.
 type InvocationRequest struct {
-	Prompt    string
-	Target    domain.WorkspaceTarget
-	ModelID   string
-	Provider  string
-	Reasoning domain.ReasoningOption
+	Prompt              string
+	Target              domain.WorkspaceTarget
+	ModelID             string
+	Provider            string
+	Reasoning           domain.ReasoningOption
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 }
 
 // Validate enforces that ModelID is explicitly bound. An empty ModelID is a
@@ -39,8 +42,10 @@ func (r InvocationRequest) Validate() error {
 // the provider without fallback substitution.
 func (r InvocationRequest) ToExecuteRequest() ExecuteRequest {
 	return ExecuteRequest{
-		Prompt: r.Prompt,
-		Mode:   string(r.Target),
-		Model:  r.ModelID,
+		Prompt:              r.Prompt,
+		Mode:                string(r.Target),
+		Model:               r.ModelID,
+		InteractionContract: r.InteractionContract,
+		Contract:            r.Contract,
 	}
 }

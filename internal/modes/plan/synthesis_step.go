@@ -193,8 +193,11 @@ func (e *Engine) groundCandidateTasks(candidates []Task, ledgerContent string) [
 	candidates = FilterUnsolicitedPkgFiles(candidates, ledgerContent)
 	candidates = FilterUndefinedSymbolShellExec(candidates, ledgerContent)
 	candidates = FilterNonExistentMutationTargets(candidates, e.rootPath)
+	if e.archetype != recon.UNKNOWN_GENERIC {
+		candidates = FilterTasksForArchetype(candidates, e.archetype)
+	}
 	if e.vanillaWeb {
-		candidates = EnforceFrontendDomainIsolation(candidates)
+		candidates = FilterTasksForArchetype(candidates, recon.VANILLA_WEB)
 		candidates = SanitizeTasksForArchetype(candidates, recon.VANILLA_WEB)
 	}
 	return candidates
@@ -220,8 +223,11 @@ func (e *Engine) salvageValidTasks(content, problem, ledgerContent string) []Tas
 	if md := ParseMarkdownToTasks(content); len(md) > 0 {
 		md = filterValidTasks(md)
 		md = FilterNonExistentMutationTargets(md, e.rootPath)
+		if e.archetype != recon.UNKNOWN_GENERIC {
+			md = FilterTasksForArchetype(md, e.archetype)
+		}
 		if e.vanillaWeb {
-			md = EnforceFrontendDomainIsolation(md)
+			md = FilterTasksForArchetype(md, recon.VANILLA_WEB)
 			md = SanitizeTasksForArchetype(md, recon.VANILLA_WEB)
 		}
 		if len(md) > 0 && !hasInvalidShellExecCommand(md) {
@@ -357,7 +363,8 @@ func (e *Engine) commitStepState(step *synthesisStepState, problem, ledgerConten
 
 // synthesizeBoundedContinuation completes a plan whose FIRST provider response
 // was cut off at the output ceiling (finish_reason="length"). It is the bounded
-// continuity driver:
+// continuity driver for legacy marker-free responses and for the validated
+// state that may be retained for bounded recovery:
 //
 //   - salvageValidTasks commits ONLY validated atomic results (atomic commit).
 //   - No salvage → NO STATE COMMIT → the next step is rescheduled with a
@@ -402,7 +409,21 @@ func (e *Engine) synthesizeBoundedContinuation(ctx context.Context, baseReq ai.R
 		req.Messages[len(req.Messages)-1].Content = boundedContinuationAppend(step.baseUserContent, step.staged, step.taskBudget)
 
 		nextResp, err := e.complete(ctx, req)
-		if err != nil || nextResp == nil || strings.TrimSpace(nextResp.Content) == "" {
+		if err != nil {
+			if ai.IsOutputTruncated(err) {
+				// A provider-authenticated length result is not a valid
+				// continuation artifact. Do not mine its partial buffer or
+				// silently convert the failure into a successful staged plan.
+				// A marker-free legacy double is tolerated only when its JSON
+				// is already complete; the explicit marker is fail-closed.
+				if nextResp == nil || nextResp.Truncated || !completeJSONArtifact(nextResp.Content) {
+					return nil, fmt.Errorf("plan engine: bounded continuation response was truncated: %w", err)
+				}
+			} else {
+				return e.commitStepState(step, problem, ledgerContent)
+			}
+		}
+		if nextResp == nil || strings.TrimSpace(nextResp.Content) == "" {
 			return e.commitStepState(step, problem, ledgerContent)
 		}
 

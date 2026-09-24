@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -78,7 +77,6 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 		return nil, fmt.Errorf("groq: do: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -116,12 +114,18 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 		usage.FirstTokenAt = usage.CompletedAt
 	}
 
-	return &ai.Response{
-		Content:     content,
-		TokenInput:  tokenIn,
-		TokenOutput: tokenOut,
-		Usage:       usage,
-	}, nil
+	response := &ai.Response{
+		Content:      content,
+		TokenInput:   tokenIn,
+		TokenOutput:  tokenOut,
+		FinishReason: groqResp.Choices[0].FinishReason,
+		Truncated:    isOutputLength(groqResp.Choices[0].FinishReason),
+		Usage:        usage,
+	}
+	if isOutputLength(groqResp.Choices[0].FinishReason) {
+		return response, ai.NewOutputTruncated("groq", groqResp.Choices[0].FinishReason)
+	}
+	return response, nil
 }
 
 func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
@@ -170,7 +174,6 @@ func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.Re
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		return nil, NewProviderError("groq", resp.StatusCode, respBody)
 	}
@@ -279,6 +282,13 @@ func (r *GroqStreamResult) FinishReason() string {
 	return ""
 }
 
+func (r *GroqStreamResult) TruncationError() error {
+	if r == nil {
+		return nil
+	}
+	return streamTruncationError("groq", r.FinishReason())
+}
+
 type groqSSEReader struct {
 	cancel           context.CancelFunc
 	body             io.ReadCloser
@@ -324,11 +334,8 @@ func (s *groqSSEReader) closeTerminal(reason string) {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
 	s.closed = true
+	_ = closeSSERequest(s.cancel, s.body, nil)
 }
 
 func (s *groqSSEReader) Read(p []byte) (int, error) {
@@ -344,9 +351,24 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.usage.markInterrupted()
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" {
+				s.closed = true
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				s.stopIdle()
+				s.usage.markCompleted(time.Now(), s.finishReason)
+				_ = closeSSERequest(s.cancel, s.body, nil)
+				return 0, io.EOF
 			}
+			s.usage.markInterrupted()
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
+			s.closed = true
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -362,12 +384,13 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
-			if s.cancel != nil {
-				s.cancel()
-			}
-			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
 			s.usage.markCompleted(time.Now(), s.finishReason)
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, io.EOF
 		}
 
@@ -401,11 +424,8 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 				if s.lifecycle != nil {
 					s.lifecycle.MarkClosed()
 				}
-				if s.cancel != nil {
-					s.cancel()
-				}
-				_, _ = io.Copy(io.Discard, s.body)
 				s.closed = true
+				_ = closeSSERequest(s.cancel, s.body, nil)
 				return n, nil
 			}
 			s.closeTerminal(chunk.Choices[0].FinishReason)
@@ -453,14 +473,13 @@ func (s *groqSSEReader) Read(p []byte) (int, error) {
 }
 
 func (s *groqSSEReader) Close() error {
+	if s.closed {
+		return nil
+	}
 	s.closed = true
 	if s.lifecycle != nil {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
-	return s.body.Close()
+	return closeSSERequest(s.cancel, s.body, nil)
 }

@@ -281,15 +281,18 @@ func (d *Driver) compressedContextFor(target string, st planner.SubTask) *Compre
 // carries the compressed structural topology instead of raw source.
 func (d *Driver) subTaskRequest(dag *planner.ExecutionDAG, st planner.SubTask, pos, total int,
 	targets []string, workspaceDigest, evidence string, compressed *CompressedStructuralContext) autonomy.LoopRequest {
+	interaction, interactionDescriptor := interactionMetadata("mutate", "build")
 	return autonomy.LoopRequest{
-		RequestID:       fmt.Sprintf("%s-%s", d.runRequestID, st.ID),
-		Prompt:          subTaskPrompt(d.prompt, dag, st, pos, total, compressed),
-		Target:          dag.Target,
-		Targets:         append([]string(nil), targets...),
-		Evidence:        evidence,
-		Intent:          "mutate",
-		MaxOutputTokens: dag.MaxOutputTokens,
-		WorkspaceDigest: workspaceDigest,
+		RequestID:           fmt.Sprintf("%s-%s", d.runRequestID, st.ID),
+		Prompt:              subTaskPrompt(d.prompt, dag, st, pos, total, compressed),
+		Target:              dag.Target,
+		Targets:             append([]string(nil), targets...),
+		Evidence:            evidence,
+		Intent:              "mutate",
+		InteractionContract: interaction,
+		Contract:            interactionDescriptor,
+		MaxOutputTokens:     dag.MaxOutputTokens,
+		WorkspaceDigest:     workspaceDigest,
 		// The approved plan forces the bounded-patch protocol on every unit.
 		RecoveryStrategy: autonomy.StrategyBoundedPatch,
 		RecoveryReason:   fmt.Sprintf("decomposition sub-task %d/%d scoped to %s", pos, total, st.Region),

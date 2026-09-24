@@ -6,14 +6,32 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
-// ErrPayloadTruncated is the transport-level signal that the provider
-// truncated the response at its max_tokens ceiling (finish_reason ==
-// "length"). Callers must fail fast with this error before any JSON or
-// envelope parsing and must NOT attempt a FULL_REWRITE -> BOUNDED_PATCH
-// transition on the truncated bytes.
-var ErrPayloadTruncated = errors.New("model output exceeded max_tokens limit: ErrPayloadTruncated")
+// ErrPayloadTruncated is the historical transport-level name for an output
+// ceiling.  It aliases the protocol-level sentinel so every provider stack
+// agrees on errors.Is identity.
+var ErrPayloadTruncated = protocol.ErrOutputTruncated
+
+// ErrOutputTruncated is the provider-neutral name used by the Phase 12
+// interaction contract.  Keep both names: older callers and adapters use
+// ErrPayloadTruncated while new structural gates use ErrOutputTruncated.
+var ErrOutputTruncated = protocol.ErrOutputTruncated
+
+// OutputTruncatedError is the typed carrier accepted by all provider stacks.
+type OutputTruncatedError = protocol.OutputTruncatedError
+
+// NewOutputTruncated builds a typed truncation error while preserving the
+// provider-native finish reason for diagnostics.
+func NewOutputTruncated(provider, finishReason string) error {
+	return protocol.NewOutputTruncated(provider, finishReason)
+}
+
+// IsOutputTruncated reports whether err carries the canonical truncation
+// signal.
+func IsOutputTruncated(err error) bool { return errors.Is(err, ErrOutputTruncated) }
 
 type Message struct {
 	Role    string `json:"role"`
@@ -25,15 +43,23 @@ type ResponseFormat struct {
 }
 
 type Request struct {
-	Model          string           `json:"model"`
-	Messages       []Message        `json:"messages"`
-	Stream         bool             `json:"stream"`
-	System         string           `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
-	MaxTokens      int              `json:"-"` // 0 = use provider default
-	Stop           []string         `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
-	Temperature    float64          `json:"-"` // 0 = use provider default
-	ResponseFormat *ResponseFormat  `json:"response_format,omitempty"`
-	Tools          []ToolDefinition `json:"-"` // Native LLM function calling tool definitions
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Stream   bool      `json:"stream"`
+	// InteractionContract is the semantic kind of turn requested by the
+	// runtime. It is metadata for the adapter boundary and never grants tool
+	// or execution authority.
+	InteractionContract protocol.InteractionContract `json:"-"`
+	// Contract carries the normalized per-step descriptor when the caller has
+	// one. A nil value is valid for legacy requests; adapters may derive a
+	// default from InteractionContract without changing dispatch.
+	Contract       *protocol.ContractDescriptor `json:"-"`
+	System         string                       `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
+	MaxTokens      int                          `json:"-"` // 0 = use provider default
+	Stop           []string                     `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
+	Temperature    float64                      `json:"-"` // 0 = use provider default
+	ResponseFormat *ResponseFormat              `json:"response_format,omitempty"`
+	Tools          []ToolDefinition             `json:"-"` // Native LLM function calling tool definitions
 	// Reasoning carries the resolved reasoning control (effort level, thinking
 	// budget, CoT cap) produced by the decision engine. Providers translate it
 	// into their native API payload (reasoning_effort / thinking.budget_tokens /
@@ -103,6 +129,19 @@ type ProviderUsage struct {
 	RateLimitedRetries int `json:"rate_limited_retries,omitempty"`
 }
 
+// EffectiveContract returns the explicit descriptor or derives a conservative
+// default from the semantic enum. It never mutates the request.
+func (r Request) EffectiveContract() *protocol.ContractDescriptor {
+	if r.Contract != nil {
+		return r.Contract
+	}
+	if !r.InteractionContract.Valid() {
+		return nil
+	}
+	d := protocol.Describe(r.InteractionContract)
+	return &d
+}
+
 // Empty reports whether the usage record carries no known provider usage.
 // This is the "unknown" state and must not render as a literal zero.
 func (u ProviderUsage) Empty() bool {
@@ -132,9 +171,46 @@ type Response struct {
 	// completion ceiling, not finished naturally — so callers can route bounded
 	// continuation instead of blind same-scope retry.
 	FinishReason string `json:"finish_reason,omitempty"`
+	// Truncated is set by a provider adapter when the authoritative provider
+	// metadata reported an output ceiling. It is distinct from merely having a
+	// FinishReason string, which legacy test doubles may populate without
+	// carrying provider truncation provenance.
+	Truncated bool `json:"truncated,omitempty"`
 	// Usage is the authoritative provider-reported usage of this invocation.
 	// Known=false means the provider returned no usage metadata.
 	Usage ProviderUsage `json:"usage,omitempty"`
+}
+
+// OutputError returns the typed truncation error when the response carries
+// output-ceiling metadata. It is safe on nil responses. The explicit
+// Truncated bit remains the strongest provenance signal, while the provider
+// finish reason and authoritative usage reason are also recognized so callers
+// cannot accidentally parse a response whose adapter forgot to set the bit.
+func (r *Response) OutputError() error {
+	if r == nil {
+		return nil
+	}
+	if !r.Truncated &&
+		!protocol.IsOutputTruncatedReason(r.FinishReason) &&
+		!protocol.IsOutputTruncatedReason(r.Usage.FinishReason) {
+		return nil
+	}
+	reason := r.FinishReason
+	if !protocol.IsOutputTruncatedReason(reason) {
+		reason = r.Usage.FinishReason
+	}
+	if !protocol.IsOutputTruncatedReason(reason) {
+		reason = ""
+	}
+	return NewOutputTruncated("", reason)
+}
+
+// ValidateOutputCompletion is the response-boundary form of OutputError.
+func ValidateOutputCompletion(resp *Response) error {
+	if resp == nil {
+		return nil
+	}
+	return resp.OutputError()
 }
 
 type Provider interface {
@@ -149,6 +225,13 @@ type Provider interface {
 // ceiling (finish_reason == "length") rather than finished naturally ("stop").
 type FinishReasonProvider interface {
 	FinishReason() string
+}
+
+// TruncationProvider is implemented by stream results that can expose a typed
+// output-ceiling error without changing io.Reader's historical EOF behavior.
+// Consumers should prefer this over comparing provider-specific strings.
+type TruncationProvider interface {
+	TruncationError() error
 }
 
 // UsageProvider is implemented by stream results that can report the

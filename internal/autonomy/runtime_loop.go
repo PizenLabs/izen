@@ -7,6 +7,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // ── RuntimeState ────────────────────────────────────────────────────────────
@@ -550,6 +551,11 @@ type LoopRequest struct {
 	IntentConfidence float64
 	TargetConfidence float64
 	Scope            string
+	// InteractionContract and Contract are Phase 12 G2 per-step protocol
+	// metadata. They describe the semantic turn; they do not grant provider
+	// tools or execution authority.
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 	// RecoveryAttempt is the 1-indexed attempt number for this request (0 = initial).
 	RecoveryAttempt int
 	// RecoveryReason is the human-readable reason for a recovery re-execution.

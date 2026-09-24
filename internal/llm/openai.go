@@ -235,7 +235,6 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		return LLMResponse{}, fmt.Errorf("openai: do: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -277,7 +276,7 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 			CacheReadTokens: cacheRead,
 			FinishReason:    "length",
 			Truncated:       true,
-		}, fmt.Errorf("%w: finish_reason=length", ErrPayloadTruncated)
+		}, NewOutputTruncated("openai", "length")
 	}
 	content = SanitizeOutput(content)
 
@@ -361,7 +360,6 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		return LLMResponse{}, fmt.Errorf("openai: do: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -377,7 +375,6 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		select {
 		case <-ctx.Done():
 			cancel()
-			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 		case <-done:
 		}
@@ -426,10 +423,10 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	for {
 		chunk, err := reader.ReadChunk()
 		if errors.Is(err, io.EOF) {
-			// Clean SSE termination: data: [DONE] consumed, drain remaining
-			// buffer to io.EOF and signal transport to close immediately.
+			// Clean SSE termination: data: [DONE] (or the terminal frame) has
+			// already closed the reader. Cancel the request immediately; do
+			// not wait for a server-side EOF or attempt a body drain.
 			cancel()
-			_, _ = io.Copy(io.Discard, resp.Body)
 			break
 		}
 		if err != nil {
@@ -513,7 +510,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 			CacheReadTokens: cacheRead,
 			FinishReason:    "length",
 			Truncated:       true,
-		}, fmt.Errorf("%w: finish_reason=length", ErrPayloadTruncated)
+		}, NewOutputTruncated("openai", "length")
 	}
 	content := full.String()
 	if strings.TrimSpace(content) == "" {
@@ -542,11 +539,9 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		}
 		llmResp.TotalCostUSD = EnforceFreeModelOverride(modelID, llmResp.TotalCostUSD)
 	}
-	// Explicit cancel signals the transport to send TCP FIN immediately;
-	// deferred drain ensures connection reuse and prevents OpenRouter's
-	// 5-minute idle timeout.
+	// Explicit cancel plus the deferred body close releases the HTTP transport
+	// immediately. A server-side EOF is never awaited on a terminal SSE turn.
 	cancel()
-	_, _ = io.Copy(io.Discard, resp.Body)
 	return llmResp, nil
 }
 

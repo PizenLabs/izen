@@ -234,7 +234,9 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		return nil, err
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
+		// The decoder has consumed the response envelope. Close directly:
+		// draining an already-terminal HTTP body can block when a gateway
+		// keeps the SSE connection open after the response.
 		_ = resp.Body.Close()
 	}()
 
@@ -293,13 +295,22 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	usage.HTTPAttempts = stats.attempts
 	usage.RateLimitedRetries = stats.rateLimitedRetries
 
-	return &ai.Response{
-		Content:     content,
-		TokenInput:  tokenIn,
-		TokenOutput: tokenOut,
-		ToolCalls:   toolCalls,
-		Usage:       usage,
-	}, nil
+	response := &ai.Response{
+		Content:      content,
+		TokenInput:   tokenIn,
+		TokenOutput:  tokenOut,
+		ToolCalls:    toolCalls,
+		FinishReason: openaiResp.Choices[0].FinishReason,
+		Truncated:    isOutputLength(openaiResp.Choices[0].FinishReason),
+		Usage:        usage,
+	}
+	if isOutputLength(openaiResp.Choices[0].FinishReason) {
+		// Preserve the provider buffer and usage for telemetry, but fail
+		// before any caller can feed the partial bytes to a structural
+		// repair/fallback parser.
+		return response, ai.NewOutputTruncated("openrouter", openaiResp.Choices[0].FinishReason)
+	}
+	return response, nil
 }
 
 func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
@@ -330,7 +341,6 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	if resp.StatusCode == http.StatusUnauthorized {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		pe := NewProviderError("openrouter", resp.StatusCode, respBody)
 		return nil, fmt.Errorf("%w: %s", ErrOpenRouterAuth, pe.Error())
@@ -338,7 +348,6 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		return nil, asCompatibilityError(resp.StatusCode, respBody)
 	}
@@ -444,6 +453,7 @@ type openrouterRequest struct {
 	Stop                []string            `json:"stop,omitempty"`
 	Stream              bool                `json:"stream,omitempty"`
 	StreamOptions       *streamOptions      `json:"stream_options,omitempty"`
+	ResponseFormat      *ai.ResponseFormat  `json:"response_format,omitempty"`
 	Tools               []json.RawMessage   `json:"tools,omitempty"`
 	// Reasoning carries OpenRouter's provider-agnostic reasoning control. It
 	// is injected from the dynamically resolved effort directive; a nil value
@@ -535,13 +545,14 @@ func openRouterModelSupportsReasoning(model string) bool {
 // OpenAI => reasoning_effort + max_completion_tokens, Anthropic => max_tokens = budget+4096.
 func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage, req ai.Request, stream bool) openrouterRequest {
 	body := openrouterRequest{
-		Model:       model,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      stream,
-		Reasoning:   reasoningFor(req),
+		Model:          model,
+		Messages:       msgs,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		Stop:           req.Stop,
+		Stream:         stream,
+		ResponseFormat: req.ResponseFormat,
+		Reasoning:      reasoningFor(req),
 	}
 	// Default output limit — never send unconstrained max_tokens. The default
 	// is 4096 so long code-generation answers complete without hitting the
@@ -709,7 +720,11 @@ func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body
 		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
 		httpReq.Header.Set("X-OpenRouter-Title", "izen")
 		httpReq.Header.Set("X-Title", "izen")
-		return p.client.Do(httpReq)
+		resp, err := p.client.Do(httpReq)
+		if err != nil && resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return resp, err
 	}
 
 	resp, err := attempt(body)
@@ -916,6 +931,19 @@ func (r *OpenRouterStreamResult) FinishReason() string {
 	}
 	return ""
 }
+
+// TruncationError exposes the typed output-ceiling signal without changing
+// io.Reader's EOF contract for consumers that still need to drain the
+// already-emitted bytes.
+func (r *OpenRouterStreamResult) TruncationError() error {
+	if r != nil && isOutputLength(r.FinishReason()) {
+		return ai.NewOutputTruncated("openrouter", r.FinishReason())
+	}
+	return nil
+}
+
+// Err is a short compatibility spelling for TruncationError.
+func (r *OpenRouterStreamResult) Err() error { return r.TruncationError() }
 
 // thinkTagSplitter is a stateful inline <think>...</think> extractor for
 // OpenRouter models that return their thinking blocks inside delta.content
@@ -1138,8 +1166,8 @@ func (s *openrouterSSEReader) drainTrailingUsage() {
 
 // closeTerminalOnFinish records a terminal finish_reason and tears the
 // channel down immediately (Stream Terminal Invariant): cancel context,
-// drain body, mark closed, complete usage. Pending bytes are preserved in
-// s.pending; callers flush them before returning EOF.
+// close the body, mark closed, and complete usage. Pending bytes are preserved
+// in s.pending; callers flush them before returning EOF.
 func (s *openrouterSSEReader) closeTerminalOnFinish(reason string) {
 	s.finishReason = reason
 	s.usage.markCompleted(time.Now(), reason)
@@ -1147,13 +1175,13 @@ func (s *openrouterSSEReader) closeTerminalOnFinish(reason string) {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
+	// A terminal finish_reason is authoritative. Do not drain the HTTP body:
+	// OpenRouter may keep the connection open after the terminal event, and a
+	// drain would wait for the request context instead of returning control to
+	// the caller.
 	s.closed = true
 	s.closeOnce.Do(func() {
-		_, _ = io.Copy(io.Discard, s.body)
-		_ = s.body.Close()
+		_ = closeSSERequest(s.cancel, s.body, s.closeTransport)
 	})
 }
 
@@ -1179,9 +1207,29 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.usage.markInterrupted()
+			// A cutoff before [DONE]/finish_reason is an interrupted stream,
+			// not a reason to leave the HTTP body parked until the parent
+			// context expires. Close it synchronously and finalize telemetry.
+			// ReadString may return a final unterminated line; preserve it
+			// when it is an explicit [DONE] sentinel.
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" {
+				s.closed = true
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				s.stopIdle()
+				s.usage.markCompleted(time.Now(), s.finishReason)
+				s.closeOnce.Do(func() { _ = closeSSERequest(s.cancel, s.body, s.closeTransport) })
+				return 0, io.EOF
 			}
+			s.usage.markInterrupted()
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
+			s.closed = true
+			s.closeOnce.Do(func() { _ = closeSSERequest(s.cancel, s.body, s.closeTransport) })
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -1197,23 +1245,20 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
-			if s.cancel != nil {
-				s.cancel()
-			}
 			if tail := s.think.takeResidue(); len(tail) > 0 {
 				s.pending = append(s.pending, tail...)
 			}
 			s.closed = true
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
 			s.usage.markCompleted(time.Now(), s.finishReason)
-			// IMMEDIATE ZERO-DEFER TEARDOWN: close the underlying HTTP body
-			// synchronously the instant [DONE] is parsed. Discard+Close
-			// signals completion to OpenRouter's edge while returning the TCP
-			// connection to Go's idle pool (Keep-Alive preserved). Pending
-			// bytes are already buffered in-memory, so closing now does not
-			// drop data — next Read drains pending then returns EOF.
+			// [DONE] is a semantic terminal event. Close the response body
+			// immediately and never wait for a server-side EOF: some gateways
+			// deliberately keep the HTTP stream open after the sentinel.
 			s.closeOnce.Do(func() {
-				_, _ = io.Copy(io.Discard, s.body)
-				_ = s.body.Close()
+				_ = closeSSERequest(s.cancel, s.body, s.closeTransport)
 			})
 			if len(s.pending) > 0 {
 				n := copy(p, s.pending)
@@ -1249,25 +1294,9 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 
 		// Stream Terminal Invariant (Phase 6.4.1): finish_reason != ""
 		// closes the output channel immediately — never wait for [DONE].
-		// Pending bytes (and think residue) are flushed first so no staged
-		// content is lost; the next Read then observes EOF.
-		// Phase 6.4.2 Bounded Usage Drain: before tearing down, allow up
-		// to 50ms for a trailing usage-only chunk so billed tokens are
-		// never dropped from TaskState.TokenUsage.
-		if dprovider.ShouldCloseOnFinishReason(chunk.Choices[0].FinishReason) {
-			if tail := s.think.takeResidue(); len(tail) > 0 {
-				s.pending = append(s.pending, tail...)
-			}
-			s.drainTrailingUsage()
-			s.closeTerminalOnFinish(chunk.Choices[0].FinishReason)
-			if len(s.pending) > 0 {
-				n := copy(p, s.pending)
-				s.pending = s.pending[n:]
-				return n, nil
-			}
-			return 0, io.EOF
-		}
-
+		// A terminal chunk may still carry content/tool deltas, so those are
+		// emitted below before the transport is closed.
+		terminal := dprovider.ShouldCloseOnFinishReason(chunk.Choices[0].FinishReason)
 		if chunk.Choices[0].Delta != nil {
 			delta := chunk.Choices[0].Delta
 			// Reasoning content: emit wrapped in sentinel so the UI can
@@ -1301,10 +1330,17 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 				out = append(out, s.think.write([]byte(delta.Content))...)
 			}
 			if len(out) > 0 {
+				if terminal {
+					if tail := s.think.takeResidue(); len(tail) > 0 {
+						s.pending = append(s.pending, tail...)
+					}
+					s.drainTrailingUsage()
+					s.closeTerminalOnFinish(chunk.Choices[0].FinishReason)
+				}
 				s.stopIdle()
 				n := copy(p, out)
 				if n < len(out) {
-					s.pending = out[n:]
+					s.pending = append(s.pending, out[n:]...)
 				}
 				return n, nil
 			}
@@ -1331,10 +1367,17 @@ func (s *openrouterSSEReader) Read(p []byte) (int, error) {
 					if s.lifecycle != nil {
 						s.lifecycle.NoteTokens(len(all))
 					}
+					if terminal {
+						if tail := s.think.takeResidue(); len(tail) > 0 {
+							s.pending = append(s.pending, tail...)
+						}
+						s.drainTrailingUsage()
+						s.closeTerminalOnFinish(chunk.Choices[0].FinishReason)
+					}
 					s.stopIdle()
 					n := copy(p, all)
 					if n < len(all) {
-						s.pending = all[n:]
+						s.pending = append(s.pending, all[n:]...)
 					}
 					return n, nil
 				}
@@ -1363,16 +1406,9 @@ func (s *openrouterSSEReader) Close() error {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
 	var err error
 	s.closeOnce.Do(func() {
-		_, _ = io.Copy(io.Discard, s.body)
-		err = s.body.Close()
+		err = closeSSERequest(s.cancel, s.body, s.closeTransport)
 	})
-	if s.closeTransport != nil {
-		s.closeTransport()
-	}
 	return err
 }

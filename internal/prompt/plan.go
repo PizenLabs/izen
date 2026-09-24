@@ -290,6 +290,100 @@ OUTPUT — raw JSON only, no fences, no comments:
 	)
 }
 
+// compactArchetypeEvidence removes language-toolchain diagnostics from a
+// compact frontend prompt. The raw investigation ledger remains available to
+// the engine, but a model constrained to static assets should not be primed
+// with a contradictory Go fallback command.
+func compactArchetypeEvidence(value, archetype string) string {
+	if strings.TrimSpace(value) == "" || !strings.EqualFold(strings.TrimSpace(archetype), "VANILLA_WEB") {
+		return value
+	}
+	lines := strings.Split(value, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "go mod") ||
+			strings.Contains(lower, "go get") ||
+			strings.Contains(lower, "go test") ||
+			strings.Contains(lower, "go build") ||
+			strings.Contains(lower, "go run") ||
+			strings.Contains(lower, "go vet") ||
+			strings.Contains(lower, "go.mod") ||
+			strings.Contains(lower, "go.sum") ||
+			strings.HasSuffix(strings.TrimSpace(lower), ".go") ||
+			strings.Contains(lower, "cargo ") ||
+			strings.Contains(lower, "pip ") ||
+			strings.Contains(lower, "npm ") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n"))
+}
+
+// BuildCompactPlanJSONPrompt is the small/free-model user turn. It keeps the
+// evidence and schema, but omits the repeated negative rule blocks used by the
+// full planner prompt. Archetype is a single positive context hint so a
+// frontend investigation cannot acquire a Go command by suggestion.
+func compactPositiveGroundedConstraint(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	lines := strings.Split(value, "\n")
+	clean := make([]string, 0, len(lines))
+	for _, line := range lines {
+		lower := strings.ToLower(strings.TrimSpace(line))
+		switch {
+		case strings.Contains(lower, "do not create"),
+			strings.Contains(lower, "do not suggest"),
+			strings.Contains(lower, "under any circumstance"):
+			continue
+		case strings.Contains(lower, "critical: you must only target"):
+			clean = append(clean, "Use only files listed in ALLOWED_FILE_TREE.")
+		default:
+			clean = append(clean, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(clean, "\n"))
+}
+
+func BuildCompactPlanJSONPrompt(problem, ledgerContent, conclusion, groundedPayload, archetype string) string {
+	problem = compactArchetypeEvidence(problem, archetype)
+	ledgerContent = compactArchetypeEvidence(ledgerContent, archetype)
+	conclusion = compactArchetypeEvidence(conclusion, archetype)
+	groundedPayload = compactArchetypeEvidence(groundedPayload, archetype)
+	groundedPayload = compactPositiveGroundedConstraint(groundedPayload)
+	var b strings.Builder
+	b.WriteString("PLAN INPUT\n")
+	if strings.TrimSpace(problem) != "" {
+		b.WriteString("PROBLEM: ")
+		b.WriteString(strings.TrimSpace(problem))
+		b.WriteByte('\n')
+	}
+	if strings.TrimSpace(ledgerContent) != "" {
+		b.WriteString("EVIDENCE:\n")
+		b.WriteString(strings.TrimSpace(ledgerContent))
+		b.WriteByte('\n')
+	}
+	if strings.TrimSpace(conclusion) != "" {
+		b.WriteString("CONCLUSION:\n")
+		b.WriteString(strings.TrimSpace(conclusion))
+		b.WriteByte('\n')
+	}
+	if strings.TrimSpace(archetype) != "" {
+		b.WriteString("WORKSPACE: ")
+		b.WriteString(strings.TrimSpace(archetype))
+		b.WriteByte('\n')
+	}
+	if strings.TrimSpace(groundedPayload) != "" {
+		b.WriteString("\n")
+		b.WriteString(strings.TrimSpace(groundedPayload))
+		b.WriteByte('\n')
+	}
+	b.WriteString("\nReturn one raw JSON plan using the supplied schema. Keep task values short.\n")
+	return b.String()
+}
+
 // planTaskBlocks is the shared output format for BuildPlanPrompt.
 const planTaskBlocks = `OUTPUT — raw task blocks only, no prose:
 - [ ] SHELL_EXEC: <exact_command> | <rationale>

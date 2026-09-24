@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"errors"
+
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // ErrPayloadTruncated is returned when finish_reason == "length" is observed.
@@ -16,7 +18,21 @@ import (
 // LLMResponse accompanying this error carries the verbatim partial Content
 // plus token counts, and callers MUST surface it with a UI boundary badge
 // instead of clearing/swallowing the buffer.
-var ErrPayloadTruncated = errors.New("model output exceeded max_tokens limit: ErrPayloadTruncated")
+var ErrPayloadTruncated = protocol.ErrOutputTruncated
+
+// ErrOutputTruncated is the protocol-level alias used by newer callers.
+var ErrOutputTruncated = protocol.ErrOutputTruncated
+
+type OutputTruncatedError = protocol.OutputTruncatedError
+
+// IsOutputTruncated reports whether err carries the canonical output-ceiling
+// signal across the legacy and protocol provider stacks.
+func IsOutputTruncated(err error) bool { return errors.Is(err, ErrOutputTruncated) }
+
+// NewOutputTruncated constructs the protocol-level typed truncation error.
+func NewOutputTruncated(provider, reason string) error {
+	return protocol.NewOutputTruncated(provider, reason)
+}
 
 // IsPayloadTruncated reports whether err wraps ErrPayloadTruncated.
 func IsPayloadTruncated(err error) bool {
@@ -30,6 +46,9 @@ type PromptRequest struct {
 	Stream      bool
 	MaxTokens   int
 	Temperature float64
+
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 
 	CacheSystem   bool
 	CacheMessages []int
