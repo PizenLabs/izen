@@ -189,7 +189,10 @@ func (d *Driver) executeSubTaskWithRetry(ctx context.Context, dag *planner.Execu
 	)
 	for attempt := 1; attempt <= maxSubTaskAttempts; attempt++ {
 		attempts = attempt
-		req := d.subTaskRequest(dag, st, pos, total, targets, workspaceDigest, baseEvidence, compressed)
+		req, contractErr := d.subTaskRequest(dag, st, pos, total, targets, workspaceDigest, baseEvidence, compressed)
+		if contractErr != nil {
+			return autonomy.Observation{}, attempts, contractErr
+		}
 		req.StreamCallback = streamCb
 		// RecoveryAttempt rotates the executor's bounded-patch context window:
 		// every retry sees materially different copyable source.
@@ -224,7 +227,10 @@ func (d *Driver) executeSubTaskWithRetry(ctx context.Context, dag *planner.Execu
 		attempts++
 		diagnosticf("[noop-semantics] sub-task %s NO_OP_OBJECTIVE_UNRESOLVED — escalating %d/%d with elevated structural context",
 			st.ID, escalations, maxNoOpEscalations)
-		req := d.subTaskRequest(dag, st, pos, total, targets, workspaceDigest, baseEvidence, compressed)
+		req, contractErr := d.subTaskRequest(dag, st, pos, total, targets, workspaceDigest, baseEvidence, compressed)
+		if contractErr != nil {
+			return autonomy.Observation{}, attempts, contractErr
+		}
 		req.StreamCallback = streamCb
 		req.NoOpEscalation = true
 		// A distinct rotated window: materially different copyable source.
@@ -280,8 +286,11 @@ func (d *Driver) compressedContextFor(target string, st planner.SubTask) *Compre
 // never be shown — nor anchor on — another unit's content), and the prompt
 // carries the compressed structural topology instead of raw source.
 func (d *Driver) subTaskRequest(dag *planner.ExecutionDAG, st planner.SubTask, pos, total int,
-	targets []string, workspaceDigest, evidence string, compressed *CompressedStructuralContext) autonomy.LoopRequest {
-	interaction, interactionDescriptor := interactionMetadata("mutate", "build")
+	targets []string, workspaceDigest, evidence string, compressed *CompressedStructuralContext) (autonomy.LoopRequest, error) {
+	interaction, interactionDescriptor, contractErr := d.currentInteractionMetadata()
+	if contractErr != nil {
+		return autonomy.LoopRequest{}, fmt.Errorf("autonomy: sub-task contract: %w", contractErr)
+	}
 	return autonomy.LoopRequest{
 		RequestID:           fmt.Sprintf("%s-%s", d.runRequestID, st.ID),
 		Prompt:              subTaskPrompt(d.prompt, dag, st, pos, total, compressed),
@@ -301,7 +310,7 @@ func (d *Driver) subTaskRequest(dag *planner.ExecutionDAG, st planner.SubTask, p
 		// from exactly this unit's line interval.
 		FocusStartLine: st.Region.StartLine,
 		FocusEndLine:   st.Region.EndLine,
-	}
+	}, nil
 }
 
 // ── DOCUMENT OUTLINE CONTEXT ────────────────────────────────────────────────

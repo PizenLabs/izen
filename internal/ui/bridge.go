@@ -9,6 +9,7 @@ import (
 	"github.com/PizenLabs/izen/internal/engine/telemetry"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -101,11 +102,29 @@ func (m *model) bridgeInvestigationToLedger(ledgerContent string, engErr error) 
 // canonical session.ContextLedger as []AtomicTask. This is the single source
 // of truth /build consumes; the session's CurrentTasks remains the live
 // execution mirror used by the orchestrator.
-func (m *model) bridgePlanToLedger(tasks []plan.Task) {
+func (m *model) bridgePlanToLedger(tasks []plan.Task, descriptors ...*protocol.ContractDescriptor) bool {
 	if m.sess == nil || len(tasks) == 0 {
-		return
+		return false
 	}
 	ledger := m.loadOrCreateLedger(modes.ModePlan)
+	if err := ledger.ValidateInteractionContract(); err != nil {
+		m.appendSystemError(err)
+		return false
+	}
+	if len(descriptors) > 0 && descriptors[0] != nil {
+		// Validate before replacing the canonical task list.  A malformed or
+		// out-of-contract plan must not partially mutate the execution ledger.
+		if err := plan.ValidateTasksForContract(tasks, *descriptors[0]); err != nil {
+			m.appendSystemError(err)
+			return false
+		}
+		ledger.SetInteractionContract(descriptors[0].Contract, descriptors[0])
+	} else if ledger.Contract != nil {
+		if err := plan.ValidateTasksForContract(tasks, *ledger.Contract); err != nil {
+			m.appendSystemError(err)
+			return false
+		}
+	}
 
 	atomic := make([]plan.AtomicTask, 0, len(tasks))
 	for _, t := range tasks {
@@ -114,6 +133,8 @@ func (m *model) bridgePlanToLedger(tasks []plan.Task) {
 			File:        t.Target,
 			Strategy:    string(t.Type),
 			Description: t.Description,
+			Rationale:   t.Rationale,
+			Solution:    t.Solution,
 		})
 		if t.Target != "" {
 			ledger.TargetFile = t.Target
@@ -121,7 +142,15 @@ func (m *model) bridgePlanToLedger(tasks []plan.Task) {
 	}
 	ledger.Tasks = atomic
 
+	// Persist the canonical handoff before publishing the session mirror.  The
+	// descriptor is part of the ledger's authority evidence, so a write failure
+	// must not advance CurrentTasks with an uncommitted plan.
+	if err := ledger.Save(); err != nil {
+		m.appendSystemError(err)
+		return false
+	}
 	m.sess.SetContextLedger(ledger)
+	return true
 }
 
 // loadOrCreateLedger returns the persisted session.ContextLedger, or a fresh
@@ -266,6 +295,13 @@ func (m *model) reloadContextLedger() {
 	}
 	ledger, err := session.LoadContextLedger()
 	if err != nil || ledger == nil {
+		return
+	}
+	if err := ledger.ValidateInteractionContract(); err != nil {
+		// Do not promote a malformed persisted descriptor into the live
+		// session. Keeping the previous in-memory handoff is safer than
+		// silently replacing it with an unverified authority claim.
+		m.appendSystemError(err)
 		return
 	}
 	m.sess.ContextLedger = ledger

@@ -48,6 +48,7 @@ import (
 	"github.com/PizenLabs/izen/internal/policy"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
+	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
@@ -302,7 +303,11 @@ type planResultMsg struct {
 	// global status.Tracker so token metrics are never lost to truncation.
 	TokenInput  int
 	TokenOutput int
-	Epoch       uint64 // dispatch generation; drop when Epoch < generationEpoch
+	// Contract is the descriptor that governed synthesis.  It is carried to
+	// the ledger commit boundary so the staged task list cannot be detached
+	// from its structural/authority contract.
+	Contract *protocol.ContractDescriptor
+	Epoch    uint64 // dispatch generation; drop when Epoch < generationEpoch
 }
 
 type agentStartMsg struct{ label string }

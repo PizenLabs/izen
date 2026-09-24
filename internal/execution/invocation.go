@@ -34,6 +34,17 @@ func (r InvocationRequest) Validate() error {
 	if r.ModelID == "" {
 		return fmt.Errorf("%w [%s]", ErrUnassignedTargetModel, string(r.Target))
 	}
+	if r.Contract != nil {
+		descriptor, err := r.Contract.Clone().Normalize()
+		if err != nil {
+			return fmt.Errorf("execution: %w: %w", protocol.ErrInvalidContract, err)
+		}
+		if r.InteractionContract != "" && r.InteractionContract != descriptor.Contract {
+			return fmt.Errorf("execution: %w: invocation contract %q does not match descriptor %q", protocol.ErrInvalidContract, r.InteractionContract, descriptor.Contract)
+		}
+	} else if r.InteractionContract != "" && !r.InteractionContract.Valid() {
+		return fmt.Errorf("execution: %w: unknown invocation contract %q", protocol.ErrInvalidContract, r.InteractionContract)
+	}
 	return nil
 }
 
@@ -46,6 +57,6 @@ func (r InvocationRequest) ToExecuteRequest() ExecuteRequest {
 		Mode:                string(r.Target),
 		Model:               r.ModelID,
 		InteractionContract: r.InteractionContract,
-		Contract:            r.Contract,
+		Contract:            cloneExecutionDescriptor(r.Contract),
 	}
 }

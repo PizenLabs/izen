@@ -261,6 +261,12 @@ type ExecutionProof struct {
 	IntentConfidence float64 `json:"intent_confidence,omitempty"`
 	TargetConfidence float64 `json:"target_confidence,omitempty"`
 	Scope            string  `json:"scope,omitempty"`
+	// InteractionContract and ContractDescriptor record the semantic protocol
+	// metadata active for this execution. They are evidence only; ContractID
+	// below remains the causal execution identity and admission remains the
+	// authority decision.
+	InteractionContract protocol.InteractionContract `json:"interaction_contract,omitempty"`
+	ContractDescriptor  *protocol.ContractDescriptor `json:"interaction_descriptor,omitempty"`
 	// RiskScope records the deterministic blast-radius tier the admission
 	// evaluator assigned to the intent (Phase 1 P1). Empty when execution was
 	// rejected before evaluation completed.
@@ -433,6 +439,20 @@ type pendingMutation struct {
 	// approval gate so the terminal (committed or rejected) evidence can attach
 	// it for post-mortem traceability.
 	ingestionTrace *ingestion.IngestionTrace
+	// interactionContract/contractDescriptor preserve the semantic contract
+	// across the approval boundary. The pending proof is reconstructed by
+	// Approve/Reject, so these fields must travel with the held mutation rather
+	// than being inferred from the next LoopRequest.
+	interactionContract protocol.InteractionContract
+	contractDescriptor  *protocol.ContractDescriptor
+}
+
+func cloneExecutionDescriptor(descriptor *protocol.ContractDescriptor) *protocol.ContractDescriptor {
+	if descriptor == nil {
+		return nil
+	}
+	copy := descriptor.Clone()
+	return &copy
 }
 
 // RuntimeExecutor is the runtime-owned execution boundary.
@@ -1020,6 +1040,71 @@ func (x *RuntimeExecutor) resolveModel(req ExecuteRequest) (string, error) {
 // must use ResolveModel (stateless Policy Resolver) and must not maintain
 // independent model state or fall back to hardcoded defaults.
 
+// validateExecutionContract enforces the active interaction contract's
+// operation ceiling at the canonical executor boundary.  It is intentionally
+// separate from RiskScope admission: a contract may prohibit a semantic turn
+// even when the broader runtime capability set would admit its risk class.
+func validateExecutionContract(req ExecuteRequest, profile strategy.ExecutionStrategyProfile, declared bool) error {
+	if !declared || req.Contract == nil {
+		return nil
+	}
+	descriptor, err := req.Contract.Clone().Normalize()
+	if err != nil {
+		return err
+	}
+	var operation protocol.Operation
+	switch profile.Strategy {
+	case strategy.TargetedMutation, strategy.DirectDeterministic, strategy.MultiFilePlanning:
+		operation = protocol.OperationFileMutate
+	case strategy.RepositoryInvestigation, strategy.TargetedReasoning, strategy.DirectResponse, strategy.HumanClarification:
+		operation = protocol.OperationRead
+	default:
+		operation = protocol.OperationFileMutate
+	}
+	if descriptor.MaxOutputTokens > 0 {
+		budget := req.MaxOutputTokens
+		if budget <= 0 {
+			budget = profile.MaxOutputTokens
+		}
+		if budget > descriptor.MaxOutputTokens {
+			return &protocol.ContractViolationError{
+				Contract:  descriptor.Contract,
+				Operation: "output_budget",
+				Reason:    fmt.Sprintf("selected budget %d exceeds descriptor ceiling %d", budget, descriptor.MaxOutputTokens),
+			}
+		}
+	}
+	if len(req.StagedSubTasks) > 0 {
+		for _, scope := range req.StagedSubTasks {
+			stagedOperation := protocol.NormalizeOperation(scope.Operation)
+			if stagedOperation == "" {
+				stagedOperation = protocol.OperationFileMutate
+			}
+			if !descriptor.AllowsOperation(string(stagedOperation)) {
+				return &protocol.ContractViolationError{
+					Contract:  descriptor.Contract,
+					Operation: string(stagedOperation),
+					Reason:    "staged execution operation is outside the active contract capability ceiling",
+				}
+			}
+			if descriptor.Archetype == protocol.ArchetypeVanillaWeb && stagedOperation == protocol.OperationShell {
+				return &protocol.ContractViolationError{
+					Contract:  descriptor.Contract,
+					Operation: string(stagedOperation),
+					Reason:    "VANILLA_WEB contract cannot dispatch a shell operation",
+				}
+			}
+		}
+	} else if !descriptor.AllowsOperation(string(operation)) {
+		return &protocol.ContractViolationError{
+			Contract:  descriptor.Contract,
+			Operation: string(operation),
+			Reason:    "selected execution strategy is outside the active contract capability ceiling",
+		}
+	}
+	return nil
+}
+
 // Execute runs the deterministic execution flow for req, driving the
 // runtime-owned ExecutionGraph. The graph is the single lifecycle authority:
 // every canonical lifecycle event is generated from a graph transition, and
@@ -1027,16 +1112,45 @@ func (x *RuntimeExecutor) resolveModel(req ExecuteRequest) (string, error) {
 // mutation it stops at the approval gate and returns PendingPatchID; the
 // caller resolves it via Approve/Reject.
 func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*ExecutionResult, error) {
-	// G2 metadata is normalized at the canonical boundary so every caller
+	contractDeclared := req.Contract != nil || req.InteractionContract != "" || len(req.StagedSubTasks) > 0
+	// G2/G3 metadata is normalized at the canonical boundary so every caller
 	// (including legacy direct tests) carries the same semantic descriptor.
-	if req.InteractionContract == "" {
-		intent := req.Intent
-		if intent == "" {
-			intent = req.Prompt
+	// Explicit metadata is checked rather than trusted: a mismatched enum or
+	// malformed capability ceiling must fail before strategy/admission/provider
+	// work begins.
+	if req.Contract != nil {
+		normalized, normErr := req.Contract.Clone().Normalize()
+		if normErr != nil {
+			return nil, fmt.Errorf("executor: %w: %w", protocol.ErrInvalidContract, normErr)
 		}
-		req.InteractionContract = protocol.SelectInteractionContract(intent, req.Mode)
-	}
-	if req.Contract == nil {
+		if req.InteractionContract != "" && req.InteractionContract != normalized.Contract {
+			return nil, fmt.Errorf("executor: %w: request contract %q does not match descriptor %q", protocol.ErrInvalidContract, req.InteractionContract, normalized.Contract)
+		}
+		req.InteractionContract = normalized.Contract
+		req.Contract = &normalized
+	} else {
+		if req.InteractionContract == "" {
+			intent := req.Intent
+			if intent == "" {
+				intent = req.Prompt
+			}
+			if len(req.StagedSubTasks) > 0 {
+				// A staged sub-task request is an autonomy dispatch even when a
+				// legacy caller omitted the enum. Derive the bounded agentic
+				// contract explicitly so its default shell/destructive denies
+				// remain active.
+				req.InteractionContract = protocol.AgenticLoop
+			} else {
+				req.InteractionContract = protocol.SelectInteractionContract(intent, req.Mode)
+				// The autonomy adapter always dispatches through the bounded
+				// agentic loop.  Preserve that semantic default for direct legacy
+				// callers that use the historical "autonomy" mode label without
+				// spelling the contract explicitly.
+				if strings.EqualFold(strings.TrimSpace(req.Mode), "autonomy") {
+					req.InteractionContract = protocol.AgenticLoop
+				}
+			}
+		}
 		descriptor := protocol.Describe(req.InteractionContract)
 		req.Contract = &descriptor
 	}
@@ -1052,6 +1166,11 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		Proof:     &ExecutionProof{RequestID: requestID, StrategyReason: "", StartedAt: time.Now()},
 	}
 	res.Proof.SessionID = sid
+	if req.Contract != nil {
+		descriptor := req.Contract.Clone()
+		res.Proof.ContractDescriptor = &descriptor
+	}
+	res.Proof.InteractionContract = req.InteractionContract
 	// Preserve the autonomy decision handoff (Phase 1 Step 6) so the intent,
 	// confidence, target confidence and scope survive into the execution proof.
 	res.Proof.Intent = req.Intent
@@ -1108,6 +1227,20 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	res.Proof.StrategyReason = profile.StrategyReason
 	res.Proof.ContextDecisions = contextDecisions(profile)
 	g.CompleteStrategy(res.Strategy, profile.ModelRequired, profile.StrategyReason)
+
+	// ── CONTRACT CEILING (Phase 12 G3) ────────────────────────────────
+	// The executor is the final defense in depth for callers that bypass the
+	// autonomy adapter.  It checks the semantic operation implied by the
+	// selected strategy/staged scopes before admission or provider work.
+	if err := validateExecutionContract(req, profile, contractDeclared); err != nil {
+		wrapped := fmt.Errorf("executor: interaction contract: %w", err)
+		g.FailExecution(events.FailurePermanent, wrapped, "executor.contract")
+		res.Err = wrapped
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), wrapped
+	}
 
 	// ── ADMISSION II: RISK SCOPE GATING (Phase 1 P1) ──────────────────
 	// The intent's blast radius is evaluated deterministically from the
@@ -1586,23 +1719,25 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 
 	// ── 9. Approval gate ───────────────────────────────────────────────
 	pm := &pendingMutation{
-		requestID:      requestID,
-		sessionID:      res.SessionID,
-		mode:           req.Mode,
-		target:         target,
-		original:       res.Original,
-		patches:        patches,
-		diffs:          diffs,
-		strategy:       res.Strategy,
-		strategyReason: res.StrategyReason,
-		targets:        targets,
-		modelCalls:     res.ModelCalls,
-		startedAt:      start,
-		g:              g,
-		contract:       contract,
-		attempt:        attempt,
-		baseline:       occBaseline,
-		ingestionTrace: res.IngestionTrace,
+		requestID:           requestID,
+		sessionID:           res.SessionID,
+		mode:                req.Mode,
+		target:              target,
+		original:            res.Original,
+		patches:             patches,
+		diffs:               diffs,
+		strategy:            res.Strategy,
+		strategyReason:      res.StrategyReason,
+		targets:             targets,
+		modelCalls:          res.ModelCalls,
+		startedAt:           start,
+		g:                   g,
+		contract:            contract,
+		attempt:             attempt,
+		baseline:            occBaseline,
+		ingestionTrace:      res.IngestionTrace,
+		interactionContract: req.InteractionContract,
+		contractDescriptor:  cloneExecutionDescriptor(req.Contract),
 	}
 	x.mu.Lock()
 	x.pending[patches[0].ID] = pm
@@ -1645,13 +1780,15 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		ArtifactKind:   "patch",
 		Content:        pm.patches[0].Modified,
 		Proof: &ExecutionProof{
-			RequestID:        pm.requestID,
-			SessionID:        pm.sessionID,
-			Strategy:         pm.strategy,
-			StrategyReason:   pm.strategyReason,
-			Targets:          pm.targets,
-			ModelInvocations: pm.modelCalls,
-			StartedAt:        pm.startedAt,
+			RequestID:           pm.requestID,
+			SessionID:           pm.sessionID,
+			Strategy:            pm.strategy,
+			StrategyReason:      pm.strategyReason,
+			Targets:             pm.targets,
+			ModelInvocations:    pm.modelCalls,
+			StartedAt:           pm.startedAt,
+			InteractionContract: pm.interactionContract,
+			ContractDescriptor:  cloneExecutionDescriptor(pm.contractDescriptor),
 		},
 		// Forensic continuity: the transport-normalization record of the raw
 		// LLM response travels with the held artifact through the approval gate
@@ -1905,12 +2042,14 @@ func (x *RuntimeExecutor) Reject(ctx context.Context, patchID, reason string) (*
 		ModelCalls:     pm.modelCalls,
 		ArtifactKind:   "patch",
 		Proof: &ExecutionProof{
-			RequestID:        pm.requestID,
-			Strategy:         pm.strategy,
-			StrategyReason:   pm.strategyReason,
-			Targets:          pm.targets,
-			ModelInvocations: pm.modelCalls,
-			StartedAt:        pm.startedAt,
+			RequestID:           pm.requestID,
+			Strategy:            pm.strategy,
+			StrategyReason:      pm.strategyReason,
+			Targets:             pm.targets,
+			ModelInvocations:    pm.modelCalls,
+			StartedAt:           pm.startedAt,
+			InteractionContract: pm.interactionContract,
+			ContractDescriptor:  cloneExecutionDescriptor(pm.contractDescriptor),
 		},
 	}
 	g := pm.g
@@ -2930,6 +3069,13 @@ func isOutputExhausted(err error) bool {
 // the authoritative provider usage are returned; the authoritative artifact
 // always travels on the ExecutionResult afterwards.
 func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (raw string, usage ai.ProviderUsage, trace *ingestion.IngestionTrace, err error) {
+	// Provider adapters are untrusted callers. Keep their descriptor mutation
+	// confined to a private request copy so the executor's active ceiling and
+	// the pending approval proof cannot be changed after admission.
+	if req.Contract != nil {
+		copy := req.Contract.Clone()
+		req.Contract = &copy
+	}
 	var reasoningStartedAt time.Time
 	var reasoningDuration time.Duration
 	var reasoningSeen bool

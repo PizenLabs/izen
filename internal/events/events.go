@@ -7,7 +7,11 @@
 // the event stream.
 package events
 
-import "time"
+import (
+	"time"
+
+	"github.com/PizenLabs/izen/internal/protocol"
+)
 
 // DomainEvent is the contract every domain event satisfies. The payload is a
 // strongly-typed struct defined alongside the event constructor so consumers
@@ -243,6 +247,11 @@ type PlanStagedPayload struct {
 	TaskCount int
 	Tasks     []string
 	Stage     string
+	// InteractionContract and Contract preserve the semantic descriptor that
+	// authorized the staged proposal. They are evidence metadata, not an
+	// execution grant.
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 }
 
 // PatchAttemptedPayload carries an attempt to apply a mutation.
@@ -734,13 +743,21 @@ func NewIntentParsed(intent, raw string, confidence float64) DomainEvent {
 	})
 }
 
-// NewPlanStaged publishes that a plan was staged into runnable tasks.
-func NewPlanStaged(taskCount int, tasks []string, stage string) DomainEvent {
-	return newEvent(EventPlanStaged, PlanStagedPayload{
+// NewPlanStaged publishes that a plan was staged into runnable tasks.  The
+// optional descriptor preserves the contract identity for ledger/event
+// consumers without changing the historical three-argument call form.
+func NewPlanStaged(taskCount int, tasks []string, stage string, descriptors ...*protocol.ContractDescriptor) DomainEvent {
+	payload := PlanStagedPayload{
 		TaskCount: taskCount,
 		Tasks:     tasks,
 		Stage:     stage,
-	})
+	}
+	if len(descriptors) > 0 && descriptors[0] != nil {
+		copy := descriptors[0].Clone()
+		payload.Contract = &copy
+		payload.InteractionContract = copy.Contract
+	}
+	return newEvent(EventPlanStaged, payload)
 }
 
 // NewPatchAttempted publishes that a mutation attempt started.

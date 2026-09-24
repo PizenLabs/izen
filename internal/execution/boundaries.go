@@ -144,6 +144,9 @@ type SubTaskScope struct {
 	// EstimatedTokens is this window's generation estimate under the same
 	// accounting as the monolithic formula.
 	EstimatedTokens int
+	// Operation is the semantic operation carried by the staged unit. Empty
+	// retains the legacy FILE_MUTATE default for older callers.
+	Operation string
 }
 
 // PreflightVerdict is the Boundary-2 decision record.

@@ -153,6 +153,20 @@ type Engine struct {
 	// remains the Security & Boundary gate while the stateless pipeline owns
 	// the LLM worker execution. Optional; nil keeps the legacy provider path.
 	facade pipeline.Facade
+
+	// interactionContract is the active semantic contract for synthesis.  A
+	// plan normally derives it from the workspace; tests and embedding callers
+	// may bind a descriptor explicitly.  It is descriptive metadata only.
+	interactionContract   protocol.InteractionContract
+	interactionDescriptor *protocol.ContractDescriptor
+	contractBindingErr    error
+	modelMetadata         protocol.ModelMetadata
+
+	// contractMu protects the last committed descriptor and metadata snapshots
+	// so a caller can inspect the exact contract used by a synthesis without
+	// racing the provider callback.
+	contractMu   sync.RWMutex
+	lastContract *protocol.ContractDescriptor
 }
 
 // PlanEngine is the descriptive name used by Phase 12 protocol callers.
@@ -180,6 +194,85 @@ func NewPlanEngine(stores ...*PlanStore) *PlanEngine {
 		store = NewPlanStore()
 	}
 	return NewEngine(store)
+}
+
+// SetInteractionContract binds a semantic contract and optional descriptor to
+// the next synthesis run.  The descriptor is normalized and copied so a
+// caller cannot mutate the active execution boundary after admission.
+func (e *Engine) SetInteractionContract(contract protocol.InteractionContract, descriptors ...*protocol.ContractDescriptor) error {
+	if e == nil {
+		return fmt.Errorf("plan engine: nil engine")
+	}
+	var descriptor protocol.ContractDescriptor
+	if len(descriptors) > 0 && descriptors[0] != nil {
+		descriptor = descriptors[0].Clone()
+	} else {
+		descriptor = protocol.Describe(contract)
+	}
+	normalized, err := descriptor.Normalize()
+	if err != nil {
+		e.contractBindingErr = fmt.Errorf("plan engine: %w: %w", protocol.ErrInvalidContract, err)
+		return e.contractBindingErr
+	}
+	if contract.Valid() && normalized.Contract != contract {
+		e.contractBindingErr = fmt.Errorf("plan engine: %w: descriptor contract %q does not match %q", protocol.ErrInvalidContract, normalized.Contract, contract)
+		return e.contractBindingErr
+	}
+	if !contract.Valid() {
+		contract = normalized.Contract
+	}
+	e.contractBindingErr = nil
+	e.interactionContract = contract
+	e.interactionDescriptor = &normalized
+	return nil
+}
+
+// WithInteractionContract is the fluent form of SetInteractionContract.  An
+// invalid descriptor is retained as a failed binding and is surfaced by the
+// next synthesis call rather than silently falling back to a more capable
+// contract.
+func (e *Engine) WithInteractionContract(contract protocol.InteractionContract, descriptors ...*protocol.ContractDescriptor) *Engine {
+	_ = e.SetInteractionContract(contract, descriptors...)
+	return e
+}
+
+// WithContract is the descriptor-first fluent alias.
+func (e *Engine) WithContract(descriptor protocol.ContractDescriptor) *Engine {
+	_ = e.SetInteractionContract(descriptor.Contract, &descriptor)
+	return e
+}
+
+// SetModelMetadata supplies provider-neutral model facts used to choose the
+// compact/standard prompt profile and output budget.  Name heuristics remain a
+// fallback when no metadata is available.
+func (e *Engine) SetModelMetadata(metadata protocol.ModelMetadata) {
+	if e == nil {
+		return
+	}
+	e.contractMu.Lock()
+	e.modelMetadata = metadata
+	e.contractMu.Unlock()
+}
+
+// WithModelMetadata is the fluent form of SetModelMetadata.
+func (e *Engine) WithModelMetadata(metadata protocol.ModelMetadata) *Engine {
+	e.SetModelMetadata(metadata)
+	return e
+}
+
+// LastContract returns a defensive copy of the descriptor used by the most
+// recent synthesis attempt, or nil before the first contract-bound run.
+func (e *Engine) LastContract() *protocol.ContractDescriptor {
+	if e == nil {
+		return nil
+	}
+	e.contractMu.RLock()
+	defer e.contractMu.RUnlock()
+	if e.lastContract == nil {
+		return nil
+	}
+	copy := e.lastContract.Clone()
+	return &copy
 }
 
 // SetUserName sets the engineer identity for system prompt injection.
@@ -303,6 +396,127 @@ func (e *Engine) emit(ev events.DomainEvent) {
 	if e != nil && e.bus != nil {
 		e.bus.Publish(ev)
 	}
+}
+
+// synthesisBudget resolves the provider-independent output ceiling for one
+// plan turn.  Explicit model metadata is authoritative; the shared
+// llmstep/name policy remains the compatibility fallback.
+func (e *Engine) synthesisBudget(modelName string, requested int) (maxTokens int, constrained bool) {
+	maxTokens, constrained = resolveSynthesisMaxTokens(modelName, requested)
+	if e == nil {
+		return maxTokens, constrained
+	}
+	e.contractMu.RLock()
+	metadata := e.modelMetadata
+	e.contractMu.RUnlock()
+	if metadata.ID != "" && !strings.EqualFold(strings.TrimSpace(metadata.ID), strings.TrimSpace(modelName)) {
+		return maxTokens, constrained
+	}
+	if metadata.ID != "" {
+		// Catalog metadata is authoritative for a named model, including a
+		// deliberate unconstrained classification.  The shared resolver's
+		// name-based clamp must not silently override that fact.
+		constrained = metadata.Constrained
+		if !metadata.Constrained && requested > 0 {
+			maxTokens = requested
+		}
+	} else if metadata.Constrained {
+		constrained = true
+	}
+	if metadata.MaxOutputTokens > 0 && (maxTokens <= 0 || metadata.MaxOutputTokens < maxTokens) {
+		maxTokens = metadata.MaxOutputTokens
+	}
+	return maxTokens, constrained
+}
+
+func (e *Engine) rememberContract(descriptor protocol.ContractDescriptor) {
+	if e == nil {
+		return
+	}
+	e.contractMu.Lock()
+	copy := descriptor.Clone()
+	e.lastContract = &copy
+	e.contractMu.Unlock()
+}
+
+// synthesisDescriptor is the single descriptor factory used by every plan
+// provider path.  Prompt selection, schema selection, retry continuation and
+// the final task guard all consume this value; no path reconstructs contract
+// metadata ad hoc from a model-name substring.
+func (e *Engine) synthesisDescriptor(modelName string, archetype protocol.Archetype, maxTokens, maxTasks int, fastTrack bool) (protocol.ContractDescriptor, error) {
+	if e != nil && e.contractBindingErr != nil {
+		return protocol.ContractDescriptor{}, e.contractBindingErr
+	}
+	var descriptor protocol.ContractDescriptor
+	var err error
+	if e != nil && e.interactionContract.Valid() {
+		if e.interactionDescriptor == nil {
+			descriptor = protocol.Describe(e.interactionContract)
+		} else {
+			descriptor = e.interactionDescriptor.Clone()
+		}
+		// The active archetype and budget are step metadata.  They may lower
+		// or specialize the descriptor, but they never change its semantic
+		// contract identity.
+		if descriptor.Archetype == "" {
+			descriptor.Archetype = archetype
+		}
+		// Runtime/model budgets may specialize a descriptor, but they must never
+		// widen an explicitly declared ceiling.  A descriptor carrying 64 output
+		// tokens remains 64 even when the shared resolver would normally choose
+		// a larger provider budget.
+		if maxTokens > 0 && (descriptor.MaxOutputTokens <= 0 || maxTokens < descriptor.MaxOutputTokens) {
+			descriptor.MaxOutputTokens = maxTokens
+		}
+		if maxTasks > 0 && (descriptor.MaxTasks <= 0 || maxTasks < descriptor.MaxTasks) {
+			descriptor.MaxTasks = maxTasks
+		}
+		descriptor, err = descriptor.Normalize()
+	} else {
+		var metadata protocol.ModelMetadata
+		if e != nil {
+			e.contractMu.RLock()
+			metadata = e.modelMetadata
+			e.contractMu.RUnlock()
+		}
+		// Metadata is a fact about one model, not a process-global override.  A
+		// stale record for another model must not change this turn's prompt or
+		// output budget; the name heuristic remains the compatibility fallback.
+		if metadata.ID != "" && !strings.EqualFold(strings.TrimSpace(metadata.ID), strings.TrimSpace(modelName)) {
+			metadata = protocol.ModelMetadata{}
+		}
+		descriptor, err = protocol.PlanDescriptorWithMetadata(modelName, metadata, archetype, maxTokens, maxTasks)
+	}
+	if err != nil {
+		return protocol.ContractDescriptor{}, err
+	}
+	if fastTrack {
+		descriptor.OutputSchema = protocol.SchemaTaskBlocks
+		descriptor.SchemaVersion = "plan.task_blocks.v1"
+		descriptor.Schema = "izen.plan.task_blocks.v1"
+	} else if descriptor.OutputSchema == "" || descriptor.OutputSchema == protocol.SchemaText {
+		descriptor.OutputSchema = protocol.SchemaPlanJSON
+		descriptor.SchemaVersion = "plan.atomic_tasks.v1"
+	}
+	if descriptor.Schema == "" {
+		if descriptor.OutputSchema == protocol.SchemaTaskBlocks {
+			descriptor.Schema = "izen.plan.task_blocks.v1"
+		} else {
+			descriptor.Schema = "izen.plan.atomic_tasks.v1"
+		}
+	}
+	if archetype == protocol.ArchetypeVanillaWeb {
+		descriptor.Archetype = protocol.ArchetypeVanillaWeb
+		if descriptor.PromptProfile == protocol.PromptProfileFull || descriptor.PromptProfile == "" {
+			descriptor.PromptProfile = protocol.PromptProfileCompact
+		}
+	}
+	normalized, err := descriptor.Normalize()
+	if err != nil {
+		return protocol.ContractDescriptor{}, err
+	}
+	e.rememberContract(normalized)
+	return normalized, nil
 }
 
 // finalizeTasks applies the compile-error shell enforcement (go get / go mod
@@ -491,6 +705,13 @@ type usageReader interface {
 // error/truncation path returns. A terminal IsComplete event closes the block
 // so the UI collapses it to a summary line.
 func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	// Provider callbacks are transport adapters, not trusted descriptor owners.
+	// Give them a private copy so a callback cannot mutate the active ceiling or
+	// the ledger-bound descriptor through the request pointer.
+	if req.Contract != nil {
+		copy := req.Contract.Clone()
+		req.Contract = &copy
+	}
 	// Strict per-attempt deadline for free/cloud models: a hung provider must be
 	// cut off fast so the caller can fail over to heuristic plan synthesis
 	// instead of blocking the TUI for minutes. Each synthesis attempt gets a
@@ -786,10 +1007,97 @@ func (e *Engine) ProcessFromLedgerFastTrack(ctx context.Context, promptText stri
 	return e.processFromLedger(ctx, "", "", modelName, true, promptText)
 }
 
+// SynthesisRequest is the explicit contract-bound entry point for callers
+// that own the plan boundary themselves.  ProcessFromLedger remains the
+// compatibility façade and derives the same descriptor when this request
+// leaves Contract zero-valued.
+type SynthesisRequest struct {
+	LedgerContent string
+	Problem       string
+	ModelName     string
+	FastTrack     bool
+	FastPrompt    string
+
+	InteractionContract protocol.InteractionContract
+	// Contract is the normalized descriptor to bind for this turn.  The
+	// pointer form is accepted for callers that already carry descriptor
+	// metadata; Contract is used when Descriptor is nil.
+	Contract   protocol.ContractDescriptor
+	Descriptor *protocol.ContractDescriptor
+	Archetype  recon.ProjectArchetype
+}
+
+// SynthesisInput is a compatibility alias for the explicit synthesis request.
+type SynthesisInput = SynthesisRequest
+
+// SynthesisResult keeps the task list and the exact descriptor that governed
+// it together, so a concurrent caller does not have to infer the contract from
+// the engine's most-recent mutable telemetry field.
+type SynthesisResult struct {
+	Tasks    []Task
+	Contract *protocol.ContractDescriptor
+}
+
+// SynthesizeWithContract is the result-oriented form of Synthesize.
+func (e *Engine) SynthesizeWithContract(ctx context.Context, request SynthesisRequest) (SynthesisResult, error) {
+	tasks, err := e.Synthesize(ctx, request)
+	if err != nil {
+		return SynthesisResult{}, err
+	}
+	return SynthesisResult{Tasks: tasks, Contract: e.LastContract()}, nil
+}
+
+// Synthesize runs one contract-bound plan synthesis.  It is intentionally a
+// thin boundary over the canonical ledger path: deterministic archetype
+// fallbacks, truncation handling, retries, and the final task/ledger guard all
+// remain centralized in processFromLedger.
+func (e *Engine) Synthesize(ctx context.Context, request SynthesisRequest) ([]Task, error) {
+	if e == nil {
+		return nil, fmt.Errorf("plan engine: nil engine")
+	}
+	// Save and restore the optional binding so an embedding can use Synthesize
+	// for more than one model without leaking descriptor state into the next
+	// call.  Engine synthesis is otherwise intentionally single-lane.
+	oldContract, oldDescriptor := e.interactionContract, e.interactionDescriptor
+	oldBindingErr := e.contractBindingErr
+	oldArchetype, oldExplicit, oldFromLedger, oldFrontend := e.archetype, e.archetypeExplicit, e.archetypeFromLedger, e.frontendOnly
+	oldVanilla := e.vanillaWeb
+	defer func() {
+		e.interactionContract, e.interactionDescriptor, e.contractBindingErr = oldContract, oldDescriptor, oldBindingErr
+		e.archetype, e.archetypeExplicit, e.archetypeFromLedger, e.frontendOnly, e.vanillaWeb = oldArchetype, oldExplicit, oldFromLedger, oldFrontend, oldVanilla
+	}()
+
+	if request.Archetype != "" {
+		e.SetArchetype(request.Archetype)
+	}
+	contract := request.InteractionContract
+	descriptor := request.Contract
+	if request.Descriptor != nil {
+		descriptor = request.Descriptor.Clone()
+	}
+	if contract.Valid() || descriptor.Contract.Valid() || descriptor.Kind.Valid() {
+		if !descriptor.Contract.Valid() && !descriptor.Kind.Valid() {
+			descriptor = protocol.Describe(contract)
+		}
+		if err := e.SetInteractionContract(contract, &descriptor); err != nil {
+			return nil, err
+		}
+	}
+	if request.FastTrack {
+		return e.ProcessFromLedgerFastTrack(ctx, request.FastPrompt, request.ModelName)
+	}
+	return e.ProcessFromLedger(ctx, request.LedgerContent, request.Problem, request.ModelName)
+}
+
 func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, problem string, modelName string, fastTrack bool, fastPrompt ...string) (tasks []Task, err error) {
 	if e == nil {
 		return nil, fmt.Errorf("plan engine: nil engine")
 	}
+	// activeDescriptor is established after archetype resolution but before any
+	// deterministic task can be returned.  The defer below is the final commit
+	// gate: no response or fallback can publish PlanStaged without passing the
+	// same contract/task validation.
+	var activeDescriptor protocol.ContractDescriptor
 
 	// ── Phase 6.4.5 Ledger Context Isolation ──────────────────────────
 	// Strip synthetic 'package root (:0)' placeholders from the forensic
@@ -808,6 +1116,12 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	}
 	e.emit(events.NewCommandReceived(raw, "plan"))
 	defer func() {
+		if err == nil && len(tasks) > 0 && activeDescriptor.Contract.Valid() {
+			if validationErr := ValidateTasksForContract(tasks, activeDescriptor, fastTrack); validationErr != nil {
+				tasks = nil
+				err = validationErr
+			}
+		}
 		if err != nil {
 			e.emit(events.NewExecutionFailed(events.FailurePermanent, err, "plan"))
 			return
@@ -817,7 +1131,8 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			for _, t := range tasks {
 				targets = append(targets, t.Target)
 			}
-			e.emit(events.NewPlanStaged(len(tasks), targets, "plan"))
+			descriptor := activeDescriptor.Clone()
+			e.emit(events.NewPlanStaged(len(tasks), targets, "plan", &descriptor))
 			e.emit(events.NewStageCompleted("plan", 0, fmt.Sprintf("staged %d tasks", len(tasks))))
 		}
 	}()
@@ -848,6 +1163,18 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 		}
 	}
 	e.vanillaWeb = e.archetype == recon.VANILLA_WEB || e.frontendOnly
+	// Bind the semantic descriptor before any deterministic fast-track.  The
+	// provisional budget is replaced with the provider-aware budget below once
+	// the generative path is reached; the identity/archetype/output schema are
+	// already fixed here for the final commit guard.
+	archetypeForContract := protocol.Archetype(e.archetype)
+	if e.vanillaWeb {
+		archetypeForContract = protocol.ArchetypeVanillaWeb
+	}
+	activeDescriptor, err = e.synthesisDescriptor(modelName, archetypeForContract, 0, 0, fastTrack)
+	if err != nil {
+		return nil, err
+	}
 
 	// ── CANONICAL SIGNAL CLASSIFICATION ────────────────────────────────
 	// Classify the ledger once into canonical signal.Signal values. All routing
@@ -1091,26 +1418,41 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 	// that mismatch is exactly what produces finish_reason="length" plus blind
 	// same-scope retries. Constrained models also receive a bounded-step
 	// instruction (fewer atomic tasks per response) so a full batch fits.
-	maxTokens, constrained := resolveSynthesisMaxTokens(modelName, planSynthesisRequestedMaxTokens)
+	maxTokens, constrained := e.synthesisBudget(modelName, planSynthesisRequestedMaxTokens)
 	stepState := newSynthesisStepState(modelName, constrained, maxTokens)
 	archetype := protocol.Archetype(e.archetype)
 	if e.vanillaWeb {
 		archetype = protocol.ArchetypeVanillaWeb
 	}
-	descriptor, descriptorErr := protocol.PlanDescriptor(modelName, archetype, maxTokens, stepState.taskBudget)
+	descriptor, descriptorErr := e.synthesisDescriptor(modelName, archetype, maxTokens, stepState.taskBudget, fastTrack)
 	if descriptorErr != nil {
-		// The model name does not affect semantic contract validity; keep the
-		// historical structured fallback if a future descriptor policy rejects
-		// an unfamiliar value.
-		descriptor = protocol.Describe(protocol.StructuredCompletion)
+		return nil, descriptorErr
 	}
+	// The descriptor is the final semantic ceiling for this turn.  Apply it to
+	// the actual provider request and to the shared continuation telemetry state
+	// as well as carrying it on the request metadata.
+	if descriptor.MaxOutputTokens > 0 && (maxTokens <= 0 || maxTokens > descriptor.MaxOutputTokens) {
+		maxTokens = descriptor.MaxOutputTokens
+		stepState = newSynthesisStepState(modelName, constrained, maxTokens)
+	}
+	if descriptor.MaxTasks > 0 && stepState.taskBudget > descriptor.MaxTasks {
+		stepState.taskBudget = descriptor.MaxTasks
+	}
+	activeDescriptor = descriptor
 	if constrained {
 		// The capability resolver is authoritative over a name heuristic: a
 		// model with a low provider ceiling gets the same compact contract.
 		descriptor.ConstrainedModel = true
 		descriptor.PromptProfile = protocol.PromptProfileCompact
+		normalizedDescriptor, normalizeErr := descriptor.Normalize()
+		if normalizeErr != nil {
+			return nil, normalizeErr
+		}
+		descriptor = normalizedDescriptor
+		activeDescriptor = descriptor
+		e.rememberContract(descriptor)
 	}
-	compactContract := descriptor.PromptProfile == protocol.PromptProfileCompact || protocol.IsSmallModel(modelName) || e.vanillaWeb
+	compactContract := descriptor.IsCompact()
 
 	var req ai.Request
 	if fastTrack && len(fastPrompt) > 0 {
@@ -1211,9 +1553,12 @@ func (e *Engine) processFromLedger(ctx context.Context, ledgerContent string, pr
 			MaxTokens:           maxTokens,
 			InteractionContract: descriptor.Contract,
 			Contract:            &descriptor,
-			ResponseFormat: &ai.ResponseFormat{
-				Type: "json_object",
-			},
+			ResponseFormat: func() *ai.ResponseFormat {
+				if descriptor.OutputSchema != protocol.SchemaTaskBlocks && descriptor.OutputSchema != protocol.SchemaText {
+					return &ai.ResponseFormat{Type: "json_object"}
+				}
+				return nil
+			}(),
 		}
 	}
 
@@ -1268,26 +1613,35 @@ The error is an undefined symbol/identifier typo in code. Generate one FILE_MUTA
 		return nil, fmt.Errorf("plan engine: empty response from provider — no content or reasoning/thinking text was emitted; retry with a smaller ledger or a different model")
 	}
 
-	// Persist raw plan output to disk.
-	_ = e.store.SaveRawMarkdown("plan", resp.Content) //nolint:contextcheck // SaveRawMarkdown is a substrate wrapper that manages its own context
-
 	if fastTrack && len(fastPrompt) > 0 {
-		// Fast-track: the model returns a minimal markdown shell checklist. A
-		// local 7B model may still emit the occasional placeholder/non-shell
-		// task; rather than hard-aborting the whole plan, we keep only the valid
-		// SHELL_EXEC tasks (placeholder FILE_MUTATE lines are dropped). If nothing
-		// usable survives, we surface a clear fallback instead of a build abort.
+		vanillaFastTrack := e.vanillaWeb || descriptor.Archetype == protocol.ArchetypeVanillaWeb
+		// Fast-track: the model returns a minimal markdown shell checklist.
+		// Validate the declared task-block schema before any parser result can
+		// reach the task ledger.  A malformed response is still allowed to use
+		// the deterministic, archetype-filtered fallback below, but never the
+		// raw invalid blocks.
+		schemaErr := ValidateContractOutput(resp.Content, descriptor, true)
 		raw := ParseMarkdownToTasks(resp.Content)
 		clean := make([]Task, 0, len(raw))
-		for _, t := range raw {
-			if t.Type == "SHELL_EXEC" && strings.TrimSpace(t.Target) != "" {
-				clean = append(clean, t)
+		if schemaErr == nil {
+			raw = filterValidTasks(raw)
+			raw = FilterNonExistentMutationTargets(raw, e.rootPath)
+			for _, t := range raw {
+				if vanillaFastTrack {
+					if t.Type == "FILE_MUTATE" {
+						clean = append(clean, t)
+					}
+					continue
+				}
+				if t.Type == "SHELL_EXEC" && strings.TrimSpace(t.Target) != "" {
+					clean = append(clean, t)
+				}
 			}
 		}
 		// FRONTEND DOMAIN ISOLATION: fast-track shell resolution is a Go
 		// dependency heuristic. In a VANILLA_WEB workspace it is invalidated
 		// immediately — no Go toolchain command may be staged.
-		if e.vanillaWeb {
+		if vanillaFastTrack {
 			clean = FilterTasksForArchetype(clean, recon.VANILLA_WEB)
 		}
 		if len(clean) == 0 {
@@ -1296,15 +1650,18 @@ The error is an undefined symbol/identifier typo in code. Generate one FILE_MUTA
 			// The soft scanner is intentionally generic; re-apply the
 			// investigation guard after it so a prose mention of go/npm cannot
 			// re-enter a VANILLA_WEB plan.
-			if e.vanillaWeb {
+			if vanillaFastTrack {
 				clean = FilterTasksForArchetype(clean, recon.VANILLA_WEB)
 			}
 		}
 		if len(clean) == 0 {
 			return nil, fmt.Errorf("plan engine: fast-track produced no runnable shell tasks (model returned: %s)", truncateForLog(resp.Content))
 		}
+		if schemaErr == nil {
+			_ = e.store.SaveRawMarkdown("plan", resp.Content) //nolint:contextcheck // Save only a schema-valid fast-track artifact
+		}
 		archetypeForValidation := e.archetype
-		if e.vanillaWeb {
+		if vanillaFastTrack {
 			archetypeForValidation = recon.VANILLA_WEB
 		}
 		return ValidateShellExecCommandsForArchetype(clean, ledgerContent, archetypeForValidation), nil
@@ -1376,13 +1733,20 @@ The error is an undefined symbol/identifier typo in code. Generate one FILE_MUTA
 			if resp == nil || resp.Content == "" {
 				continue
 			}
-			_ = e.store.SaveRawMarkdown("plan", resp.Content) //nolint:contextcheck // substrate wrapper manages its own context
 		}
 
-		// Clean LLM response: strip markdown fences and extract first/last JSON boundary
-		// before parsing. This prevents raw text/diffs from crashing the parser.
+		// Clean LLM response: strip markdown fences and extract first/last JSON
+		// boundary before parsing.  The contract validator runs on the complete
+		// payload first; a tolerant/auto-closing parser is never allowed to turn
+		// a schema-invalid artifact into staged work.
 		cleanContent := cleanLLMResponse(resp.Content)
-		jsonResult := ParseJSONPlan(cleanContent)
+		jsonResult := &JSONPlanValidationResult{Valid: false, Error: "contract schema validation failed"}
+		if schemaErr := ValidateContractOutput(resp.Content, descriptor); schemaErr == nil {
+			jsonResult = ParseJSONPlan(cleanContent)
+			if jsonResult.Valid {
+				_ = e.store.SaveRawMarkdown("plan", resp.Content) //nolint:contextcheck // persist only a schema-valid plan artifact
+			}
+		}
 
 		if jsonResult.Valid && len(jsonResult.Tasks) > 0 {
 			var candidates []Task
@@ -1567,11 +1931,17 @@ func (e *Engine) synthesizeViaFacade(ctx context.Context, problem, ledgerContent
 	if e == nil || e.facade == nil {
 		return nil, fmt.Errorf("plan engine: no pipeline facade wired")
 	}
-	res, err := e.facade.ExecutePlan(ctx, pipeline.Request{
+	descriptor := e.LastContract()
+	pipelineReq := pipeline.Request{
 		Mode:        "plan",
 		Description: problem,
 		Scope:       e.AllowedFiles,
-	})
+	}
+	if descriptor != nil {
+		pipelineReq.InteractionContract = descriptor.Contract
+		pipelineReq.Contract = descriptor
+	}
+	res, err := e.facade.ExecutePlan(ctx, pipelineReq)
 	if err != nil {
 		return nil, fmt.Errorf("plan engine: pipeline facade execution failed: %w", err)
 	}
@@ -1623,6 +1993,12 @@ func (e *Engine) diagnoseSynthesisFailure(message string) {
 // existence, vanilla-web and shell-command guards). It returns nil when the
 // output is unusable so the caller can fall back to the JSON retry loop.
 func (e *Engine) tolerantMarkdownTasks(content, problem, ledgerContent string) []Task {
+	// Markdown task blocks are a deterministic compatibility fallback for
+	// legacy providers, but they still have to satisfy the task-block schema;
+	// arbitrary prose is never mined into executable work by this path.
+	if err := ValidateContractOutput(content, protocol.Describe(protocol.StructuredCompletion), true); err != nil {
+		return nil
+	}
 	md := ParseMarkdownToTasks(content)
 	if len(md) == 0 {
 		return nil
@@ -2336,38 +2712,72 @@ func truncateForLog(s string) string {
 // direct file mutation, bypasses the Senior Architect prompt and uses
 // the zero-prose direct mutation prompt instead.
 func (e *Engine) ProcessPlan(ctx context.Context, modelName string, objective string, contextStr string) error {
-	if e == nil || e.provider == nil {
+	if e == nil || (e.provider == nil && e.streamProv == nil) {
 		return nil
 	}
 
 	isDirectMut := detectDirectMutation(objective, "") != nil
+	maxTokens, constrained := e.synthesisBudget(modelName, planSynthesisRequestedMaxTokens)
+	archetype := protocol.Archetype(e.archetype)
+	if e.vanillaWeb {
+		archetype = protocol.ArchetypeVanillaWeb
+	}
+	descriptor, err := e.synthesisDescriptor(modelName, archetype, maxTokens, 0, false)
+	if err != nil {
+		return err
+	}
+	if descriptor.MaxOutputTokens > 0 && (maxTokens <= 0 || maxTokens > descriptor.MaxOutputTokens) {
+		maxTokens = descriptor.MaxOutputTokens
+	}
+	if constrained {
+		descriptor.ConstrainedModel = true
+		descriptor.PromptProfile = protocol.PromptProfileCompact
+		normalizedDescriptor, normalizeErr := descriptor.Normalize()
+		if normalizeErr != nil {
+			return normalizeErr
+		}
+		descriptor = normalizedDescriptor
+		e.rememberContract(descriptor)
+	}
 
+	systemPrompt := prompt.PlanSynthesisSystemPromptForTier(prompt.ResolveTierForModel(modelName, ""))
+	if descriptor.IsCompact() {
+		systemPrompt = descriptor.PlanInstructions(prompt.PlanSynthesisSchema())
+	}
+	if isDirectMut {
+		systemPrompt = prompt.PlanDirectMutationSystemPrompt()
+		if descriptor.Archetype == protocol.ArchetypeVanillaWeb {
+			systemPrompt += "\n\n[ARCHETYPE CONTEXT]\nWorkspace VANILLA_WEB: use FILE_MUTATE for existing .html, .css, or .js files."
+		}
+	}
 	req := ai.Request{
 		Model: modelName,
 		Messages: []ai.Message{
-			{
-				Role:    "system",
-				Content: prompt.PlanSynthesisSystemPromptForTier(prompt.ResolveTierForModel(modelName, "")),
-			},
-			{
-				Role:    "user",
-				Content: prompt.BuildPlanPrompt(objective, contextStr, isDirectMut, ""),
-			},
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: prompt.BuildPlanPrompt(objective, contextStr, isDirectMut, "")},
 		},
-		Stream:    false,
-		MaxTokens: 1536,
+		Stream:              false,
+		MaxTokens:           maxTokens,
+		InteractionContract: descriptor.Contract,
+		Contract:            &descriptor,
+		ResponseFormat:      &ai.ResponseFormat{Type: "json_object"},
 	}
 
-	if isDirectMut {
-		req.Messages[0].Content = prompt.PlanDirectMutationSystemPrompt()
-	}
-
-	resp, err := e.provider(ctx, req)
+	resp, err := e.complete(ctx, req)
 	if err != nil {
+		if ai.IsOutputTruncated(err) {
+			return fmt.Errorf("plan engine: provider response was truncated before structural parsing: %w", err)
+		}
 		return err
 	}
 	if resp == nil {
 		return fmt.Errorf("plan engine: provider returned a nil response")
+	}
+	if resp.Truncated || isTruncatedFinish(resp.FinishReason) {
+		return fmt.Errorf("plan engine: provider response was truncated before structural parsing: %w", ai.NewOutputTruncated(modelName, resp.FinishReason))
+	}
+	if err := ValidateContractOutput(resp.Content, descriptor); err != nil {
+		return err
 	}
 
 	return e.store.SaveRawMarkdown("plan", resp.Content) //nolint:contextcheck // substrate wrapper manages its own context
@@ -2510,10 +2920,18 @@ func extractFormatChange(lower string) (sourceFormat, targetFormat string) {
 // PlanSchemaError indicates a plan output schema violation.
 type PlanSchemaError struct {
 	Message string
+	Cause   error
 }
 
 func (e *PlanSchemaError) Error() string {
 	return "plan output schema violation: " + e.Message
+}
+
+func (e *PlanSchemaError) Unwrap() error {
+	if e != nil && e.Cause != nil {
+		return e.Cause
+	}
+	return ErrContractSchema
 }
 
 // softFallbackShellTasks scans prose/explanation text for standard runnable

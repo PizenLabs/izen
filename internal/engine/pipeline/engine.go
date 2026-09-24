@@ -14,6 +14,7 @@ import (
 	"github.com/PizenLabs/izen/internal/engine/layer4"
 	"github.com/PizenLabs/izen/internal/engine/telemetry"
 	"github.com/PizenLabs/izen/internal/lea"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // Sentinel errors returned by the pipeline engine.
@@ -47,13 +48,15 @@ type Request struct {
 	Mode string
 	// Intent is the Layer 3 execution intent (refactor, new_feature, bug_fix,
 	// rename, ...). Empty defaults to refactor for generative requests.
-	Intent       layer3.Intent
-	TargetFile   string
-	TargetSymbol string
-	NewName      string
-	NewImport    string
-	Description  string
-	Scope        []string
+	Intent              layer3.Intent
+	TargetFile          string
+	TargetSymbol        string
+	NewName             string
+	NewImport           string
+	Description         string
+	Scope               []string
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 }
 
 // Result is the immutable outcome of a full pipeline run. It exposes the
@@ -419,14 +422,24 @@ func (e *Engine) Run(ctx context.Context, req Request) (*Result, error) {
 // toLayer3Request projects a pipeline request onto a Layer 3 request.
 func (e *Engine) toLayer3Request(req Request, intent layer3.Intent) layer3.Request {
 	return layer3.Request{
-		Intent:       intent,
-		TargetFile:   req.TargetFile,
-		TargetSymbol: req.TargetSymbol,
-		NewName:      req.NewName,
-		NewImport:    req.NewImport,
-		Description:  req.Description,
-		Scope:        req.Scope,
+		Intent:              intent,
+		TargetFile:          req.TargetFile,
+		TargetSymbol:        req.TargetSymbol,
+		NewName:             req.NewName,
+		NewImport:           req.NewImport,
+		Description:         req.Description,
+		Scope:               req.Scope,
+		InteractionContract: req.InteractionContract,
+		Contract:            cloneProtocolDescriptor(req.Contract),
 	}
+}
+
+func cloneProtocolDescriptor(descriptor *protocol.ContractDescriptor) *protocol.ContractDescriptor {
+	if descriptor == nil {
+		return nil
+	}
+	copy := descriptor.Clone()
+	return &copy
 }
 
 // newPipeline builds a fresh Layer 3 pipeline for one run. The pipeline is
@@ -524,9 +537,11 @@ func (w *routeWorker) Execute(ctx context.Context, exec *layer2.ExecutionContext
 	}
 	prompt := layer3.BuildPrompt(exec, req, w.maxPrompt)
 	resp, err := w.client.Complete(ctx, &layer3.CompletionRequest{
-		Provider: layer3.Provider(w.provider),
-		Model:    w.model,
-		Prompt:   prompt,
+		Provider:            layer3.Provider(w.provider),
+		Model:               w.model,
+		Prompt:              prompt,
+		InteractionContract: req.InteractionContract,
+		Contract:            cloneProtocolDescriptor(req.Contract),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: %s completion: %w", w.provider, err)

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // eventSource is the subscription surface the LedgerBuilder consumes. The
@@ -33,10 +34,12 @@ type IntentEntry struct {
 
 // PlanEntry records the latest staged plan.
 type PlanEntry struct {
-	TaskCount int
-	Tasks     []string
-	Stage     string
-	At        time.Time
+	TaskCount           int
+	Tasks               []string
+	Stage               string
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
+	At                  time.Time
 }
 
 // PatchEntry records one applied patch with its line metrics.
@@ -124,7 +127,18 @@ func (l *ContextLedger) Apply(ev events.DomainEvent) {
 	case events.IntentClassifiedPayload:
 		l.intent = IntentEntry{Intent: p.Intent, Raw: p.Raw, Confidence: p.Confidence, At: ev.Timestamp()}
 	case events.PlanStagedPayload:
-		l.plan = PlanEntry{TaskCount: p.TaskCount, Tasks: append([]string(nil), p.Tasks...), Stage: p.Stage, At: ev.Timestamp()}
+		entry := PlanEntry{
+			TaskCount:           p.TaskCount,
+			Tasks:               append([]string(nil), p.Tasks...),
+			Stage:               p.Stage,
+			InteractionContract: p.InteractionContract,
+			At:                  ev.Timestamp(),
+		}
+		if p.Contract != nil {
+			copy := p.Contract.Clone()
+			entry.Contract = &copy
+		}
+		l.plan = entry
 	case events.PhaseChangedPayload:
 		l.phase = p.To
 	case events.PatchAppliedPayload:
@@ -147,11 +161,16 @@ func (l *ContextLedger) Snapshot() LedgerSnapshot {
 	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	plan := l.plan
+	if l.plan.Contract != nil {
+		copy := l.plan.Contract.Clone()
+		plan.Contract = &copy
+	}
 	return LedgerSnapshot{
 		Commands:   append([]CommandEntry(nil), l.commands...),
 		Intent:     l.intent,
 		Phase:      l.phase,
-		Plan:       l.plan,
+		Plan:       plan,
 		Patches:    append([]PatchEntry(nil), l.patches...),
 		Failures:   append([]FailureEntry(nil), l.failures...),
 		Stages:     append([]StageEntry(nil), l.stages...),

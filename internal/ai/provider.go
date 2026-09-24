@@ -129,11 +129,16 @@ type ProviderUsage struct {
 	RateLimitedRetries int `json:"rate_limited_retries,omitempty"`
 }
 
-// EffectiveContract returns the explicit descriptor or derives a conservative
-// default from the semantic enum. It never mutates the request.
+// EffectiveContract returns a normalized defensive descriptor or derives a
+// conservative default from the semantic enum. It never mutates the request;
+// malformed or mismatched explicit metadata fails closed as nil.
 func (r Request) EffectiveContract() *protocol.ContractDescriptor {
 	if r.Contract != nil {
-		return r.Contract
+		normalized, err := r.Contract.Clone().Normalize()
+		if err != nil || (r.InteractionContract != "" && r.InteractionContract != normalized.Contract) {
+			return nil
+		}
+		return &normalized
 	}
 	if !r.InteractionContract.Valid() {
 		return nil

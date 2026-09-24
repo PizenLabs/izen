@@ -34,6 +34,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/policy"
+	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
@@ -1034,6 +1035,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, flush
 		}
 
+		// Deterministic planners do not always carry an LLM descriptor.  Bind
+		// their task list to the canonical structured plan contract before the
+		// ledger commit gate below.
+		if msg.Contract == nil {
+			descriptor := protocol.Describe(protocol.StructuredCompletion)
+			msg.Contract = &descriptor
+		}
+
 		// ── TOKEN ACCOUNTING ────────────────────────────────────────────
 		// The provider-reported usage of plan synthesis is dispatched as a
 		// UsageUpdateMsg (see the final return of this case) so the UsageUpdateMsg
@@ -1067,6 +1076,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		}
 
+		// ── CONTRACT BOUNDARY VALIDATION ───────────────────────────────
+		// The parser is intentionally tolerant, but no task list may cross the
+		// session/ledger commit boundary unless the active descriptor accepts
+		// every task.  This is the final UI-side guard for results assembled by
+		// older or alternate PlanEngine callers.
+		if msg.Contract != nil {
+			if contractErr := plan.ValidateTasksForContract(msg.Tasks, *msg.Contract); contractErr != nil {
+				m.logActivity("[ContractGuard] Rejected staged plan: %v", contractErr)
+				m.push(roleError, fmt.Sprintf("Plan rejected by interaction contract: %v", contractErr))
+				m.refreshViewportContent()
+				m.gotoBottomIfAllowed()
+				flush := m.flushPendingRecords()
+				return m, flush
+			}
+		}
+
 		// ── PLAN INTENT CAPTURE (TaskContext hygiene) ──────────────────
 		// Record the raw user intent that produced this plan so /build can
 		// reconstruct the rewrite context WITHOUT reading obsolete workspace
@@ -1078,10 +1103,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.lastPlanIntent = m.sess.ObjectiveIntent()
 		}
 
+		// BRIDGE FIRST: mirror the validated structured /plan queue into the
+		// canonical session.ContextLedger before updating the live session task
+		// mirror.  A bridge-level contract failure must not leave CurrentTasks
+		// staged while the authoritative ledger rejected the same plan.
+		if !m.bridgePlanToLedger(msg.Tasks, msg.Contract) {
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
+			flush := m.flushPendingRecords()
+			return m, flush
+		}
 		m.sess.StageTaskList(&msg.Tasks)
-		// BRIDGE: mirror the structured /plan queue into the canonical
-		// session.ContextLedger as []AtomicTask — the SSOT /build consumes.
-		m.bridgePlanToLedger(msg.Tasks)
 		m.handoffCtx.PendingTodos = make([]string, len(msg.Tasks))
 		for i, t := range msg.Tasks {
 			icon := Icon.ShellExec

@@ -97,6 +97,12 @@ type SubTask struct {
 	Target string
 	// Description is the bounded instruction describing the change window.
 	Description string
+	// Operation/TaskType identify the semantic operation carried by this unit
+	// when a staged plan is dispatched under a protocol contract. Older plans
+	// leave both empty; the dispatcher treats an omitted operation as the
+	// canonical FILE_MUTATE decomposition operation.
+	Operation string `json:"operation,omitempty"`
+	TaskType  string `json:"task_type,omitempty"`
 	// Region is the inclusive 1-indexed line window of the original artifact.
 	Region Region
 	// EstimatedTokens is this sub-task's generation estimate under the same
@@ -110,6 +116,18 @@ type SubTask struct {
 // String renders the compact proposal line for one sub-task.
 func (st SubTask) String() string {
 	return fmt.Sprintf("%s [%s] %s — %s (~%d tok)", st.ID, st.Kind, st.Description, st.Region, st.EstimatedTokens)
+}
+
+// EffectiveOperation returns the explicit operation carried by a sub-task, or
+// the canonical mutation default used by legacy decomposition plans.
+func (st SubTask) EffectiveOperation() string {
+	if strings.TrimSpace(st.Operation) != "" {
+		return st.Operation
+	}
+	if strings.TrimSpace(st.TaskType) != "" {
+		return st.TaskType
+	}
+	return "FILE_MUTATE"
 }
 
 // ExecutionDAG is the validated decomposition plan of ONE infeasible

@@ -217,27 +217,37 @@ func (e *Engine) salvageValidTasks(content, problem, ledgerContent string) []Tas
 	if content == "" {
 		return nil
 	}
+	descriptor := e.LastContract()
+	if descriptor == nil {
+		return nil
+	}
 
 	// Tolerant markdown blocks: Mini/free models emit "- [ ] TASK" lines even
-	// when the JSON was cut off. Accept them through the same validation gates.
-	if md := ParseMarkdownToTasks(content); len(md) > 0 {
-		md = filterValidTasks(md)
-		md = FilterNonExistentMutationTargets(md, e.rootPath)
-		if e.archetype != recon.UNKNOWN_GENERIC {
-			md = FilterTasksForArchetype(md, e.archetype)
-		}
-		if e.vanillaWeb {
-			md = FilterTasksForArchetype(md, recon.VANILLA_WEB)
-			md = SanitizeTasksForArchetype(md, recon.VANILLA_WEB)
-		}
-		if len(md) > 0 && !hasInvalidShellExecCommand(md) {
-			return md
+	// when the JSON was cut off. Accept them only when the complete task-block
+	// contract validates; partial/prose fragments never become staged state.
+	if err := ValidateContractOutput(content, *descriptor, true); err == nil {
+		if md := ParseMarkdownToTasks(content); len(md) > 0 {
+			md = filterValidTasks(md)
+			md = FilterNonExistentMutationTargets(md, e.rootPath)
+			if e.archetype != recon.UNKNOWN_GENERIC {
+				md = FilterTasksForArchetype(md, e.archetype)
+			}
+			if e.vanillaWeb {
+				md = FilterTasksForArchetype(md, recon.VANILLA_WEB)
+				md = SanitizeTasksForArchetype(md, recon.VANILLA_WEB)
+			}
+			if len(md) > 0 && !hasInvalidShellExecCommand(md) {
+				return md
+			}
 		}
 	}
 
 	// Full JSON plan: a truncation that closed cleanly at a task boundary
 	// (tolerant sanitization/auto-close) yields a valid, complete plan with the
 	// tasks emitted before exhaustion — an independently valid atomic result.
+	if err := ValidateContractOutput(content, *descriptor); err != nil {
+		return nil
+	}
 	jsonResult := ParseJSONPlan(content)
 	if jsonResult.Valid && len(jsonResult.Tasks) > 0 {
 		var candidates []Task
@@ -445,8 +455,17 @@ func (e *Engine) synthesizeBoundedContinuation(ctx context.Context, baseReq ai.R
 		}
 
 		// Natural stop: the model had room to complete — accept its plan,
-		// merged with the committed staged state.
+		// merged with the committed staged state.  The same structural gate
+		// used by the initial turn runs here as well; continuation never gets
+		// a weaker parser merely because it is a later step.
 		e.emit(events.NewStepCompleted(step.stepOrdinal(), len(step.staged), nextResp.FinishReason))
+		if req.Contract == nil {
+			return e.commitStepState(step, problem, ledgerContent)
+		}
+		if err := ValidateContractOutput(nextResp.Content, *req.Contract); err != nil {
+			return e.commitStepState(step, problem, ledgerContent)
+		}
+		_ = e.store.SaveRawMarkdown("plan", nextResp.Content) //nolint:contextcheck // persist only a schema-valid continuation artifact
 		parsed := ParseJSONPlan(cleanLLMResponse(nextResp.Content))
 		if parsed.Valid && len(parsed.Tasks) > 0 {
 			var cands []Task

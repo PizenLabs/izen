@@ -204,6 +204,11 @@ type Observation struct {
 	// re-submits with ParentContractID = this ID so the runtime appends a
 	// causally linked recovery contract instead of rewriting history.
 	ContractID string
+	// InteractionContract and Contract preserve the semantic descriptor that
+	// was active for this observation. They are evidence metadata only; the
+	// execution ContractID above remains the authorization/lineage identity.
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 	// Intent is the classified intent (authoritative).
 	Intent Intent
 	// Target is the resolved mutation target (authoritative).
@@ -583,6 +588,10 @@ type LoopRequest struct {
 	// evaluated individually and the monolithic full-rewrite estimation of
 	// the original target is suppressed. Nil for non-DAG requests.
 	StagedPlan *planner.ExecutionDAG
+	// StagedSubTasks is the normalized scope view used by alternate callers
+	// that already projected a DAG. It is still subject to the active
+	// contract's authority guard before dispatch.
+	StagedSubTasks []execution.SubTaskScope
 	// ProposalIntent carries the human-selected interactive proposal strategy
 	// (Phase 2 proposal gateway) injected into the execution-context
 	// constraints for this attempt. It is pure data selected on the TUI

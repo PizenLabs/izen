@@ -37,6 +37,7 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/modes/review"
+	"github.com/PizenLabs/izen/internal/protocol"
 	oregistry "github.com/PizenLabs/izen/internal/provider/registry"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
@@ -1535,7 +1536,11 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		select {
 		case o := <-outCh:
 			cancel()
-			return planResultMsg{Tasks: o.tasks, Err: o.err, Handoff: handoff, TokenInput: o.tokIn, TokenOutput: o.tokOut}
+			var contract *protocol.ContractDescriptor
+			if m.planEngine != nil {
+				contract = m.planEngine.LastContract()
+			}
+			return planResultMsg{Tasks: o.tasks, Err: o.err, Handoff: handoff, TokenInput: o.tokIn, TokenOutput: o.tokOut, Contract: contract}
 		case <-ftCtx.Done():
 			// First-token deadline missed: the provider is unresponsive.
 			cancel()

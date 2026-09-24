@@ -13,11 +13,17 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/preflight"
+	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/loop"
 	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
+// interactionMetadata is retained for package-local compatibility. New
+// dispatch paths use selectInteractionContract so explicit bindings and
+// classified capabilities cannot be bypassed.
+//
+//nolint:unused // kept for package-local compatibility with existing callers.
 func interactionMetadata(prompt, mode string) (protocol.InteractionContract, *protocol.ContractDescriptor) {
 	contract := protocol.SelectInteractionContract(prompt, mode)
 	descriptor := protocol.Describe(contract)
@@ -133,6 +139,15 @@ type Driver struct {
 	// DecisionSurface option set. Empty is the conservative default.
 	subcommand string
 
+	// activeInteraction/activeDescriptor are the semantic contract binding for
+	// the current run.  They are kept on the Driver (rather than reconstructed
+	// in each dispatcher) so recovery, clarification, and DAG sub-task
+	// requests cannot silently drift to a more capable interaction.
+	activeInteraction  protocol.InteractionContract
+	activeDescriptor   *protocol.ContractDescriptor
+	contractExplicit   bool
+	contractBindingErr error
+
 	// ── Recovery Contract Mutation ────────────────────────────────────
 	mutationStrategy     MutationStrategy
 	allowASTBypass       bool
@@ -224,6 +239,45 @@ func WithSubcommand(s string) Option {
 	return func(d *Driver) { d.subcommand = s }
 }
 
+// WithInteractionContract binds the semantic interaction contract used by the
+// driver and all of its dispatch/recovery requests.  The descriptor is
+// optional; when omitted the contract's conservative default is used.  The
+// variadic form keeps the option convenient for callers that only need to
+// select the contract kind.
+func WithInteractionContract(contract protocol.InteractionContract, descriptors ...*protocol.ContractDescriptor) Option {
+	return func(d *Driver) {
+		if d == nil {
+			return
+		}
+		descriptor := protocol.Describe(contract)
+		if len(descriptors) > 0 && descriptors[0] != nil {
+			descriptor = descriptors[0].Clone()
+		}
+		normalized, err := descriptor.Normalize()
+		if err != nil {
+			d.contractBindingErr = err
+			return
+		}
+		if contract.Valid() && normalized.Contract != contract {
+			d.contractBindingErr = fmt.Errorf("autonomy: contract binding mismatch: descriptor=%q requested=%q", normalized.Contract, contract)
+			return
+		}
+		if !contract.Valid() {
+			contract = normalized.Contract
+		}
+		d.activeInteraction = contract
+		d.contractExplicit = true
+		copy := normalized.Clone()
+		d.activeDescriptor = &copy
+		d.contractBindingErr = nil
+	}
+}
+
+// WithContract is a descriptor-first alias for WithInteractionContract.
+func WithContract(descriptor protocol.ContractDescriptor) Option {
+	return WithInteractionContract(descriptor.Contract, &descriptor)
+}
+
 // Substrate returns the execution target.
 func (d *Driver) Substrate() substrate.ProposalExecutor {
 	if d == nil {
@@ -298,7 +352,24 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// never guesses a target. A clarification boundary parks BEFORE any
 	// execution — no model call, no mutation.
 	d.resolved = d.adapter.Resolve(objective)
-	interaction, interactionDescriptor := interactionMetadata(objective, "build")
+	interaction, interactionDescriptor, contractErr := d.selectInteractionContract(objective)
+	if contractErr != nil {
+		_, _ = d.loop.Abort("interaction contract binding failed: "+contractErr.Error(), autonomy.FailurePermanent)
+		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
+		d.runCtx, d.runCancel = nil, nil
+		return nil, fmt.Errorf("autonomy: interaction contract: %w", contractErr)
+	}
+	// The strategy gateway is the deterministic authority for whether this
+	// run can act.  If it selected a mutation strategy but the text classifier
+	// produced a read-only contract, promote only to the bounded AgenticLoop
+	// contract; never promote a read-only strategy in the opposite direction.
+	if !d.contractExplicit && (d.resolved.Profile.Strategy == strategy.TargetedMutation || d.resolved.Profile.Strategy == strategy.DirectDeterministic) {
+		interaction = protocol.AgenticLoop
+		descriptor := protocol.Describe(interaction)
+		interactionDescriptor = &descriptor
+	}
+	d.activeInteraction = interaction
+	d.activeDescriptor = interactionDescriptor
 	d.req = autonomy.LoopRequest{
 		RequestID:           d.runRequestID,
 		Prompt:              objective,
@@ -327,6 +398,12 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		d.enrichBoundary()
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 		return d.term(), nil
+	}
+	if err := ValidateObjectiveContract(objective, interaction, interactionDescriptor); err != nil {
+		_, _ = d.loop.Abort("interaction contract authority ceiling: "+err.Error(), autonomy.FailurePermanent)
+		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
+		d.runCtx, d.runCancel = nil, nil
+		return nil, err
 	}
 	d.obs = d.contextObservation()
 	term, err := d.observeAndRun(d.runCtx, runID) //nolint:contextcheck // runCtx is the run's own cancellation context
@@ -383,6 +460,17 @@ var ErrNoHeldPatch = errors.New("no held patch to approve")
 // regeneration). A hard approve error (no result, e.g. double-approve)
 // aborts the run so it can never park at a stale awaiting_human.
 func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, error) {
+	if err := ValidateDispatchContract(autonomy.LoopRequest{
+		Prompt:              d.prompt,
+		Target:              firstTarget(d.req.Targets),
+		Targets:             append([]string(nil), d.req.Targets...),
+		Intent:              "modification",
+		MutationStrategy:    StrategyFullRewrite.String(),
+		InteractionContract: d.req.InteractionContract,
+		Contract:            cloneContract(d.req.Contract),
+	}); err != nil {
+		return d.term(), err
+	}
 	pid, err := d.approvalPatchID()
 	if err != nil {
 		return d.term(), err
@@ -475,14 +563,24 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
 		return d.term(), errors.New("autonomy: clarify requires a parked clarification boundary")
 	}
-	interaction, interactionDescriptor := interactionMetadata(d.prompt, "build")
-	d.req = autonomy.LoopRequest{
-		Prompt:              d.prompt,
-		Targets:             []string{target},
-		WorkspaceDigest:     d.adapter.WorkspaceVersion([]string{target}),
-		InteractionContract: interaction,
-		Contract:            interactionDescriptor,
+	interaction, interactionDescriptor, contractErr := d.currentInteractionMetadata()
+	if contractErr != nil {
+		return d.term(), fmt.Errorf("autonomy: interaction contract: %w", contractErr)
 	}
+	// Preserve the active contract and request identity across clarification;
+	// only the deterministic target is replaced.
+	d.req.Prompt = d.prompt
+	d.req.Target = target
+	d.req.Targets = []string{target}
+	d.req.WorkspaceDigest = d.adapter.WorkspaceVersion([]string{target})
+	d.req.InteractionContract = interaction
+	d.req.Contract = interactionDescriptor
+	d.req.RecoveryAttempt = 0
+	d.req.RecoveryStrategy = ""
+	d.req.RecoveryReason = ""
+	d.req.ParentContractID = ""
+	d.req.StagedPlan = nil
+	d.req.FocusStartLine, d.req.FocusEndLine = 0, 0
 	d.obs = d.contextObservation()
 	d.loop.ReleaseHuman("target specified: " + target)
 	d.publish(ctx)
@@ -851,6 +949,77 @@ func (d *Driver) SetStreamCallback(cb execution.StreamCallback) {
 	d.streamCb = cb
 }
 
+// ActiveContract returns a defensive copy of the descriptor currently bound
+// to the driver, or nil when the driver has not selected a contract yet.
+func (d *Driver) ActiveContract() *protocol.ContractDescriptor {
+	if d == nil || d.activeDescriptor == nil {
+		return nil
+	}
+	copy := d.activeDescriptor.Clone()
+	return &copy
+}
+
+// InteractionContract returns the semantic contract currently bound to the
+// driver.  A zero value means selection is still pending for the next run.
+func (d *Driver) InteractionContract() protocol.InteractionContract {
+	if d == nil {
+		return ""
+	}
+	return d.activeInteraction
+}
+
+// selectInteractionContract derives the contract from the classified intent
+// when no explicit binding was supplied.  The mode passed to the pure selector
+// is the autonomy dispatch mode, not a provider capability declaration; a
+// read-only objective therefore cannot inherit mutation authority merely
+// because the adapter is running on the build surface.
+func (d *Driver) selectInteractionContract(objective string) (protocol.InteractionContract, *protocol.ContractDescriptor, error) {
+	if d != nil && d.contractBindingErr != nil {
+		return "", nil, d.contractBindingErr
+	}
+	if d != nil && d.contractExplicit && d.activeInteraction.Valid() {
+		descriptor := protocol.Describe(d.activeInteraction)
+		if d.activeDescriptor != nil {
+			descriptor = d.activeDescriptor.Clone()
+		}
+		normalized, err := descriptor.Normalize()
+		if err != nil {
+			return "", nil, err
+		}
+		return normalized.Contract, func() *protocol.ContractDescriptor { copy := normalized.Clone(); return &copy }(), nil
+	}
+	classified := autonomy.Classify(objective, nil)
+	caps := make([]string, 0, len(classified.Required))
+	for _, capability := range classified.Required {
+		caps = append(caps, string(capability))
+	}
+	contract := protocol.SelectInteractionContract(objective, "autonomy", caps...)
+	descriptor := protocol.Describe(contract)
+	return contract, &descriptor, nil
+}
+
+func (d *Driver) currentInteractionMetadata() (protocol.InteractionContract, *protocol.ContractDescriptor, error) {
+	if d != nil && d.req.InteractionContract.Valid() {
+		var descriptor *protocol.ContractDescriptor
+		if d.req.Contract != nil {
+			descriptor = d.req.Contract
+		} else {
+			value := protocol.Describe(d.req.InteractionContract)
+			descriptor = &value
+		}
+		normalized, err := descriptor.Clone().Normalize()
+		if err != nil {
+			return "", nil, err
+		}
+		if d.req.InteractionContract.Valid() && normalized.Contract != d.req.InteractionContract {
+			return "", nil, fmt.Errorf("autonomy: %w: active request contract %q does not match descriptor %q", protocol.ErrInvalidContract, d.req.InteractionContract, normalized.Contract)
+		}
+		copy := normalized.Clone()
+		return normalized.Contract, &copy, nil
+	}
+	return d.selectInteractionContract(d.prompt)
+}
+
 // ── drive helpers ───────────────────────────────────────────────────────────
 
 // observeAndRun pushes the current observation through Observe → decide →
@@ -950,6 +1119,13 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// Ensure child attempt identity: stable parent runRequestID with attempt suffix.
 			if d.req.RequestID == "" {
 				d.req.RequestID = d.runRequestID
+			}
+			// Contract validation is a dispatcher boundary, not a provider
+			// concern.  Reject an out-of-ceiling staged operation before the
+			// adapter can create a model request or a held patch.
+			if contractErr := ValidateDispatchContract(d.req); contractErr != nil {
+				term := d.terminateAbort(ctx, "interaction contract authority ceiling: "+contractErr.Error(), autonomy.FailurePermanent)
+				return term, contractErr
 			}
 			obs, err := d.adapter.Execute(ctx, d.req)
 			// Late-result guard: if the run was aborted/superseded while we were
@@ -1063,6 +1239,21 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				}
 				return nil, fmt.Errorf("autonomy: repair: %w", err)
 			}
+			// Recovery may change artifact strategy and causal lineage, but it
+			// must not change the active interaction contract.  Rebind the
+			// request to the driver's immutable descriptor even when an injected
+			// RepairFunc returns a freshly assembled LoopRequest.
+			if d.req.InteractionContract.Valid() {
+				activeContract, activeDescriptor, metadataErr := d.currentInteractionMetadata()
+				if metadataErr != nil {
+					return nil, fmt.Errorf("autonomy: recovery contract: %w", metadataErr)
+				}
+				if req.InteractionContract != "" && req.InteractionContract != activeContract {
+					return nil, fmt.Errorf("autonomy: recovery contract drift: request=%s active=%s", req.InteractionContract, activeContract)
+				}
+				req.InteractionContract = activeContract
+				req.Contract = cloneContract(activeDescriptor)
+			}
 			// Child attempt identity: parent run ID plus attempt number.
 			if req.RecoveryAttempt > 0 {
 				req.RequestID = fmt.Sprintf("%s-attempt-%d", d.runRequestID, req.RecoveryAttempt)
@@ -1136,11 +1327,20 @@ func (d *Driver) contextObservation() autonomy.Observation {
 	if maxOut <= 0 {
 		maxOut = d.resolved.Profile.MaxOutputTokens
 	}
+	interaction := d.req.InteractionContract
+	if interaction == "" && d.req.Contract != nil {
+		interaction = d.req.Contract.Contract
+		if interaction == "" {
+			interaction = d.req.Contract.Kind
+		}
+	}
 	return autonomy.Observation{
-		Intent:          autonomy.ParseIntent(d.prompt),
-		Target:          firstTarget(d.req.Targets),
-		Evidence:        d.req.Evidence,
-		MaxOutputTokens: maxOut,
+		Intent:              autonomy.ParseIntent(d.prompt),
+		Target:              firstTarget(d.req.Targets),
+		Evidence:            d.req.Evidence,
+		MaxOutputTokens:     maxOut,
+		InteractionContract: interaction,
+		Contract:            cloneContract(d.req.Contract),
 	}
 }
 

@@ -766,6 +766,15 @@ func (d *Driver) stageDecomposition(ctx context.Context) bool {
 		diagnosticf("[boundary2] decomposition unavailable: %v — falling back to explicit re-scope", err)
 		return false
 	}
+	contract, descriptor, contractErr := d.currentInteractionMetadata()
+	if contractErr != nil {
+		diagnosticf("[boundary2] decomposition contract unavailable: %v — falling back to explicit re-scope", contractErr)
+		return false
+	}
+	if err := ValidateStagedPlanContract(contract, descriptor, dag); err != nil {
+		diagnosticf("[boundary2] decomposition violates active interaction contract: %v — falling back to explicit re-scope", err)
+		return false
+	}
 	d.dag = dag
 	b := autonomy.HumanBoundary{
 		Reason:   dag.ProposalSummary(),
@@ -849,6 +858,16 @@ func (d *Driver) ResumeApproveProposal(ctx context.Context) (*autonomy.LoopTermi
 	dag := d.Proposal()
 	if dag == nil {
 		return d.term(), errors.New("autonomy: proposal approval requires a parked DECOMPOSITION_PROPOSAL boundary")
+	}
+	contract, descriptor, contractErr := d.currentInteractionMetadata()
+	if contractErr != nil {
+		return d.term(), fmt.Errorf("autonomy: proposal contract: %w", contractErr)
+	}
+	// The boundary exposes the proposal as mutable data. Revalidate the exact
+	// object at the human-release seam so a caller cannot alter its operation,
+	// budget, or DAG invariants between staging and approval.
+	if err := ValidateStagedPlanContract(contract, descriptor, dag); err != nil {
+		return d.term(), err
 	}
 	d.runID++
 	d.loop.ReleaseHuman("DECOMPOSITION_PROPOSAL approved")
