@@ -247,11 +247,39 @@ func (r *Registry) Len() int {
 }
 
 // Snapshot returns a copy of the in-memory slice (lock-free read + copy).
+// It is the full discovered catalog, including models flagged ineligible
+// for execution (see IneligibleReason). Selection surfaces must use
+// LoadExecutable instead.
 func (r *Registry) Snapshot() []ModelDescriptor {
 	src := r.Load().Models
 	out := make([]ModelDescriptor, len(src))
 	copy(out, src)
 	return out
+}
+
+// LoadExecutable returns an immutable snapshot restricted to models
+// eligible for selection and execution through Izen's current execution
+// path. The raw catalog (Load/Snapshot, on-disk cache) always preserves
+// every discovered model with its IneligibleReason marking; this view is
+// the executable subset pickers and activation flows must consume.
+func (r *Registry) LoadExecutable() *ModelSnapshot {
+	snap := r.Load()
+	models := ExecutableModels(snap.Models)
+	counts := make(map[string]int, len(snap.Providers))
+	for _, m := range models {
+		counts[m.Provider]++
+	}
+	summaries := make([]ProviderSummary, 0, len(snap.Providers))
+	for _, s := range snap.Providers {
+		s.ModelCount = counts[s.Name]
+		summaries = append(summaries, s)
+	}
+	return &ModelSnapshot{
+		Models:    models,
+		Providers: summaries,
+		Version:   snap.Version,
+		UpdatedAt: snap.UpdatedAt,
+	}
 }
 
 // SetSeed replaces the in-memory catalog (tests/benchmarks). It rebuilds

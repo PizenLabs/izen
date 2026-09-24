@@ -90,11 +90,12 @@ type HandlerDeps struct {
 	// maintain independent model configuration state or fallback to a
 	// hardcoded default.
 	Authority *runtime.RuntimeAuthority
-	// Config is the global configuration used to resolve the active provider
-	// for strict provider-model compatibility verification. When set, a
-	// model that does not belong to the active provider is rejected before
-	// dispatch, preventing stale Ollama models from leaking into OpenRouter
-	// workers.
+	// Config is a fallback provider source for admission-time
+	// compatibility verification when the authority binding carries no
+	// provider (legacy/empty authority state). The authority binding is the
+	// primary provider source: the bound model is always checked against
+	// the provider stored in the SAME binding, never against a separately
+	// stored config provider.
 	Config *config.Config
 }
 
@@ -228,13 +229,20 @@ func (h *SubmitPromptHandler) Handle(ctx context.Context, cmd runtime.RuntimeCom
 		if targetModel == "" {
 			return fmt.Errorf("%w [%s]", execution.ErrUnassignedTargetModel, target)
 		}
+		// The provider travels with the model in the SAME authority binding:
+		// admission must never combine the bound model with a separately
+		// stored provider (e.g. a stale session-config provider shadowing a
+		// fresh authority binding after /models switches providers). Config
+		// is only a fallback for bindings that carry no provider
+		// (legacy/empty authority state).
+		activeProvider := strings.TrimSpace(ref.Provider)
+		if activeProvider == "" && h.deps.Config != nil {
+			activeProvider = h.deps.Config.ActiveProviderName()
+		}
 		// Strict provider-model compatibility: a stale Ollama model must not
 		// leak into an OpenRouter worker. The active provider owns the model.
-		if h.deps.Config != nil {
-			activeProvider := h.deps.Config.ActiveProviderName()
-			if activeProvider != "" && !handlerModelBelongsToProvider(activeProvider, targetModel) {
-				return fmt.Errorf("%w: model %q does not belong to provider %q [%s]", execution.ErrProviderModelMismatch, targetModel, activeProvider, target)
-			}
+		if activeProvider != "" && !handlerModelBelongsToProvider(activeProvider, targetModel) {
+			return fmt.Errorf("%w: model %q does not belong to provider %q [%s]", execution.ErrProviderModelMismatch, targetModel, activeProvider, target)
 		}
 	}
 

@@ -235,11 +235,12 @@ func fetchOpenRouterModels(client *http.Client, apiKey string) ([]ModelInfo, err
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+	// Documented app-attribution headers only (never authorization).
+	// No X-OpenRouter-Categories is sent: unrecognized values are
+	// silently dropped by OpenRouter and no header grants eligibility.
 	req.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
 	req.Header.Set("X-Title", "izen")
 	req.Header.Set("X-OpenRouter-Title", "izen")
-	req.Header.Set("X-OpenRouter-Categories", "agent-runtime")
-	req.Header.Set("X-OpenRouter-Description", "AI amplifies human judgment. Humans remain in control.")
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -19,6 +19,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 	"github.com/PizenLabs/izen/internal/llm"
+	oregistry "github.com/PizenLabs/izen/internal/provider/registry"
 )
 
 // ErrOpenRouterAuth is returned when OpenRouter authentication fails (HTTP 401
@@ -30,6 +31,35 @@ var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401):
 // configuration references but is NEVER used as an implicit fallback during
 // live invocation. Every invocation MUST carry an explicit ModelBinding.
 const DefaultOpenRouterModel = "anthropic/claude-3.5-sonnet"
+
+// ErrOpenRouterModelIncompatible is returned when a model cannot be
+// executed through Izen's current OpenRouter execution path (e.g. models
+// the provider restricts to agentic harnesses). It is a provider/model
+// compatibility refusal, not a generic streaming failure: callers must not
+// retry it and must not silently switch models.
+var ErrOpenRouterModelIncompatible = errors.New("openrouter: model unavailable for Izen's current OpenRouter execution path")
+
+// guardModelExecutable rejects models known to be ineligible for Izen's
+// current OpenRouter execution path before any network I/O, so catalog
+// presence can never again reach inference only to fail with HTTP 403.
+func guardModelExecutable(model string) error {
+	inelig := oregistry.CheckExecutable("openrouter", model)
+	if inelig == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: model %q is %s", ErrOpenRouterModelIncompatible, model, inelig.Reason)
+}
+
+// asCompatibilityError classifies a non-OK inference response: an
+// agentic-harness HTTP 403 becomes a compatibility error carrying the
+// sentinel; every other status keeps the existing ProviderError behavior.
+func asCompatibilityError(statusCode int, respBody []byte) error {
+	pe := NewProviderError("openrouter", statusCode, respBody)
+	if pe.IsModelCompatibility() {
+		return fmt.Errorf("%w: %s", ErrOpenRouterModelIncompatible, pe.Error())
+	}
+	return pe
+}
 
 // ErrUnassignedTargetModel is returned when an OpenRouter request carries no
 // explicit model ID. The worker MUST reject locally before dispatch.
@@ -183,6 +213,9 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	if err != nil {
 		return nil, err
 	}
+	if err := guardModelExecutable(model); err != nil {
+		return nil, err
+	}
 
 	key := p.resolveAPIKey()
 	if key == "" {
@@ -212,7 +245,7 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, NewProviderError("openrouter", resp.StatusCode, respBody)
+		return nil, asCompatibilityError(resp.StatusCode, respBody)
 	}
 
 	var openaiResp openrouterResponse
@@ -274,6 +307,9 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	if err != nil {
 		return nil, err
 	}
+	if err := guardModelExecutable(model); err != nil {
+		return nil, err
+	}
 
 	key := p.resolveAPIKey()
 	if key == "" {
@@ -304,7 +340,7 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		cancel()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		return nil, NewProviderError("openrouter", resp.StatusCode, respBody)
+		return nil, asCompatibilityError(resp.StatusCode, respBody)
 	}
 
 	sr := &openrouterSSEReader{
@@ -665,11 +701,14 @@ func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body
 		if stream {
 			httpReq.Header.Set("Accept", "text/event-stream")
 		}
+		// App-attribution headers (documented, optional, never
+		// authorization): HTTP-Referer identifies the app for rankings,
+		// X-Title/X-OpenRouter-Title sets its display name. No Categories
+		// header is sent: OpenRouter silently drops unrecognized category
+		// values and attribution headers never grant model eligibility.
 		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
 		httpReq.Header.Set("X-OpenRouter-Title", "izen")
 		httpReq.Header.Set("X-Title", "izen")
-		httpReq.Header.Set("X-OpenRouter-Categories", "agent-runtime")
-		httpReq.Header.Set("X-OpenRouter-Description", "AI amplifies human judgment. Humans remain in control.")
 		return p.client.Do(httpReq)
 	}
 

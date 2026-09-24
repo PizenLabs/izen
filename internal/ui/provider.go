@@ -168,8 +168,10 @@ func (m *model) switchProvider(name string) tea.Cmd {
 	// leaks into an OpenRouter context and is rejected by the validator.
 	if auth := m.modelAuthority; auth != nil {
 		binding := auth.ActiveBinding()
+		cleared := false
 		if binding.ModelID != "" && !modelBelongsToProvider(name, string(binding.ModelID)) {
 			// Clear stale binding and re-seed with new provider's default.
+			cleared = true
 			newDefault := ""
 			if provCfg, ok := m.cfg.AI.Providers[name]; ok {
 				newDefault = provCfg.DefaultModel
@@ -182,6 +184,23 @@ func (m *model) switchProvider(name string) tea.Cmd {
 				_ = config.PersistActiveBinding(name, newDefault, "")
 			} else {
 				auth.Activate(authority.ModelBinding{})
+			}
+		}
+		// Mirror the post-switch authority binding into the live session
+		// config so config-derived readers (submit admission, executor
+		// fallbacks, status views) observe the same provider/model pair the
+		// authority owns. Without this mirror the session config keeps the
+		// pre-switch binding and execution admission combines a stale
+		// provider with the new model. An untouched empty authority never
+		// wipes a persisted session binding.
+		if m.cfg != nil {
+			mirrored := auth.ActiveBinding()
+			if mirrored.ModelID != "" || cleared {
+				m.cfg.Bindings.Active = config.ActiveBindingConfig{
+					Provider: string(mirrored.ProviderID),
+					Model:    string(mirrored.ModelID),
+					Variant:  string(mirrored.VariantParams),
+				}
 			}
 		}
 	}
