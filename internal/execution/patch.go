@@ -103,8 +103,9 @@ type PatchManager struct {
 	// task to transition to TaskCompleted.
 	verifier *Verifier
 
-	auth   *authorization.MutationAuthorization
-	budget *budget.MutationBudget
+	auth           *authorization.MutationAuthorization
+	budget         *budget.MutationBudget
+	admissionCheck func(string) error
 
 	// mutationSet is the authoritative mutation boundary this manager operates
 	// inside. The set OWNS the transaction lifetime (begin/commit/rollback are
@@ -266,6 +267,12 @@ func (pm *PatchManager) SetContextID(id string) {
 
 func (pm *PatchManager) SetAuthorization(auth *authorization.MutationAuthorization) {
 	pm.auth = auth
+}
+
+// SetAdmissionCheck installs the pre-write contract gate used by a bound
+// execution Engine. A nil check restores legacy PatchManager behavior.
+func (pm *PatchManager) SetAdmissionCheck(check func(string) error) {
+	pm.admissionCheck = check
 }
 
 func (pm *PatchManager) Authorization() *authorization.MutationAuthorization {
@@ -477,6 +484,11 @@ func sanitizeCtxID(id string) string {
 }
 
 func (pm *PatchManager) Apply(patch *Patch) error {
+	if pm.admissionCheck != nil {
+		if err := pm.admissionCheck("FILE_MUTATE"); err != nil {
+			return err
+		}
+	}
 	patchStartTime := time.Now()
 	if err := checkAuthorization(pm.auth); err != nil {
 		if globalActivityLog != nil {

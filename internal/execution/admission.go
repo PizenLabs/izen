@@ -14,15 +14,19 @@ import (
 // ── Admission: Deterministic Risk Scope Gating (Phase 1 P1) ────────────────
 //
 // Every intent crosses the admission boundary BEFORE it reaches the execution
-// stages that can act on the world. The boundary performs exactly two
-// deterministic checks:
+// stages that can act on the world. The boundary performs three deterministic
+// checks:
 //
 //  1. CONTEXT FIDELITY — the intent's frozen ContextSnapshot must still match
 //     its sealed digest and must still bind to the request's declared context
 //     fields (prompt, referenced files, evidence). Any mid-flight modification
 //     fails closed.
 //
-//  2. RISK SCOPE — the intent's blast radius is classified into a bounded
+//  2. INTERACTION CONTRACT — the active descriptor's AuthorityCeiling and
+//     capability sets are checked against every declared action. A contract can
+//     lower the request surface but can never grant runtime authority.
+//
+//  3. RISK SCOPE — the intent's blast radius is classified into a bounded
 //     risk-scope tier by a pure function of the declared strategy, task type,
 //     command text and target set, then checked against the admitted
 //     capabilities. An intent whose scope exceeds what is admitted is rejected
@@ -82,6 +86,10 @@ type RiskInput struct {
 	// TaskType is the canonical staged-task type label ("FILE_MUTATE",
 	// "SHELL_EXEC", ...) when the intent carries one.
 	TaskType string
+	// Operation is an explicit semantic operation alias.  It is useful at
+	// boundaries that receive a protocol operation rather than a domain task
+	// type; when both are present, admission evaluates both declarations.
+	Operation string
 	// Command is the OS command text for shell-execution intents.
 	Command string
 	// Targets is the resolved workspace-relative file target set.
@@ -102,20 +110,62 @@ type RiskVerdict struct {
 func EvaluateRiskScope(in RiskInput) RiskVerdict {
 	v := RiskVerdict{Scope: ScopeReadOnly}
 	taskType := strings.ToUpper(strings.TrimSpace(in.TaskType))
+	operation := strings.ToUpper(strings.TrimSpace(in.Operation))
+
+	// TaskType is the canonical domain vocabulary.  Operation is accepted as
+	// an equivalent explicit spelling at protocol/dispatch boundaries; both
+	// declarations are deliberately considered when they disagree by the
+	// admission layer rather than silently preferring one of them.
+	if taskType == "" {
+		taskType = operation
+	}
 
 	switch {
-	case taskType == task.TaskShellExec.String():
+	case taskType == task.TaskShellExec.String() || taskType == "SHELL_EXEC" || taskType == "SHELL" || taskType == "COMMAND" || taskType == "EXEC":
 		v.Scope = ScopeShellSideEffect
 		v.Reasons = append(v.Reasons, "task type SHELL_EXEC executes an external OS command")
 	case taskType == task.TaskFileMutate.String() ||
 		taskType == task.TaskFileEdit.String() ||
-		taskType == task.TaskGitAction.String():
+		taskType == task.TaskGitAction.String() ||
+		taskType == "FILE_MUTATE" ||
+		taskType == "FILE_EDIT" ||
+		taskType == "EDIT" ||
+		taskType == "ATOMIC_REPLACE" ||
+		taskType == "DIFF_PATCH" ||
+		taskType == "MUTATE" ||
+		taskType == "MUTATION" ||
+		taskType == "GIT_ACTION" ||
+		taskType == "GIT" ||
+		taskType == "COMMIT":
 		v.Scope = ScopeWorkspaceMutate
 		v.Reasons = append(v.Reasons, fmt.Sprintf("task type %s mutates the workspace", taskType))
-	case taskType == task.TaskVerify.String():
-		v.Reasons = append(v.Reasons, "task type VERIFY is read-only verification")
+	case taskType == "DESTRUCTIVE" || taskType == "DESTROY" || taskType == "DELETE" || taskType == "DELETE_FILE" || taskType == "REMOVE" || taskType == "REMOVE_FILE" || taskType == "DROP" || taskType == "WIPE":
+		v.Scope = ScopeDestructive
+		v.Reasons = append(v.Reasons, "task type DESTRUCTIVE requests an irreversible operation")
+	case taskType == "TOOL_CALL":
+		// Tool calls cross a process/provider boundary in the current runtime;
+		// classify them with the external side-effect tier until a dedicated
+		// runtime grant exists.
+		v.Scope = ScopeShellSideEffect
+		v.Reasons = append(v.Reasons, "task type TOOL_CALL requires an external capability grant")
+	case taskType == task.TaskVerify.String() || taskType == "VERIFY" || taskType == "VERIFICATION" || taskType == "READ" || taskType == "READ_ONLY" || taskType == "READONLY":
+		v.Reasons = append(v.Reasons, fmt.Sprintf("task type %s is read-only", taskType))
+	case taskType == "":
+		// A command without an explicit task type is still an attempted shell
+		// action.  Treating it as read-only would let a caller erase the
+		// action type and inherit a read-only contract.
+		if strings.TrimSpace(in.Command) != "" {
+			v.Scope = ScopeShellSideEffect
+			v.Reasons = append(v.Reasons, "command text declares shell execution")
+		} else {
+			v.applyStrategy(in.Strategy)
+		}
 	default:
-		v.applyStrategy(in.Strategy)
+		// Unknown task types fail closed at the non-destructive acting tier.
+		// Contract admission will additionally return a typed authority error
+		// for the unknown operation, so it cannot become a read-only bypass.
+		v.Scope = ScopeWorkspaceMutate
+		v.Reasons = append(v.Reasons, fmt.Sprintf("unknown task type %q classified conservatively", taskType))
 	}
 
 	// ── Deterministic escalations ────────────────────────────────────────
@@ -132,6 +182,21 @@ func EvaluateRiskScope(in RiskInput) RiskVerdict {
 			v.Scope = ScopeDestructive
 			v.Reasons = append(v.Reasons, reason)
 			break
+		}
+	}
+	// If both explicit declarations are present and disagree, evaluate the
+	// second one as well and retain the higher risk tier. This keeps the pure
+	// evaluator conservative even when a caller supplies a FILE_MUTATE label
+	// alongside a SHELL_EXEC operation.
+	if operation != "" && taskType != "" && operation != taskType {
+		secondary := EvaluateRiskScope(RiskInput{
+			Operation: operation,
+			Command:   in.Command,
+			Targets:   in.Targets,
+		})
+		if secondary.Scope > v.Scope {
+			v.Scope = secondary.Scope
+			v.Reasons = append(v.Reasons, secondary.Reasons...)
 		}
 	}
 	return v
@@ -256,19 +321,6 @@ func ReadOnlyAdmittedCapabilities() *AdmittedCapabilities {
 	return &AdmittedCapabilities{ReadOnly: true}
 }
 
-// AdmissionDecision is the observable verdict of one admission pass.
-type AdmissionDecision struct {
-	// Allowed reports whether the intent may proceed to execution.
-	Allowed bool
-	// Requested is the evaluated risk scope of the intent.
-	Requested RiskScope
-	// Reason explains the verdict deterministically.
-	Reason string
-	// Snapshot is the verified context snapshot the intent carries forward
-	// (nil when context fidelity failed).
-	Snapshot *ContextSnapshot
-}
-
 // AdmissionGateway is the deterministic admission gate over the RuntimeExecutor
 // entry point. It is stateless beyond its admitted capability set (swapped
 // atomically) and safe for concurrent use.
@@ -280,24 +332,30 @@ type AdmissionGateway struct {
 // set; a nil set defaults to StandardAdmittedCapabilities.
 func NewAdmissionGateway(caps *AdmittedCapabilities) *AdmissionGateway {
 	g := &AdmissionGateway{}
-	if caps == nil {
-		caps = StandardAdmittedCapabilities()
-	}
-	g.caps.Store(caps)
+	g.SetCapabilities(caps)
 	return g
 }
 
 // SetCapabilities replaces the admitted capability set atomically (test seam /
 // runtime re-granting). A nil set defaults to StandardAdmittedCapabilities.
+// The value is copied at the boundary so a caller cannot mutate an admitted
+// grant while an execution is being checked.
 func (g *AdmissionGateway) SetCapabilities(caps *AdmittedCapabilities) {
 	if caps == nil {
 		caps = StandardAdmittedCapabilities()
 	}
-	g.caps.Store(caps)
+	copy := *caps
+	g.caps.Store(&copy)
 }
 
 // Capabilities exposes the currently admitted capability set (observability).
-func (g *AdmissionGateway) Capabilities() AdmittedCapabilities { return *g.caps.Load() }
+func (g *AdmissionGateway) Capabilities() AdmittedCapabilities {
+	caps := g.caps.Load()
+	if caps == nil {
+		return AdmittedCapabilities{}
+	}
+	return *caps
+}
 
 // verifyIntentContext enforces CONTEXT FIDELITY: it returns the verified
 // snapshot the request must execute under. A carried snapshot must be sealed
@@ -359,32 +417,4 @@ func bindSnapshotToRequest(s *ContextSnapshot, req ExecuteRequest) error {
 		}
 	}
 	return nil
-}
-
-// Admit runs BOTH admission checks for one intent against the given strategy
-// profile: context fidelity first (fail-closed on any tampering), then risk
-// scope against the admitted capabilities. On success the decision carries the
-// verified snapshot to propagate into execution.
-func (g *AdmissionGateway) Admit(req ExecuteRequest, root string, profile strategy.ExecutionStrategyProfile) (AdmissionDecision, error) {
-	snapshot, err := verifyIntentContext(req, root)
-	if err != nil {
-		return AdmissionDecision{Requested: ScopeDestructive, Reason: "context fidelity verification failed"}, err
-	}
-	targets := req.Targets
-	if len(targets) == 0 && req.Target != "" {
-		targets = []string{req.Target}
-	}
-	verdict := EvaluateRiskScope(RiskInput{
-		Strategy: string(profile.Strategy),
-		Targets:  targets,
-	})
-	decision := AdmissionDecision{Requested: verdict.Scope, Snapshot: snapshot}
-	if !g.caps.Load().Allows(verdict.Scope) {
-		decision.Reason = fmt.Sprintf("intent evaluated as %s exceeds admitted capabilities: %s",
-			verdict.Scope, strings.Join(verdict.Reasons, "; "))
-		return decision, fmt.Errorf("%w: evaluated %s", ErrRiskScopeExceeded, verdict.Scope)
-	}
-	decision.Allowed = true
-	decision.Reason = strings.Join(verdict.Reasons, "; ")
-	return decision, nil
 }

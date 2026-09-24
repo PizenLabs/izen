@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -170,6 +171,15 @@ type ExecuteRequest struct {
 	// submission can never be refused for the size of the whole target it was
 	// decomposed from.
 	StagedSubTasks []SubTaskScope
+	// Operation / TaskType / Command are optional explicit action facts for
+	// admission.  They let a dispatcher carry a canonical task operation all
+	// the way to the execution gate instead of asking admission to infer it
+	// from a broad strategy label.  StagedSubTasks remains the canonical
+	// multi-action surface; these fields are additive and fail closed when
+	// they conflict with the active contract.
+	Operation string
+	TaskType  string
+	Command   string
 	// NoOpEscalation marks this invocation as a NO-OP escalation attempt: the
 	// previous attempt answered NO_CHANGES_REQUIRED while structural analysis
 	// indicated work remains. The bounded-patch context window is WIDENED
@@ -455,6 +465,10 @@ func cloneExecutionDescriptor(descriptor *protocol.ContractDescriptor) *protocol
 	return &copy
 }
 
+type sessionResolverRef struct {
+	fn func() string
+}
+
 // RuntimeExecutor is the runtime-owned execution boundary.
 //
 // PHASE 1 AUTHORIZATION BOUNDARY (P0-2): this type is the SINGLE canonical
@@ -477,10 +491,11 @@ type RuntimeExecutor struct {
 	verifier  *Verifier
 	auth      *authorization.MutationAuthorization
 	admission *AdmissionGateway
-	// sessionID resolves the active originating session at admission when the
-	// request does not carry one (INV-SESSION-10). It is wired by the
-	// composition root to the SessionManager's active-session accessor.
-	sessionID func() string
+	// sessionResolver resolves the active originating session at admission when
+	// the request does not carry one (INV-SESSION-10). It is atomically swapped
+	// by the composition root so admission can run before any executor mutex is
+	// acquired.
+	sessionResolver atomic.Pointer[sessionResolverRef]
 	// contracts is the runtime-owned contract identity ledger (Phase 2 P2):
 	// it derives immutable ContractIDs at admission, increments AttemptIDs
 	// deterministically across retries, and instantiates bounded causal
@@ -505,7 +520,7 @@ type RuntimeExecutor struct {
 
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
-	counter int
+	counter atomic.Int64
 
 	// observeSnapshot is the Observation-phase memory cache: target → content.
 	// It is populated ONCE per Execute via observeTargets and is the single
@@ -671,9 +686,11 @@ func (x *RuntimeExecutor) SetAuthorization(a *authorization.MutationAuthorizatio
 // not carry an explicit SessionID, so every execution — including autonomous
 // and headless submissions — is correlated with the session that produced it.
 func (x *RuntimeExecutor) SetSessionResolver(fn func() string) {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	x.sessionID = fn
+	if fn == nil {
+		x.sessionResolver.Store(nil)
+		return
+	}
+	x.sessionResolver.Store(&sessionResolverRef{fn: fn})
 }
 
 // observeTargets captures each target's bytes during Observation and caches
@@ -751,11 +768,8 @@ func (x *RuntimeExecutor) resolveSessionID(req ExecuteRequest) string {
 	if req.SessionID != "" {
 		return req.SessionID
 	}
-	x.mu.Lock()
-	fn := x.sessionID
-	x.mu.Unlock()
-	if fn != nil {
-		return fn()
+	if resolver := x.sessionResolver.Load(); resolver != nil && resolver.fn != nil {
+		return resolver.fn()
 	}
 	return ""
 }
@@ -776,10 +790,7 @@ func (x *RuntimeExecutor) emit(ev events.DomainEvent) {
 }
 
 func (x *RuntimeExecutor) nextID() string {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	x.counter++
-	return fmt.Sprintf("exec-%d", x.counter)
+	return fmt.Sprintf("exec-%d", x.counter.Add(1))
 }
 
 // ErrProviderModelMismatch is the deterministic error returned when the model
@@ -1040,69 +1051,50 @@ func (x *RuntimeExecutor) resolveModel(req ExecuteRequest) (string, error) {
 // must use ResolveModel (stateless Policy Resolver) and must not maintain
 // independent model state or fall back to hardcoded defaults.
 
-// validateExecutionContract enforces the active interaction contract's
-// operation ceiling at the canonical executor boundary.  It is intentionally
-// separate from RiskScope admission: a contract may prohibit a semantic turn
-// even when the broader runtime capability set would admit its risk class.
+// defaultExecutionContract binds a descriptor for legacy direct callers that
+// did not carry G2 metadata.  Mode remains a ceiling; an empty mode follows the
+// already-selected execution strategy so old direct mutation fixtures do not
+// acquire a synthetic read-only contract.
+func defaultExecutionContract(req ExecuteRequest, profile strategy.ExecutionStrategyProfile) protocol.InteractionContract {
+	switch strings.ToLower(strings.TrimSpace(req.Mode)) {
+	case "ask", "review", "investigate":
+		return protocol.DirectCompletion
+	case "plan":
+		return protocol.StructuredCompletion
+	case "build", "autonomy":
+		return protocol.AgenticLoop
+	}
+	switch profile.Strategy {
+	case strategy.TargetedMutation, strategy.DirectDeterministic:
+		return protocol.AgenticLoop
+	case strategy.MultiFilePlanning:
+		return protocol.StructuredCompletion
+	default:
+		return protocol.DirectCompletion
+	}
+}
+
+// validateExecutionContract is the executor's early defense-in-depth check.
+// The canonical decision is still made by AdmissionGateway.Admit; keeping a
+// pure preflight here prevents a malformed/forbidden request from reaching
+// provider setup or any later execution stage.
 func validateExecutionContract(req ExecuteRequest, profile strategy.ExecutionStrategyProfile, declared bool) error {
-	if !declared || req.Contract == nil {
+	// Keep the historical parameter for source compatibility, but never allow
+	// a caller to smuggle a descriptor past the pure contract check by setting
+	// the flag false. A non-nil descriptor is always authoritative.
+	_ = declared
+	if req.Contract == nil {
 		return nil
 	}
 	descriptor, err := req.Contract.Clone().Normalize()
 	if err != nil {
 		return err
 	}
-	var operation protocol.Operation
-	switch profile.Strategy {
-	case strategy.TargetedMutation, strategy.DirectDeterministic, strategy.MultiFilePlanning:
-		operation = protocol.OperationFileMutate
-	case strategy.RepositoryInvestigation, strategy.TargetedReasoning, strategy.DirectResponse, strategy.HumanClarification:
-		operation = protocol.OperationRead
-	default:
-		operation = protocol.OperationFileMutate
+	if err := validateAdmissionBudget(req, profile, descriptor); err != nil {
+		return err
 	}
-	if descriptor.MaxOutputTokens > 0 {
-		budget := req.MaxOutputTokens
-		if budget <= 0 {
-			budget = profile.MaxOutputTokens
-		}
-		if budget > descriptor.MaxOutputTokens {
-			return &protocol.ContractViolationError{
-				Contract:  descriptor.Contract,
-				Operation: "output_budget",
-				Reason:    fmt.Sprintf("selected budget %d exceeds descriptor ceiling %d", budget, descriptor.MaxOutputTokens),
-			}
-		}
-	}
-	if len(req.StagedSubTasks) > 0 {
-		for _, scope := range req.StagedSubTasks {
-			stagedOperation := protocol.NormalizeOperation(scope.Operation)
-			if stagedOperation == "" {
-				stagedOperation = protocol.OperationFileMutate
-			}
-			if !descriptor.AllowsOperation(string(stagedOperation)) {
-				return &protocol.ContractViolationError{
-					Contract:  descriptor.Contract,
-					Operation: string(stagedOperation),
-					Reason:    "staged execution operation is outside the active contract capability ceiling",
-				}
-			}
-			if descriptor.Archetype == protocol.ArchetypeVanillaWeb && stagedOperation == protocol.OperationShell {
-				return &protocol.ContractViolationError{
-					Contract:  descriptor.Contract,
-					Operation: string(stagedOperation),
-					Reason:    "VANILLA_WEB contract cannot dispatch a shell operation",
-				}
-			}
-		}
-	} else if !descriptor.AllowsOperation(string(operation)) {
-		return &protocol.ContractViolationError{
-			Contract:  descriptor.Contract,
-			Operation: string(operation),
-			Reason:    "selected execution strategy is outside the active contract capability ceiling",
-		}
-	}
-	return nil
+	_, err = validateAdmissionContract(req, profile, descriptor)
+	return err
 }
 
 // Execute runs the deterministic execution flow for req, driving the
@@ -1112,6 +1104,15 @@ func validateExecutionContract(req ExecuteRequest, profile strategy.ExecutionStr
 // mutation it stops at the approval gate and returns PendingPatchID; the
 // caller resolves it via Approve/Reject.
 func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*ExecutionResult, error) {
+	// Snapshot the staged action slice at the dispatch boundary. A caller may
+	// reuse its plan buffer after Execute returns; admission must never observe
+	// a later mutation that changes the active contract's requested operation.
+	if req.Targets != nil {
+		req.Targets = append([]string(nil), req.Targets...)
+	}
+	if req.StagedSubTasks != nil {
+		req.StagedSubTasks = append([]SubTaskScope(nil), req.StagedSubTasks...)
+	}
 	contractDeclared := req.Contract != nil || req.InteractionContract != "" || len(req.StagedSubTasks) > 0
 	// G2/G3 metadata is normalized at the canonical boundary so every caller
 	// (including legacy direct tests) carries the same semantic descriptor.
@@ -1129,6 +1130,9 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		req.InteractionContract = normalized.Contract
 		req.Contract = &normalized
 	} else {
+		if req.InteractionContract != "" && !req.InteractionContract.Valid() {
+			return nil, fmt.Errorf("executor: %w: unknown interaction contract %q", protocol.ErrInvalidContract, req.InteractionContract)
+		}
 		if req.InteractionContract == "" {
 			intent := req.Intent
 			if intent == "" {
@@ -1154,6 +1158,10 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		descriptor := protocol.Describe(req.InteractionContract)
 		req.Contract = &descriptor
 	}
+	// Admission preflight below must be able to reject a request without first
+	// taking the executor's mutation/pending lock. ID and session correlation
+	// use lock-free snapshots; the actual registry/pending locks are acquired
+	// only after admission succeeds.
 	requestID := req.RequestID
 	if requestID == "" {
 		requestID = x.nextID()
@@ -1228,6 +1236,20 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	res.Proof.ContextDecisions = contextDecisions(profile)
 	g.CompleteStrategy(res.Strategy, profile.ModelRequired, profile.StrategyReason)
 
+	// Legacy direct callers may not carry protocol metadata.  Once the
+	// canonical strategy is known, bind a conservative descriptor that agrees
+	// with that strategy before admission.  This closes the old loophole where
+	// an implicit DirectCompletion descriptor could accompany a mutation
+	// strategy, while preserving read-only mode ceilings.
+	if !contractDeclared {
+		contract := defaultExecutionContract(req, profile)
+		descriptor := protocol.Describe(contract)
+		req.InteractionContract = contract
+		req.Contract = &descriptor
+		res.Proof.InteractionContract = contract
+		res.Proof.ContractDescriptor = cloneExecutionDescriptor(&descriptor)
+	}
+
 	// ── CONTRACT CEILING (Phase 12 G3) ────────────────────────────────
 	// The executor is the final defense in depth for callers that bypass the
 	// autonomy adapter.  It checks the semantic operation implied by the
@@ -1248,7 +1270,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// admitted capabilities BEFORE any execution stage that could act on the
 	// world. Out-of-scope intents are rejected here — never escalated
 	// implicitly.
-	decision, admitErr := x.admission.Admit(req, x.root, profile)
+	decision, admitErr := x.admission.Admit(req, x.root, profile, req.Contract)
 	if admitErr != nil {
 		err := fmt.Errorf("executor: admission rejected request %s: %w", requestID, admitErr)
 		g.FailExecution(events.FailurePermanent, err, "executor.admission")
@@ -1261,6 +1283,11 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 	req.Context = decision.Snapshot
 	res.Proof.RiskScope = decision.Requested.String()
+	if decision.Contract != nil {
+		descriptor := decision.Contract.Clone()
+		res.Proof.ContractDescriptor = &descriptor
+		res.Proof.InteractionContract = decision.InteractionContract
+	}
 
 	// ── 2. Target resolution ───────────────────────────────────────────
 	targets := req.Targets
@@ -1767,6 +1794,53 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	x.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("executor: no pending mutation for patch %q", patchID)
+	}
+
+	// Re-check the held semantic contract immediately before approval. The
+	// descriptor is immutable on the pending record, but the runtime capability
+	// grant may have changed while the artifact waited for a human; neither may
+	// turn a held FILE_MUTATE into an unadmitted write.
+	approvalDescriptor := cloneExecutionDescriptor(pm.contractDescriptor)
+	if approvalDescriptor == nil && pm.interactionContract.Valid() {
+		descriptor := protocol.Describe(pm.interactionContract)
+		approvalDescriptor = &descriptor
+	}
+	if approvalDescriptor != nil {
+		profile := strategy.ExecutionStrategyProfile{Strategy: strategy.ExecutionStrategy(pm.strategy)}
+		admissionReq := ExecuteRequest{
+			Targets:             append([]string(nil), pm.targets...),
+			Operation:           string(protocol.OperationFileMutate),
+			InteractionContract: pm.interactionContract,
+			Contract:            cloneExecutionDescriptor(approvalDescriptor),
+		}
+		if _, admissionErr := x.admission.Admit(admissionReq, x.root, profile, approvalDescriptor); admissionErr != nil {
+			err := fmt.Errorf("executor: approval rejected request %s: %w", pm.requestID, admissionErr)
+			res := &ExecutionResult{
+				RequestID: pm.requestID,
+				Mode:      pm.mode,
+				SessionID: pm.sessionID,
+				Strategy:  pm.strategy,
+				Targets:   append([]string(nil), pm.targets...),
+				Proof: &ExecutionProof{
+					RequestID:           pm.requestID,
+					SessionID:           pm.sessionID,
+					Strategy:            pm.strategy,
+					StrategyReason:      pm.strategyReason,
+					Targets:             append([]string(nil), pm.targets...),
+					StartedAt:           pm.startedAt,
+					InteractionContract: pm.interactionContract,
+					ContractDescriptor:  cloneExecutionDescriptor(approvalDescriptor),
+				},
+				Err: err,
+			}
+			res.Proof.Outcome = OutcomeFailed
+			res.Proof.FinishedAt = time.Now()
+			if pm.g != nil {
+				pm.g.FailExecution(events.FailurePermanent, err, "executor.approval.admission")
+				setProofGraph(res, pm.g)
+			}
+			return x.finalizeResult(res), err
+		}
 	}
 
 	res := &ExecutionResult{

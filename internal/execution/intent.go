@@ -9,6 +9,7 @@ import (
 	"github.com/PizenLabs/izen/internal/domain/command"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/parser"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // ── IntentGateway (unified intent resolution) ──────────────────────────────
@@ -53,6 +54,11 @@ type IntentResolution struct {
 	// the ExecuteRequest and verified at the RuntimeExecutor admission
 	// boundary; any mid-flight modification fails closed there.
 	Context *ContextSnapshot
+	// InteractionContract and Contract are the normalized semantic descriptor
+	// selected at the intent boundary and carried unchanged to execution
+	// admission. They constrain the request; they never grant authority.
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 }
 
 // IntentGateway is the unified intent resolver. It is stateless beyond its
@@ -118,6 +124,7 @@ func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, In
 		res.Prompt = raw
 		res.Profile = profile
 		req := ExecuteRequest{Prompt: raw, Strategy: &profile, ScopeProvenance: res.ScopeProvenance}
+		bindGatewayContract(&req, &res, profile)
 		freezeGatewayContext(&req, &res, profile, g.root)
 		return req, res, nil
 	}
@@ -141,6 +148,7 @@ func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, In
 		MaxOutputTokens: profile.MaxOutputTokens,
 		Strategy:        &profile,
 	}
+	bindGatewayContract(&req, &res, profile)
 	freezeGatewayContext(&req, &res, profile, g.root)
 	return req, res, nil
 }
@@ -168,6 +176,35 @@ func (g *IntentGateway) selectScopedStrategy(prompt string, scope intentdomain.S
 		profile.Artifact = strategy.ArtifactContract{Kind: "explanation", Bounded: true, Description: "read-only investigation or plan"}
 	}
 	return profile
+}
+
+// bindGatewayContract attaches the semantic descriptor selected at the intent
+// boundary. A scope-authorized mutation receives the bounded agentic contract;
+// an unauthorized mutation remains read-only, and planning receives the
+// structured proposal contract. The descriptor is copied onto the request and
+// resolution so admission never has to reconstruct an untyped operation.
+func bindGatewayContract(req *ExecuteRequest, res *IntentResolution, profile strategy.ExecutionStrategyProfile) {
+	if req == nil {
+		return
+	}
+	contract := protocol.DirectCompletion
+	switch {
+	case profile.Strategy == strategy.MultiFilePlanning:
+		contract = protocol.StructuredCompletion
+	case req.ScopeProvenance.AllowsMutation() &&
+		(profile.Strategy == strategy.TargetedMutation || profile.Strategy == strategy.DirectDeterministic):
+		contract = protocol.AgenticLoop
+	case strings.Contains(strings.ToLower(req.Prompt), "json") || strings.Contains(strings.ToLower(req.Prompt), "schema"):
+		contract = protocol.StructuredCompletion
+	}
+	descriptor := protocol.Describe(contract)
+	req.InteractionContract = contract
+	req.Contract = &descriptor
+	if res != nil {
+		copy := descriptor.Clone()
+		res.InteractionContract = contract
+		res.Contract = &copy
+	}
 }
 
 // freezeGatewayContext seals the intent context payload onto both the request

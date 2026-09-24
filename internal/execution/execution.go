@@ -1,6 +1,8 @@
 package execution
 
 import (
+	"sync/atomic"
+
 	"github.com/PizenLabs/izen/internal/checkpoint"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/authorization"
@@ -8,6 +10,7 @@ import (
 	"github.com/PizenLabs/izen/internal/git"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/runtime/output"
 	"github.com/PizenLabs/izen/internal/session"
 )
@@ -25,6 +28,12 @@ type Engine struct {
 
 	Risk     *RiskClassifier
 	Verifier *Verifier
+	// admission is the legacy Engine's contract-bound dispatch gate. The
+	// canonical RuntimeExecutor owns the production path; this field keeps
+	// older Engine facades from becoming an authority escape when a contract
+	// is explicitly bound to them.
+	admission *AdmissionGateway
+	contract  atomic.Pointer[protocol.ContractDescriptor]
 	// Artifact is the V3 protocol-centric artifact pipeline (contract
 	// parsing, normalization, pluggable validation, failure policy and
 	// reasoning-leak telemetry). It is non-nil for every engine.
@@ -73,6 +82,7 @@ func NewEngine(root string, cfg *config.Config, sess *session.Session, langID ..
 		langID:      activeLangID,
 		Risk:        rc,
 		Verifier:    v,
+		admission:   NewAdmissionGateway(nil),
 		Artifact:    NewV3ArtifactPipeline(),
 	}
 	// The engine owns a fresh mutation boundary from construction. PatchManager
