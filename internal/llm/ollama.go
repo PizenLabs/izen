@@ -12,6 +12,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/httpx"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 type OllamaClient struct {
@@ -60,6 +61,9 @@ func rejectOllamaNamespacedModel(model string) error {
 }
 
 func (c *OllamaClient) buildMessages(req PromptRequest) []openAIMessage {
+	if prepared, _, err := preparePromptContract("ollama", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]openAIMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, openAIMessage{Role: "system", Content: req.System})
@@ -79,12 +83,18 @@ func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 	if err := rejectOllamaNamespacedModel(c.resolveModel(req.Model)); err != nil {
 		return LLMResponse{}, err
 	}
+	prepared, plan, err := preparePromptContract("ollama", req)
+	if err != nil {
+		return LLMResponse{}, err
+	}
+	req = prepared
 	body := openAIReq{
-		Model:       c.resolveModel(req.Model),
-		Messages:    c.buildMessages(req),
-		Stream:      false,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
+		Model:        c.resolveModel(req.Model),
+		Messages:     c.buildMessages(req),
+		Stream:       false,
+		MaxTokens:    req.MaxTokens,
+		Temperature:  req.Temperature,
+		FormatSchema: nativePromptSchema(plan),
 	}
 	if body.MaxTokens <= 0 {
 		body.MaxTokens = 4096
@@ -154,11 +164,24 @@ func (c *OllamaClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		tokenOut = len(text) / 4
 	}
 
-	llmResp := LLMResponse{
+	finishReason := openaiResp.Choices[0].FinishReason
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	llmResp := stampPromptResponse(LLMResponse{
 		Content:      text,
 		TokenInput:   tokenIn,
 		TokenOutput:  tokenOut,
 		TotalCostUSD: 0,
+		FinishReason: protocol.NormalizeFinishReason(finishReason),
+	}, "ollama", c.resolveModel(req.Model), plan)
+	if protocol.IsOutputTruncatedReason(finishReason) {
+		llmResp.Truncated = true
+		llmResp.FinishReason = "length"
+		if c.bus != nil {
+			c.bus.Publish(events.NewProviderUsageUpdate("", c.resolveModel(req.Model), tokenIn, tokenOut, 0))
+		}
+		return llmResp, protocol.NewOutputTruncated("ollama", "length")
 	}
 	if c.bus != nil {
 		c.bus.Publish(events.NewProviderUsageUpdate("", c.resolveModel(req.Model), tokenIn, tokenOut, 0))
@@ -171,12 +194,18 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	if err := rejectOllamaNamespacedModel(c.resolveModel(req.Model)); err != nil {
 		return LLMResponse{}, err
 	}
+	prepared, plan, err := preparePromptContract("ollama", req)
+	if err != nil {
+		return LLMResponse{}, err
+	}
+	req = prepared
 	body := openAIReq{
-		Model:       c.resolveModel(req.Model),
-		Messages:    c.buildMessages(req),
-		Stream:      true,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
+		Model:        c.resolveModel(req.Model),
+		Messages:     c.buildMessages(req),
+		Stream:       true,
+		MaxTokens:    req.MaxTokens,
+		Temperature:  req.Temperature,
+		FormatSchema: nativePromptSchema(plan),
 	}
 	if body.MaxTokens <= 0 {
 		body.MaxTokens = 4096
@@ -216,6 +245,7 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 
 	var full strings.Builder
 	var reasoning strings.Builder
+	finishReason := ""
 	tokenIn, tokenOut := 0, 0
 	reader := newOpenAIStreamReader(resp.Body)
 
@@ -233,6 +263,9 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		if chunk.Usage != nil {
 			tokenIn = chunk.Usage.PromptTokens
 			tokenOut = chunk.Usage.CompletionTokens
+		}
+		if len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason != "" {
+			finishReason = protocol.NormalizeFinishReason(chunk.Choices[0].FinishReason)
 		}
 
 		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
@@ -283,10 +316,20 @@ func (c *OllamaClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		content = stripThinkingTags(reasoning.String())
 	}
 
-	return LLMResponse{
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	response := stampPromptResponse(LLMResponse{
 		Content:      SanitizeOutput(content),
 		TokenInput:   tokenIn,
 		TokenOutput:  tokenOut,
 		TotalCostUSD: 0,
-	}, nil
+		FinishReason: finishReason,
+	}, "ollama", c.resolveModel(req.Model), plan)
+	if protocol.IsOutputTruncatedReason(finishReason) {
+		response.Truncated = true
+		response.FinishReason = "length"
+		return response, protocol.NewOutputTruncated("ollama", "length")
+	}
+	return response, nil
 }

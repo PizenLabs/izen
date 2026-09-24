@@ -685,6 +685,24 @@ type usageReader interface {
 	Usage() ai.ProviderUsage
 }
 
+func stampPlanResponse(resp *ai.Response, req ai.Request) {
+	if resp == nil {
+		return
+	}
+	if resp.Contract == nil && req.Contract != nil {
+		resp.SetContractMetadata(resp.Provider, req.Model, req.InteractionContract, req.Contract)
+	}
+	if resp.FinishReason == "" {
+		resp.FinishReason = resp.Usage.FinishReason
+	}
+	if protocol.IsOutputTruncatedReason(resp.FinishReason) {
+		resp.FinishReason = "length"
+	}
+	if protocol.IsOutputTruncatedReason(resp.Usage.FinishReason) {
+		resp.Usage.FinishReason = "length"
+	}
+}
+
 // complete performs a single LLM synthesis call. When a streaming provider is
 // wired it runs over ExecuteStream and accumulates the buffer rune-safe,
 // stripping reasoning sentinels. A provider-authenticated length finish is
@@ -726,6 +744,9 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 
 	if e.streamProv == nil {
 		resp, err := e.provider(attemptCtx, req)
+		if resp != nil {
+			stampPlanResponse(resp, req)
+		}
 		if err != nil {
 			if attemptCtx.Err() != nil {
 				// Return whatever the provider produced alongside the timeout
@@ -836,12 +857,14 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 	// "stop" completion is always treated as success even if the deadline
 	// expired a microsecond after the last byte.
 	if attemptCtx.Err() != nil && finishReason != "stop" && !truncated {
-		return &ai.Response{
+		response := &ai.Response{
 			Content:      content,
 			TokenInput:   input,
 			TokenOutput:  output,
 			FinishReason: finishReason,
-		}, fmt.Errorf("%w: provider exceeded the %.0fs per-attempt budget", ErrPlanAttemptTimeout, planAttemptTimeout.Seconds())
+		}
+		stampPlanResponse(response, req)
+		return response, fmt.Errorf("%w: provider exceeded the %.0fs per-attempt budget", ErrPlanAttemptTimeout, planAttemptTimeout.Seconds())
 	}
 
 	// Truncation-aware response: the accumulated buffer is retained for
@@ -854,6 +877,7 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 		FinishReason: finishReason,
 		Truncated:    truncated,
 	}
+	stampPlanResponse(response, req)
 	if truncated {
 		return response, ai.NewOutputTruncated(req.Model, finishReason)
 	}
@@ -865,7 +889,7 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 // a partial buffer when this returns true.
 func isTruncatedFinish(reason string) bool {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "length", "max_tokens", "max tokens", "max_output_tokens", "max output tokens", "truncated", "token_limit", "output_limit", "max_output":
+	case "length", "max_tokens", "max tokens", "max_output_tokens", "max output tokens", "max_output_token", "max-output-tokens", "max-output-token", "max output token", "truncated", "token_limit", "output_limit", "max_output":
 		return true
 	default:
 		return false

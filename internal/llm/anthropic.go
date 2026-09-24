@@ -96,6 +96,9 @@ func (c *AnthropicClient) WithEventBus(bus *events.Bus) *AnthropicClient {
 }
 
 func (c *AnthropicClient) buildSystemContent(req PromptRequest) []anthropicContent {
+	if prepared, _, err := preparePromptContract("anthropic", req); err == nil {
+		req = prepared
+	}
 	if req.System == "" {
 		return nil
 	}
@@ -107,6 +110,9 @@ func (c *AnthropicClient) buildSystemContent(req PromptRequest) []anthropicConte
 }
 
 func (c *AnthropicClient) buildMessages(req PromptRequest) []anthropicMessage {
+	if prepared, _, err := preparePromptContract("anthropic", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]anthropicMessage, 0, len(req.Messages))
 	for i, m := range req.Messages {
 		content := anthropicContent{Type: "text", Text: m.Content}
@@ -125,6 +131,11 @@ func (c *AnthropicClient) buildMessages(req PromptRequest) []anthropicMessage {
 }
 
 func (c *AnthropicClient) GenerateResponse(ctx context.Context, req PromptRequest) (LLMResponse, error) {
+	prepared, plan, err := preparePromptContract("anthropic", req)
+	if err != nil {
+		return LLMResponse{}, err
+	}
+	req = prepared
 	maxTokens := req.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 4096
@@ -192,16 +203,18 @@ func (c *AnthropicClient) GenerateResponse(ctx context.Context, req PromptReques
 		cacheRead = claudeResp.Usage.CacheReadTokens
 	}
 
-	llmResp := LLMResponse{
+	finishReason := protocol.NormalizeFinishReason(claudeResp.StopReason)
+	llmResp := stampPromptResponse(LLMResponse{
 		Content:          content,
 		TokenInput:       tokenIn,
 		TokenOutput:      tokenOut,
 		CacheWriteTokens: cacheWrite,
 		CacheReadTokens:  cacheRead,
-		FinishReason:     claudeResp.StopReason,
-	}
+		FinishReason:     finishReason,
+	}, "anthropic", c.resolveModel(req.Model), plan)
 	if protocol.IsOutputTruncatedReason(claudeResp.StopReason) {
 		llmResp.Truncated = true
+		llmResp.FinishReason = "length"
 		if c.bus != nil {
 			c.bus.Publish(events.NewProviderUsageUpdate("", c.resolveModel(req.Model), tokenIn, tokenOut, 0))
 		}
@@ -214,6 +227,11 @@ func (c *AnthropicClient) GenerateResponse(ctx context.Context, req PromptReques
 }
 
 func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {
+	prepared, plan, err := preparePromptContract("anthropic", req)
+	if err != nil {
+		return LLMResponse{}, err
+	}
+	req = prepared
 	maxTokens := req.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 4096
@@ -316,40 +334,41 @@ func (c *AnthropicClient) StreamResponse(ctx context.Context, req PromptRequest,
 				// before message_stop. Return immediately so the HTTP body is
 				// closed by the defer without waiting for another frame.
 				cancel()
-				response := LLMResponse{
+				response := stampPromptResponse(LLMResponse{
 					Content:          SanitizeOutput(full.String()),
 					TokenInput:       tokenIn,
 					TokenOutput:      tokenOut,
 					CacheWriteTokens: cacheWrite,
 					CacheReadTokens:  cacheRead,
-					FinishReason:     event.Delta.StopReason,
-				}
+					FinishReason:     protocol.NormalizeFinishReason(event.Delta.StopReason),
+				}, "anthropic", c.resolveModel(req.Model), plan)
 				if protocol.IsOutputTruncatedReason(event.Delta.StopReason) {
 					response.Truncated = true
-					return response, protocol.NewOutputTruncated("anthropic", event.Delta.StopReason)
+					response.FinishReason = "length"
+					return response, protocol.NewOutputTruncated("anthropic", "length")
 				}
 				return response, nil
 			}
 		case "message_stop":
 			cancel()
-			return LLMResponse{
+			return stampPromptResponse(LLMResponse{
 				Content:          SanitizeOutput(full.String()),
 				TokenInput:       tokenIn,
 				TokenOutput:      tokenOut,
 				CacheWriteTokens: cacheWrite,
 				CacheReadTokens:  cacheRead,
-			}, nil
+			}, "anthropic", c.resolveModel(req.Model), plan), nil
 		}
 	}
 
 	cancel()
-	return LLMResponse{
+	return stampPromptResponse(LLMResponse{
 		Content:          SanitizeOutput(full.String()),
 		TokenInput:       tokenIn,
 		TokenOutput:      tokenOut,
 		CacheWriteTokens: cacheWrite,
 		CacheReadTokens:  cacheRead,
-	}, nil
+	}, "anthropic", c.resolveModel(req.Model), plan), nil
 }
 
 func (c *AnthropicClient) resolveModel(override string) string {

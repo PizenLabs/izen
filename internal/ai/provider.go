@@ -2,6 +2,7 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -38,9 +39,118 @@ type Message struct {
 	Content string `json:"content"`
 }
 
-type ResponseFormat struct {
-	Type string `json:"type"` // "json_object" or "text"
+// JSONSchemaFormat is the OpenAI-compatible json_schema envelope. Keeping the
+// schema as RawMessage lets a protocol descriptor be forwarded without a
+// lossy map[string]any round trip.
+type JSONSchemaFormat struct {
+	Name   string          `json:"name"`
+	Strict bool            `json:"strict"`
+	Schema json.RawMessage `json:"schema"`
 }
+
+// ResponseFormat is the provider-neutral structured-output request shape. Type
+// may be the legacy "json_object"/"text" value or the OpenAI-compatible
+// "json_schema" value. Name, Strict, and Schema are convenience fields used by
+// adapters; MarshalJSON emits the provider's nested json_schema envelope.
+type ResponseFormat struct {
+	Type       string            `json:"type"` // "json_schema", "json_object", or "text"
+	Name       string            `json:"-"`
+	Strict     bool              `json:"-"`
+	Schema     json.RawMessage   `json:"-"`
+	JSONSchema *JSONSchemaFormat `json:"-"`
+}
+
+// MarshalJSON keeps the old two-field representation byte-for-byte compatible
+// while allowing the native JSON Schema representation to be added without a
+// second request type.
+func (f ResponseFormat) MarshalJSON() ([]byte, error) {
+	if f.Type != "json_schema" {
+		return json.Marshal(struct {
+			Type string `json:"type"`
+		}{Type: f.Type})
+	}
+	format := f.JSONSchema
+	if format == nil {
+		format = &JSONSchemaFormat{}
+	} else {
+		copy := *format
+		format = &copy
+	}
+	if format.Name == "" {
+		format.Name = f.Name
+	}
+	if format.Name == "" {
+		format.Name = "interaction_contract"
+	}
+	if !format.Strict {
+		format.Strict = f.Strict
+	}
+	if len(format.Schema) == 0 {
+		format.Schema = append(json.RawMessage(nil), f.Schema...)
+	}
+	if len(format.Schema) == 0 {
+		format.Schema = json.RawMessage(`{"type":"object"}`)
+	}
+	return json.Marshal(struct {
+		Type       string            `json:"type"`
+		JSONSchema *JSONSchemaFormat `json:"json_schema"`
+	}{Type: f.Type, JSONSchema: format})
+}
+
+// NewJSONSchemaResponseFormat creates the native OpenAI-compatible structured
+// output envelope from a provider-neutral schema document.
+func NewJSONSchemaResponseFormat(name string, schema json.RawMessage) *ResponseFormat {
+	return &ResponseFormat{
+		Type:   "json_schema",
+		Name:   name,
+		Strict: true,
+		Schema: append(json.RawMessage(nil), schema...),
+	}
+}
+
+// UnmarshalJSON accepts both the compact convenience representation and the
+// provider's nested json_schema envelope.
+func (f *ResponseFormat) UnmarshalJSON(data []byte) error {
+	if f == nil {
+		return nil
+	}
+	var wire struct {
+		Type       string            `json:"type"`
+		Name       string            `json:"name"`
+		Strict     bool              `json:"strict"`
+		Schema     json.RawMessage   `json:"schema"`
+		JSONSchema *JSONSchemaFormat `json:"json_schema"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	f.Type = wire.Type
+	f.Name = wire.Name
+	f.Strict = wire.Strict
+	f.Schema = append(json.RawMessage(nil), wire.Schema...)
+	f.JSONSchema = wire.JSONSchema
+	if f.JSONSchema != nil {
+		if f.Name == "" {
+			f.Name = f.JSONSchema.Name
+		}
+		f.Strict = f.JSONSchema.Strict
+		if len(f.Schema) == 0 {
+			f.Schema = append(json.RawMessage(nil), f.JSONSchema.Schema...)
+		}
+	}
+	return nil
+}
+
+// SchemaMode lets an embedding boundary explicitly select the adaptive wire
+// strategy. Empty/Auto is the production default: use native schema support
+// when the adapter knows it, otherwise use the compact prompt fallback.
+type SchemaMode string
+
+const (
+	SchemaModeAuto   SchemaMode = "auto"
+	SchemaModeNative SchemaMode = "native"
+	SchemaModePrompt SchemaMode = "prompt"
+)
 
 type Request struct {
 	Model    string    `json:"model"`
@@ -59,7 +169,14 @@ type Request struct {
 	Stop           []string                     `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
 	Temperature    float64                      `json:"-"` // 0 = use provider default
 	ResponseFormat *ResponseFormat              `json:"response_format,omitempty"`
-	Tools          []ToolDefinition             `json:"-"` // Native LLM function calling tool definitions
+	// SchemaMode optionally overrides the adapter's native-vs-fallback choice.
+	// The default is SchemaModeAuto; it never changes the semantic contract.
+	SchemaMode SchemaMode `json:"-"`
+	// ModelMetadata is an optional provider-catalog fact. An explicit false
+	// SupportsStructuredOutput value forces the prompt fallback even when the
+	// provider family normally accepts a native schema field.
+	ModelMetadata *protocol.ModelMetadata `json:"-"`
+	Tools         []ToolDefinition        `json:"-"` // Native LLM function calling tool definitions
 	// Reasoning carries the resolved reasoning control (effort level, thinking
 	// budget, CoT cap) produced by the decision engine. Providers translate it
 	// into their native API payload (reasoning_effort / thinking.budget_tokens /
@@ -147,6 +264,17 @@ func (r Request) EffectiveContract() *protocol.ContractDescriptor {
 	return &d
 }
 
+// StructuralOutputSchema returns the normalized JSON Schema document carried
+// by the request contract. A nil document means the contract is textual or
+// otherwise has no JSON structural output.
+func (r Request) StructuralOutputSchema() (json.RawMessage, error) {
+	descriptor := r.EffectiveContract()
+	if descriptor == nil {
+		return nil, nil
+	}
+	return descriptor.JSONSchema()
+}
+
 // Empty reports whether the usage record carries no known provider usage.
 // This is the "unknown" state and must not render as a literal zero.
 func (u ProviderUsage) Empty() bool {
@@ -168,6 +296,22 @@ type Response struct {
 	TokenInput  int        `json:"token_input"`
 	TokenOutput int        `json:"token_output"`
 	ToolCalls   []ToolCall `json:"tool_calls,omitempty"` // Native LLM function calls from tool_calls finish_reason
+	// Provider and Model identify the wire endpoint that produced this result.
+	// They are metadata only; callers must not infer authority from them.
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+	// InteractionContract and Contract preserve the exact semantic descriptor
+	// used to build the request. Providers return a defensive copy so a caller
+	// cannot mutate admission state through a response value.
+	InteractionContract protocol.InteractionContract `json:"interaction_contract,omitempty"`
+	Contract            *protocol.ContractDescriptor `json:"interaction_contract_descriptor,omitempty"`
+	// ContractMetadata is a compatibility alias for callers that use the
+	// explicit metadata name. It is kept out of JSON to avoid duplicating the
+	// canonical descriptor in serialized evidence.
+	ContractMetadata *protocol.ContractDescriptor `json:"-"`
+	NativeSchema     bool                         `json:"native_schema,omitempty"`
+	Schema           json.RawMessage              `json:"schema,omitempty"`
+	InlineConstraint string                       `json:"inline_constraint,omitempty"`
 	// FinishReason is the provider's terminal finish_reason when one is
 	// observable ("stop", "length", "tool_calls", ...). Streaming consumers
 	// populate it from the stream's FinishReasonProvider; non-streaming
@@ -206,8 +350,10 @@ func (r *Response) OutputError() error {
 	}
 	if !protocol.IsOutputTruncatedReason(reason) {
 		reason = ""
+	} else {
+		reason = "length"
 	}
-	return NewOutputTruncated("", reason)
+	return NewOutputTruncated(r.Provider, reason)
 }
 
 // ValidateOutputCompletion is the response-boundary form of OutputError.
@@ -216,6 +362,97 @@ func ValidateOutputCompletion(resp *Response) error {
 		return nil
 	}
 	return resp.OutputError()
+}
+
+// ResponseMetadata is the standardized provider payload metadata wrapper. It
+// keeps protocol identity, terminal outcome, and authoritative usage together
+// for non-streaming callers and for stream result implementations.
+type ResponseMetadata struct {
+	Provider            string                       `json:"provider,omitempty"`
+	Model               string                       `json:"model,omitempty"`
+	InteractionContract protocol.InteractionContract `json:"interaction_contract,omitempty"`
+	Contract            *protocol.ContractDescriptor `json:"interaction_contract_descriptor,omitempty"`
+	ContractMetadata    *protocol.ContractDescriptor `json:"-"`
+	FinishReason        string                       `json:"finish_reason,omitempty"`
+	Truncated           bool                         `json:"truncated,omitempty"`
+	NativeSchema        bool                         `json:"native_schema,omitempty"`
+	Schema              json.RawMessage              `json:"schema,omitempty"`
+	InlineConstraint    string                       `json:"inline_constraint,omitempty"`
+	Usage               ProviderUsage                `json:"usage,omitempty"`
+}
+
+// ProviderPayload and StandardizedResponse are descriptive aliases for
+// integrations that name the response wrapper after its transport boundary.
+type ProviderPayload = ResponseMetadata
+type StandardizedResponse = ResponseMetadata
+
+// Metadata returns a defensive, uniform view of the response envelope.
+func (r *Response) Metadata() ResponseMetadata {
+	if r == nil {
+		return ResponseMetadata{}
+	}
+	contract := r.Contract
+	if contract == nil {
+		contract = r.ContractMetadata
+	}
+	if contract != nil {
+		copy := contract.Clone()
+		contract = &copy
+	}
+	usage := r.Usage
+	if r.FinishReason != "" && usage.FinishReason == "" {
+		usage.FinishReason = r.FinishReason
+	}
+	if protocol.IsOutputTruncatedReason(usage.FinishReason) {
+		usage.FinishReason = "length"
+	}
+	if r.Truncated && usage.FinishReason == "" {
+		usage.FinishReason = "length"
+	}
+	finishReason := protocol.NormalizeFinishReason(r.FinishReason)
+	if finishReason == "" {
+		finishReason = usage.FinishReason
+	}
+	truncated := r.Truncated || protocol.IsOutputTruncatedReason(finishReason)
+	return ResponseMetadata{
+		Provider:            r.Provider,
+		Model:               r.Model,
+		InteractionContract: r.InteractionContract,
+		Contract:            contract,
+		ContractMetadata:    contract,
+		FinishReason:        finishReason,
+		Truncated:           truncated,
+		NativeSchema:        r.NativeSchema,
+		Schema:              append(json.RawMessage(nil), r.Schema...),
+		InlineConstraint:    r.InlineConstraint,
+		Usage:               usage,
+	}
+}
+
+// ProviderPayload returns the standardized transport wrapper under its
+// provider-oriented name.
+func (r *Response) ProviderPayload() ResponseMetadata { return r.Metadata() }
+
+// SetContractMetadata stamps the request identity onto a response without
+// retaining the caller's mutable descriptor pointer.
+func (r *Response) SetContractMetadata(provider, model string, contract protocol.InteractionContract, descriptor *protocol.ContractDescriptor) {
+	if r == nil {
+		return
+	}
+	r.Provider = provider
+	r.Model = model
+	if contract == "" && descriptor != nil {
+		contract = descriptor.Contract
+	}
+	r.InteractionContract = contract
+	if descriptor == nil {
+		r.Contract = nil
+		r.ContractMetadata = nil
+		return
+	}
+	copy := descriptor.Clone()
+	r.Contract = &copy
+	r.ContractMetadata = &copy
 }
 
 type Provider interface {
@@ -237,6 +474,13 @@ type FinishReasonProvider interface {
 // Consumers should prefer this over comparing provider-specific strings.
 type TruncationProvider interface {
 	TruncationError() error
+}
+
+// ResponseMetadataProvider is implemented by stream results that can expose
+// the same standardized contract/finish-reason wrapper as a non-streaming
+// response. The core pipeline uses this metadata after the reader reaches EOF.
+type ResponseMetadataProvider interface {
+	ResponseMetadata() ResponseMetadata
 }
 
 // UsageProvider is implemented by stream results that can report the

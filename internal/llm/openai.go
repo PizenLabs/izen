@@ -14,6 +14,7 @@ import (
 	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/httpx"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 type OpenAIClient struct {
@@ -99,12 +100,30 @@ func clampOpenAIMaxTokens(n int) int {
 type streamOptions = StreamOptions
 
 type openAIReq struct {
-	Model         string          `json:"model"`
-	Messages      []openAIMessage `json:"messages"`
-	Stream        bool            `json:"stream,omitempty"`
-	MaxTokens     int             `json:"max_tokens,omitempty"`
-	Temperature   float64         `json:"temperature,omitempty"`
-	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
+	Model          string                `json:"model"`
+	Messages       []openAIMessage       `json:"messages"`
+	Stream         bool                  `json:"stream,omitempty"`
+	MaxTokens      int                   `json:"max_tokens,omitempty"`
+	Temperature    float64               `json:"temperature,omitempty"`
+	StreamOptions  *streamOptions        `json:"stream_options,omitempty"`
+	ResponseFormat *promptResponseFormat `json:"response_format,omitempty"`
+	FormatSchema   json.RawMessage       `json:"-"`
+}
+
+// MarshalJSON lets the shared OpenAI-compatible request carry Ollama's native
+// format object without changing the legacy request's default wire shape.
+func (r openAIReq) MarshalJSON() ([]byte, error) {
+	type alias openAIReq
+	raw, err := json.Marshal(alias(r))
+	if err != nil || len(r.FormatSchema) == 0 {
+		return raw, err
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	fields["format"] = json.RawMessage(r.FormatSchema)
+	return json.Marshal(fields)
 }
 
 type openAIResp struct {
@@ -176,6 +195,9 @@ func (c *OpenAIClient) Name() string {
 }
 
 func (c *OpenAIClient) buildMessages(req PromptRequest) []openAIMessage {
+	if prepared, _, err := preparePromptContract(c.Name(), req); err == nil {
+		req = prepared
+	}
 	msgs := make([]openAIMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, openAIMessage{Role: "system", Content: req.System})
@@ -198,12 +220,19 @@ func (c *OpenAIClient) resolveModel(override string) string {
 }
 
 func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) (LLMResponse, error) {
+	provider := c.Name()
+	prepared, plan, err := preparePromptContract(provider, req)
+	if err != nil {
+		return LLMResponse{}, err
+	}
+	req = prepared
 	body := openAIReq{
-		Model:       c.resolveModel(req.Model),
-		Messages:    c.buildMessages(req),
-		Stream:      false,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
+		Model:          c.resolveModel(req.Model),
+		Messages:       c.buildMessages(req),
+		Stream:         false,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		ResponseFormat: plan.ResponseFormat,
 	}
 	// Default output limit: never send unconstrained max_tokens (0 or null).
 	body.MaxTokens = clampOpenAIMaxTokens(body.MaxTokens)
@@ -260,7 +289,7 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 	// Task 1: truncated payload handling — intercept BEFORE envelope parsing,
 	// but PRESERVE the canonical partial buffer. Universal Stream Outcome:
 	// length -> PARTIAL across all tiers; never clear/swallow the buffer.
-	if openaiResp.Choices[0].FinishReason == "length" {
+	if protocol.IsOutputTruncatedReason(openaiResp.Choices[0].FinishReason) {
 		tokenIn, tokenOut, cacheRead := 0, 0, 0
 		if openaiResp.Usage != nil {
 			tokenIn = openaiResp.Usage.PromptTokens
@@ -269,14 +298,15 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 				cacheRead = openaiResp.Usage.PromptDetails.CachedTokens
 			}
 		}
-		return LLMResponse{
+		response := stampPromptResponse(LLMResponse{
 			Content:         content,
 			TokenInput:      tokenIn,
 			TokenOutput:     tokenOut,
 			CacheReadTokens: cacheRead,
 			FinishReason:    "length",
 			Truncated:       true,
-		}, NewOutputTruncated("openai", "length")
+		}, provider, c.resolveModel(req.Model), plan)
+		return response, NewOutputTruncated("openai", "length")
 	}
 	content = SanitizeOutput(content)
 
@@ -291,14 +321,18 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 		}
 	}
 
-	llmResp := LLMResponse{
+	finishReason := openaiResp.Choices[0].FinishReason
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	llmResp := stampPromptResponse(LLMResponse{
 		Content:         content,
 		TokenInput:      tokenIn,
 		TokenOutput:     tokenOut,
 		CacheReadTokens: cacheRead,
-		FinishReason:    "stop",
+		FinishReason:    protocol.NormalizeFinishReason(finishReason),
 		Truncated:       false,
-	}
+	}, provider, c.resolveModel(req.Model), plan)
 
 	if strings.Contains(c.baseURL, "openrouter") {
 		modelID := c.resolveModel(req.Model)
@@ -320,13 +354,20 @@ func (c *OpenAIClient) GenerateResponse(ctx context.Context, req PromptRequest) 
 }
 
 func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {
+	provider := c.Name()
+	prepared, plan, err := preparePromptContract(provider, req)
+	if err != nil {
+		return LLMResponse{}, err
+	}
+	req = prepared
 	body := openAIReq{
-		Model:         c.resolveModel(req.Model),
-		Messages:      c.buildMessages(req),
-		Stream:        true,
-		MaxTokens:     req.MaxTokens,
-		Temperature:   req.Temperature,
-		StreamOptions: &streamOptions{IncludeUsage: true},
+		Model:          c.resolveModel(req.Model),
+		Messages:       c.buildMessages(req),
+		Stream:         true,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		StreamOptions:  &streamOptions{IncludeUsage: true},
+		ResponseFormat: plan.ResponseFormat,
 	}
 	// Default output limit: never send unconstrained max_tokens (0 or null).
 	body.MaxTokens = clampOpenAIMaxTokens(body.MaxTokens)
@@ -389,6 +430,7 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	// before the provider delivers its final usage chunk.
 	outputChars := 0
 	truncated := false
+	finishReason := ""
 	reader := newOpenAIStreamReader(resp.Body)
 	reader.cancel = cancel
 	// Phase 6.4.5 unified stream accumulator: delta.reasoning, delta.thinking,
@@ -456,9 +498,13 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 			accum.SetAuthoritative(tokenIn, tokenOut)
 		}
 
-		// Task 1: intercept finish_reason == "length" BEFORE any envelope parsing.
-		if len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason == "length" {
-			truncated = true
+		// Task 1: intercept every provider output-ceiling spelling BEFORE
+		// any envelope parsing.
+		if len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason != "" {
+			finishReason = protocol.NormalizeFinishReason(chunk.Choices[0].FinishReason)
+			if protocol.IsOutputTruncatedReason(chunk.Choices[0].FinishReason) {
+				truncated = true
+			}
 		}
 		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
 			delta := chunk.Choices[0].Delta
@@ -503,14 +549,14 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 	// verbatim (no synthetic mutation); callers map length -> PARTIAL.
 	if truncated {
 		cancel()
-		return LLMResponse{
+		return stampPromptResponse(LLMResponse{
 			Content:         full.String(),
 			TokenInput:      tokenIn,
 			TokenOutput:     tokenOut,
 			CacheReadTokens: cacheRead,
 			FinishReason:    "length",
 			Truncated:       true,
-		}, NewOutputTruncated("openai", "length")
+		}, provider, c.resolveModel(req.Model), plan), NewOutputTruncated("openai", "length")
 	}
 	content := full.String()
 	if strings.TrimSpace(content) == "" {
@@ -518,14 +564,17 @@ func (c *OpenAIClient) StreamResponse(ctx context.Context, req PromptRequest, ha
 		content = stripThinkingTags(reasoning.String())
 	}
 
-	llmResp := LLMResponse{
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	llmResp := stampPromptResponse(LLMResponse{
 		Content:         SanitizeOutput(content),
 		TokenInput:      tokenIn,
 		TokenOutput:     tokenOut,
 		CacheReadTokens: cacheRead,
-		FinishReason:    "stop",
+		FinishReason:    finishReason,
 		Truncated:       false,
-	}
+	}, provider, c.resolveModel(req.Model), plan)
 
 	if strings.Contains(c.baseURL, "openrouter") {
 		modelID := c.resolveModel(req.Model)

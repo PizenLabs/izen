@@ -48,6 +48,27 @@ type claudeThinking struct {
 	BudgetTokens int    `json:"budget_tokens"`
 }
 
+type claudeTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+func claudeTools(tools []ai.ToolDefinition) []claudeTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]claudeTool, 0, len(tools))
+	for _, tool := range tools {
+		out = append(out, claudeTool{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			InputSchema: append(json.RawMessage(nil), tool.Function.Parameters...),
+		})
+	}
+	return out
+}
+
 type claudeRequest struct {
 	Model         string          `json:"model"`
 	Messages      []claudeMessage `json:"messages"`
@@ -57,6 +78,7 @@ type claudeRequest struct {
 	System        string          `json:"system,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
 	Thinking      *claudeThinking `json:"thinking,omitempty"`
+	Tools         []claudeTool    `json:"tools,omitempty"`
 	// ExtraParams carries arbitrary provider-native JSON fields merged
 	// directly into the HTTP POST body (generic passthrough).
 	ExtraParams map[string]any `json:"-"`
@@ -136,6 +158,9 @@ type claudeDelta struct {
 }
 
 func (p *ClaudeProvider) buildMessages(req ai.Request) []claudeMessage {
+	if prepared, _, err := PrepareContractRequest("anthropic", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]claudeMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		content := sanitizeContent(m.Content)
@@ -159,6 +184,11 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	if req.Model != "" {
 		model = req.Model
 	}
+	prepared, plan, err := PrepareContractRequest("anthropic", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -175,7 +205,11 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		System:        req.System,
 		StopSequences: req.Stop,
 		Thinking:      thinkingFor(req),
+		Tools:         claudeTools(req.Tools),
 		ExtraParams:   req.ExtraParams,
+	}
+	if isCasualSystemPrompt(req.System) {
+		body.Tools = nil
 	}
 
 	payload, err := json.Marshal(body)
@@ -236,15 +270,14 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 
 	finishReason := claudeStopReason(claudeResp.StopReason)
 	response := &ai.Response{
-		Content:      content,
-		TokenInput:   tokenIn,
-		TokenOutput:  tokenOut,
-		FinishReason: finishReason,
-		Truncated:    isOutputLength(finishReason),
-		Usage:        usage,
+		Content:     content,
+		TokenInput:  tokenIn,
+		TokenOutput: tokenOut,
+		Usage:       usage,
 	}
-	if isOutputLength(finishReason) {
-		return response, ai.NewOutputTruncated("anthropic", finishReason)
+	StampResponseMetadata(response, "anthropic", model, plan, finishReason)
+	if response.Truncated {
+		return response, ai.NewOutputTruncated("anthropic", "length")
 	}
 	return response, nil
 }
@@ -254,6 +287,11 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	if req.Model != "" {
 		model = req.Model
 	}
+	prepared, plan, err := PrepareContractRequest("anthropic", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -270,6 +308,7 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		System:        req.System,
 		StopSequences: req.Stop,
 		Thinking:      thinkingFor(req),
+		Tools:         claudeTools(req.Tools),
 		ExtraParams:   req.ExtraParams,
 	}
 
@@ -308,17 +347,18 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	sr.usage.markRequestStarted(time.Now())
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &ClaudeStreamResult{ReadCloser: sr, sr: sr}, nil
+	return &ClaudeStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("anthropic", model, plan)}, nil
 }
 
 type ClaudeStreamResult struct {
 	io.ReadCloser
-	sr *claudeSSEReader
+	sr       *claudeSSEReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *ClaudeStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -329,14 +369,22 @@ func (r *ClaudeStreamResult) Usage() ai.ProviderUsage {
 // stop_reason ("end_turn", "tool_use", ...) is returned.
 func (r *ClaudeStreamResult) FinishReason() string {
 	if r.sr != nil {
-		switch r.sr.finishReason {
-		case "max_tokens":
-			return "length"
-		default:
-			return r.sr.finishReason
-		}
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// this stream.
+func (r *ClaudeStreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	metadata := r.metadata
+	metadata.FinishReason = r.FinishReason()
+	metadata.Truncated = isOutputLength(metadata.FinishReason)
+	metadata.Usage = normalizeUsageMetadata(r.Usage())
+	return metadata
 }
 
 func (r *ClaudeStreamResult) TruncationError() error {

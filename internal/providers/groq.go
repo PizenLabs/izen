@@ -44,17 +44,24 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 	if model == "" {
 		return nil, fmt.Errorf("groq: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
+	prepared, plan, err := PrepareContractRequest("groq", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
 	body := groqRequest{
-		Model:       model,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      false,
-		ExtraParams: req.ExtraParams,
+		Model:          model,
+		Messages:       msgs,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		Stop:           req.Stop,
+		Stream:         false,
+		ResponseFormat: req.ResponseFormat,
+		Tools:          marshalContractTools(req.Tools),
+		ExtraParams:    req.ExtraParams,
 	}
 
 	payload, err := json.Marshal(body)
@@ -115,15 +122,14 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 	}
 
 	response := &ai.Response{
-		Content:      content,
-		TokenInput:   tokenIn,
-		TokenOutput:  tokenOut,
-		FinishReason: groqResp.Choices[0].FinishReason,
-		Truncated:    isOutputLength(groqResp.Choices[0].FinishReason),
-		Usage:        usage,
+		Content:     content,
+		TokenInput:  tokenIn,
+		TokenOutput: tokenOut,
+		Usage:       usage,
 	}
-	if isOutputLength(groqResp.Choices[0].FinishReason) {
-		return response, ai.NewOutputTruncated("groq", groqResp.Choices[0].FinishReason)
+	StampResponseMetadata(response, "groq", model, plan, groqResp.Choices[0].FinishReason)
+	if response.Truncated {
+		return response, ai.NewOutputTruncated("groq", "length")
 	}
 	return response, nil
 }
@@ -133,18 +139,25 @@ func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.Re
 	if model == "" {
 		return nil, fmt.Errorf("groq: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
+	prepared, plan, err := PrepareContractRequest("groq", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
 	body := groqRequest{
-		Model:         model,
-		Messages:      msgs,
-		MaxTokens:     req.MaxTokens,
-		Temperature:   req.Temperature,
-		Stop:          req.Stop,
-		Stream:        true,
-		StreamOptions: &streamOptions{IncludeUsage: true},
-		ExtraParams:   req.ExtraParams,
+		Model:          model,
+		Messages:       msgs,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		Stop:           req.Stop,
+		Stream:         true,
+		StreamOptions:  &streamOptions{IncludeUsage: true},
+		ResponseFormat: req.ResponseFormat,
+		Tools:          marshalContractTools(req.Tools),
+		ExtraParams:    req.ExtraParams,
 	}
 
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -182,10 +195,13 @@ func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.Re
 	sr.usage.markRequestStarted(time.Now())
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &GroqStreamResult{ReadCloser: sr, sr: sr}, nil
+	return &GroqStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("groq", model, plan)}, nil
 }
 
 func (p *GroqProvider) buildMessages(req ai.Request) []groqMessage {
+	if prepared, _, err := PrepareContractRequest("groq", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]groqMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, groqMessage{Role: "system", Content: req.System})
@@ -203,13 +219,15 @@ type groqMessage struct {
 }
 
 type groqRequest struct {
-	Model         string         `json:"model"`
-	Messages      []groqMessage  `json:"messages"`
-	MaxTokens     int            `json:"max_tokens,omitempty"`
-	Temperature   float64        `json:"temperature,omitempty"`
-	Stop          []string       `json:"stop,omitempty"`
-	Stream        bool           `json:"stream,omitempty"`
-	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+	Model          string             `json:"model"`
+	Messages       []groqMessage      `json:"messages"`
+	MaxTokens      int                `json:"max_tokens,omitempty"`
+	Temperature    float64            `json:"temperature,omitempty"`
+	Stop           []string           `json:"stop,omitempty"`
+	Stream         bool               `json:"stream,omitempty"`
+	StreamOptions  *streamOptions     `json:"stream_options,omitempty"`
+	ResponseFormat *ai.ResponseFormat `json:"response_format,omitempty"`
+	Tools          []json.RawMessage  `json:"tools,omitempty"`
 	// ExtraParams carries arbitrary provider-native JSON fields merged
 	// directly into the HTTP POST body (generic passthrough).
 	ExtraParams map[string]any `json:"-"`
@@ -263,12 +281,13 @@ func (u *groqUsage) ProviderUsage() ai.ProviderUsage {
 
 type GroqStreamResult struct {
 	io.ReadCloser
-	sr *groqSSEReader
+	sr       *groqSSEReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *GroqStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -277,9 +296,22 @@ func (r *GroqStreamResult) Usage() ai.ProviderUsage {
 // ("stop", "length", "tool_calls", ...), or "" if none was seen.
 func (r *GroqStreamResult) FinishReason() string {
 	if r.sr != nil {
-		return r.sr.finishReason
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// this stream.
+func (r *GroqStreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	metadata := r.metadata
+	metadata.FinishReason = r.FinishReason()
+	metadata.Truncated = isOutputLength(metadata.FinishReason)
+	metadata.Usage = normalizeUsageMetadata(r.Usage())
+	return metadata
 }
 
 func (r *GroqStreamResult) TruncationError() error {

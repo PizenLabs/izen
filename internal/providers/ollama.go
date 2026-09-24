@@ -71,8 +71,12 @@ type ollamaRequest struct {
 	Stream        bool            `json:"stream,omitempty"`
 	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
 	Format        string          `json:"format,omitempty"` // "json" for structured output
-	MaxTokens     *int            `json:"max_tokens,omitempty"`
-	Options       *struct {
+	// FormatSchema carries Ollama's native JSON Schema object. It is kept out
+	// of the default tags because Format remains a backwards-compatible string
+	// for callers that explicitly request generic JSON mode.
+	FormatSchema json.RawMessage `json:"-"`
+	MaxTokens    *int            `json:"max_tokens,omitempty"`
+	Options      *struct {
 		NumPredict  int     `json:"num_predict"`
 		Temperature float64 `json:"temperature,omitempty"`
 	} `json:"options,omitempty"`
@@ -84,7 +88,16 @@ type ollamaRequest struct {
 // MarshalJSON merges ExtraParams into the top-level object. Native keys win.
 func (r ollamaRequest) MarshalJSON() ([]byte, error) {
 	type alias ollamaRequest
-	return marshalWithExtra(alias(r), r.ExtraParams)
+	raw, err := marshalWithExtra(alias(r), r.ExtraParams)
+	if err != nil || len(r.FormatSchema) == 0 {
+		return raw, err
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	fields["format"] = json.RawMessage(compactJSON(r.FormatSchema))
+	return json.Marshal(fields)
 }
 
 type ollamaResponse struct {
@@ -169,6 +182,9 @@ func sanitizeContent(s string) string {
 }
 
 func (p *OllamaProvider) buildMessages(req ai.Request) []ollamaMessage {
+	if prepared, _, err := PrepareContractRequest("ollama", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]ollamaMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, ollamaMessage{Role: "system", Content: req.System})
@@ -190,6 +206,11 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	if err := rejectNamespacedModel(model); err != nil {
 		return nil, err
 	}
+	prepared, plan, err := PrepareContractRequest("ollama", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -198,11 +219,12 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		maxTokens = 4096
 	}
 	body := ollamaRequest{
-		Model:       model,
-		Messages:    msgs,
-		Stream:      false,
-		MaxTokens:   &maxTokens,
-		ExtraParams: req.ExtraParams,
+		Model:        model,
+		Messages:     msgs,
+		Stream:       false,
+		MaxTokens:    &maxTokens,
+		FormatSchema: plan.NativeJSONSchema(),
+		ExtraParams:  req.ExtraParams,
 		Options: &struct {
 			NumPredict  int     `json:"num_predict"`
 			Temperature float64 `json:"temperature,omitempty"`
@@ -291,15 +313,14 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	}
 
 	response := &ai.Response{
-		Content:      content,
-		TokenInput:   tokenIn,
-		TokenOutput:  tokenOut,
-		FinishReason: ollamaResp.Choices[0].FinishReason,
-		Truncated:    isOutputLength(ollamaResp.Choices[0].FinishReason),
-		Usage:        usage,
+		Content:     content,
+		TokenInput:  tokenIn,
+		TokenOutput: tokenOut,
+		Usage:       usage,
 	}
-	if isOutputLength(ollamaResp.Choices[0].FinishReason) {
-		return response, ai.NewOutputTruncated("ollama", ollamaResp.Choices[0].FinishReason)
+	StampResponseMetadata(response, "ollama", model, plan, ollamaResp.Choices[0].FinishReason)
+	if response.Truncated {
+		return response, ai.NewOutputTruncated("ollama", "length")
 	}
 	return response, nil
 }
@@ -314,6 +335,11 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	if err := rejectNamespacedModel(model); err != nil {
 		return nil, err
 	}
+	prepared, plan, err := PrepareContractRequest("ollama", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -327,6 +353,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Stream:        true,
 		StreamOptions: &streamOptions{IncludeUsage: true},
 		MaxTokens:     &maxTokens,
+		FormatSchema:  plan.NativeJSONSchema(),
 		ExtraParams:   req.ExtraParams,
 		Options: &struct {
 			NumPredict  int     `json:"num_predict"`
@@ -371,17 +398,18 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	sr.usage.markRequestStarted(time.Now())
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &StreamResult{ReadCloser: sr, sr: sr}, nil
+	return &StreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("ollama", model, plan)}, nil
 }
 
 type StreamResult struct {
 	io.ReadCloser
-	sr *sseReader
+	sr       *sseReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *StreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -390,9 +418,22 @@ func (r *StreamResult) Usage() ai.ProviderUsage {
 // ("stop", "length", "tool_calls", ...), or "" if none was seen.
 func (r *StreamResult) FinishReason() string {
 	if r.sr != nil {
-		return r.sr.finishReason
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// this stream.
+func (r *StreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	metadata := r.metadata
+	metadata.FinishReason = r.FinishReason()
+	metadata.Truncated = isOutputLength(metadata.FinishReason)
+	metadata.Usage = normalizeUsageMetadata(r.Usage())
+	return metadata
 }
 
 func (r *StreamResult) TruncationError() error {

@@ -49,6 +49,10 @@ type PromptRequest struct {
 
 	InteractionContract protocol.InteractionContract
 	Contract            *protocol.ContractDescriptor
+	// SchemaMode optionally forces native schema or compact prompt fallback.
+	// Empty preserves the provider's automatic choice.
+	SchemaMode    string
+	ModelMetadata *protocol.ModelMetadata
 
 	CacheSystem   bool
 	CacheMessages []int
@@ -78,6 +82,15 @@ type LLMResponse struct {
 	CacheReadTokens  int
 	TotalCostUSD     float64
 	DurationMs       int64
+	// Provider/Model and the contract fields are the legacy stack's
+	// standardized metadata wrapper. They are descriptive only.
+	Provider            string
+	Model               string
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
+	NativeSchema        bool
+	Schema              string
+	InlineConstraint    string
 	// FinishReason is the provider-native terminal reason ("stop", "length",
 	// "tool_calls", ...). "length" maps to the universal PARTIAL outcome.
 	FinishReason string
@@ -116,13 +129,24 @@ func (a *ProviderAdapter) GenerateResponse(ctx context.Context, req PromptReques
 	if err != nil {
 		return LLMResponse{}, err
 	}
-	return LLMResponse{
+	return stampAdapterResponse(LLMResponse{
 		Content:          content,
 		TokenInput:       tokenIn,
 		TokenOutput:      tokenOut,
 		CacheWriteTokens: cacheWrite,
 		CacheReadTokens:  cacheRead,
-	}, nil
+	}, a.name, req), nil
+}
+
+func stampAdapterResponse(response LLMResponse, provider string, req PromptRequest) LLMResponse {
+	response.Provider = provider
+	response.Model = req.Model
+	response.InteractionContract = req.InteractionContract
+	if req.Contract != nil {
+		copy := req.Contract.Clone()
+		response.Contract = &copy
+	}
+	return response
 }
 
 func (a *ProviderAdapter) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {
@@ -133,10 +157,10 @@ func (a *ProviderAdapter) StreamResponse(ctx context.Context, req PromptRequest,
 	if err != nil {
 		return LLMResponse{}, err
 	}
-	return LLMResponse{
+	return stampAdapterResponse(LLMResponse{
 		TokenInput:       tokenIn,
 		TokenOutput:      tokenOut,
 		CacheWriteTokens: cacheWrite,
 		CacheReadTokens:  cacheRead,
-	}, nil
+	}, a.name, req), nil
 }

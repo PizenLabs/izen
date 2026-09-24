@@ -107,11 +107,21 @@ func IsOutputTruncated(err error) bool { return errors.Is(err, ErrOutputTruncate
 // denotes an output ceiling.
 func IsOutputTruncatedReason(reason string) bool {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "length", "max_tokens", "max tokens", "max_output_tokens", "max output tokens", "truncated", "token_limit", "output_limit", "max_output":
+	case "length", "max_tokens", "max tokens", "max_output_tokens", "max output tokens", "max_output_token", "max-output-tokens", "max-output-token", "max output token", "truncated", "token_limit", "output_limit", "max_output":
 		return true
 	default:
 		return false
 	}
+}
+
+// NormalizeFinishReason returns the canonical "length" label for every
+// provider-specific output-ceiling spelling. Non-truncation labels are left
+// untouched for provider-specific diagnostics.
+func NormalizeFinishReason(reason string) string {
+	if IsOutputTruncatedReason(reason) {
+		return "length"
+	}
+	return reason
 }
 
 // InteractionContract is the semantic kind of model interaction required by a
@@ -290,6 +300,13 @@ type ContractDescriptor struct {
 	// concrete plan schema is supplied by the plan package; the protocol does
 	// not embed provider or prompt formatting.
 	OutputSchema OutputSchema `json:"output_schema,omitempty"`
+	// StructuralOutputSchema is an optional provider-neutral JSON Schema
+	// document carried by a descriptor.  It is deliberately a string so the
+	// descriptor remains easy to persist in a ledger and so adapters can parse
+	// and validate it at their wire boundary.  Schema is retained as the
+	// historical identifier/text field; when both are present this field is the
+	// concrete document and wins.
+	StructuralOutputSchema string `json:"structural_output_schema,omitempty"`
 	// SchemaVersion is an optional stable label for consumers that persist a
 	// descriptor in an execution ledger.
 	SchemaVersion string `json:"schema_version,omitempty"`
@@ -324,8 +341,12 @@ type DescriptorOptions struct {
 	AllowedCapabilities   []Capability
 	ForbiddenCapabilities []Capability
 	OutputSchema          OutputSchema
-	SchemaVersion         string
-	Schema                string
+	// StructuralOutputSchema optionally carries a concrete JSON Schema
+	// document.  It is kept separate from Schema so schema identifiers and
+	// persisted prompt text remain backwards compatible.
+	StructuralOutputSchema string
+	SchemaVersion          string
+	Schema                 string
 }
 
 // ModelMetadata is the small amount of provider-neutral model information the
@@ -405,6 +426,14 @@ func NewContractDescriptor(contract InteractionContract, options ...DescriptorOp
 	if outputSchema == "" {
 		outputSchema = defaults.output
 	}
+	// A concrete structural document is an explicit request for JSON output
+	// unless the caller also selected a different known shape.  Keeping the
+	// inference here makes descriptors assembled from persisted metadata behave
+	// the same as descriptors assembled through DescriptorOptions.
+	if outputSchema == defaults.output && defaults.output == SchemaText &&
+		(strings.TrimSpace(opts.StructuralOutputSchema) != "" || looksLikeJSONDocument(opts.Schema)) {
+		outputSchema = SchemaJSON
+	}
 	if !validAuthorityCeiling(authority) {
 		return ContractDescriptor{}, fmt.Errorf("%w: unknown authority ceiling %q", ErrInvalidContract, authority)
 	}
@@ -425,24 +454,25 @@ func NewContractDescriptor(contract InteractionContract, options ...DescriptorOp
 		}
 	}
 	return ContractDescriptor{
-		Contract:              contract,
-		Kind:                  contract,
-		StructuredOutput:      structured,
-		Tools:                 tools,
-		Streaming:             opts.Streaming,
-		Reasoning:             opts.Reasoning,
-		PromptProfile:         promptProfile,
-		ContextProfile:        contextProfile,
-		Archetype:             opts.Archetype,
-		MaxOutputTokens:       opts.MaxOutputTokens,
-		MaxTasks:              opts.MaxTasks,
-		ConstrainedModel:      opts.Constrained,
-		AuthorityCeiling:      authority,
-		AllowedCapabilities:   allowed,
-		ForbiddenCapabilities: forbidden,
-		OutputSchema:          outputSchema,
-		SchemaVersion:         opts.SchemaVersion,
-		Schema:                opts.Schema,
+		Contract:               contract,
+		Kind:                   contract,
+		StructuredOutput:       structured,
+		Tools:                  tools,
+		Streaming:              opts.Streaming,
+		Reasoning:              opts.Reasoning,
+		PromptProfile:          promptProfile,
+		ContextProfile:         contextProfile,
+		Archetype:              opts.Archetype,
+		MaxOutputTokens:        opts.MaxOutputTokens,
+		MaxTasks:               opts.MaxTasks,
+		ConstrainedModel:       opts.Constrained,
+		AuthorityCeiling:       authority,
+		AllowedCapabilities:    allowed,
+		ForbiddenCapabilities:  forbidden,
+		OutputSchema:           outputSchema,
+		StructuralOutputSchema: strings.TrimSpace(opts.StructuralOutputSchema),
+		SchemaVersion:          opts.SchemaVersion,
+		Schema:                 opts.Schema,
 	}, nil
 }
 
@@ -556,19 +586,20 @@ func (d ContractDescriptor) Normalize() (ContractDescriptor, error) {
 		return ContractDescriptor{}, fmt.Errorf("%w: contract identity mismatch: contract=%q kind=%q", ErrInvalidContract, d.Contract, d.Kind)
 	}
 	normalized, err := NewContractDescriptor(contract, DescriptorOptions{
-		Streaming:             d.Streaming,
-		Reasoning:             d.Reasoning,
-		PromptProfile:         d.PromptProfile,
-		Archetype:             d.Archetype,
-		MaxOutputTokens:       d.MaxOutputTokens,
-		MaxTasks:              d.MaxTasks,
-		Constrained:           d.ConstrainedModel,
-		AuthorityCeiling:      d.AuthorityCeiling,
-		AllowedCapabilities:   d.AllowedCapabilities,
-		ForbiddenCapabilities: d.ForbiddenCapabilities,
-		OutputSchema:          d.OutputSchema,
-		SchemaVersion:         d.SchemaVersion,
-		Schema:                d.Schema,
+		Streaming:              d.Streaming,
+		Reasoning:              d.Reasoning,
+		PromptProfile:          d.PromptProfile,
+		Archetype:              d.Archetype,
+		MaxOutputTokens:        d.MaxOutputTokens,
+		MaxTasks:               d.MaxTasks,
+		Constrained:            d.ConstrainedModel,
+		AuthorityCeiling:       d.AuthorityCeiling,
+		AllowedCapabilities:    d.AllowedCapabilities,
+		ForbiddenCapabilities:  d.ForbiddenCapabilities,
+		OutputSchema:           d.OutputSchema,
+		StructuralOutputSchema: d.StructuralOutputSchema,
+		SchemaVersion:          d.SchemaVersion,
+		Schema:                 d.Schema,
 	})
 	if err != nil {
 		return ContractDescriptor{}, err

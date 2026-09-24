@@ -222,6 +222,11 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		return nil, fmt.Errorf("%w: api key is empty — set OPENROUTER_API_KEY or configure api_key in provider config", ErrOpenRouterAuth)
 	}
 
+	prepared, plan, err := PrepareContractRequest("openrouter", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 	msgs := p.buildMessages(req)
 
 	body := p.buildRequest(model, msgs, req, false)
@@ -296,19 +301,17 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	usage.RateLimitedRetries = stats.rateLimitedRetries
 
 	response := &ai.Response{
-		Content:      content,
-		TokenInput:   tokenIn,
-		TokenOutput:  tokenOut,
-		ToolCalls:    toolCalls,
-		FinishReason: openaiResp.Choices[0].FinishReason,
-		Truncated:    isOutputLength(openaiResp.Choices[0].FinishReason),
-		Usage:        usage,
+		Content:     content,
+		TokenInput:  tokenIn,
+		TokenOutput: tokenOut,
+		ToolCalls:   toolCalls,
+		Usage:       usage,
 	}
-	if isOutputLength(openaiResp.Choices[0].FinishReason) {
+	StampResponseMetadata(response, "openrouter", model, plan, openaiResp.Choices[0].FinishReason)
+	if response.Truncated {
 		// Preserve the provider buffer and usage for telemetry, but fail
-		// before any caller can feed the partial bytes to a structural
-		// repair/fallback parser.
-		return response, ai.NewOutputTruncated("openrouter", openaiResp.Choices[0].FinishReason)
+		// before any caller can feed the partial bytes to a structural parser.
+		return response, ai.NewOutputTruncated("openrouter", "length")
 	}
 	return response, nil
 }
@@ -327,6 +330,11 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		return nil, fmt.Errorf("%w: api key is empty — set OPENROUTER_API_KEY or configure api_key in provider config", ErrOpenRouterAuth)
 	}
 
+	prepared, plan, err := PrepareContractRequest("openrouter", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 	msgs := p.buildMessages(req)
 
 	body := p.buildRequest(model, msgs, req, true)
@@ -364,10 +372,13 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	// chunks replace this estimate verbatim when they arrive.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
 	sr.usage.recordTransport(stats.attempts, stats.rateLimitedRetries)
-	return &OpenRouterStreamResult{ReadCloser: sr, sr: sr}, nil
+	return &OpenRouterStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("openrouter", model, plan)}, nil
 }
 
 func (p *OpenRouterProvider) buildMessages(req ai.Request) []openrouterMessage {
+	if prepared, _, err := PrepareContractRequest("openrouter", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]openrouterMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, openrouterMessage{Role: "system", Content: req.System})
@@ -544,6 +555,12 @@ func openRouterModelSupportsReasoning(model string) bool {
 // It also enforces provider-specific token contracts via TokenManager:
 // OpenAI => reasoning_effort + max_completion_tokens, Anthropic => max_tokens = budget+4096.
 func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage, req ai.Request, stream bool) openrouterRequest {
+	if prepared, plan, err := PrepareContractRequest("openrouter", req); err == nil {
+		req = prepared
+		if !plan.NativeSchema && plan.InlineConstraint != "" && !messagesContainSchemaMarker(msgs) && !strings.Contains(req.System, StructuredOutputPromptMarker) {
+			msgs = appendInlineConstraintToMessages(msgs, plan.InlineConstraint)
+		}
+	}
 	body := openrouterRequest{
 		Model:          model,
 		Messages:       msgs,
@@ -651,6 +668,25 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 // isCasualSystemPrompt reports whether system is the minimal casual prompt.
 // It checks for the tiny contract without the full MODE contracts so a casual
 // greeting never carries tool schemas.
+func messagesContainSchemaMarker(msgs []openrouterMessage) bool {
+	for _, message := range msgs {
+		if strings.Contains(message.Content, StructuredOutputPromptMarker) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendInlineConstraintToMessages(msgs []openrouterMessage, constraint string) []openrouterMessage {
+	if len(msgs) == 0 {
+		return []openrouterMessage{{Role: "system", Content: constraint}}
+	}
+	out := append([]openrouterMessage(nil), msgs...)
+	last := len(out) - 1
+	out[last].Content = strings.TrimSpace(out[last].Content) + "\n\n" + constraint
+	return out
+}
+
 func isCasualSystemPrompt(system string) bool {
 	if system == "" {
 		return false
@@ -910,12 +946,13 @@ func (u *openrouterUsage) ProviderUsage() ai.ProviderUsage {
 
 type OpenRouterStreamResult struct {
 	io.ReadCloser
-	sr *openrouterSSEReader
+	sr       *openrouterSSEReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *OpenRouterStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -927,9 +964,22 @@ func (r *OpenRouterStreamResult) Usage() ai.ProviderUsage {
 // ceiling ("length").
 func (r *OpenRouterStreamResult) FinishReason() string {
 	if r.sr != nil {
-		return r.sr.finishReason
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// this stream.
+func (r *OpenRouterStreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	metadata := r.metadata
+	metadata.FinishReason = r.FinishReason()
+	metadata.Truncated = isOutputLength(metadata.FinishReason)
+	metadata.Usage = normalizeUsageMetadata(r.Usage())
+	return metadata
 }
 
 // TruncationError exposes the typed output-ceiling signal without changing

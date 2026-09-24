@@ -44,6 +44,9 @@ func TestOutputTruncatedTypedIdentity(t *testing.T) {
 	if !IsOutputTruncatedReason("MAX_TOKENS") || !IsOutputTruncatedReason("token_limit") {
 		t.Fatal("provider output-ceiling reason was not normalized")
 	}
+	if got := NormalizeFinishReason("max-output-tokens"); got != "length" {
+		t.Fatalf("normalized finish reason = %q, want length", got)
+	}
 }
 
 func TestSelectInteractionContractRespectsModeCeiling(t *testing.T) {

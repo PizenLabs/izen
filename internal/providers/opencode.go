@@ -59,6 +59,9 @@ func (p *OpenCodeProvider) resolveAPIKey() string {
 }
 
 func (p *OpenCodeProvider) buildMessages(req ai.Request) []opencodeMessage {
+	if prepared, _, err := PrepareContractRequest("opencode", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]opencodeMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, opencodeMessage{Role: "system", Content: req.System})
@@ -80,17 +83,23 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 	if key == "" {
 		return nil, fmt.Errorf("opencode: api key is empty — set OPENCODE_API_KEY or configure api_key in provider config")
 	}
+	prepared, plan, err := PrepareContractRequest("opencode", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
 	body := opencodeRequest{
-		Model:       model,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      false,
-		ExtraParams: req.ExtraParams,
+		Model:          model,
+		Messages:       msgs,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		Stop:           req.Stop,
+		Stream:         false,
+		ResponseFormat: req.ResponseFormat,
+		ExtraParams:    req.ExtraParams,
 	}
 
 	// INVARIANT 1: casual minimal prompts must never carry tools.
@@ -178,16 +187,15 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 	}
 
 	response := &ai.Response{
-		Content:      content,
-		TokenInput:   tokenIn,
-		TokenOutput:  tokenOut,
-		ToolCalls:    toolCalls,
-		FinishReason: ocResp.Choices[0].FinishReason,
-		Truncated:    isOutputLength(ocResp.Choices[0].FinishReason),
-		Usage:        usage,
+		Content:     content,
+		TokenInput:  tokenIn,
+		TokenOutput: tokenOut,
+		ToolCalls:   toolCalls,
+		Usage:       usage,
 	}
-	if isOutputLength(ocResp.Choices[0].FinishReason) {
-		return response, ai.NewOutputTruncated("opencode", ocResp.Choices[0].FinishReason)
+	StampResponseMetadata(response, "opencode", model, plan, ocResp.Choices[0].FinishReason)
+	if response.Truncated {
+		return response, ai.NewOutputTruncated("opencode", "length")
 	}
 	return response, nil
 }
@@ -202,18 +210,24 @@ func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (i
 	if key == "" {
 		return nil, fmt.Errorf("opencode: api key is empty — set OPENCODE_API_KEY or configure api_key in provider config")
 	}
+	prepared, plan, err := PrepareContractRequest("opencode", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
 	body := opencodeRequest{
-		Model:         model,
-		Messages:      msgs,
-		MaxTokens:     req.MaxTokens,
-		Temperature:   req.Temperature,
-		Stop:          req.Stop,
-		Stream:        true,
-		StreamOptions: &streamOptions{IncludeUsage: true},
-		ExtraParams:   req.ExtraParams,
+		Model:          model,
+		Messages:       msgs,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		Stop:           req.Stop,
+		Stream:         true,
+		StreamOptions:  &streamOptions{IncludeUsage: true},
+		ResponseFormat: req.ResponseFormat,
+		ExtraParams:    req.ExtraParams,
 	}
 
 	// INVARIANT 1: casual minimal prompts must never carry tools.
@@ -263,7 +277,7 @@ func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (i
 	sr.usage.markRequestStarted(time.Now())
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &OpenCodeStreamResult{ReadCloser: sr, sr: sr}, nil
+	return &OpenCodeStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("opencode", model, plan)}, nil
 }
 
 type opencodeMessage struct {
@@ -272,14 +286,15 @@ type opencodeMessage struct {
 }
 
 type opencodeRequest struct {
-	Model         string            `json:"model"`
-	Messages      []opencodeMessage `json:"messages"`
-	MaxTokens     int               `json:"max_tokens,omitempty"`
-	Temperature   float64           `json:"temperature,omitempty"`
-	Stop          []string          `json:"stop,omitempty"`
-	Stream        bool              `json:"stream,omitempty"`
-	StreamOptions *streamOptions    `json:"stream_options,omitempty"`
-	Tools         []json.RawMessage `json:"tools,omitempty"`
+	Model          string             `json:"model"`
+	Messages       []opencodeMessage  `json:"messages"`
+	MaxTokens      int                `json:"max_tokens,omitempty"`
+	Temperature    float64            `json:"temperature,omitempty"`
+	Stop           []string           `json:"stop,omitempty"`
+	Stream         bool               `json:"stream,omitempty"`
+	StreamOptions  *streamOptions     `json:"stream_options,omitempty"`
+	ResponseFormat *ai.ResponseFormat `json:"response_format,omitempty"`
+	Tools          []json.RawMessage  `json:"tools,omitempty"`
 	// ExtraParams carries arbitrary provider-native JSON fields merged
 	// directly into the HTTP POST body (generic passthrough).
 	ExtraParams map[string]any `json:"-"`
@@ -355,12 +370,13 @@ func (u *opencodeUsage) ProviderUsage() ai.ProviderUsage {
 
 type OpenCodeStreamResult struct {
 	io.ReadCloser
-	sr *opencodeSSEReader
+	sr       *opencodeSSEReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *OpenCodeStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -369,9 +385,22 @@ func (r *OpenCodeStreamResult) Usage() ai.ProviderUsage {
 // ("stop", "length", "tool_calls", ...), or "" if none was seen.
 func (r *OpenCodeStreamResult) FinishReason() string {
 	if r.sr != nil {
-		return r.sr.finishReason
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// this stream.
+func (r *OpenCodeStreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	metadata := r.metadata
+	metadata.FinishReason = r.FinishReason()
+	metadata.Truncated = isOutputLength(metadata.FinishReason)
+	metadata.Usage = normalizeUsageMetadata(r.Usage())
+	return metadata
 }
 
 func (r *OpenCodeStreamResult) TruncationError() error {

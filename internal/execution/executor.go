@@ -209,13 +209,15 @@ type ExecuteRequest struct {
 // unknown); Known distinguishes "provider reported usage" from "usage unknown"
 // so a genuine zero is never conflated with a missing usage record.
 type ModelInvocation struct {
-	Model           string `json:"model"`
-	TokenInput      int    `json:"token_input"`
-	TokenOutput     int    `json:"token_output"`
-	Known           bool   `json:"known"`
-	CachedTokens    int    `json:"cached_tokens,omitempty"`
-	ReasoningTokens int    `json:"reasoning_tokens,omitempty"`
-	FinishReason    string `json:"finish_reason,omitempty"`
+	Model               string                       `json:"model"`
+	TokenInput          int                          `json:"token_input"`
+	TokenOutput         int                          `json:"token_output"`
+	Known               bool                         `json:"known"`
+	CachedTokens        int                          `json:"cached_tokens,omitempty"`
+	ReasoningTokens     int                          `json:"reasoning_tokens,omitempty"`
+	FinishReason        string                       `json:"finish_reason,omitempty"`
+	InteractionContract protocol.InteractionContract `json:"interaction_contract,omitempty"`
+	ContractDescriptor  *protocol.ContractDescriptor `json:"interaction_contract_descriptor,omitempty"`
 	// HTTPAttempts is the number of transport round-trips this single LOGICAL
 	// invocation performed (1 + every 429 backoff / 400-schema retry). Retry
 	// forensics (Phase 7 P5): one model invocation may span multiple HTTP
@@ -2521,7 +2523,11 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// billing from Completed.OutputTokens (the 5,883-token repro: the
 		// artifact was rejected as "unterminated <script> element" and the
 		// provider's authoritative usage vanished from Izen's account).
-		inv := ModelInvocation{Model: model}
+		inv := ModelInvocation{
+			Model:               model,
+			InteractionContract: req.InteractionContract,
+			ContractDescriptor:  cloneExecutionDescriptor(req.Contract),
+		}
 		if usage.Known {
 			inv.Known = true
 			inv.TokenInput = usage.PromptTokens
@@ -3044,7 +3050,11 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		// Billed invocation evidence for EVERY attempt: an exhausted-at-the-gate
 		// call is a completed provider response whose payload was cut by the
 		// provider — its authoritative usage is recorded, never dropped.
-		inv := ModelInvocation{Model: model}
+		inv := ModelInvocation{
+			Model:               model,
+			InteractionContract: req.InteractionContract,
+			ContractDescriptor:  cloneExecutionDescriptor(req.Contract),
+		}
 		if usage.Known {
 			inv.Known = true
 			inv.TokenInput = usage.PromptTokens
@@ -3215,6 +3225,9 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			return "", ai.ProviderUsage{}, nil, err
 		}
 		usage := resp.Usage
+		if metadata := resp.Metadata(); usage.FinishReason == "" {
+			usage.FinishReason = metadata.FinishReason
+		}
 		if !usage.Known && (resp.TokenInput > 0 || resp.TokenOutput > 0) {
 			// Legacy usage transport: some adapters/mocks report usage on the
 			// response fields rather than the ProviderUsage record.
@@ -3293,6 +3306,10 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	var usageUp ai.UsageProvider
 	if up, ok := rawStream.(ai.UsageProvider); ok {
 		usageUp = up
+	}
+	var metadataUp ai.ResponseMetadataProvider
+	if metadata, ok := rawStream.(ai.ResponseMetadataProvider); ok {
+		metadataUp = metadata
 	}
 	var lastUsage ai.ProviderUsage
 	emitUsage := func() {
@@ -3538,10 +3555,34 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			usage = u
 		}
 	}
+	var responseMetadata ai.ResponseMetadata
+	if metadataUp != nil {
+		responseMetadata = metadataUp.ResponseMetadata()
+		if responseMetadata.Usage.Known {
+			usage = responseMetadata.Usage
+		}
+		if usage.FinishReason == "" {
+			usage.FinishReason = responseMetadata.FinishReason
+		}
+		if protocol.IsOutputTruncatedReason(usage.FinishReason) {
+			usage.FinishReason = "length"
+		}
+	}
 	// A stream adapter may expose authoritative truncation independently of
 	// its usage record. Honor that signal before ingestion or artifact
 	// parsing; legacy readers that only expose FinishReason retain the
 	// historical compatibility behavior.
+	if metadataUp != nil && (responseMetadata.Truncated || protocol.IsOutputTruncatedReason(responseMetadata.FinishReason)) {
+		finishReason := responseMetadata.FinishReason
+		if finishReason == "" {
+			finishReason = "length"
+		}
+		if streamCb != nil {
+			streamCb(StreamEvent{RequestID: requestID, Kind: "done", FinishReason: finishReason, Usage: usage})
+		}
+		gate := &OutputGateError{Outcome: CanonicalOutputExhausted, Target: "", FinishReason: finishReason}
+		return "", usage, nil, errors.Join(gate, ai.ErrOutputTruncated, ErrPayloadTruncated)
+	}
 	if truncating, ok := rawStream.(ai.TruncationProvider); ok {
 		if truncErr := truncating.TruncationError(); truncErr != nil {
 			finishReason := usage.FinishReason

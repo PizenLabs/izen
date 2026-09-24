@@ -50,6 +50,7 @@ type openaiRequest struct {
 	Stream         bool               `json:"stream,omitempty"`
 	StreamOptions  *streamOptions     `json:"stream_options,omitempty"`
 	ResponseFormat *ai.ResponseFormat `json:"response_format,omitempty"`
+	Tools          []json.RawMessage  `json:"tools,omitempty"`
 	// ReasoningEffort is the native OpenAI qualitative reasoning control
 	// (low / medium / high / xhigh). It is injected from the dynamically
 	// resolved effort directive; empty omits the field.
@@ -108,6 +109,9 @@ func (u *openaiUsage) ProviderUsage() ai.ProviderUsage {
 }
 
 func (p *OpenAIProvider) buildMessages(req ai.Request) []openaiMessage {
+	if prepared, _, err := PrepareContractRequest("openai", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]openaiMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, openaiMessage{Role: "system", Content: req.System})
@@ -124,6 +128,11 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	if model == "" {
 		return nil, fmt.Errorf("openai: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
+	prepared, plan, err := PrepareContractRequest("openai", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -135,8 +144,12 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		Stop:            req.Stop,
 		Stream:          false,
 		ResponseFormat:  req.ResponseFormat,
+		Tools:           marshalContractTools(req.Tools),
 		ReasoningEffort: req.Reasoning.LevelOrDefault(),
 		ExtraParams:     req.ExtraParams,
+	}
+	if isCasualSystemPrompt(req.System) {
+		body.Tools = nil
 	}
 
 	payload, err := json.Marshal(body)
@@ -192,33 +205,23 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	}
 	usage.CompletedAt = time.Now()
 	usage.FinishReason = openaiResp.Choices[0].FinishReason
-	// Task 1: fail fast on truncated payload before envelope parsing, but
-	// PRESERVE the canonical partial buffer. Universal Stream Outcome:
-	// length -> PARTIAL across all tiers; never clear/swallow the buffer.
-	if openaiResp.Choices[0].FinishReason == "length" {
-		if usage.FirstTokenAt.IsZero() {
-			usage.FirstTokenAt = usage.CompletedAt
-		}
-		return &ai.Response{
-			Content:      content,
-			TokenInput:   tokenIn,
-			TokenOutput:  tokenOut,
-			FinishReason: "length",
-			Truncated:    true,
-			Usage:        usage,
-		}, ai.NewOutputTruncated("openai", "length")
-	}
 	if usage.FirstTokenAt.IsZero() {
 		usage.FirstTokenAt = usage.CompletedAt
 	}
-
-	return &ai.Response{
-		Content:      content,
-		TokenInput:   tokenIn,
-		TokenOutput:  tokenOut,
-		FinishReason: openaiResp.Choices[0].FinishReason,
-		Usage:        usage,
-	}, nil
+	response := &ai.Response{
+		Content:     content,
+		TokenInput:  tokenIn,
+		TokenOutput: tokenOut,
+		Usage:       usage,
+	}
+	StampResponseMetadata(response, "openai", model, plan, openaiResp.Choices[0].FinishReason)
+	if response.Truncated {
+		// The response wrapper is returned alongside the typed error so the
+		// caller can retain verbatim partial bytes while refusing structural
+		// parsing.
+		return response, ai.NewOutputTruncated("openai", "length")
+	}
+	return response, nil
 }
 
 func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
@@ -226,6 +229,11 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	if model == "" {
 		return nil, fmt.Errorf("openai: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
+	prepared, plan, err := PrepareContractRequest("openai", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -238,8 +246,12 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Stream:          true,
 		StreamOptions:   &streamOptions{IncludeUsage: true},
 		ResponseFormat:  req.ResponseFormat,
+		Tools:           marshalContractTools(req.Tools),
 		ReasoningEffort: req.Reasoning.LevelOrDefault(),
 		ExtraParams:     req.ExtraParams,
+	}
+	if isCasualSystemPrompt(req.System) {
+		body.Tools = nil
 	}
 
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -278,17 +290,18 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	// Phase 6.4.4 Optimistic Prompt Token Invariant: commit the estimated
 	// prompt count BEFORE entering the SSE chunk read loop.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &OpenAIStreamResult{ReadCloser: sr, sr: sr}, nil
+	return &OpenAIStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("openai", model, plan)}, nil
 }
 
 type OpenAIStreamResult struct {
 	io.ReadCloser
-	sr *openaiSSEReader
+	sr       *openaiSSEReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *OpenAIStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -297,9 +310,22 @@ func (r *OpenAIStreamResult) Usage() ai.ProviderUsage {
 // ("stop", "length", "tool_calls", ...), or "" if none was seen.
 func (r *OpenAIStreamResult) FinishReason() string {
 	if r.sr != nil {
-		return r.sr.finishReason
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// callers that consume a stream through the ai.Provider interface.
+func (r *OpenAIStreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	metadata := r.metadata
+	metadata.FinishReason = r.FinishReason()
+	metadata.Truncated = isOutputLength(metadata.FinishReason)
+	metadata.Usage = normalizeUsageMetadata(r.Usage())
+	return metadata
 }
 
 // TruncationError exposes the typed output-ceiling signal while retaining EOF

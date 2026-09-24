@@ -33,7 +33,7 @@ var ErrPayloadTruncated = ai.ErrPayloadTruncated
 // the OpenAI-compatible and Google/Anthropic adapters.
 func isOutputLength(reason string) bool {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "length", "max_tokens", "max tokens", "max_output_tokens", "max output tokens", "truncated", "token_limit", "output_limit", "max_output":
+	case "length", "max_tokens", "max tokens", "max_output_tokens", "max output tokens", "max_output_token", "max-output-tokens", "max-output-token", "max output token", "max_output", "truncated", "token_limit", "output_limit":
 		return true
 	default:
 		return false
