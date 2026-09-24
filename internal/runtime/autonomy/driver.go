@@ -890,9 +890,17 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 		if d.runID != runID {
 			return d.term(), nil
 		}
-		if cerr := ctx.Err(); cerr != nil {
+		// ── EXPLICIT CANCELLATION GATE ─────────────────────────────────
+		// The loop has no channel receives; this select is the inter-step
+		// cancellation boundary. The in-flight executor call below receives
+		// ctx and honours it (provider HTTP requests are built with
+		// http.NewRequestWithContext), so Esc / Ctrl+C breaks both a blocked
+		// provider call and the next inter-step window immediately.
+		select {
+		case <-ctx.Done():
 			// Cancellation is a clean permanent abort, not a propagated error.
 			return d.terminateAbort(ctx, "context cancelled", autonomy.FailurePermanent), nil //nolint:nilerr // termination, not a failure
+		default:
 		}
 		switch d.loop.State() {
 		case autonomy.RuntimeDeciding, autonomy.RuntimeInterpreting:
