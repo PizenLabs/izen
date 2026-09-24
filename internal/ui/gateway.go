@@ -387,6 +387,11 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 			m.recordRuntimeProof(msg.res)
 		}
 		m.finalizeOperation(outcome, execErr)
+		// A terminal execution failure must release the workflow phase: the
+		// operation is finalized, but the phase machine still owns the header
+		// status. Without this reset the TUI would keep rendering BUILDING
+		// after the engine halted (the reported state-desync defect).
+		m.unwindBuildFailure()
 		if outcome == OpOutcomeCancelled {
 			m.push(roleSystem, infoStyle.Render("Cancelled. No files were modified."))
 		} else {

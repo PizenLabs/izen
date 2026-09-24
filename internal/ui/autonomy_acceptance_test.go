@@ -82,6 +82,11 @@ func noExecutionEnginesStarted(m *model) bool {
 // CASE A — conversation.
 // "what is Go?" is answered as ASK / direct response: no execution timeline,
 // no mutation, no proposal, no grant.
+//
+// /ask MODE AUTHORITY CEILING (commit a3d76f8, #179): bare free-form input in
+// the /ask boundary never enters the autonomy decision runtime — the classifier
+// is advisory only and confidence cannot raise the ASK read-only ceiling. The
+// turn therefore answers directly, and no AUTONOMY DECISION trace is emitted.
 func TestAcceptanceCaseAConversationDirectResponse(t *testing.T) {
 	m := autonomyAcceptanceModel()
 
@@ -104,8 +109,8 @@ func TestAcceptanceCaseAConversationDirectResponse(t *testing.T) {
 	if !noExecutionEnginesStarted(m) {
 		t.Fatal("conversation must not start any execution engine")
 	}
-	if !strings.Contains(recordsText(m), "AUTONOMY DECISION") {
-		t.Error("conversation still observes the autonomy decision")
+	if strings.Contains(recordsText(m), "AUTONOMY DECISION") {
+		t.Error("conversation in /ask must not enter the autonomy decision runtime (mode authority ceiling)")
 	}
 }
 
@@ -132,37 +137,45 @@ func TestAcceptanceCaseBAskInspectReadOnly(t *testing.T) {
 }
 
 // CASE B' — /ask mutation request.
-// "/ask remove redundant content from @index.html" must NOT silently execute
-// or answer as chat: the autonomy runtime returns a capability escalation
-// proposal (ask_user). The user authorizes the boundary once.
-func TestAcceptanceCaseBAskMutationEscalates(t *testing.T) {
+// "/ask remove redundant content from @index.html" is a read-only /ask turn.
+//
+// /ask READ-ONLY BOUNDARY + MODE AUTHORITY CEILING (commit a3d76f8, #179): a
+// natural-language mutation objective typed under /ask must NEVER silently
+// execute, NEVER acquire a proposal/approval surface, and NEVER enter the
+// autonomy decision runtime. It answers as read-only chat; explicit execution
+// stays explicit via /build $prompt/$hot (covered by Cases D/E/F/G).
+//
+// (This replaces the pre-#179 expectation that /ask mutation escalated to an
+// ask_user capability proposal — that escalation path is now reached only by
+// explicit execution markers.)
+func TestAcceptanceCaseBAskMutationStaysReadOnly(t *testing.T) {
 	writeIndexFixture(t)
 	m := autonomyAcceptanceModel()
 
 	cmd := m.handleInput("/ask remove redundant content from @index.html")
-	if cmd != nil {
-		t.Fatalf("/ask mutation must await a proposal gate, got cmd %T", cmd)
+	if cmd == nil {
+		t.Fatal("/ask mutation must still dispatch the read-only chat response")
 	}
-	if m.pendingAutonomyProposal == nil {
-		t.Fatal("/ask mutation must stage a capability escalation proposal")
+	// Read-only boundary: no escalation surface of any kind.
+	if m.pendingAutonomyProposal != nil {
+		t.Fatal("/ask mutation must not escalate to an autonomy proposal")
 	}
-	if !m.pendingAutonomyProposal.Missing.Has(autonomy.CapMutate) {
-		t.Fatalf("escalation must request the mutate capability, got %v", m.pendingAutonomyProposal.Missing)
+	if len(m.pendingAutonomyTargets) > 0 {
+		t.Fatal("/ask mutation must not stage a target selector")
 	}
 	if m.autonomy.Grants().Count() != 0 {
-		t.Fatal("escalation must not grant until Execute")
+		t.Fatal("/ask mutation must not grant anything")
 	}
-	// The proposal must not expose internal grant vocabulary.
-	view := m.renderAutonomyProposalBlock(100)
-	if strings.Contains(view, "/grant") || strings.Contains(view, "bitmask") {
-		t.Error("proposal must never expose internal authorization vocabulary")
+	// No mutation may be staged for approval, and the decision runtime is
+	// never consulted for bare language under /ask.
+	if m.executorPendingPatchID != "" || m.pendingBuildApproval {
+		t.Error("/ask mutation must not stage a mutation for approval")
 	}
-	// The user never types a second command: Execute escalates and continues.
-	if cmd := m.executeAutonomyProposal(); cmd == nil {
-		t.Fatal("Execute on the /ask escalation must continue execution")
+	if strings.Contains(recordsText(m), "AUTONOMY DECISION") {
+		t.Error("/ask mutation must not enter the autonomy decision runtime (mode authority ceiling)")
 	}
-	if got := m.resolver.Current(); got != modes.ModeBuild {
-		t.Fatalf("post-escalation workspace = /%s, want /build", got)
+	if got := m.resolver.Current(); got != modes.ModeAsk {
+		t.Fatalf("workspace = /%s, want /ask (mutation text cannot raise the ceiling)", got)
 	}
 }
 

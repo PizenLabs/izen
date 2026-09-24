@@ -196,6 +196,9 @@ func (m *model) beginOperation(kind OperationKind) *operation {
 	m.executionStartedAt = time.Now()
 	m.activeOp = op
 	m.cancelGraceDeadline = time.Time{}
+	// A new operation invalidates any pending hard-deadline detach watch: a
+	// stale 250ms tick must never detach a run that started after it was armed.
+	m.cancelDeadlineSeq++
 	m.streaming = false
 	m.agentRunning = true
 	m.agentDone = false

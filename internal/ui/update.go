@@ -1441,6 +1441,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// result through the same executionResultUpdate projection.
 		return m.handleGatedExecution(msg)
 
+	case TerminalExecutionMsg:
+		// ── FATAL TERMINAL EXECUTION EVENT (truthful state transition) ──
+		// The autonomous driver (or an execution boundary) returned an
+		// unrecoverable error (e.g. OpenRouter HTTP 403). This is the single
+		// atomic transition out of an active execution: halt every timer tick,
+		// finalize the operation, unwind the workflow phase, and restore IDLE —
+		// so no spinner, timer, or BUILDING header can survive a halted engine.
+		return m.handleTerminalExecution(msg)
+
+	case terminalDeadlineMsg:
+		// ── §20.2 HARD-DEADLINE CANCELLATION FALLBACK ────────────────
+		// Soft cancellation did not confirm termination within the 250ms
+		// deadline: detach the execution handle and force IDLE so a wedged
+		// worker can never hold the input lock or a stale BUILDING state.
+		return m.handleTerminalDeadline(msg)
+
 	case autonomousRunMsg:
 		// ── PRODUCTION AUTONOMOUS DRIVER OUTCOME (Phase 6) ───────────
 		// The bounded driver Run/Resume/Abort returned: a terminal outcome
