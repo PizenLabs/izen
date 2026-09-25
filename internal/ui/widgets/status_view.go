@@ -306,15 +306,13 @@ func (v StatusView) contentLines(width, height int) []string {
 			if len(policyRows) > 1 {
 				priority = append(priority, policyRows[1:]...)
 			}
-			if len(pathRows) > 1 {
-				// Extra wrapped path lines are already included above; this
-				// keeps the ordering stable when slicing.
-			}
 			priority = append(priority, divider, footer)
 			if len(priority) > height {
 				// Always keep the footer visible; drop middle rows first.
-				kept := priority[:max(0, height-1)]
-				lines = append(kept, footer)
+				lines = priority[:max(0, height-1)]
+				if len(lines) < height {
+					lines = append(lines, footer)
+				}
 				if len(lines) > height {
 					lines = lines[:height]
 				}
@@ -382,38 +380,6 @@ func View(snapshot workspace.Status, widths ...int) string {
 // keep widget constructors and renderers separate.
 func RenderStatusView(snapshot workspace.Status, widths ...int) string {
 	return RenderStatus(snapshot, widths...)
-}
-
-func statusKV(label, value string) string {
-	return statusLabelStyle.Render(fmt.Sprintf("%-15s", label)) + " " + value
-}
-
-func statusValueRender(value string) string {
-	if strings.Contains(value, "\x1b[") {
-		return value
-	}
-	return statusValueStyle.Render(value)
-}
-
-func statusPair(labelA, valueA, labelB, valueB string) string {
-	field := func(label, value string) string {
-		return statusLabelStyle.Render(label+": ") + statusValueRender(value)
-	}
-	return field(labelA, valueA) + "  " + field(labelB, valueB)
-}
-
-func statusTriple(labelA, valueA, labelB, valueB, labelC, valueC, mode string, widths ...int) string {
-	field := func(label, value string) string {
-		return statusLabelStyle.Render(label+": ") + statusValueRender(value)
-	}
-	if len(widths) > 0 && widths[0] < 58 && labelC == "Policy Gate" {
-		labelC = "Gate"
-	}
-	line := field(labelA, valueA) + " · " + field(labelB, valueB) + " · " + field(labelC, valueC)
-	if strings.TrimSpace(mode) != "" {
-		line += " · " + field("Mode", mode)
-	}
-	return line
 }
 
 func statusRow(label, value string) string {
@@ -490,11 +456,12 @@ func wrapStatusText(text string, avail int) []string {
 				lines = append(lines, chunk)
 			}
 		}
-		if cur == "" {
+		switch {
+		case cur == "":
 			cur = word
-		} else if len([]rune(cur))+1+len([]rune(word)) <= avail {
+		case len([]rune(cur))+1+len([]rune(word)) <= avail:
 			cur += " " + word
-		} else {
+		default:
 			flush()
 			cur = word
 		}
@@ -592,21 +559,6 @@ func renderASTState(indexer workspace.IndexerStatus) string {
 		return statusErrorStyle.Render("error")
 	default:
 		return statusMutedStyle.Render("unavailable")
-	}
-}
-
-func renderPolicyGate(gate string) string {
-	switch strings.ToLower(strings.TrimSpace(gate)) {
-	case "read-only", "readonly", "read only":
-		return statusGoodStyle.Render("Read-Only")
-	case "interactive", "controlled", "write", "execute":
-		return statusWarnStyle.Render(gate)
-	case "awaiting approval", "approval", "blocked":
-		return statusWarnStyle.Render(gate)
-	case "denied", "closed", "error":
-		return statusErrorStyle.Render(gate)
-	default:
-		return statusMutedStyle.Render(gate)
 	}
 }
 

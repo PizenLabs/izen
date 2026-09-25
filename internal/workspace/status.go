@@ -149,6 +149,7 @@ type RuntimeState = StatusInputs
 // function never waits for a subprocess after that deadline, so even a fake or
 // hung git binary cannot block the caller beyond the inspection budget (apart
 // from OS-level process cleanup performed by exec.CommandContext).
+// ctx must be non-nil, as required by the context package contract.
 func CollectStatus(ctx context.Context, root string, inputs ...StatusInputs) Status {
 	var in StatusInputs
 	if len(inputs) > 0 {
@@ -213,10 +214,8 @@ type gitResult struct {
 
 // inspectVCS runs branch, short-SHA, and porcelain-status probes in parallel.
 // The three calls are independent and each has the same strict deadline.
+// parent must be non-nil, as required by the context package contract.
 func inspectVCS(parent context.Context, root string) VCSStatus {
-	if parent == nil {
-		parent = context.Background()
-	}
 	gitTimeout := GitCommandTimeout
 	if gitTimeout <= 0 || gitTimeout > MaxGitCommandTimeout {
 		gitTimeout = MaxGitCommandTimeout
