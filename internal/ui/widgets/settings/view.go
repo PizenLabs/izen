@@ -99,7 +99,7 @@ func (m Model) View() string {
 			// focused setting altogether. If only one line remains, keep the
 			// focused row and let the description occupy the other line.
 			if available == 1 && height >= 3 && upperHeight > 1 {
-				var focused []string
+				focused := make([]string, 0, len(settingRowsByTab[m.activeTab]))
 				for _, index := range settingRowsByTab[m.activeTab] {
 					focused = append(focused, m.renderRow(index, m.displayValue(index), width))
 				}
@@ -118,8 +118,8 @@ func (m Model) View() string {
 	if height > upperHeight+footerHeight {
 		upper = append(upper, make([]string, height-upperHeight-footerHeight)...)
 	}
-	lines := append(upper, footer...)
-	return m.fitHeight(strings.Join(lines, "\n"))
+	upper = append(upper, footer...)
+	return m.fitHeight(strings.Join(upper, "\n"))
 }
 
 func (m Model) displayValue(index int) string {

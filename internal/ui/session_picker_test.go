@@ -206,33 +206,61 @@ func TestSessionPickerUpDownNavigation(t *testing.T) {
 	}
 }
 
-// TestSessionPickerNewSession verifies n creates a new session and updates view.
-func TestSessionPickerNewSession(t *testing.T) {
+// TestSessionPickerCreateCommitsInlineTitle verifies the title typed in the
+// new-session editor is persisted through the normal session boundary.
+func TestSessionPickerCreateCommitsInlineTitle(t *testing.T) {
 	m, sm, _ := sessionCLITestModel(t)
 	m.handleCommand("/session")
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
-	if cmd == nil {
-		t.Fatal("n should emit new command")
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	cursor := m.sessionPicker.cursor
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	if m.sessionPicker.cursor != cursor {
+		t.Fatalf("create input moved row cursor from %d to %d", cursor, m.sessionPicker.cursor)
 	}
-	msgs := drainCmds(t, cmd)
-	for _, msg := range msgs {
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter in create editor should emit a commit")
+	}
+	for _, msg := range drainCmds(t, cmd) {
 		if _, ok := msg.(sessionPickerNewMsg); ok {
 			_, _ = m.Update(msg)
 		}
 	}
-	// After new session, picker should still be open and refreshed.
-	if !m.showSessionPicker {
-		t.Fatal("picker should remain open after n")
+	active := sm.Active()
+	sess, err := sm.Inspect(active)
+	if err != nil {
+		t.Fatalf("inspect new session: %v", err)
 	}
-	if m.sessionPicker == nil || len(m.sessionPicker.sessions) != 2 {
-		t.Fatalf("picker sessions after new = %v", m.sessionPicker.sessions)
+	if sess.Title != "jk" {
+		t.Fatalf("new session title = %q, want jk", sess.Title)
 	}
-	// Active slot should have toggled.
-	if sm.Active() == session.SlotA {
-		// initial active was A, after New should be B
-		if len(sm.List(context.Background())) != 2 {
-			t.Fatal("list should still have 2 slots")
+}
+
+// TestSessionPickerNewSession verifies n opens the inline new-session editor
+// without crossing the session boundary before Enter is pressed.
+func TestSessionPickerNewSession(t *testing.T) {
+	m, sm, _ := sessionCLITestModel(t)
+	m.handleCommand("/session")
+	activeBefore := sm.Active()
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	if cmd == nil {
+		t.Fatal("n should emit a begin-new command")
+	}
+	if !m.sessionPicker.creating {
+		t.Fatal("n should focus the inline new-session editor")
+	}
+	if sm.Active() != activeBefore {
+		t.Fatal("n must not create a session before Enter")
+	}
+	// The begin message is intentionally a no-op in the parent model.
+	for _, msg := range drainCmds(t, cmd) {
+		if _, ok := msg.(sessionPickerNewMsg); ok {
+			_, _ = m.Update(msg)
 		}
+	}
+	if !m.showSessionPicker || m.sessionPicker == nil {
+		t.Fatal("picker should remain open while editing a new title")
 	}
 }
 
@@ -267,6 +295,55 @@ func TestSessionPickerRename(t *testing.T) {
 	}
 	if sess.Title != "Renamed via picker" {
 		t.Fatalf("Title = %q, want renamed", sess.Title)
+	}
+}
+
+// TestSessionPickerInlineInputOwnsNavigationKeys verifies that j/k are text in
+// both inline editors, rather than row navigation commands.
+func TestSessionPickerInlineInputOwnsNavigationKeys(t *testing.T) {
+	infos := mockSlotInfos()
+	sp := NewSessionPickerModal(infos)
+	sp.SetSize(78, 24)
+	sp.cursor = 0
+
+	_, _ = sp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	renameCursor := sp.cursor
+	_, _ = sp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	_, _ = sp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	if sp.cursor != renameCursor {
+		t.Fatalf("j/k changed row cursor during rename: got %d, want %d", sp.cursor, renameCursor)
+	}
+	if got := sp.renameInput.Value(); !strings.Contains(got, "jk") {
+		t.Fatalf("rename input = %q, want j/k typed into buffer", got)
+	}
+
+	sp.clearInlineInput()
+	_, _ = sp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	createCursor := sp.cursor
+	_, _ = sp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	_, _ = sp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	if sp.cursor != createCursor {
+		t.Fatalf("j/k changed row cursor during create: got %d, want %d", sp.cursor, createCursor)
+	}
+	if got := sp.renameInput.Value(); got != "jk" {
+		t.Fatalf("create input = %q, want jk", got)
+	}
+
+	_, cmd := sp.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter in create mode should emit a commit command")
+	}
+	for _, msg := range drainCmds(t, cmd) {
+		newMsg, ok := msg.(sessionPickerNewMsg)
+		if !ok {
+			continue
+		}
+		if !newMsg.commit || newMsg.title != "jk" {
+			t.Fatalf("new message = %+v, want committed title jk", newMsg)
+		}
+	}
+	if sp.creating || sp.renameInput.Focused() {
+		t.Fatal("create editor should release focus after commit")
 	}
 }
 
@@ -380,6 +457,10 @@ func TestSessionPickerCompact(t *testing.T) {
 	if cc.EventCount == 0 {
 		t.Fatal("compact event count should be >0")
 	}
+	if got := m.sessionPicker.statusMsg; !strings.Contains(got, "Compacted Session [") ||
+		!strings.Contains(got, "->") || !strings.Contains(got, "reduced") {
+		t.Fatalf("compaction status missing token savings: %q", got)
+	}
 }
 
 // TestSessionPickerWindowResize verifies modal adapts to tea.WindowSizeMsg.
@@ -408,6 +489,23 @@ func TestSessionPickerWindowResize(t *testing.T) {
 	view = m.sessionPicker.View()
 	if view == "" {
 		t.Fatal("picker view empty after narrow resize")
+	}
+}
+
+// TestSessionPickerResizeRecalculatesTitleColumn verifies that a direct widget
+// resize changes the elastic title width rather than leaving a stale table
+// layout behind.
+func TestSessionPickerResizeRecalculatesTitleColumn(t *testing.T) {
+	sp := NewSessionPickerModal(mockSlotInfos())
+	sp.SetViewportSize(120, 40)
+	wide := sp.columnLayout().title
+	sp.Update(tea.WindowSizeMsg{Width: 58, Height: 30})
+	narrow := sp.columnLayout().title
+	if narrow >= wide {
+		t.Fatalf("title width did not shrink after resize: wide=%d narrow=%d", wide, narrow)
+	}
+	if lipgloss.Width(sp.renderHeader(sp.columnLayout().showSlot, sp.columnLayout().showDirty, sp.columnLayout().showLast)) > sp.contentWidth() {
+		t.Fatal("header exceeds the recalculated content width")
 	}
 }
 

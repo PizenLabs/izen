@@ -292,3 +292,64 @@ func estimateTokens(s string) int {
 	}
 	return (len([]rune(s)) + 3) / 4
 }
+
+// EstimateTokens exposes the same deterministic token heuristic used by the
+// compactor to presentation code that needs to report context savings. It is
+// intentionally an estimate rather than a provider-specific billing count.
+func EstimateTokens(s string) int {
+	return estimateTokens(s)
+}
+
+// EstimateHistoryTokens estimates the prompt footprint of the raw history
+// before compaction. It mirrors the compiler's turn serializer (`role: text`)
+// so the before/after report compares the same representation on both sides.
+func EstimateHistoryTokens(messages []session.Message) int {
+	var b strings.Builder
+	for i, message := range messages {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(message.Role)
+		b.WriteString(": ")
+		b.WriteString(message.Content)
+	}
+	return estimateTokens(b.String())
+}
+
+// EstimateContextTokens estimates the prompt footprint of a compacted
+// generation using the same objective/summary/recent serialization as the
+// context compiler. This is the closest local representation of the context
+// handed to the next turn.
+func EstimateContextTokens(cc *session.CompactContext) int {
+	if cc == nil {
+		return 0
+	}
+	var b strings.Builder
+	if cc.Objective != "" {
+		b.WriteString("objective: ")
+		b.WriteString(cc.Objective)
+	}
+	if cc.Summary != "" {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString("summary: ")
+		b.WriteString(cc.Summary)
+	}
+	if len(cc.DirtyFiles) > 0 {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString("uncommitted workspace changes (from a previous session): ")
+		b.WriteString(strings.Join(cc.DirtyFiles, ", "))
+	}
+	for _, message := range cc.Recent {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(message.Role)
+		b.WriteString(": ")
+		b.WriteString(message.Content)
+	}
+	return estimateTokens(b.String())
+}

@@ -217,6 +217,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.pendingPermission != nil {
 		return m, m.handlePermissionModalKey(msg)
 	}
+	// ── SESSION PICKER FOCUS TRAP ───────────────────────────────────
+	// Processing/approval states can call handleKey directly before the
+	// normal Update routing block. Keep the inline editor authoritative there
+	// as well, so j/k and arrows can never escape to workspace navigation
+	// while a rename/create buffer owns focus.
+	if m.showSessionPicker && m.sessionPicker != nil {
+		var cmd tea.Cmd
+		m.sessionPicker, cmd = m.sessionPicker.Update(msg)
+		return m, cmd
+	}
 	// ── UNIFIED DIFF VIEWER MODAL ────────────────────────────────────
 	// While open it owns j/k + arrows (scroll), c (fold focused hunk),
 	// a (fold all), and Esc/q (close). This guard covers states that
@@ -1357,6 +1367,9 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		if m.showBanner {
 			m.showBanner = false
 		}
+		// A new user turn ends the resume orientation window: the briefing is
+		// replaced by the live conversation, never carried into later turns.
+		m.clearResumeBriefing()
 		m.ti.SetValue("")
 		m.ti.Reset()
 		m.syncInputFromTI()

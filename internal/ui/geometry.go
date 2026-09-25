@@ -96,6 +96,12 @@ func (m *model) viewportContentPrefixHeight() int {
 			prefix.WriteString("\n")
 		}
 	}
+	if m.resumeBriefing != nil {
+		if b := m.renderResumeBriefing(); b != "" {
+			prefix.WriteString(b)
+			prefix.WriteString("\n")
+		}
+	}
 	ctx := m.renderContextHeader()
 	if ctx != "" {
 		prefix.WriteString(ctx)

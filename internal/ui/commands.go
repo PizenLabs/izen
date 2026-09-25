@@ -456,6 +456,15 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// receives a turn that is one query behind because the current input is
 	// committed first, not retrofitted at stream completion.
 	m.sess.AddMessage("user", line, 5)
+	// ── TWO-STAGE SESSION TITLING (STAGE 1) ──────────────────────────
+	// The first accepted human turn deterministically names the session so it
+	// never surfaces as a raw timestamp id in the Session Manager. The title is
+	// committed by the persistSession call below; Stage 2 (async model
+	// refinement) is armed here and dispatched after the first stream turn.
+	if model := strings.TrimSpace(m.getActiveModelName()); model != "" {
+		m.sess.Model = model
+	}
+	m.applyFirstTurnTitle(line)
 	m.persistSession("commands")
 
 	// ── HYBRID INTENT GATEWAY ────────────────────────────────────────

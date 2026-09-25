@@ -162,6 +162,9 @@ func (m *model) handleCasualAutoUnwind(line string) bool {
 
 	// 4. Direct response immediately, without entering pipeline dispatch.
 	if m.sess != nil {
+		// Stage 1 titling also applies to the casual first turn: the session
+		// must never surface with a raw timestamp title.
+		m.applyFirstTurnTitle(content)
 		m.sess.AddMessage("user", content, 5)
 		m.sess.AddMessage("assistant", m.casualDirectResponse(content), 5)
 		m.persistSession("gateway-auto-unwind")

@@ -400,7 +400,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	}
 
 	// ── VI-MODE INTERCEPT: route all key events to the vi-mode handler ──
-	if keyMsg, ok := msg.(tea.KeyMsg); ok && m.inViMode {
+	if keyMsg, ok := msg.(tea.KeyMsg); ok && m.inViMode && (!m.showSessionPicker || m.sessionPicker == nil) {
 		return m.handleViModeKey(keyMsg)
 	}
 
@@ -414,10 +414,21 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		switch msg.(type) {
 		case sessionPickerResumeMsg, sessionPickerNewMsg, sessionPickerRenameMsg, sessionPickerArchiveMsg, sessionPickerDeleteMsg, sessionPickerCompactMsg, sessionPickerCloseMsg:
 			// fall through to main switch
+		case sessionPickerEditorMsg:
+			// Only editor-owned async messages are consumed here; unrelated
+			// runtime/tick/background messages must reach the main switch.
+			updated, cmd := m.sessionPicker.Update(msg)
+			m.sessionPicker = updated
+			return m, cmd
 		case tea.WindowSizeMsg:
-			// fall through to main switch (resize adapts modal via render)
+			// Let the widget consume resize events before the main model
+			// updates its viewport. This keeps column widths and scroll bounds
+			// correct even when the modal is rendered before the next frame.
+			updated, _ := m.sessionPicker.Update(msg)
+			m.sessionPicker = updated
+			// fall through to main switch (the parent viewport also resizes)
 		default:
-			return m, nil
+			// Unrelated messages continue to the parent update loop.
 		}
 	}
 
@@ -679,19 +690,59 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case sessionPickerResumeMsg:
-		return m, m.handleSessionPickerResume(msg.slot)
+		if m.showSessionPicker && m.sessionPicker != nil && m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, m.handleSessionPickerResume(msg.slot)
+		}
+		return m, nil
 	case sessionPickerNewMsg:
-		return m, m.handleSessionPickerNew()
+		if !m.showSessionPicker || m.sessionPicker == nil || !m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, nil
+		}
+		if msg.begin && !msg.commit {
+			// n opens the inline title editor; it is not a session boundary
+			// until Enter emits the commit phase.
+			return m, nil
+		}
+		if msg.commit && msg.inputID != 0 && msg.inputID == m.sessionPicker.pendingNewID {
+			m.sessionPicker.pendingNewID = 0
+			return m, m.handleSessionPickerNew(msg.title)
+		}
+		// Ignore a zero-value or stale command after the editor was canceled or
+		// the modal was closed; session boundaries must never be replayable.
+		return m, nil
 	case sessionPickerRenameMsg:
+		if !m.showSessionPicker || m.sessionPicker == nil || !m.sessionPicker.ownsMessage(msg.pickerID) ||
+			msg.inputID == 0 || msg.inputID != m.sessionPicker.pendingRenameID {
+			return m, nil
+		}
+		m.sessionPicker.pendingRenameID = 0
 		return m, m.handleSessionPickerRename(msg.slot, msg.title)
 	case sessionPickerArchiveMsg:
-		return m, m.handleSessionPickerArchive(msg.slot)
+		if m.showSessionPicker && m.sessionPicker != nil && m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, m.handleSessionPickerArchive(msg.slot)
+		}
+		return m, nil
 	case sessionPickerDeleteMsg:
-		return m, m.handleSessionPickerDelete(msg.slot)
+		if m.showSessionPicker && m.sessionPicker != nil && m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, m.handleSessionPickerDelete(msg.slot)
+		}
+		return m, nil
 	case sessionPickerCompactMsg:
-		return m, m.handleSessionPickerCompact(msg.slot)
+		if m.showSessionPicker && m.sessionPicker != nil && m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, m.handleSessionPickerCompact(msg.slot)
+		}
+		return m, nil
 	case sessionPickerCloseMsg:
-		return m, m.closeSessionPicker()
+		if m.showSessionPicker && m.sessionPicker != nil && m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, m.closeSessionPicker()
+		}
+		return m, nil
+
+	case sessionTitleRefinedMsg:
+		// Stage 2 completion: apply on the UI goroutine only when the result is
+		// fresh and the user has not renamed the session in the meantime.
+		m.handleSessionTitleRefined(msg)
+		return m, nil
 
 	case runtimeResultMsg:
 		// GENERATION EPOCH ISOLATION: silently drop stale worker results
@@ -723,6 +774,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.showSessionPicker && m.sessionPicker != nil {
+			// Keep the widget's responsive layout in lockstep with the parent
+			// viewport, even when a direct resize reaches the root model.
+			m.sessionPicker.SetViewportSize(msg.Width, msg.Height)
+		}
 		padding := 4
 		w := msg.Width - padding
 		if w < 20 {
@@ -3313,6 +3369,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamLiveTokens = 0
 		m.streamBaseInputTokens = 0
 
+		// ── STAGE 2: ASYNC SESSION TITLE REFINEMENT ────────────────
+		// After the first stream turn completes, dispatch the non-blocking
+		// Commit/Fast summarization. It runs off the UI goroutine and returns a
+		// sessionTitleRefinedMsg; the handler only applies it when the session
+		// is still the same and the title is still the Stage 1 heuristic.
+		var titleCmd tea.Cmd
+		if m.titleRefineArmed {
+			m.titleRefineArmed = false
+			titleCmd = m.refineTitleCmd()
+		}
+
 		// ── MANDATORY SYNCHRONOUS FLUSH (STREAM COMPLETION) ─────────
 		// The final frame must render NOW, on this turn — never deferred to a
 		// pending repaintTickMsg that could be dropped, starved, or processed
@@ -3324,7 +3391,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.refreshViewportContentImmediate()
 		// Full stream transparency: mark the live thought block complete so the
 		// Ctrl+O drawer collapses to its "▸ Thought for Xs (N tokens)" summary.
-		return m, m.thoughtUpdateCmd("", true)
+		return m, tea.Batch(m.thoughtUpdateCmd("", true), titleCmd)
 
 	case streamErrMsg:
 		// Handle executor streaming error separately.

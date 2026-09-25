@@ -176,27 +176,7 @@ func (r *Registry) For(mode modes.Mode) (ViewMode, bool) {
 // never sees mode, banner, prompt, footer, or action logic.
 // sessionPickerDialogSize clamps the session picker dialog to the terminal.
 func (m *model) sessionPickerDialogSize() (int, int) {
-	w := sessionPickerPreferredWidth
-	h := sessionPickerPreferredHeight
-
-	const edgeMargin = 2
-	if m.width > 0 {
-		if maxW := m.width - edgeMargin; maxW < w {
-			w = maxW
-		}
-	}
-	if m.height > 0 {
-		if maxH := m.height - edgeMargin; maxH < h {
-			h = maxH
-		}
-	}
-	if w < sessionPickerMinWidth {
-		w = sessionPickerMinWidth
-	}
-	if h < sessionPickerMinHeight {
-		h = sessionPickerMinHeight
-	}
-	return w, h
+	return sessionPickerDialogSizeFor(m.width, m.height)
 }
 
 func (m *model) renderSessionPickerModal() string {
@@ -223,14 +203,10 @@ func (m *model) renderSessionPickerModal() string {
 
 	dialogW, dialogH := m.sessionPickerDialogSize()
 	m.sessionPicker.SetSize(dialogW, dialogH)
-	spView := m.sessionPicker.View()
-
-	modalBox := lipgloss.NewStyle().
-		Width(dialogW+2).
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(colorMauve)).
-		Padding(0, 1).
-		Render(spView)
+	// SessionPickerModal already owns its rounded border and padding. Keeping
+	// the host wrapper transparent avoids a second frame whose extra cells can
+	// clip at Tmux-pane edges during a resize.
+	modalBox := m.sessionPicker.View()
 
 	centered := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modalBox)
 	return overlayOn(normalContent, centered, m.width, m.height)

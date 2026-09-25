@@ -52,6 +52,10 @@ type Session struct {
 	// distinct from the immutable SessionID. When empty, the objective is the
 	// effective title.
 	Title string `json:"title,omitempty"`
+	// Model records the active model assigned to the session at the last
+	// accepted turn. Like Title it is mutable session metadata and never part
+	// of the immutable identity.
+	Model string `json:"model,omitempty"`
 	// Lifecycle is the explicit session lifecycle state (SESSION.md §28).
 	// Active/Dormant are pointer-derived; Archived is the explicit transition
 	// applied via /session archive. Only explicit lifecycle commands may move a
@@ -645,6 +649,7 @@ func (s *Session) Purge() {
 	s.History = nil
 	s.ContextLedger = nil
 	s.Title = ""
+	s.Model = ""
 	s.Lifecycle = LifecycleActive
 	s.WorkspaceDirtyFiles = nil
 }

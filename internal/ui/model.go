@@ -816,6 +816,23 @@ type model struct {
 	// Banner visibility state
 	showBanner bool
 
+	// ── Two-stage session titling (Stage 2 async refinement) ──────────
+	// titleRefiner injects the one-shot summarizer (nil => wired provider).
+	// titleRefineArmed is set by Stage 1 and consumed once on the first stream
+	// completion. titlePrompt/titleHeuristic capture the originating prompt and
+	// the deterministic Stage 1 title so a late Stage 2 result can be rejected
+	// when the session switched or the user renamed manually.
+	titleRefiner     titleRefinerFunc
+	titleRefineArmed bool
+	titlePrompt      string
+	titleHeuristic   string
+
+	// resumeBriefing is the orientation data injected at the top of the fresh
+	// viewport when a dormant session is resumed. It is rendered on demand so a
+	// terminal resize re-wraps it, and cleared on the first prompt submission
+	// that starts a new conversation.
+	resumeBriefing *resumeBriefingData
+
 	// Window dimensions
 	width     int
 	height    int
@@ -4409,6 +4426,15 @@ func (m *model) refreshViewportContent() {
 	var chrome strings.Builder
 	if m.showBanner && len(m.records) == 0 {
 		if b := m.renderStartupBanner(m.width); b != "" {
+			chrome.WriteString(b)
+			chrome.WriteString("\n")
+		}
+	}
+	// RESUME BRIEFING: orientation banner for a freshly resumed session. It is
+	// pinned at the top of the fresh viewport until the first user prompt
+	// clears it. Legacy chat history is never re-rendered into the buffer.
+	if m.resumeBriefing != nil {
+		if b := m.renderResumeBriefing(); b != "" {
 			chrome.WriteString(b)
 			chrome.WriteString("\n")
 		}
