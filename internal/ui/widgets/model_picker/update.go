@@ -218,7 +218,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		budget := m.listRowBudget
 		if budget <= 0 {
-			budget = max(5, m.innerHeight-6)
+			budget = max(5, m.innerHeight-7)
 			if budget <= 0 {
 				budget = 5
 			}
@@ -238,7 +238,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		budget := m.listRowBudget
 		if budget <= 0 {
-			budget = max(5, m.innerHeight-6)
+			budget = max(5, m.innerHeight-7)
 			if budget <= 0 {
 				budget = 5
 			}

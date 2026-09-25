@@ -393,8 +393,9 @@ func (m Model) ProviderFilter() string { return m.provider }
 //	W_inner = modalW - 4 (border 2 + padding 1+1)
 //	H_inner = modalH - 2 (border 2, padding 0 vertical)
 //
-// Chrome = 6 lines (Title, Search, Divider, Reasoning, Bindings, Footer)
-// listRowBudget = max(3, innerHeight - 6)
+// Chrome = 7 lines (Title, Divider, Divider, Active Model, Provider,
+// Variant, Footer)
+// listRowBudget = max(3, innerHeight - 7)
 func (m Model) SetSize(w, h int) Model {
 	if w < 1 {
 		w = 1
@@ -406,7 +407,7 @@ func (m Model) SetSize(w, h int) Model {
 	m.modalH = h
 	m.innerWidth = max(20, w-4)
 	m.innerHeight = max(5, h-2)
-	m.listRowBudget = max(3, m.innerHeight-6)
+	m.listRowBudget = max(3, m.innerHeight-7)
 	// Legacy aliases: width/height now represent inner bounds for all
 	// rendering helpers (clipLine, padFooter, render*).
 	m.width = m.innerWidth

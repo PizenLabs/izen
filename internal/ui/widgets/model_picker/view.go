@@ -125,6 +125,8 @@ func (m Model) renderBrowsingLayout() string {
 	b.WriteString("\n")
 	b.WriteString(m.clipLine(m.renderActiveLine()))
 	b.WriteString("\n")
+	b.WriteString(m.clipLine(m.renderProviderLine()))
+	b.WriteString("\n")
 	b.WriteString(m.clipLine(m.renderVariantLine()))
 	b.WriteString("\n")
 
@@ -199,6 +201,10 @@ func (m Model) footerText() string {
 }
 
 // renderBrowsingFooter delivers the dual-pane keybinding footer.
+// Plain width is capped at 84 cells (min(84, windowWidth-4) contract) so the
+// full hint line — including the trailing "Esc close" — survives without
+// wrapping or truncation at normal modal sizes. On narrow bounds middle
+// segments are dropped first, always preserving Tab-select and Esc-close.
 func (m Model) renderBrowsingFooter() string {
 	keyStyle := lipgloss.NewStyle().Foreground(colorText).Bold(true)
 	descStyle := lipgloss.NewStyle().Foreground(colorSubtext0)
@@ -211,17 +217,44 @@ func (m Model) renderBrowsingFooter() string {
 		inner = 64
 	}
 
-	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s   %s %s   %s %s",
-		keyStyle.Render("Tab"), descStyle.Render("select pane"),
-		keyStyle.Render("↑/↓"), descStyle.Render("navigate"),
-		keyStyle.Render("Enter"), descStyle.Render("configure & activate"),
-		keyStyle.Render("Alt+A"), descStyle.Render("set API key"),
-		keyStyle.Render("Alt+i"), descStyle.Render("details"),
-		keyStyle.Render("Esc"), descStyle.Render("close"),
-	)
-	if m.innerWidth <= 0 && m.width <= 0 {
-		return help
+	segments := [][2]string{
+		{"Tab", "select"},
+		{"↑/↓", "nav"},
+		{"Enter", "activate"},
+		{"Alt+A", "API key"},
+		{"Alt+i", "details"},
+		{"Esc", "close"},
 	}
+	buildStyled := func(segs [][2]string) string {
+		parts := make([]string, 0, len(segs))
+		for _, s := range segs {
+			parts = append(parts, keyStyle.Render(s[0])+" "+descStyle.Render(s[1]))
+		}
+		return strings.Join(parts, "   ")
+	}
+	buildPlain := func(segs [][2]string) string {
+		parts := make([]string, 0, len(segs))
+		for _, s := range segs {
+			parts = append(parts, s[0]+" "+s[1])
+		}
+		return strings.Join(parts, "   ")
+	}
+	if m.innerWidth <= 0 && m.width <= 0 {
+		return buildStyled(segments)
+	}
+	// Adaptively drop middle hints until the plain line fits, preserving
+	// the leading Tab and trailing Esc-close anchors.
+	for lipgloss.Width(buildPlain(segments)) > inner && len(segments) > 3 {
+		idx := len(segments) / 2
+		if idx <= 0 {
+			idx = 1
+		}
+		if idx >= len(segments)-1 {
+			idx = len(segments) - 2
+		}
+		segments = append(segments[:idx], segments[idx+1:]...)
+	}
+	help := buildStyled(segments)
 	return truncateStyled(help, inner)
 }
 
@@ -477,7 +510,8 @@ func (m Model) snapshotModels() []registry.ModelDescriptor {
 
 // paneHeight returns the height available for the dual-pane content area.
 // Chrome above and below the panes: header(1) + divider(1) + divider(1) +
-// active(1) + variant(1) = 5 lines, plus padFooter's 1-line footer = 6 total.
+// active(1) + provider(1) + variant(1) = 6 lines, plus padFooter's 1-line
+// footer = 7 total.
 func (m Model) paneHeight() int {
 	innerH := m.innerHeight
 	if innerH <= 0 {
@@ -486,7 +520,7 @@ func (m Model) paneHeight() int {
 	if innerH <= 0 {
 		return 16
 	}
-	return max(3, innerH-6)
+	return max(3, innerH-7)
 }
 
 // renderLeftPane dispatches the left pane: the Roles policy list when the
@@ -860,8 +894,9 @@ func (m Model) buildVerticalSeparator() string {
 	return strings.Join(lines, "\n")
 }
 
-// renderActiveLine shows the currently highlighted provider and model. In
-// Roles mode it surfaces the highlighted role policy override instead.
+// renderActiveLine shows the currently active model ID without the filter
+// category prefix (no "All models /" prefix). In Roles mode it surfaces the
+// highlighted role policy override instead.
 func (m Model) renderActiveLine() string {
 	if m.showingRoles {
 		role := m.HighlightedRole()
@@ -871,32 +906,54 @@ func (m Model) renderActiveLine() string {
 		}
 		return mutedStyle.Render("Role: ") + accentStyle.Render(role) + mutedStyle.Render(suffix)
 	}
-	prov := m.highlightedProvider()
-	if prov == "" {
-		prov = "All models"
-	}
 	modelID := "—"
 	if hl := m.Highlighted(); hl != nil {
 		modelID = hl.ID
+	} else if sel := m.SelectedModel(); sel != nil {
+		modelID = sel.ID
 	}
-	return mutedStyle.Render("Active: ") + accentStyle.Render(prov) + mutedStyle.Render(" / ") + accentStyle.Render(modelID)
+	return mutedStyle.Render("Active Model: ") + accentStyle.Render(modelID)
+}
+
+// activeProviderID resolves the underlying execution provider for the
+// currently active model, so the "All models" global scope still shows an
+// explicit provider (e.g. openrouter, ollama, openai).
+func (m Model) activeProviderID() string {
+	if hl := m.Highlighted(); hl != nil && hl.Provider != "" {
+		return hl.Provider
+	}
+	if sel := m.SelectedModel(); sel != nil && sel.Provider != "" {
+		return sel.Provider
+	}
+	return m.highlightedProvider()
+}
+
+// renderProviderLine shows the resolved execution provider for the active
+// model. The label carries faint/muted styling while the provider name uses
+// the primary accent.
+func (m Model) renderProviderLine() string {
+	provider := m.activeProviderID()
+	if provider == "" {
+		provider = "—"
+	}
+	return mutedStyle.Render("Provider:     ") + accentStyle.Render(provider)
 }
 
 // renderVariantLine shows the reasoning policy variant for the highlighted model.
 func (m Model) renderVariantLine() string {
 	sel := m.Highlighted()
 	if sel == nil {
-		return mutedStyle.Render("Variant: —")
+		return mutedStyle.Render("Variant:      ") + accentStyle.Render("—")
 	}
 	opt, ok := m.CurrentReasoningOption()
 	if !ok {
-		return mutedStyle.Render("Variant: Fixed")
+		return mutedStyle.Render("Variant:      ") + accentStyle.Render("Fixed")
 	}
 	label := opt
 	if label == "" {
 		label = "Default"
 	}
-	return mutedStyle.Render("Variant: ") + accentStyle.Render(label)
+	return mutedStyle.Render("Variant:      ") + accentStyle.Render(label)
 }
 
 // renderHeader renders the registry title with total count and sync state:
@@ -999,9 +1056,9 @@ func (m Model) syncIndicator() (string, interface {
 }
 
 // visibleWindow computes the dynamic viewport: chrome-aware budget from
-// innerHeight with cursor-following scroll offset. Spec: Total Chrome = 6
-// (Title, Search, Divider, Reasoning, Bindings, Help footer).
-// listRowBudget = max(3, innerHeight - 6). Zero height = show all.
+// innerHeight with cursor-following scroll offset. Spec: Total Chrome = 7
+// (Title, Divider, Divider, Active Model, Provider, Variant, Help footer).
+// listRowBudget = max(3, innerHeight - 7). Zero height = show all.
 //
 //nolint:unused // retained as the pane-agnostic contract ancestor of visibleWindowBudget
 func (m Model) visibleWindow() (start, end int) {
@@ -1018,7 +1075,7 @@ func (m Model) visibleWindow() (start, end int) {
 		if m.listRowBudget > 0 {
 			budget = m.listRowBudget
 		} else {
-			budget = max(3, innerH-6)
+			budget = max(3, innerH-7)
 		}
 		if budget > total {
 			budget = total
