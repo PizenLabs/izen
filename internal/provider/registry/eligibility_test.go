@@ -12,23 +12,19 @@ import (
 	"github.com/PizenLabs/izen/internal/provider/detector"
 )
 
-// TestCheckExecutable_SeededAgenticOnly: the evidence-seeded entry is
-// ineligible with its documented reason, matched case-insensitively.
-func TestCheckExecutable_SeededAgenticOnly(t *testing.T) {
+// TestCheckExecutable_NoBlacklist: the adaptive runtime no longer blacklists
+// any model. Even the observed agentic-harness models are executable — they are
+// promoted, not rejected.
+func TestCheckExecutable_NoBlacklist(t *testing.T) {
 	for _, tc := range []struct{ provider, id string }{
 		{"openrouter", "thinkingmachines/inkling:free"},
 		{"OpenRouter", "ThinkingMachines/Inkling:Free"},
 		{"  openrouter  ", "  thinkingmachines/inkling:free  "},
+		{"openrouter", "thinkingmachines/inkling-small:free"},
+		{"OpenRouter", "ThinkingMachines/Inkling-Small:Free"},
 	} {
-		inelig := CheckExecutable(tc.provider, tc.id)
-		if inelig == nil {
-			t.Fatalf("CheckExecutable(%q, %q) = nil, want ineligible", tc.provider, tc.id)
-		}
-		if inelig.Reason != ReasonAgenticHarnessOnly {
-			t.Errorf("Reason = %q, want %q", inelig.Reason, ReasonAgenticHarnessOnly)
-		}
-		if inelig.Detail == "" || inelig.Evidence == "" {
-			t.Errorf("Detail/Evidence must be documented, got %+v", inelig)
+		if inelig := CheckExecutable(tc.provider, tc.id); inelig != nil {
+			t.Fatalf("CheckExecutable(%q, %q) = %+v, want nil (no blacklist)", tc.provider, tc.id, inelig)
 		}
 	}
 }
@@ -40,7 +36,7 @@ func TestCheckExecutable_NormalModels(t *testing.T) {
 		{"openrouter", "anthropic/claude-3.5-sonnet"},
 		{"openrouter", "openai/gpt-4o"},
 		{"openrouter", "thinkingmachines/inkling"},
-		{"openrouter", "thinkingmachines/inkling-small:free"},
+		{"openrouter", "thinkingmachines/inkling-small"},
 		{"ollama", "llama3.2:3b"},
 		{"openrouter", ""},
 		{"", "openai/gpt-4o"},
@@ -68,15 +64,15 @@ func TestCheckExecutable_ExactMatchNoOverblock(t *testing.T) {
 }
 
 // TestModelDescriptorExecutable covers the descriptor-level view used by
-// ExecutableModels/LoadExecutable.
+// ExecutableModels/LoadExecutable. No discovered model is locally rejected.
 func TestModelDescriptorExecutable(t *testing.T) {
 	flagged := ModelDescriptor{ID: "openai/gpt-4o", Provider: "openrouter", IneligibleReason: string(ReasonAgenticHarnessOnly)}
-	if flagged.Executable() {
-		t.Errorf("descriptor with IneligibleReason must not be executable")
+	if !flagged.Executable() {
+		t.Errorf("legacy IneligibleReason must not make a descriptor non-executable")
 	}
 	policyHit := ModelDescriptor{ID: "thinkingmachines/inkling:free", Provider: "openrouter"}
-	if policyHit.Executable() {
-		t.Errorf("policy-listed model must not be executable even without explicit flag")
+	if !policyHit.Executable() {
+		t.Errorf("agentic-harness model must be executable (promoted, not blocked)")
 	}
 	normal := ModelDescriptor{ID: "openai/gpt-4o", Provider: "openrouter"}
 	if !normal.Executable() {
@@ -84,8 +80,8 @@ func TestModelDescriptorExecutable(t *testing.T) {
 	}
 }
 
-// TestExecutableModels_PreservesOrder: filtering keeps order and never
-// mutates the input.
+// TestExecutableModels_PreservesOrder: with no blacklist every discovered
+// model is executable, order is preserved, and the input is never mutated.
 func TestExecutableModels_PreservesOrder(t *testing.T) {
 	in := []Model{
 		{ID: "openai/gpt-4o", Provider: "openrouter"},
@@ -93,18 +89,17 @@ func TestExecutableModels_PreservesOrder(t *testing.T) {
 		{ID: "anthropic/claude-3.5-sonnet", Provider: "openrouter"},
 	}
 	got := ExecutableModels(in)
-	if len(got) != 2 || got[0].ID != "openai/gpt-4o" || got[1].ID != "anthropic/claude-3.5-sonnet" {
-		t.Fatalf("ExecutableModels = %v, want the two eligible models in order", got)
+	if len(got) != 3 || got[0].ID != "openai/gpt-4o" || got[1].ID != "thinkingmachines/inkling:free" || got[2].ID != "anthropic/claude-3.5-sonnet" {
+		t.Fatalf("ExecutableModels = %v, want all three models in order", got)
 	}
 	if len(in) != 3 {
 		t.Fatalf("input slice must not be mutated, got %d models", len(in))
 	}
 }
 
-// TestLoadExecutable_SeparatesDiscoveredFromSelectable: the full snapshot
-// still discovers every catalog model while the executable view excludes
-// the ineligible one.
-func TestLoadExecutable_SeparatesDiscoveredFromSelectable(t *testing.T) {
+// TestLoadExecutable_NoModelHidden: with no blacklist the executable view
+// equals the full discovered catalog.
+func TestLoadExecutable_NoModelHidden(t *testing.T) {
 	r := NewRegistryWithCachePath("")
 	r.SetSeed([]ModelDescriptor{
 		{ID: "openai/gpt-4o", Provider: "openrouter", Name: "GPT-4o"},
@@ -112,21 +107,20 @@ func TestLoadExecutable_SeparatesDiscoveredFromSelectable(t *testing.T) {
 	})
 	full := r.Load()
 	if len(full.Models) != 2 {
-		t.Fatalf("discovered catalog = %d models, want 2 (raw preserved)", len(full.Models))
+		t.Fatalf("discovered catalog = %d models, want 2", len(full.Models))
 	}
 	exec := r.LoadExecutable()
-	if len(exec.Models) != 1 || exec.Models[0].ID != "openai/gpt-4o" {
-		t.Fatalf("executable view = %v, want only openai/gpt-4o", exec.Models)
+	if len(exec.Models) != 2 {
+		t.Fatalf("executable view = %v, want every discovered model (nothing hidden)", exec.Models)
 	}
 	if exec.Version != full.Version {
 		t.Errorf("executable view must carry the snapshot version, got %d want %d", exec.Version, full.Version)
 	}
 }
 
-// TestFetchHTTPModels_MarksIneligibleButPreservesCatalog: a mocked catalog
-// containing an agentic-only model yields discovered==true for both models,
-// eligible==false/selectable==false only for the restricted one.
-func TestFetchHTTPModels_MarksIneligibleButPreservesCatalog(t *testing.T) {
+// TestFetchHTTPModels_PreservesCatalog: a mocked catalog containing an
+// agentic-harness model discovers every model and marks none ineligible.
+func TestFetchHTTPModels_PreservesCatalog(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{
@@ -154,13 +148,13 @@ func TestFetchHTTPModels_MarksIneligibleButPreservesCatalog(t *testing.T) {
 	}
 	ink, ok := byID["thinkingmachines/inkling:free"]
 	if !ok {
-		t.Fatalf("agentic-only model must still be discovered, got %v", got)
+		t.Fatalf("agentic-harness model must still be discovered, got %v", got)
 	}
-	if ink.Executable() {
-		t.Errorf("thinkingmachines/inkling:free must be flagged ineligible")
+	if !ink.Executable() {
+		t.Errorf("agentic-harness model must stay executable (promoted, not blocked)")
 	}
-	if ink.IneligibleReason == "" {
-		t.Errorf("flagged model must carry IneligibleReason")
+	if ink.IneligibleReason != "" {
+		t.Errorf("no model may be marked ineligible, got %q", ink.IneligibleReason)
 	}
 	if normal := byID["openai/gpt-4o"]; !normal.Executable() {
 		t.Errorf("normal model must stay executable: %+v", normal)
@@ -183,8 +177,8 @@ func TestSync_PreservesRawCatalogOnDisk(t *testing.T) {
 	if err := r.Sync(context.Background(), provs); err != nil {
 		t.Fatalf("Sync() error = %v", err)
 	}
-	if got := r.LoadExecutable().Models; len(got) != 1 || got[0].ID != "openai/gpt-4o" {
-		t.Fatalf("executable view after Sync = %v, want only openai/gpt-4o", got)
+	if got := r.LoadExecutable().Models; len(got) != 2 {
+		t.Fatalf("executable view after Sync = %v, want every discovered model", got)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "models.json"))
 	if err != nil {

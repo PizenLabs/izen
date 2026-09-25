@@ -196,6 +196,23 @@ type streamErrMsg struct {
 	usageEstimated bool
 }
 
+// roleFallbackNoticeMsg carries an EXPLICIT role-chain model switch into the
+// trace view. It is produced by the stream producer when the primary model
+// failed on a network-transient error and the turn was retried on the role's
+// configured fallback model. It never mutates the active binding.
+type roleFallbackNoticeMsg struct {
+	// notice is the rendered trace line:
+	// "[fallback] Primary model failed (<reason>). Switched to <fallback>."
+	notice string
+	// primary is the model that failed, fallback the model now executing.
+	primary  string
+	fallback string
+	// reason is the classified cause (e.g. "rate limit (HTTP 429)").
+	reason string
+	// role is the config key whose chain fired (e.g. "plan").
+	role string
+}
+
 type PlanStreamingFinishedMsg struct {
 	Success bool
 }

@@ -40,6 +40,20 @@ func (p *PreparedProvider) Name() string {
 	return p.inner.Name()
 }
 
+// SetToolRunner forwards the read-only tool runner to the wrapped provider when
+// it supports one. It keeps the adaptive read-only tool loop working through
+// the context-compiler facade without leaking the facade to callers.
+func (p *PreparedProvider) SetToolRunner(runner ai.ToolRunner) {
+	if p == nil || p.inner == nil {
+		return
+	}
+	if setter, ok := p.inner.(interface {
+		SetToolRunner(ai.ToolRunner)
+	}); ok {
+		setter.SetToolRunner(runner)
+	}
+}
+
 func (p *PreparedProvider) prepare(ctx context.Context, req ai.Request) (ai.Request, error) {
 	if p == nil || p.inner == nil {
 		return ai.Request{}, fmt.Errorf("contextcompiler: nil prepared provider")

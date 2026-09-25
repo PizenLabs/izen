@@ -54,19 +54,17 @@ type incompatibleModel struct {
 	Evidence string
 }
 
-// incompatibleModels is the evidence-seeded provider-compatibility policy.
-// OpenRouter provides no machine-readable harness-eligibility signal in its
-// catalog, so entries here require observed provider evidence (documented
-// in Evidence) and exact-ID matching.
-var incompatibleModels = []incompatibleModel{
-	{
-		Provider: "openrouter",
-		ID:       "thinkingmachines/inkling:free",
-		Reason:   ReasonAgenticHarnessOnly,
-		Detail:   "Model unavailable for Izen's current OpenRouter execution path: restricted to agentic harnesses.",
-		Evidence: "Observed HTTP 403 from POST /chat/completions: 'thinkingmachines/inkling:free is only available on agentic harnesses.' Catalog entry carries no harness-eligibility flag.",
-	},
-}
+// incompatibleModels is the provider-compatibility RESTRICTION policy.
+//
+// ARCHITECTURAL DECISION (adaptive runtime): Izen no longer blacklists models.
+// A model that a provider restricts to an agentic wire harness is NOT
+// ineligible — the runtime dynamically promotes its interaction contract and
+// attaches authentic read-only tools (see wire_policy.go and the OpenRouter
+// adapter). This table is therefore intentionally empty; it remains the
+// extension point for a model that a provider rejects at the transport level
+// for reasons that cannot be resolved by promotion. Agentic-harness models
+// MUST NOT be added here.
+var incompatibleModels = []incompatibleModel{}
 
 // normalizeModelKey trims and lowercases a provider/model identifier for
 // exact policy comparison.
@@ -101,13 +99,12 @@ func CheckExecutable(provider, modelID string) *ModelIneligibility {
 }
 
 // Executable reports whether a descriptor may be selected and executed.
-// A descriptor with an explicit IneligibleReason is never executable;
-// otherwise the policy table is consulted so hand-built descriptors are
-// covered too.
+//
+// No model is locally rejected by default: only an entry in the (currently
+// empty) restriction policy makes a model non-executable. The legacy
+// IneligibleReason JSON field is preserved for catalog compatibility but is
+// no longer authoritative — agentic-harness models are promoted, not blocked.
 func (m ModelDescriptor) Executable() bool {
-	if strings.TrimSpace(m.IneligibleReason) != "" {
-		return false
-	}
 	return CheckExecutable(m.Provider, m.ID) == nil
 }
 

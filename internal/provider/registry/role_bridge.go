@@ -64,7 +64,12 @@ func ResolveRoleModel(roleName string, cfg *config.CascadeConfig, reg *Registry)
 	if reg == nil {
 		return ModelDescriptor{}, fmt.Errorf("role %q: nil model registry", roleName)
 	}
-	models := ToRoleDescriptors(reg.Snapshot())
+	// Boundary: role resolution must only ever see executable models. The
+	// full discovered catalog (Snapshot) can carry models flagged
+	// IneligibleReason for Izen's execution path; resolving a role to one of
+	// those would reintroduce the catalog→inference bypass this guard exists
+	// to close. LoadExecutable() is the selectable view.
+	models := ToRoleDescriptors(reg.LoadExecutable().Models)
 	var bindings map[string]string
 	if cfg != nil {
 		bindings = cfg.Roles

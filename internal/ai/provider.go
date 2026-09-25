@@ -37,6 +37,12 @@ func IsOutputTruncated(err error) bool { return errors.Is(err, ErrOutputTruncate
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// ToolCalls is populated on an assistant message that requested tool
+	// invocations (finish_reason "tool_calls"). ToolCallID binds a "tool"
+	// message back to the assistant tool call it answers. Both are wire
+	// envelopes for the adaptive read-only tool loop.
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
 // JSONSchemaFormat is the OpenAI-compatible json_schema envelope. Keeping the

@@ -38,7 +38,6 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/modes/review"
 	"github.com/PizenLabs/izen/internal/protocol"
-	oregistry "github.com/PizenLabs/izen/internal/provider/registry"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	riview "github.com/PizenLabs/izen/internal/review"
@@ -2393,12 +2392,11 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 		m.gotoBottomIfAllowed()
 		return nil
 	}
-	if inelig := oregistry.CheckExecutable(resolvedProvider, modelName); inelig != nil {
-		m.push(roleError, fmt.Sprintf("[✗] Model unavailable for Izen's current execution path: %s is %s", modelName, inelig.Reason))
-		m.refreshViewportContent()
-		m.gotoBottomIfAllowed()
-		return nil
-	}
+	// ADAPTIVE RUNTIME: /model never rejects a discovered model locally. A
+	// model whose provider wire policy requires an agentic harness is executed
+	// natively through Dynamic Contract Promotion (the provider adapter
+	// promotes the interaction contract and binds read-only tools before
+	// dispatch). Selection failure is only ever a binding validation error.
 	if err := m.persistAndActivateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
 		m.refreshViewportContent()

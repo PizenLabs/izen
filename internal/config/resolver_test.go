@@ -190,13 +190,18 @@ func writeProjectConfig(t *testing.T, root string, modeDefaults map[string]strin
 	}
 }
 
+// writeGlobalConfig writes a stub ~/.izen/config.yml for the resolver
+// precedence tests.
+//
+// HOME is redirected into a per-test temp directory: the global config lives in
+// the real user home, so writing (and then cleaning up) the real file would
+// destroy the developer's actual configuration — including their provider keys
+// — every time the suite runs.
 func writeGlobalConfig(t *testing.T, modeDefaults map[string]string) {
 	t.Helper()
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("UserHomeDir: %v", err)
-	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 
 	dir := filepath.Join(home, ".izen")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -215,12 +220,8 @@ func writeGlobalConfig(t *testing.T, modeDefaults map[string]string) {
 		t.Fatalf("marshal global config: %v", err)
 	}
 
-	path := filepath.Join(home, ".izen", "config.yml")
+	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
-
-	t.Cleanup(func() {
-		_ = os.Remove(path)
-	})
 }

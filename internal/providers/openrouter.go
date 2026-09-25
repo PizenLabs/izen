@@ -19,6 +19,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	dprovider "github.com/PizenLabs/izen/internal/core/domain/provider"
 	"github.com/PizenLabs/izen/internal/llm"
+	"github.com/PizenLabs/izen/internal/protocol"
 	oregistry "github.com/PizenLabs/izen/internal/provider/registry"
 )
 
@@ -32,28 +33,60 @@ var ErrOpenRouterAuth = errors.New("openrouter: authorization failed (HTTP 401):
 // live invocation. Every invocation MUST carry an explicit ModelBinding.
 const DefaultOpenRouterModel = "anthropic/claude-3.5-sonnet"
 
-// ErrOpenRouterModelIncompatible is returned when a model cannot be
-// executed through Izen's current OpenRouter execution path (e.g. models
-// the provider restricts to agentic harnesses). It is a provider/model
-// compatibility refusal, not a generic streaming failure: callers must not
-// retry it and must not silently switch models.
+// ErrOpenRouterModelIncompatible classifies a WIRE-level refusal: the provider
+// answered a dispatched request with an agentic-harness HTTP 403. It is never
+// produced locally — Izen no longer pre-flight-guards models (see
+// promoteAgenticWireContract), so a model that is selectable always reaches
+// the provider with a promoted contract. Callers must not switch models on it:
+// a wire-policy requirement is satisfied by Dynamic Contract Promotion, and a
+// genuine permission refusal is a configuration problem the user must see.
 var ErrOpenRouterModelIncompatible = errors.New("openrouter: model unavailable for Izen's current OpenRouter execution path")
 
-// guardModelExecutable rejects models known to be ineligible for Izen's
-// current OpenRouter execution path before any network I/O, so catalog
-// presence can never again reach inference only to fail with HTTP 403.
-func guardModelExecutable(model string) error {
-	inelig := oregistry.CheckExecutable("openrouter", model)
-	if inelig == nil {
-		return nil
+// promoteAgenticWireContract performs the adaptive runtime promotion for
+// agentic-harness models: when the target model requires a tool schema on the
+// wire and the request carries none (e.g. a DirectCompletion /ask request), it
+// elevates the interaction contract to ToolEnabledCompletion and attaches
+// IZEN's authentic read-only tools. Standard models are untouched so
+// DirectCompletion keeps its lower token overhead.
+//
+// It is a no-op when tools are already present or the existing contract is
+// already tool-bearing.
+func promoteAgenticWireContract(req ai.Request, model string) ai.Request {
+	if len(req.Tools) > 0 {
+		return req
 	}
-	return fmt.Errorf("%w: model %q is %s", ErrOpenRouterModelIncompatible, model, inelig.Reason)
+	if !oregistry.RequiresAgenticHarnessWire("openrouter", model) {
+		return req
+	}
+	switch req.InteractionContract {
+	case "", protocol.DirectCompletion:
+	default:
+		// Tool-enabled and agentic loops already carry tools; structured-
+		// completion keeps its schema contract (can't carry both).
+		return req
+	}
+	descriptor := protocol.Describe(protocol.ToolEnabledCompletion)
+	req.InteractionContract = descriptor.Contract
+	req.Contract = &descriptor
+	req.Tools = ai.ReadOnlyTools()
+	return req
 }
 
-// asCompatibilityError classifies a non-OK inference response: an
-// agentic-harness HTTP 403 becomes a compatibility error carrying the
-// sentinel; every other status keeps the existing ProviderError behavior.
-func asCompatibilityError(statusCode int, respBody []byte) error {
+// asCompatibilityError classifies a non-OK inference response for a dispatched
+// model. Three outcomes, in order:
+//
+//  1. the provider's agentic-harness ROUTING GATE refused the request
+//     (ErrOpenRouterAgenticGate) — an access policy on the provider side, kept
+//     distinct from a model incompatibility so the UI can explain it precisely,
+//  2. an agentic-harness HTTP 403 compatibility refusal
+//     (ErrOpenRouterModelIncompatible),
+//  3. every other status keeps the existing ProviderError behavior.
+//
+// No outcome reverts the model: the caller keeps the user's binding.
+func asCompatibilityError(model string, statusCode int, respBody []byte) error {
+	if gateErr := asAgenticGateError(model, statusCode, respBody); gateErr != nil {
+		return gateErr
+	}
 	pe := NewProviderError("openrouter", statusCode, respBody)
 	if pe.IsModelCompatibility() {
 		return fmt.Errorf("%w: %s", ErrOpenRouterModelIncompatible, pe.Error())
@@ -80,6 +113,11 @@ const maxOpenRouterMaxTokens = 8192
 // constrained/free-tier models (max_output <= 1024). 980 leaves headroom
 // below a 1024 ceiling so the completion never hits finish_reason="length".
 const constrainedOpenRouterMaxTokens = 980
+
+// openRouterUserAgent identifies Izen truthfully to the provider. It is a
+// stable constant (not a build-stamped version) so provider-side attribution
+// groups every Izen request under one client identity.
+const openRouterUserAgent = "izen/0.2 (agentic coding harness; +https://github.com/PizenLabs/izen)"
 
 // isOpenRouterFreeTierModel reports whether a model ID is an OpenRouter
 // free-tier model (":free" suffix, case-insensitive). Free-tier models are
@@ -161,6 +199,22 @@ type OpenRouterProvider struct {
 	model   string
 	baseURL string
 	client  *http.Client
+
+	// toolRunner is the execution-pipeline read-only tool runner. When set,
+	// agentic-harness models run the adaptive read-only tool loop so a
+	// tool_calls response is executed and the final answer is produced
+	// in-process. It is optional: without it the provider still promotes the
+	// wire contract (no 403) but cannot execute tool calls itself.
+	toolRunner ai.ToolRunner
+}
+
+// SetToolRunner injects the execution-pipeline read-only tool runner used by
+// the adaptive tool loop for agentic-harness models.
+func (p *OpenRouterProvider) SetToolRunner(runner ai.ToolRunner) {
+	if p == nil {
+		return
+	}
+	p.toolRunner = runner
 }
 
 func NewOpenRouterProvider(apiKey, model, baseURL string) *OpenRouterProvider {
@@ -208,13 +262,28 @@ func (p *OpenRouterProvider) resolveAPIKey() string {
 	return ""
 }
 
+// Execute performs one logical OpenRouter invocation. Agentic-harness models
+// run the adaptive read-only tool loop when a runner is available; every other
+// model runs a single request. The wire contract is promoted before dispatch in
+// both cases, so an agentic model never receives a toolless request.
 func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
-	requestStarted := time.Now()
 	model, err := p.resolveModel(req.Model)
 	if err != nil {
 		return nil, err
 	}
-	if err := guardModelExecutable(model); err != nil {
+	req = promoteAgenticWireContract(req, model)
+	if p.toolRunner != nil && oregistry.RequiresAgenticHarnessWire("openrouter", model) {
+		return ai.RunReadOnlyToolLoop(ctx, p.executeOnce, p.toolRunner, req, ai.ToolLoopOptions{})
+	}
+	return p.executeOnce(ctx, req)
+}
+
+// executeOnce performs exactly one HTTP chat-completion invocation. It is the
+// single-shot primitive the read-only tool loop drives.
+func (p *OpenRouterProvider) executeOnce(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
+	model, err := p.resolveModel(req.Model)
+	if err != nil {
 		return nil, err
 	}
 
@@ -253,7 +322,7 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, asCompatibilityError(resp.StatusCode, respBody)
+		return nil, asCompatibilityError(model, resp.StatusCode, respBody)
 	}
 
 	var openaiResp openrouterResponse
@@ -318,15 +387,30 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 }
 
 func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
-	requestStarted := time.Now()
 	model, err := p.resolveModel(req.Model)
 	if err != nil {
 		return nil, err
 	}
-	if err := guardModelExecutable(model); err != nil {
-		return nil, err
+	// Dynamic Contract Promotion: an agentic-harness model is executed
+	// natively — the contract is promoted to ToolEnabledCompletion and
+	// IZEN's authentic read-only tools are attached before dispatch. There is
+	// no local pre-flight guard and no model reversion on this path.
+	req = promoteAgenticWireContract(req, model)
+	// Agentic-harness models: execute the bounded read-only tool loop
+	// in-process and surface the final answer as a one-shot stream. This keeps
+	// /ask working for models whose provider requires a tool schema.
+	if p.toolRunner != nil && oregistry.RequiresAgenticHarnessWire("openrouter", model) {
+		resp, loopErr := ai.RunReadOnlyToolLoop(ctx, p.executeOnce, p.toolRunner, req, ai.ToolLoopOptions{})
+		if loopErr != nil {
+			return nil, loopErr
+		}
+		content := ""
+		if resp != nil {
+			content = resp.Content
+		}
+		return newSynthesizedStream(content), nil
 	}
-
+	requestStarted := time.Now()
 	key := p.resolveAPIKey()
 	if key == "" {
 		return nil, fmt.Errorf("%w: api key is empty — set OPENROUTER_API_KEY or configure api_key in provider config", ErrOpenRouterAuth)
@@ -359,7 +443,7 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
 		_ = resp.Body.Close()
-		return nil, asCompatibilityError(resp.StatusCode, respBody)
+		return nil, asCompatibilityError(model, resp.StatusCode, respBody)
 	}
 
 	sr := &openrouterSSEReader{
@@ -387,7 +471,19 @@ func (p *OpenRouterProvider) buildMessages(req ai.Request) []openrouterMessage {
 	}
 	for _, m := range req.Messages {
 		content := sanitizeContent(m.Content)
-		msgs = append(msgs, openrouterMessage{Role: m.Role, Content: content})
+		om := openrouterMessage{Role: m.Role, Content: content, ToolCallID: m.ToolCallID}
+		for _, tc := range m.ToolCalls {
+			typ := tc.Type
+			if typ == "" {
+				typ = "function"
+			}
+			om.ToolCalls = append(om.ToolCalls, openrouterToolCall{
+				ID:       tc.ID,
+				Type:     typ,
+				Function: openrouterToolCallFunc{Name: tc.Function.Name, Arguments: tc.Function.Arguments},
+			})
+		}
+		msgs = append(msgs, om)
 	}
 	return cleanMessages(msgs)
 }
@@ -403,19 +499,25 @@ func (p *OpenRouterProvider) buildMessages(req ai.Request) []openrouterMessage {
 //  5. Sliding window: keep at most the last 30 messages to prevent unbounded
 //     token growth across long sessions.
 func cleanMessages(msgs []openrouterMessage) []openrouterMessage {
-	// Step 1: drop empty content.
+	// Step 1: drop empty content, but never a tool-call or tool-result
+	// envelope — the assistant tool_calls block may legitimately carry empty
+	// content and must survive for the tool loop to be valid.
 	filtered := msgs[:0]
 	for _, m := range msgs {
-		if m.Content != "" {
+		if m.Content != "" || len(m.ToolCalls) > 0 || m.ToolCallID != "" {
 			filtered = append(filtered, m)
 		}
 	}
 	msgs = filtered
 
-	// Step 2: merge consecutive same-role messages.
+	// Step 2: merge consecutive same-role messages. Tool-call and tool-result
+	// envelopes are never merged (each is an atomic wire record).
 	merged := make([]openrouterMessage, 0, len(msgs))
 	for i, m := range msgs {
-		if i > 0 && m.Role == msgs[i-1].Role && m.Role != "system" {
+		mergeable := m.Role != "system" && len(m.ToolCalls) == 0 && m.ToolCallID == "" &&
+			i > 0 && len(msgs[i-1].ToolCalls) == 0 && msgs[i-1].ToolCallID == "" &&
+			m.Role == msgs[i-1].Role
+		if mergeable {
 			last := &merged[len(merged)-1]
 			last.Content += "\n" + m.Content
 			continue
@@ -455,6 +557,10 @@ func cleanMessages(msgs []openrouterMessage) []openrouterMessage {
 type openrouterMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// ToolCalls is set on an assistant message that requested tool calls;
+	// ToolCallID binds a "tool" result message to its originating call.
+	ToolCalls  []openrouterToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string               `json:"tool_call_id,omitempty"`
 }
 
 type openrouterRequest struct {
@@ -651,7 +757,12 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 	// INVARIANT 1: ZERO-TOOL PAYLOAD ON CASUAL — if the system prompt is the
 	// minimal casual contract, tools MUST be omitted entirely (not even an empty
 	// array). Defensive: even if caller erroneously sets Tools, drop them.
-	if isCasualSystemPrompt(req.System) {
+	//
+	// EXCEPTION (adaptive runtime): an agentic-harness model rejects a toolless
+	// request with HTTP 403 regardless of the prompt profile, so the read-only
+	// tool schema must survive even on a casual turn.
+	agenticWire := oregistry.RequiresAgenticHarnessWire("openrouter", model)
+	if isCasualSystemPrompt(req.System) && !agenticWire {
 		body.Tools = nil
 	} else if len(req.Tools) > 0 {
 		rawTools := make([]json.RawMessage, 0, len(req.Tools))
@@ -758,6 +869,14 @@ func (p *OpenRouterProvider) doChatRequest(ctx context.Context, key string, body
 		httpReq.Header.Set("HTTP-Referer", "https://pizenlabs.github.io/izen314")
 		httpReq.Header.Set("X-OpenRouter-Title", "izen")
 		httpReq.Header.Set("X-Title", "izen")
+		// Truthful client identification. Go's implicit default
+		// ("Go-http-client/1.1") hides the caller from provider-side app
+		// attribution and diagnostics; Izen names itself instead. Izen NEVER
+		// borrows another product's User-Agent: OpenRouter's agentic-harness
+		// routing gate is a User-Agent allowlist (see agentic_gate.go), and
+		// impersonating a registered harness to pass it would be a lie about
+		// who is calling.
+		httpReq.Header.Set("User-Agent", openRouterUserAgent)
 		resp, err := p.client.Do(httpReq)
 		if err != nil && resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
@@ -944,6 +1063,19 @@ func (u *openrouterUsage) ProviderUsage() ai.ProviderUsage {
 		out.TotalTokens = out.PromptTokens + out.CompletionTokens + out.ReasoningTokens
 	}
 	return out
+}
+
+// synthesizedStream presents already-complete content as an io.ReadCloser. It
+// is used by the adaptive tool loop (ExecuteStream) so the caller-visible
+// streaming contract is preserved once the model has produced its final answer.
+type synthesizedStream struct {
+	*strings.Reader
+}
+
+func (s *synthesizedStream) Close() error { return nil }
+
+func newSynthesizedStream(content string) io.ReadCloser {
+	return &synthesizedStream{Reader: strings.NewReader(content)}
 }
 
 type OpenRouterStreamResult struct {

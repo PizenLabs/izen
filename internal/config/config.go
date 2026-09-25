@@ -103,6 +103,13 @@ type Config struct {
 	// Unified model binding (single source of truth)
 	Bindings BindingsConfig `yaml:"bindings"`
 
+	// Roles is the explicit, user-configurable role fallback chain keyed by
+	// semantic role (plan, default, ...). Each entry declares a primary model
+	// and/or a fallback model; see role_fallback.go. Izen never reverts a model
+	// implicitly — the only switch is this chain, and it fires exclusively on
+	// network-transient failures (timeout / HTTP 429 / HTTP 5xx).
+	Roles map[string]RoleFallbackConfig `yaml:"roles,omitempty"`
+
 	AI        AIConfig        `yaml:"ai"`
 	Models    ModelConfig     `yaml:"models"`
 	Execution ExecutionConfig `yaml:"execution"`

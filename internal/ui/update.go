@@ -3415,6 +3415,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Ctrl+O drawer collapses to its "▸ Thought for Xs (N tokens)" summary.
 		return m, tea.Batch(m.thoughtUpdateCmd("", true), titleCmd)
 
+	case roleFallbackNoticeMsg:
+		// EXPLICIT ROLE FALLBACK EVENT: the turn switched to the role's
+		// configured fallback model after a network-transient primary failure.
+		// This is an informational trace line — the user's active binding is
+		// never rewritten by a fallback.
+		m.push(roleSystem, infoStyle.Render(msg.notice))
+		m.refreshViewportContent()
+		m.gotoBottomIfAllowed()
+		return m, nil
+
 	case streamErrMsg:
 		// Handle executor streaming error separately.
 		if m.execStreaming {
@@ -3491,6 +3501,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 
+		// ── NETWORK-TRANSIENT FAILURES ─────────────────────────────────
+		// A primary model that failed on a network timeout / rate limit /
+		// server error is retried on the role's configured fallback model
+		// (see role_fallback.go) at the dispatch site, so a streamErrMsg
+		// reaching this point means the whole chain failed. Surface the real
+		// cause — never an implicit model reversion.
+
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
@@ -3507,11 +3524,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.err != nil {
 			sanitizedErr = providers.SanitizeAPIError(msg.err)
 		}
-		if errors.Is(msg.err, providers.ErrOpenRouterAuth) {
+		switch {
+		case errors.Is(msg.err, providers.ErrOpenRouterAuth):
 			m.push(roleError, errorStyle.Render("✗ OpenRouter Authorization Failed"))
 			m.push(roleSystem, infoStyle.Render("Invalid or missing OPENROUTER_API_KEY. Please check your environment variables or run:"))
 			m.push(roleSystem, infoStyle.Render("  export OPENROUTER_API_KEY=<your_key>"))
-		} else {
+		case errors.Is(msg.err, providers.ErrOpenRouterAgenticGate):
+			// Provider-side access policy, NOT a model incompatibility and NOT
+			// a reason to change models: OpenRouter serves this model's free
+			// endpoints only to agentic harnesses it has registered (its
+			// "Gate Free Endpoints by Agentic Harness" routing step, a
+			// User-Agent allowlist). Izen keeps the user's binding and names
+			// the three real remedies.
+			m.push(roleError, errorStyle.Render(
+				fmt.Sprintf("✗ %s is served only to registered agentic harnesses (OpenRouter routing gate).", m.getActiveModelName())))
+			m.push(roleSystem, infoStyle.Render("  Your active model is unchanged — this is a provider access policy, not an Izen model reversion."))
+			m.push(roleSystem, infoStyle.Render("  • use the non-gated model id in the same family, e.g. openrouter/thinkingmachines/inkling-small"))
+			m.push(roleSystem, infoStyle.Render("  • or declare a fallback in ~/.izen/config.yml: roles.<role>.fallback"))
+			m.push(roleSystem, infoStyle.Render("  • or list Izen at https://openrouter.ai/apps to be registered as a harness"))
+			m.pruneFailedPromptFromHistory()
+		default:
 			sanitized := sanitizedErr
 			// TTFT Timeout: no first byte arrived and the failure is a
 			// deadline, the first-byte idle watchdog firing, or a
