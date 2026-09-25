@@ -101,7 +101,7 @@ func ValidateDispatchContract(req core.LoopRequest) error {
 // objective before preflight, manifest generation, or any provider-capable
 // dispatcher is entered.
 func ValidateObjectiveContract(objective string, contract protocol.InteractionContract, descriptor *protocol.ContractDescriptor) error {
-	d := protocol.ContractDescriptor{}
+	var d protocol.ContractDescriptor
 	if descriptor != nil {
 		d = descriptor.Clone()
 	} else {
