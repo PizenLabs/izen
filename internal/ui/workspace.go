@@ -8,6 +8,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/modes"
+	statuswidget "github.com/PizenLabs/izen/internal/ui/widgets"
 )
 
 // Section is a mode-owned content block in the workspace. Modes compose their
@@ -305,6 +306,58 @@ func (m *model) renderModelPickerModal() string {
 	return overlayOn(normalContent, centered, m.width, m.height)
 }
 
+// StatusModalSize computes the responsive outer bounds for the standalone
+// status popup. The widget applies the same formula to WindowSizeMsg values;
+// keeping this host wrapper makes the geometry easy to assert alongside the
+// settings modal.
+func StatusModalSize(w, h int) (int, int) {
+	return statuswidget.StatusModalSize(tea.WindowSizeMsg{Width: w, Height: h})
+}
+
+// renderStatusModal overlays the fixed status card on the normal workspace
+// without adding any status text to the conversation document.
+func (m *model) renderStatusModal() string {
+	w, h := m.width, m.height
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+
+	var normalWS Workspace
+	if m.Ready && m.viewRegistry != nil && m.resolver != nil {
+		if view, ok := m.viewRegistry.For(m.resolver.Current()); ok {
+			normalWS = view.BuildWorkspace(m)
+		}
+	}
+	var parts []string
+	if normalWS.Viewport != "" {
+		parts = append(parts, normalWS.Viewport)
+	}
+	if normalWS.ProposalDock != "" {
+		parts = append(parts, normalWS.ProposalDock)
+	}
+	if normalWS.Input != "" {
+		parts = append(parts, normalWS.Input)
+	}
+	if normalWS.Footer != "" {
+		parts = append(parts, normalWS.Footer)
+	}
+	mainView := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	modalW, modalH := StatusModalSize(w, h)
+	m.statusView = m.statusView.SetSize(modalW, modalH)
+	statusModalView := m.statusView.View()
+	statusModalView = lipgloss.Place(
+		w, h,
+		lipgloss.Center, lipgloss.Center,
+		statusModalView,
+		lipgloss.WithWhitespaceChars(" "),
+	)
+	return overlayOn(mainView, statusModalView, w, h)
+}
+
 // SettingsModalSize computes responsive standalone settings dialog bounds.
 // The four-cell terminal margin keeps the box clear of terminal edges; the
 // widget receives these same outer bounds from every WindowSizeMsg.
@@ -481,6 +534,12 @@ func splitVis(s string, visLen int) (string, string) {
 }
 
 func (m *model) BuildWorkspace() Workspace {
+	// Status is an explicitly requested, read-only overlay. Keep it available
+	// even when a host is still completing workspace initialization; the normal
+	// onboarding/help surfaces remain underneath it.
+	if m.showStatus {
+		return Workspace{Overlay: m.renderStatusModal()}
+	}
 	// FIRST-RUN DISK GATE: authoritative .izen/ existence check supersedes
 	// any in-memory initStage value. This prevents stale/incorrect state
 	// (e.g., initNone zero value, initComplete from auto-create bypass)

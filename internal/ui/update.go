@@ -38,6 +38,7 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
+	statuscommand "github.com/PizenLabs/izen/internal/ui/commands"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
 	settings_widget "github.com/PizenLabs/izen/internal/ui/widgets/settings"
@@ -120,7 +121,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	// render flag so text input restores the active blinking cursor on the
 	// very next frame — no waiting for the release timer.
 	m.scrollChromeDirty = true
-	if _, ok := msg.(tea.KeyMsg); ok {
+	if _, ok := msg.(tea.KeyMsg); ok && !m.showStatus {
 		m.endScrollBurst()
 	}
 
@@ -170,6 +171,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	if m.pendingQuitConfirm {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			return m, m.handleQuitConfirmKey(keyMsg)
+		}
+	}
+
+	// ── STANDALONE STATUS MODAL INTERCEPT ─────────────────────────────
+	// Status owns the complete keyboard surface while open. Only the two
+	// explicit dismissal keys escape; every other key is consumed so text,
+	// scrolling, vi navigation, and workspace shortcuts cannot leak through
+	// the popup. WindowSizeMsg intentionally falls through so the parent
+	// viewport and modal can re-center on resize.
+	if m.showStatus {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			m.handleStatusKey(msg)
+			return m, nil
+		case tea.MouseMsg:
+			return m, nil
 		}
 	}
 
@@ -531,7 +548,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// type switch below. Without this, gitInitResultMsg gets swallowed
 		// and the init stage never advances after pressing 'Y'.
 		switch msg.(type) {
-		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg, domainEventMsg, controlFactMsg:
+		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg, domainEventMsg, controlFactMsg, statuscommand.ResultMsg:
 			// fall through to main type switch
 		default:
 			return m, nil
@@ -571,6 +588,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+
+	case statuscommand.ResultMsg:
+		m.handleStatusResult(msg)
+		return m, nil
 
 	case configLoadedMsg:
 		// Defensive workspace loader result (dispatched once per startup from
@@ -774,6 +795,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.resizeStatusView(msg.Width, msg.Height)
 		if m.showSessionPicker && m.sessionPicker != nil {
 			// Keep the widget's responsive layout in lockstep with the parent
 			// viewport, even when a direct resize reaches the root model.

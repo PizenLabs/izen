@@ -270,6 +270,7 @@ func officialCommands() []CommandDescriptor {
 		// Global commands (/).
 		{Marker: MarkerSlash, Name: "help", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "render the mode and command reference"},
 		{Marker: MarkerSlash, Name: "usage", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "display runtime usage, tokens, and provider status"},
+		{Marker: MarkerSlash, Name: "status", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "inspect workspace, VCS, symbol, session, and authority state"},
 		{Marker: MarkerSlash, Name: "models", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "switch or pick the active model/provider"},
 		{Marker: MarkerSlash, Name: "settings", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "open response and viewport preferences"},
 		{Marker: MarkerSlash, Name: "provider", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "switch provider (deprecated, use /models)"},

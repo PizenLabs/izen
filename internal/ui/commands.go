@@ -44,6 +44,7 @@ import (
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/runtime/authority"
 	"github.com/PizenLabs/izen/internal/session"
+	statuscommand "github.com/PizenLabs/izen/internal/ui/commands"
 	verification "github.com/PizenLabs/izen/internal/verification"
 )
 
@@ -82,6 +83,7 @@ var validSystemCommands = map[string]struct{}{
 	"/?":                {},
 	"/quit":             {},
 	"/usage":            {},
+	"/status":           {},
 	"/provider":         {},
 	"/models":           {},
 	"/settings":         {},
@@ -190,15 +192,20 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
-	// ── STALE ACTION-CHIP INVALIDATION ───────────────────────────────
-	// Any new user input ends the previous result's relevance: a chip
-	// referencing a completed, cancelled, or superseded operation must not
-	// linger and offer to re-run an obsolete action. A fresh interaction
-	// always renders with a clean chip surface.
-	m.currentResult = nil
+	// /status is observational: preserve the current result/error surface so
+	// inspecting the workspace never mutates the interaction context.
+	statusInspection := isStatusCommandInput(line)
+	if !statusInspection {
+		// ── STALE ACTION-CHIP INVALIDATION ───────────────────────────────
+		// Any new user input ends the previous result's relevance: a chip
+		// referencing a completed, cancelled, or superseded operation must not
+		// linger and offer to re-run an obsolete action. A fresh interaction
+		// always renders with a clean chip surface.
+		m.currentResult = nil
 
-	// Clear any stale error bar on new user input
-	m.lastApplyError = ""
+		// Clear any stale error bar on new user input.
+		m.lastApplyError = ""
+	}
 
 	// ── CASUAL CONVERSATION AUTO-UNWIND ─────────────────────────────
 	// A casual prompt ("hi") while the WorkflowStateMachine is in any
@@ -216,8 +223,9 @@ func (m *model) handleInput(line string) tea.Cmd {
 	if m.streaming || m.agentRunning {
 		// Settings is a presentation-only modal and remains available during a
 		// live stream so CoT visibility and viewport policy can change without
-		// interrupting the response.
-		if line != "/settings" && !strings.HasPrefix(line, "/settings ") {
+		// interrupting the response. /status is likewise observational and
+		// remains available while a turn is active.
+		if line != "/settings" && !strings.HasPrefix(line, "/settings ") && !statusInspection {
 			// $inspect is a read-only observational directive: it renders the
 			// telemetry of the most recently finalized operation without starting
 			// any work. It is exempt from the busy-input guard so the developer can
@@ -229,6 +237,12 @@ func (m *model) handleInput(line string) tea.Cmd {
 				return nil
 			}
 		}
+	}
+
+	// /status is always observational, including while a confirmation gate is
+	// pending. Do not let the pending-test router consume the command.
+	if statusInspection {
+		return m.handleCommand(line)
 	}
 
 	// Safety gate confirmation: pending test/run confirmation for large repos
@@ -2069,7 +2083,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /spec  inspect the compiled conversation context (read-only)"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /settings  /objective  /drop  /clear  /quit  /copy  /compact"))
+		m.push(roleSystem, infoStyle.Render("  /help  /usage  /status  /models  /settings  /objective  /drop  /clear  /quit  /copy  /compact"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("sessions"))
@@ -2087,6 +2101,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /explain-decision  inspect why a tech stack was chosen"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  /usage           inspect token usage and provider status"))
+		m.push(roleSystem, infoStyle.Render("  /status          inspect workspace, VCS, index, session, and authority state"))
 		m.push(roleSystem, infoStyle.Render("  /models      interactive model picker (fuzzy search)"))
 		m.push(roleSystem, infoStyle.Render("  /settings    response and viewport preferences"))
 		m.push(roleSystem, infoStyle.Render("  /models <name> switch active model directly (e.g. /models claude-3-5-sonnet)"))
@@ -2116,6 +2131,15 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 
 	case cmd == "/usage":
 		return m.runUsageCmd()
+
+	case name[0] == statuscommand.Name:
+		if len(name) > 1 {
+			m.push(roleError, "usage: /status")
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
+			return nil
+		}
+		return m.runStatusCmd()
 
 	case cmd == "/grant":
 		// DEPRECATED: authorization is now an internal operation of the

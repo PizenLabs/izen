@@ -67,6 +67,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ui/status"
 	uitool "github.com/PizenLabs/izen/internal/ui/tool"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
+	status_widget "github.com/PizenLabs/izen/internal/ui/widgets"
 	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
 	settings_widget "github.com/PizenLabs/izen/internal/ui/widgets/settings"
 )
@@ -1564,10 +1565,16 @@ type model struct {
 	// Standalone Settings modal. The widget owns only Response Style, CoT
 	// visibility, and viewport auto-scroll; provider/model registry state
 	// remains exclusively in modelPicker.
-	showSettings       bool
-	settingsModel      settings_widget.Model
-	hideThinkingBlocks bool
-	viewportManager    ViewportManager
+	showSettings  bool
+	settingsModel settings_widget.Model
+	// Standalone status modal. The widget owns only presentation state and
+	// responsive bounds; the UI model owns visibility and focus.
+	showStatus          bool
+	statusView          status_widget.StatusView
+	statusRequest       uint64
+	statusCommandBuffer string
+	hideThinkingBlocks  bool
+	viewportManager     ViewportManager
 
 	// modelRegistry is the cache-first RAM catalog backing the picker.
 	// Lazily created on /models from the local JSON cache (zero network);

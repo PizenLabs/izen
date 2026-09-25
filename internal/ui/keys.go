@@ -1276,14 +1276,36 @@ func (m *model) syncInputFromTI() {
 // autocomplete Enter path, which completes a unique whole-line suggestion
 // before handing off here.
 func (m *model) submitEnter() (tea.Model, tea.Cmd) {
+	userInput := m.ExpandPasteTokens(m.ti.Value())
+	m.dismissSuggestions()
+
+	// /status is an observational command, not a conversational turn. Route it
+	// before the model-admission, activity-surface unseal, and stream-reset
+	// machinery so inspecting a live session cannot mutate its interaction
+	// state. It still echoes the command into the viewport/history list, but
+	// does not persist or mutate the durable conversation.
+	if isStatusCommandInput(userInput) {
+		m.ti.SetValue("")
+		m.ti.Reset()
+		m.syncInputFromTI()
+		if m.showStatus {
+			// A repeated /status is a pure close request; do not append
+			// another command record to the conversation stream.
+			m.closeStatus()
+			return m, nil
+		}
+		m.history = append(m.history, userInput)
+		m.historyIndex = len(m.history)
+		m.push(roleUser, userInput)
+		m.lockTailToNewPrompt()
+		return m, m.handleInput(userInput)
+	}
+
 	m.setScrollLocked(false)
 	// A new user interaction reopens the activity surface sealed by /clear:
 	// everything the user submits from here on is a fresh interaction whose
 	// events belong in the viewport again (see lifecycle.go).
 	m.unsealActivitySurface()
-
-	userInput := m.ExpandPasteTokens(m.ti.Value())
-	m.dismissSuggestions()
 
 	// ── EMPTY PROMPT GUARD ───────────────────────────────────────
 	// Enter on an empty/whitespace-only input is a no-op: short-circuit
