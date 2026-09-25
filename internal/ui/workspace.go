@@ -3,9 +3,12 @@ package ui
 import (
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/modes"
+	statuswidget "github.com/PizenLabs/izen/internal/ui/widgets"
 )
 
 // Section is a mode-owned content block in the workspace. Modes compose their
@@ -48,6 +51,92 @@ type Workspace struct {
 	Sections     []Section
 }
 
+// ViewportManager is the workspace-owned runtime authority for stream
+// auto-scroll. The settings modal can edit the persisted preference, but it
+// never moves the viewport itself; all stream rendering consults this manager.
+type ViewportManager struct {
+	autoScroll config.AutoScrollMode
+}
+
+func newViewportManager(mode config.AutoScrollMode) ViewportManager {
+	return ViewportManager{autoScroll: config.NormalizeAutoScrollMode(string(mode))}
+}
+
+// SetAutoScrollMode updates the runtime viewport policy.
+func (vm *ViewportManager) SetAutoScrollMode(mode config.AutoScrollMode) {
+	if vm == nil {
+		return
+	}
+	vm.autoScroll = config.NormalizeAutoScrollMode(string(mode))
+}
+
+// AutoScrollMode returns the current runtime viewport policy.
+func (vm ViewportManager) AutoScrollMode() config.AutoScrollMode {
+	return config.NormalizeAutoScrollMode(string(vm.autoScroll))
+}
+
+// ShouldFollowTail reports whether a stream frame may move the viewport.
+// Mouse selection always owns the viewport while dragging. Smart respects a
+// user's manual scroll lock; Always deliberately overrides that lock; Off
+// never moves the viewport as a consequence of a stream event.
+func (vm ViewportManager) ShouldFollowTail(userLocked, dragging bool) bool {
+	if dragging {
+		return false
+	}
+	switch vm.AutoScrollMode() {
+	case config.AutoScrollAlways:
+		return true
+	case config.AutoScrollOff:
+		return false
+	default:
+		return !userLocked
+	}
+}
+
+// autoScrollMode returns the current workspace viewport policy.
+func (m *model) autoScrollMode() config.AutoScrollMode {
+	if m == nil {
+		return config.AutoScrollSmart
+	}
+	return m.viewportManager.AutoScrollMode()
+}
+
+// setAutoScrollMode applies a new viewport policy to the workspace manager
+// and repaints the current document so the change is visible immediately.
+func (m *model) setAutoScrollMode(mode config.AutoScrollMode) {
+	if m == nil {
+		return
+	}
+	normalized := config.NormalizeAutoScrollMode(string(mode))
+	m.viewportManager.SetAutoScrollMode(normalized)
+	if normalized == config.AutoScrollAlways {
+		m.setScrollLocked(false)
+		if m.lastScrollTotal > 0 {
+			m.docScrollOffset = m.maxAppScroll()
+		}
+	}
+	if m.Ready && m.resolver != nil && m.viewRegistry != nil {
+		m.refreshViewportContent()
+	}
+}
+
+// handleSettingsShortcut owns the global Ctrl+P binding. It runs before the
+// model-picker key router so the picker cannot reinterpret Ctrl+P as local
+// navigation. The same shortcut toggles the standalone settings overlay.
+func (m *model) handleSettingsShortcut(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if msg.Type != tea.KeyCtrlP && msg.String() != "ctrl+p" {
+		return nil, false
+	}
+	if m == nil {
+		return nil, true
+	}
+	if m.showSettings {
+		m.closeSettings()
+		return nil, true
+	}
+	return m.openSettings(), true
+}
+
 // ViewMode builds the Workspace for a single workflow mode. Each mode owns its
 // own view construction; there is no central switch over modes. Modes are
 // registered explicitly into a Registry at bootstrap (see Registry), so adding
@@ -88,27 +177,7 @@ func (r *Registry) For(mode modes.Mode) (ViewMode, bool) {
 // never sees mode, banner, prompt, footer, or action logic.
 // sessionPickerDialogSize clamps the session picker dialog to the terminal.
 func (m *model) sessionPickerDialogSize() (int, int) {
-	w := sessionPickerPreferredWidth
-	h := sessionPickerPreferredHeight
-
-	const edgeMargin = 2
-	if m.width > 0 {
-		if maxW := m.width - edgeMargin; maxW < w {
-			w = maxW
-		}
-	}
-	if m.height > 0 {
-		if maxH := m.height - edgeMargin; maxH < h {
-			h = maxH
-		}
-	}
-	if w < sessionPickerMinWidth {
-		w = sessionPickerMinWidth
-	}
-	if h < sessionPickerMinHeight {
-		h = sessionPickerMinHeight
-	}
-	return w, h
+	return sessionPickerDialogSizeFor(m.width, m.height)
 }
 
 func (m *model) renderSessionPickerModal() string {
@@ -135,14 +204,10 @@ func (m *model) renderSessionPickerModal() string {
 
 	dialogW, dialogH := m.sessionPickerDialogSize()
 	m.sessionPicker.SetSize(dialogW, dialogH)
-	spView := m.sessionPicker.View()
-
-	modalBox := lipgloss.NewStyle().
-		Width(dialogW+2).
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(colorMauve)).
-		Padding(0, 1).
-		Render(spView)
+	// SessionPickerModal already owns its rounded border and padding. Keeping
+	// the host wrapper transparent avoids a second frame whose extra cells can
+	// clip at Tmux-pane edges during a resize.
+	modalBox := m.sessionPicker.View()
 
 	centered := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modalBox)
 	return overlayOn(normalContent, centered, m.width, m.height)
@@ -239,6 +304,123 @@ func (m *model) renderModelPickerModal() string {
 		lipgloss.WithWhitespaceChars(" "),
 	)
 	return overlayOn(normalContent, centered, m.width, m.height)
+}
+
+// StatusModalSize computes the responsive outer bounds for the standalone
+// status popup. The widget applies the same formula to WindowSizeMsg values;
+// keeping this host wrapper makes the geometry easy to assert alongside the
+// settings modal.
+func StatusModalSize(w, h int) (int, int) {
+	return statuswidget.StatusModalSize(tea.WindowSizeMsg{Width: w, Height: h})
+}
+
+// renderStatusModal overlays the fixed status card on the normal workspace
+// without adding any status text to the conversation document.
+func (m *model) renderStatusModal() string {
+	w, h := m.width, m.height
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+
+	var normalWS Workspace
+	if m.Ready && m.viewRegistry != nil && m.resolver != nil {
+		if view, ok := m.viewRegistry.For(m.resolver.Current()); ok {
+			normalWS = view.BuildWorkspace(m)
+		}
+	}
+	var parts []string
+	if normalWS.Viewport != "" {
+		parts = append(parts, normalWS.Viewport)
+	}
+	if normalWS.ProposalDock != "" {
+		parts = append(parts, normalWS.ProposalDock)
+	}
+	if normalWS.Input != "" {
+		parts = append(parts, normalWS.Input)
+	}
+	if normalWS.Footer != "" {
+		parts = append(parts, normalWS.Footer)
+	}
+	mainView := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	modalW, modalH := StatusModalSize(w, h)
+	m.statusView = m.statusView.SetSize(modalW, modalH)
+	statusModalView := m.statusView.View()
+	statusModalView = lipgloss.Place(
+		w, h,
+		lipgloss.Center, lipgloss.Center,
+		statusModalView,
+		lipgloss.WithWhitespaceChars(" "),
+	)
+	return overlayOn(mainView, statusModalView, w, h)
+}
+
+// SettingsModalSize computes responsive standalone settings dialog bounds.
+// The four-cell terminal margin keeps the box clear of terminal edges; the
+// widget receives these same outer bounds from every WindowSizeMsg.
+func SettingsModalSize(w, h int) (int, int) {
+	return max(1, min(72, w-4)), max(1, min(18, h-4))
+}
+
+// renderSettingsModal wraps the reduced settings widget in the same
+// overlayOn modal pattern used by the registry picker. The normal workspace is
+// kept underneath so closing the dialog returns focus without rebuilding or
+// resetting the primary view.
+func (m *model) renderSettingsModal() string {
+	w, h := m.width, m.height
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+	var normalWS Workspace
+	if m.Ready && m.viewRegistry != nil && m.resolver != nil {
+		if v, ok := m.viewRegistry.For(m.resolver.Current()); ok {
+			normalWS = v.BuildWorkspace(m)
+		}
+	}
+	var parts []string
+	if normalWS.Viewport != "" {
+		parts = append(parts, normalWS.Viewport)
+	}
+	if normalWS.ProposalDock != "" {
+		parts = append(parts, normalWS.ProposalDock)
+	}
+	if normalWS.Input != "" {
+		parts = append(parts, normalWS.Input)
+	}
+	if normalWS.Footer != "" {
+		parts = append(parts, normalWS.Footer)
+	}
+	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
+	modalW, modalH := SettingsModalSize(w, h)
+	m.settingsModel = m.settingsModel.SetSize(modalW, modalH)
+	innerW, innerH := m.settingsModel.InnerSize()
+	innerContent := m.settingsModel.View()
+
+	modalBox := lipgloss.NewStyle().
+		// Lipgloss Width includes horizontal padding; the border adds the
+		// remaining two cells. Add those border cells back so the rendered
+		// outer box exactly matches modalW.
+		Width(innerW+2).
+		Height(innerH).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(colorMauve)).
+		Padding(0, 1).
+		Render(innerContent)
+
+	centered := lipgloss.Place(
+		w, h,
+		lipgloss.Center, lipgloss.Center,
+		modalBox,
+		lipgloss.WithWhitespaceChars(" "),
+	)
+	return overlayOn(normalContent, centered, w, h)
 }
 
 func (m *model) renderTraceOverlayModal() string {
@@ -352,6 +534,12 @@ func splitVis(s string, visLen int) (string, string) {
 }
 
 func (m *model) BuildWorkspace() Workspace {
+	// Status is an explicitly requested, read-only overlay. Keep it available
+	// even when a host is still completing workspace initialization; the normal
+	// onboarding/help surfaces remain underneath it.
+	if m.showStatus {
+		return Workspace{Overlay: m.renderStatusModal()}
+	}
 	// FIRST-RUN DISK GATE: authoritative .izen/ existence check supersedes
 	// any in-memory initStage value. This prevents stale/incorrect state
 	// (e.g., initNone zero value, initComplete from auto-create bypass)
@@ -364,6 +552,9 @@ func (m *model) BuildWorkspace() Workspace {
 	}
 	if m.showHelpOverlay {
 		return Workspace{Overlay: m.renderHelpOverlay()}
+	}
+	if m.showSettings {
+		return Workspace{Overlay: m.renderSettingsModal()}
 	}
 	if m.showModelPicker {
 		return Workspace{Overlay: m.renderModelPickerModal()}

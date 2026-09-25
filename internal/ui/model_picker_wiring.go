@@ -33,21 +33,11 @@ import (
 // msg.ModelID/Provider flow straight from the event payload into
 // ValidateBinding and PersistActiveBinding: no fallback layer overrides the
 // assigned model with a default.
-// rejectIneligibleModel enforces the ModelEligibility boundary at selection
-// time: a discovered-but-ineligible model (e.g. agentic-harness-only) can
-// never become the active executable binding through picker, direct, or
-// role-override flows. It reports true when the binding was rejected.
-func (m *model) rejectIneligibleModel(provider, id string) bool {
-	inelig := registry.CheckExecutable(provider, id)
-	if inelig == nil {
-		return false
-	}
-	m.push(roleError, fmt.Sprintf("[✗] Model unavailable for Izen's current execution path: %s/%s is %s", provider, id, inelig.Reason))
-	m.refreshViewportContent()
-	m.gotoBottomIfAllowed()
-	return true
-}
-
+//
+// Adaptive Runtime: every discovered model — including agentic-harness models —
+// is selectable. The provider pre-flight guard remains the execution boundary;
+// the picker never rejects a model locally.
+//
 // persistActiveBindingFn persists the unified active binding. It defaults to
 // config.PersistActiveBinding and is stubbed in tests so activation paths
 // never touch the real home directory.
@@ -67,8 +57,8 @@ var persistActiveBindingFn = config.PersistActiveBinding
 // Steps 1–3 keep the three runtime binding representations (persisted store,
 // session config, authority) atomically consistent: no execution path can
 // observe provider=openrouter with a stale ollama model, or provider=ollama
-// with a new OpenRouter model. Callers run validation and the eligibility
-// gate before invoking this helper.
+// with a new OpenRouter model. Callers run binding validation before invoking
+// this helper; the provider pre-flight guard owns execution eligibility.
 func (m *model) persistAndActivateBinding(binding authority.ModelBinding) error {
 	if err := persistActiveBindingFn(string(binding.ProviderID), string(binding.ModelID), string(binding.VariantParams)); err != nil {
 		return err
@@ -95,9 +85,6 @@ func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedM
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
-		return nil
-	}
-	if m.rejectIneligibleModel(msg.Provider, msg.ModelID) {
 		return nil
 	}
 	if err := m.persistAndActivateBinding(binding); err != nil {
@@ -139,10 +126,12 @@ func newModelPickerFromCache(m *model) model_picker.Model {
 		m.modelRegistry = registry.NewRegistry()
 		_ = m.modelRegistry.LoadCache()
 	}
-	// Executable view only: discovered-but-ineligible models (e.g.
-	// agentic-harness-only) are filtered before the picker ever sees them.
-	// The full raw catalog stays in the registry snapshot and on disk.
-	mp := model_picker.New(m.modelRegistry.LoadExecutable())
+	// Adaptive Runtime metadata display: the picker shows EVERY discovered
+	// model, including agentic-harness models, rendered neutrally with a
+	// capability badge and an explicit runtime path. No model is hidden or
+	// disabled here; the execution boundary (provider pre-flight) remains the
+	// safety net.
+	mp := model_picker.New(m.modelRegistry.Load())
 	if m.resolver != nil {
 		mp = mp.SetActiveWorkspace(m.resolver.Current().String())
 		m.ensureModelAuthority()
@@ -191,9 +180,6 @@ func (m *model) applyPickerActivation(um model_picker.Model) tea.Cmd {
 	}
 	if err := authority.ValidateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
-		return nil
-	}
-	if m.rejectIneligibleModel(provider, id) {
 		return nil
 	}
 	if err := m.persistAndActivateBinding(binding); err != nil {
@@ -253,14 +239,14 @@ func (m *model) refreshModelRegistryCmd() tea.Cmd {
 			defer cancel()
 			_ = svc.RefreshRegistry(ctx)
 			_ = reg.LoadCache()
-			return model_picker.SnapshotMsg{Snap: reg.LoadExecutable()}
+			return model_picker.SnapshotMsg{Snap: reg.Load()}
 		}
 	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		_ = reg.Sync(ctx, discovery.DiscoverProviders(ctx))
-		return model_picker.SnapshotMsg{Snap: reg.LoadExecutable()}
+		return model_picker.SnapshotMsg{Snap: reg.Load()}
 	}
 }
 
@@ -303,9 +289,6 @@ func (m *model) pickerActivateCmd(cmd modelapp.ActivateModelCommand) tea.Cmd {
 		}
 		if err := authority.ValidateBinding(binding); err != nil {
 			m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
-			return nil
-		}
-		if m.rejectIneligibleModel(cmd.Provider, cmd.ModelID) {
 			return nil
 		}
 		if err := m.persistAndActivateBinding(binding); err != nil {
@@ -450,9 +433,6 @@ func (m *model) applyRoleOverride(msg model_picker.RolePolicyOverrideMsg) tea.Cm
 	}
 	if err := authority.ValidateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Role override rejected: %s", err.Error()))
-		return nil
-	}
-	if m.rejectIneligibleModel(msg.Provider, msg.ModelID) {
 		return nil
 	}
 	if m.cfg != nil {

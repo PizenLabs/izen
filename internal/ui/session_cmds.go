@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -37,6 +38,8 @@ func (m *model) runNewSessionCmd() tea.Cmd {
 	m.resolver.Set(sess.Mode)
 	m.resetTransientInteraction()
 	m.unsealActivitySurface()
+	m.resetTitlePipeline()
+	m.clearResumeBriefing()
 	// MANDATORY: Reset all Token Metrics and UI Counters
 	m.resetTokenMetrics()
 	m.push(roleSystem, infoStyle.Render("New conversation session started. Context and token metrics reset."))
@@ -150,7 +153,9 @@ func (m *model) runSessionListCmd() tea.Cmd {
 			state = "ARCHIVED"
 		}
 		label := fmt.Sprintf("  [%s] slot %s  %s", state, info.Slot, info.SessionID)
-		if info.Objective != "" {
+		if info.Title != "" {
+			label += "  " + info.Title
+		} else if info.Objective != "" {
 			label += "  " + info.Objective
 		}
 		if info.DirtyCount > 0 {
@@ -183,6 +188,8 @@ func (m *model) runSessionResumeCmd(target session.SlotID) tea.Cmd {
 	m.resolver.Set(sess.Mode)
 	m.resetTransientInteraction()
 	m.unsealActivitySurface()
+	m.resetTitlePipeline()
+	m.setResumeBriefing(target, sess)
 	msg := fmt.Sprintf("/session resume: now active on slot %s · %s", target, sess.SessionID)
 	if len(sess.WorkspaceDirtyFiles) > 0 {
 		msg += fmt.Sprintf(" · ⚠ uncommitted changes carried over: %d file(s)", len(sess.WorkspaceDirtyFiles))
@@ -303,6 +310,51 @@ func (m *model) runSessionDeleteCmd(target session.SlotID) tea.Cmd {
 	return nil
 }
 
+// formatTokenCount renders token counts with thousands separators for the
+// compact feedback line (for example, 48,000).
+func formatTokenCount(n int) string {
+	if n < 0 {
+		return "-" + formatTokenCount(-n)
+	}
+	digits := strconv.Itoa(n)
+	if len(digits) <= 3 {
+		return digits
+	}
+	var b strings.Builder
+	lead := len(digits) % 3
+	if lead > 0 {
+		b.WriteString(digits[:lead])
+	}
+	for i := lead; i < len(digits); i += 3 {
+		if b.Len() > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(digits[i : i+3])
+	}
+	return b.String()
+}
+
+func compactionStatus(target session.SlotID, before, after int) string {
+	beforeText := formatTokenCount(before)
+	afterText := formatTokenCount(after)
+	if before == 0 {
+		return fmt.Sprintf("Compacted Session [%s]: %s -> %s tokens (0%% reduced; no baseline)",
+			target, beforeText, afterText)
+	}
+	if after < before {
+		reduced := (before - after) * 100 / before
+		return fmt.Sprintf("Compacted Session [%s]: %s -> %s tokens (%d%% reduced)",
+			target, beforeText, afterText, reduced)
+	}
+	if before > 0 && after > before {
+		increased := (after - before) * 100 / before
+		return fmt.Sprintf("Compacted Session [%s]: %s -> %s tokens (0%% reduced; context expanded %d%%)",
+			target, beforeText, afterText, increased)
+	}
+	return fmt.Sprintf("Compacted Session [%s]: %s -> %s tokens (0%% reduced)",
+		target, beforeText, afterText)
+}
+
 // runSessionCompactCmd manually triggers the Generational Compactor over the
 // target session's raw history and sinks the produced generation through the
 // SessionManager's atomic seam. Compaction is derived state — raw history is
@@ -310,14 +362,21 @@ func (m *model) runSessionDeleteCmd(target session.SlotID) tea.Cmd {
 func (m *model) runSessionCompactCmd(target session.SlotID) tea.Cmd {
 	if m.compactionRunner == nil {
 		m.push(roleError, "/session compact unavailable: no compaction runner wired")
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus("compact unavailable: no compaction runner wired", true)
+		}
 		return nil
 	}
 	sess, err := m.sessionManager.Inspect(target)
 	if err != nil {
 		m.push(roleError, fmt.Sprintf("/session compact %s failed: %v", target, err))
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus(fmt.Sprintf("compact %s failed: %v", target, err), true)
+		}
 		return nil
 	}
 	base, _ := m.sessionManager.CompactContext(target)
+	before := compaction.EstimateHistoryTokens(sess.History)
 	lastCP := ""
 	if len(sess.Checkpoints) > 0 {
 		lastCP = sess.Checkpoints[len(sess.Checkpoints)-1]
@@ -336,13 +395,36 @@ func (m *model) runSessionCompactCmd(target session.SlotID) tea.Cmd {
 	cc, err := m.compactionRunner.Compact(context.Background(), job)
 	if err != nil {
 		m.push(roleError, fmt.Sprintf("/session compact %s failed: %v", target, err))
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus(fmt.Sprintf("compact %s failed: %v", target, err), true)
+		}
+		return nil
+	}
+	if cc == nil {
+		err := fmt.Errorf("compaction returned an empty context")
+		m.push(roleError, fmt.Sprintf("/session compact %s failed: %v", target, err))
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus(fmt.Sprintf("compact %s failed: %v", target, err), true)
+		}
 		return nil
 	}
 	if err := m.sessionManager.SetCompactContext(context.Background(), target, cc); err != nil {
 		m.push(roleError, fmt.Sprintf("/session compact %s: sink failed: %v", target, err))
+		if m.sessionPicker != nil {
+			m.sessionPicker.SetStatus(fmt.Sprintf("compact %s sink failed: %v", target, err), true)
+		}
 		return nil
 	}
-	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("/session compact %s: generation %d sealed · %d events folded", target, cc.Generation, cc.EventCount)))
+	after := compaction.EstimateContextTokens(cc)
+	status := compactionStatus(target, before, after)
+	// Keep the result in both surfaces: the modal footer is the requested
+	// visual feedback, while the system record remains useful when the command
+	// is invoked through a non-modal /session compact path.
+	if m.sessionPicker != nil {
+		m.sessionPicker.SetCompactionStatus(target, before, after)
+	}
+	m.push(roleSystem, infoStyle.Render(fmt.Sprintf("/session compact %s: generation %d sealed · %d events folded · %s",
+		target, cc.Generation, cc.EventCount, status)))
 	return nil
 }
 
@@ -365,7 +447,7 @@ func (m *model) openSessionPicker() tea.Cmd {
 		m.push(roleError, "/session unavailable: no session manager wired")
 		return nil
 	}
-	infos := m.sessionManager.List(context.Background())
+	infos := m.decorateSessionInfos(m.sessionManager.List(context.Background()))
 	sp := NewSessionPickerModal(infos)
 	if m.width > 0 && m.height > 0 {
 		w, h := m.sessionPickerDialogSize()
@@ -391,8 +473,31 @@ func (m *model) refreshSessionPicker() {
 	if m.sessionPicker == nil || m.sessionManager == nil {
 		return
 	}
-	infos := m.sessionManager.List(context.Background())
-	m.sessionPicker.SetSessions(infos)
+	infos := m.decorateSessionInfos(m.sessionManager.List(context.Background()))
+	m.sessionPicker.RefreshSessions(infos)
+}
+
+// decorateSessionInfos enriches the read-only slot projection with the live
+// active-session model/token metrics and the model context window, so the
+// Session Manager DETAILS preview is accurate without extra disk reads.
+func (m *model) decorateSessionInfos(infos []session.SlotInfo) []session.SlotInfo {
+	if m == nil {
+		return infos
+	}
+	for i := range infos {
+		model := infos[i].Model
+		if infos[i].Active {
+			if active := strings.TrimSpace(m.getActiveModelName()); active != "" {
+				model = active
+				infos[i].Model = active
+			}
+			if live := m.InputTokens + m.OutputTokens; live > 0 {
+				infos[i].Tokens = live
+			}
+		}
+		infos[i].ContextWindow = m.contextWindowForModel(model)
+	}
+	return infos
 }
 
 // handleSessionPickerResume executes the atomic switch for the selected slot
@@ -417,6 +522,8 @@ func (m *model) handleSessionPickerResume(target session.SlotID) tea.Cmd {
 	m.resolver.Set(sess.Mode)
 	m.resetTransientInteraction()
 	m.unsealActivitySurface()
+	m.resetTitlePipeline()
+	m.setResumeBriefing(target, sess)
 	_ = m.closeSessionPicker()
 	msg := fmt.Sprintf("/session resume: now active on slot %s · %s", target, sess.SessionID)
 	if len(sess.WorkspaceDirtyFiles) > 0 {
@@ -426,8 +533,15 @@ func (m *model) handleSessionPickerResume(target session.SlotID) tea.Cmd {
 	return nil
 }
 
-// handleSessionPickerNew creates a fresh session and refreshes the modal.
-func (m *model) handleSessionPickerNew() tea.Cmd {
+// handleSessionPickerNew creates a fresh session and refreshes the modal. The
+// title is applied after the atomic boundary so the immutable session ID and
+// the mutable title are still written through the manager's rename seam.
+func (m *model) handleSessionPickerNew(titles ...string) tea.Cmd {
+	title := ""
+	if len(titles) > 0 {
+		title = titles[0]
+	}
+	title = strings.TrimSpace(title)
 	if m.state == StateProcessing || m.state == StateAwaitingApproval || m.streaming || m.agentRunning {
 		if m.sessionPicker != nil {
 			m.sessionPicker.SetStatus("cannot start session while execution is in flight", true)
@@ -443,16 +557,33 @@ func (m *model) handleSessionPickerNew() tea.Cmd {
 		}
 		return nil
 	}
+	titleRenameFailed := false
+	if title != "" {
+		if err := m.sessionManager.Rename(context.Background(), m.sessionManager.Active(), title); err != nil {
+			titleRenameFailed = true
+			if m.sessionPicker != nil {
+				m.sessionPicker.SetStatus(fmt.Sprintf("new session created, title failed: %v", err), true)
+			} else {
+				m.push(roleError, fmt.Sprintf("/new title failed: %v", err))
+			}
+		}
+	}
 	m.sess = sess
 	m.resolver.Set(sess.Mode)
 	m.resetTransientInteraction()
 	m.unsealActivitySurface()
+	m.resetTitlePipeline()
+	m.clearResumeBriefing()
 	m.resetTokenMetrics()
 	m.push(roleSystem, infoStyle.Render("New conversation session started. Context and token metrics reset."))
 	m.push(roleSystem, infoStyle.Render("/new: started a fresh session · previous session preserved, resumable via /session resume A|B"))
 	m.refreshSessionPicker()
-	if m.sessionPicker != nil {
-		m.sessionPicker.SetStatus(fmt.Sprintf("new session on slot %s", m.sessionManager.Active()), false)
+	if m.sessionPicker != nil && !titleRenameFailed {
+		status := fmt.Sprintf("new session on slot %s", m.sessionManager.Active())
+		if title != "" {
+			status += fmt.Sprintf(" · titled %q", title)
+		}
+		m.sessionPicker.SetStatus(status, false)
 	}
 	return nil
 }
@@ -517,6 +648,8 @@ func (m *model) handleSessionPickerDelete(target session.SlotID) tea.Cmd {
 	}
 	m.resetTransientInteraction()
 	m.unsealActivitySurface()
+	m.resetTitlePipeline()
+	m.clearResumeBriefing()
 	m.refreshSessionPicker()
 	if m.sessionPicker != nil {
 		m.sessionPicker.SetStatus(fmt.Sprintf("slot %s purged", target), false)
@@ -529,11 +662,9 @@ func (m *model) handleSessionPickerDelete(target session.SlotID) tea.Cmd {
 func (m *model) handleSessionPickerCompact(target session.SlotID) tea.Cmd {
 	cmd := m.runSessionCompactCmd(target)
 	m.refreshSessionPicker()
-	if m.sessionPicker != nil && cmd == nil {
-		// runSessionCompactCmd already pushed status; surface a transient modal status as well.
-		// If no error was pushed, show success; errors already have a status via pushed records.
-		// Check last error text to avoid double success on failure.
-		_ = cmd
+	if m.sessionPicker != nil && m.sessionPicker.statusMsg == "" {
+		// The detailed before/after line is set by runSessionCompactCmd. Keep a
+		// conservative fallback for alternate runners that return without one.
 		m.sessionPicker.SetStatus(fmt.Sprintf("compact %s requested", target), false)
 	}
 	return cmd

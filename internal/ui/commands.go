@@ -38,12 +38,12 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/modes/review"
 	"github.com/PizenLabs/izen/internal/protocol"
-	oregistry "github.com/PizenLabs/izen/internal/provider/registry"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/runtime/authority"
 	"github.com/PizenLabs/izen/internal/session"
+	statuscommand "github.com/PizenLabs/izen/internal/ui/commands"
 	verification "github.com/PizenLabs/izen/internal/verification"
 )
 
@@ -82,8 +82,10 @@ var validSystemCommands = map[string]struct{}{
 	"/?":                {},
 	"/quit":             {},
 	"/usage":            {},
+	"/status":           {},
 	"/provider":         {},
 	"/models":           {},
+	"/settings":         {},
 	"/objective":        {},
 	"/clear":            {},
 	"/drop":             {},
@@ -95,6 +97,7 @@ var validSystemCommands = map[string]struct{}{
 	"/arch":             {},
 	"/explain-decision": {},
 	"/decide":           {},
+	"/spec":             {},
 	"/copy":             {},
 	"/compact":          {},
 }
@@ -188,15 +191,20 @@ func (m *model) handleInput(line string) tea.Cmd {
 		return nil
 	}
 
-	// ── STALE ACTION-CHIP INVALIDATION ───────────────────────────────
-	// Any new user input ends the previous result's relevance: a chip
-	// referencing a completed, cancelled, or superseded operation must not
-	// linger and offer to re-run an obsolete action. A fresh interaction
-	// always renders with a clean chip surface.
-	m.currentResult = nil
+	// /status is observational: preserve the current result/error surface so
+	// inspecting the workspace never mutates the interaction context.
+	statusInspection := isStatusCommandInput(line)
+	if !statusInspection {
+		// ── STALE ACTION-CHIP INVALIDATION ───────────────────────────────
+		// Any new user input ends the previous result's relevance: a chip
+		// referencing a completed, cancelled, or superseded operation must not
+		// linger and offer to re-run an obsolete action. A fresh interaction
+		// always renders with a clean chip surface.
+		m.currentResult = nil
 
-	// Clear any stale error bar on new user input
-	m.lastApplyError = ""
+		// Clear any stale error bar on new user input.
+		m.lastApplyError = ""
+	}
 
 	// ── CASUAL CONVERSATION AUTO-UNWIND ─────────────────────────────
 	// A casual prompt ("hi") while the WorkflowStateMachine is in any
@@ -212,16 +220,28 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	// Rigid active guards to block spamming inputs during background processes
 	if m.streaming || m.agentRunning {
-		// $inspect is a read-only observational directive: it renders the
-		// telemetry of the most recently finalized operation without starting
-		// any work. It is exempt from the busy-input guard so the developer can
-		// always inspect the authoritative execution record.
-		if !strings.HasPrefix(line, "$inspect") {
-			m.push(roleSystem, "Input blocked: task active.")
-			m.refreshViewportContent()
-			m.gotoBottomIfAllowed()
-			return nil
+		// Settings is a presentation-only modal and remains available during a
+		// live stream so CoT visibility and viewport policy can change without
+		// interrupting the response. /status is likewise observational and
+		// remains available while a turn is active.
+		if line != "/settings" && !strings.HasPrefix(line, "/settings ") && !statusInspection {
+			// $inspect is a read-only observational directive: it renders the
+			// telemetry of the most recently finalized operation without starting
+			// any work. It is exempt from the busy-input guard so the developer can
+			// always inspect the authoritative execution record.
+			if !strings.HasPrefix(line, "$inspect") {
+				m.push(roleSystem, "Input blocked: task active.")
+				m.refreshViewportContent()
+				m.gotoBottomIfAllowed()
+				return nil
+			}
 		}
+	}
+
+	// /status is always observational, including while a confirmation gate is
+	// pending. Do not let the pending-test router consume the command.
+	if statusInspection {
+		return m.handleCommand(line)
 	}
 
 	// Safety gate confirmation: pending test/run confirmation for large repos
@@ -449,6 +469,15 @@ func (m *model) handleInput(line string) tea.Cmd {
 	// receives a turn that is one query behind because the current input is
 	// committed first, not retrofitted at stream completion.
 	m.sess.AddMessage("user", line, 5)
+	// ── TWO-STAGE SESSION TITLING (STAGE 1) ──────────────────────────
+	// The first accepted human turn deterministically names the session so it
+	// never surfaces as a raw timestamp id in the Session Manager. The title is
+	// committed by the persistSession call below; Stage 2 (async model
+	// refinement) is armed here and dispatched after the first stream turn.
+	if model := strings.TrimSpace(m.getActiveModelName()); model != "" {
+		m.sess.Model = model
+	}
+	m.applyFirstTurnTitle(line)
 	m.persistSession("commands")
 
 	// ── HYBRID INTENT GATEWAY ────────────────────────────────────────
@@ -2049,8 +2078,11 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  $prompt <objective>  enter the autonomous runtime (intent → capability → workspace → decision → execution)"))
 		m.push(roleSystem, infoStyle.Render("  $decide <prompt>     run the intent → workspace → decision trace"))
 		m.push(roleSystem, "")
+		m.push(roleSystem, labelBoldStyle.Render("context"))
+		m.push(roleSystem, infoStyle.Render("  /spec  inspect the compiled conversation context (read-only)"))
+		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /objective  /drop  /clear  /quit  /copy  /compact"))
+		m.push(roleSystem, infoStyle.Render("  /help  /usage  /status  /models  /settings  /objective  /drop  /clear  /quit  /copy  /compact"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("sessions"))
@@ -2068,7 +2100,9 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /explain-decision  inspect why a tech stack was chosen"))
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  /usage           inspect token usage and provider status"))
+		m.push(roleSystem, infoStyle.Render("  /status          inspect workspace, VCS, index, session, and authority state"))
 		m.push(roleSystem, infoStyle.Render("  /models      interactive model picker (fuzzy search)"))
+		m.push(roleSystem, infoStyle.Render("  /settings    response and viewport preferences"))
 		m.push(roleSystem, infoStyle.Render("  /models <name> switch active model directly (e.g. /models claude-3-5-sonnet)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
@@ -2097,12 +2131,27 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 	case cmd == "/usage":
 		return m.runUsageCmd()
 
+	case name[0] == statuscommand.Name:
+		if len(name) > 1 {
+			m.push(roleError, "usage: /status")
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
+			return nil
+		}
+		return m.runStatusCmd()
+
 	case cmd == "/grant":
 		// DEPRECATED: authorization is now an internal operation of the
 		// autonomy proposal (ask_user → Execute). The handler remains only as
 		// an internal compatibility seam; the /grant token is not a registry
 		// command and is not reachable through the parser pipeline.
 		return m.handleAutonomyGrant("")
+
+	case cmd == "/spec":
+		// Read-only ContextSpec inspection: status, revisions, goal, targets,
+		// active constraints/decisions and open questions. It never authorizes
+		// or executes.
+		return m.runSpecCmd()
 
 	case strings.HasPrefix(cmd, "/decide"):
 		content := strings.TrimSpace(strings.TrimPrefix(cmd, "/decide"))
@@ -2126,12 +2175,20 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, mutedStyle.Render("💡 Tip: Provider switching is automatic! Use /models to pick any model, or /usage to inspect provider API keys."))
 		return m.runUsageCmd()
 
+	case cmd == "/settings":
+		// Standalone reduced-schema settings surface. It owns only response
+		// style, CoT visibility, and viewport auto-scroll; registry state stays
+		// exclusively in the /models picker.
+		m.showModelPicker = false
+		return m.openSettings()
+
 	case cmd == "/models":
 		// Phase 3 contextual picker: cache-first, never blocking. Reads
 		// synchronously from the atomic Registry RAM snapshot (<2ms); zero
 		// network I/O, zero Fetching screen. On a cold start (zero cached
 		// models) the picker's Init emits SyncRequestedMsg so background
 		// workers pull provider APIs without blocking the TUI.
+		m.showSettings = false
 		m.showModelPicker = true
 		m.modelPicker = newModelPickerFromCache(m)
 		return m.modelPicker.Init()
@@ -2335,12 +2392,11 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 		m.gotoBottomIfAllowed()
 		return nil
 	}
-	if inelig := oregistry.CheckExecutable(resolvedProvider, modelName); inelig != nil {
-		m.push(roleError, fmt.Sprintf("[✗] Model unavailable for Izen's current execution path: %s is %s", modelName, inelig.Reason))
-		m.refreshViewportContent()
-		m.gotoBottomIfAllowed()
-		return nil
-	}
+	// ADAPTIVE RUNTIME: /model never rejects a discovered model locally. A
+	// model whose provider wire policy requires an agentic harness is executed
+	// natively through Dynamic Contract Promotion (the provider adapter
+	// promotes the interaction contract and binds read-only tools before
+	// dispatch). Selection failure is only ever a binding validation error.
 	if err := m.persistAndActivateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
 		m.refreshViewportContent()

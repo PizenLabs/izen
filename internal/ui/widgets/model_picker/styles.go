@@ -46,6 +46,14 @@ var (
 	//nolint:unused // retained for spec compatibility
 	inactiveProviderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
 
+	// agenticBadgeStyle renders the [Agentic] capability badge for models whose
+	// provider wire policy requires an agentic harness. It is deliberately
+	// faint Mauve (#cba6f7) so it reads as informational metadata rather than
+	// an error or a blocking state.
+	agenticBadgeStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#cba6f7")).
+				Faint(true)
+
 	// Per-provider badges (Catppuccin Mocha accents – legacy identifiers kept for
 	// backward compat; palette updated to spec's explicit Mocha mapping).
 	openRouterBadge = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7")) // Mauve per spec

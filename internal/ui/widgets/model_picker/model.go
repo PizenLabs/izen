@@ -393,8 +393,9 @@ func (m Model) ProviderFilter() string { return m.provider }
 //	W_inner = modalW - 4 (border 2 + padding 1+1)
 //	H_inner = modalH - 2 (border 2, padding 0 vertical)
 //
-// Chrome = 6 lines (Title, Search, Divider, Reasoning, Bindings, Footer)
-// listRowBudget = max(3, innerHeight - 6)
+// Chrome = 8 lines (Title, Divider, Divider, Active Model, Provider,
+// Variant, Runtime Path, Footer)
+// listRowBudget = max(3, innerHeight - 8)
 func (m Model) SetSize(w, h int) Model {
 	if w < 1 {
 		w = 1
@@ -406,7 +407,7 @@ func (m Model) SetSize(w, h int) Model {
 	m.modalH = h
 	m.innerWidth = max(20, w-4)
 	m.innerHeight = max(5, h-2)
-	m.listRowBudget = max(3, m.innerHeight-6)
+	m.listRowBudget = max(3, m.innerHeight-8)
 	// Legacy aliases: width/height now represent inner bounds for all
 	// rendering helpers (clipLine, padFooter, render*).
 	m.width = m.innerWidth
@@ -464,6 +465,14 @@ func (m Model) FocusList() Model {
 
 // SearchFocused reports the current focus.
 func (m Model) SearchFocused() bool { return m.focus == FocusSearch }
+
+// searchInputActive reports whether printable input belongs in the search
+// buffer. The legacy mirror and the shim's focused bit are both checked so
+// older callers that set only one of the focus indicators retain the same
+// collision-free behavior.
+func (m Model) searchInputActive() bool {
+	return m.focus == FocusSearch || m.searchFocused || m.searchInput.Focused()
+}
 
 // PaneFocus returns the active pane focus (PaneProviders or PaneModels).
 func (m Model) PaneFocus() PaneFocus { return m.paneFocus }

@@ -31,7 +31,7 @@ func TestSetSizeClampsAndStores(t *testing.T) {
 func TestProviderBadgesAndDivider(t *testing.T) {
 	m := New(seedSnapshot(testModels())).SetSize(100, 30)
 	view := m.View()
-	for _, want := range []string{"PROVIDERS", "MODELS", "─", "Active:"} {
+	for _, want := range []string{"PROVIDERS", "MODELS", "─", "Active Model:", "Provider:"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("view missing %q:\n%s", want, view)
 		}

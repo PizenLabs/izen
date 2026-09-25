@@ -164,6 +164,11 @@ func (m *model) toggleThoughtBlock() bool {
 		}
 		return true
 	}
+	// The settings preference is authoritative: Alt+O/Ctrl+O must not reveal
+	// hidden CoT content through a second control path.
+	if m.hideThinkingBlocks {
+		return true
+	}
 	switch {
 	case m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0:
 		m.thinkingBuffer.Toggle()
@@ -212,6 +217,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.pendingPermission != nil {
 		return m, m.handlePermissionModalKey(msg)
 	}
+	// ── SESSION PICKER FOCUS TRAP ───────────────────────────────────
+	// Processing/approval states can call handleKey directly before the
+	// normal Update routing block. Keep the inline editor authoritative there
+	// as well, so j/k and arrows can never escape to workspace navigation
+	// while a rename/create buffer owns focus.
+	if m.showSessionPicker && m.sessionPicker != nil {
+		var cmd tea.Cmd
+		m.sessionPicker, cmd = m.sessionPicker.Update(msg)
+		return m, cmd
+	}
 	// ── UNIFIED DIFF VIEWER MODAL ────────────────────────────────────
 	// While open it owns j/k + arrows (scroll), c (fold focused hunk),
 	// a (fold all), and Esc/q (close). This guard covers states that
@@ -222,6 +237,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		return m, nil
+	}
+	// Keep the global shortcut available to direct handleKey callers as well
+	// as the normal Update path (which handles it before modal routing).
+	if cmd, handled := m.handleSettingsShortcut(msg); handled {
+		return m, cmd
 	}
 	// ── TRACE OVERLAY DISMISSAL ──────────────────────────────────────
 	if m.showTraceOverlay {
@@ -1256,14 +1276,36 @@ func (m *model) syncInputFromTI() {
 // autocomplete Enter path, which completes a unique whole-line suggestion
 // before handing off here.
 func (m *model) submitEnter() (tea.Model, tea.Cmd) {
+	userInput := m.ExpandPasteTokens(m.ti.Value())
+	m.dismissSuggestions()
+
+	// /status is an observational command, not a conversational turn. Route it
+	// before the model-admission, activity-surface unseal, and stream-reset
+	// machinery so inspecting a live session cannot mutate its interaction
+	// state. It still echoes the command into the viewport/history list, but
+	// does not persist or mutate the durable conversation.
+	if isStatusCommandInput(userInput) {
+		m.ti.SetValue("")
+		m.ti.Reset()
+		m.syncInputFromTI()
+		if m.showStatus {
+			// A repeated /status is a pure close request; do not append
+			// another command record to the conversation stream.
+			m.closeStatus()
+			return m, nil
+		}
+		m.history = append(m.history, userInput)
+		m.historyIndex = len(m.history)
+		m.push(roleUser, userInput)
+		m.lockTailToNewPrompt()
+		return m, m.handleInput(userInput)
+	}
+
 	m.setScrollLocked(false)
 	// A new user interaction reopens the activity surface sealed by /clear:
 	// everything the user submits from here on is a fresh interaction whose
 	// events belong in the viewport again (see lifecycle.go).
 	m.unsealActivitySurface()
-
-	userInput := m.ExpandPasteTokens(m.ti.Value())
-	m.dismissSuggestions()
 
 	// ── EMPTY PROMPT GUARD ───────────────────────────────────────
 	// Enter on an empty/whitespace-only input is a no-op: short-circuit
@@ -1286,6 +1328,7 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		m.push(roleStatus, "⚠ No active model set for provider. Please select a model to begin.")
 		m.refreshViewportContent()
 		m.ti.Focus()
+		m.showSettings = false
 		m.showModelPicker = true
 		m.modelPicker = newModelPickerFromCache(m)
 		return m, m.modelPicker.Init()
@@ -1346,6 +1389,9 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		if m.showBanner {
 			m.showBanner = false
 		}
+		// A new user turn ends the resume orientation window: the briefing is
+		// replaced by the live conversation, never carried into later turns.
+		m.clearResumeBriefing()
 		m.ti.SetValue("")
 		m.ti.Reset()
 		m.syncInputFromTI()

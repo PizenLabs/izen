@@ -24,6 +24,7 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/contextcompiler"
+	"github.com/PizenLabs/izen/internal/contextspec"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/runtime"
@@ -66,7 +67,9 @@ import (
 	"github.com/PizenLabs/izen/internal/ui/status"
 	uitool "github.com/PizenLabs/izen/internal/ui/tool"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
+	status_widget "github.com/PizenLabs/izen/internal/ui/widgets"
 	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
+	settings_widget "github.com/PizenLabs/izen/internal/ui/widgets/settings"
 )
 
 // ── Init stage types ──────────────────────────────────────────────────────────
@@ -191,6 +194,23 @@ type streamErrMsg struct {
 	// usageEstimated is true when the token counts are a character-count
 	// estimate rather than the provider's authoritative usage.
 	usageEstimated bool
+}
+
+// roleFallbackNoticeMsg carries an EXPLICIT role-chain model switch into the
+// trace view. It is produced by the stream producer when the primary model
+// failed on a network-transient error and the turn was retried on the role's
+// configured fallback model. It never mutates the active binding.
+type roleFallbackNoticeMsg struct {
+	// notice is the rendered trace line:
+	// "[fallback] Primary model failed (<reason>). Switched to <fallback>."
+	notice string
+	// primary is the model that failed, fallback the model now executing.
+	primary  string
+	fallback string
+	// reason is the classified cause (e.g. "rate limit (HTTP 429)").
+	reason string
+	// role is the config key whose chain fired (e.g. "plan").
+	role string
 }
 
 type PlanStreamingFinishedMsg struct {
@@ -814,6 +834,23 @@ type model struct {
 	// Banner visibility state
 	showBanner bool
 
+	// ── Two-stage session titling (Stage 2 async refinement) ──────────
+	// titleRefiner injects the one-shot summarizer (nil => wired provider).
+	// titleRefineArmed is set by Stage 1 and consumed once on the first stream
+	// completion. titlePrompt/titleHeuristic capture the originating prompt and
+	// the deterministic Stage 1 title so a late Stage 2 result can be rejected
+	// when the session switched or the user renamed manually.
+	titleRefiner     titleRefinerFunc
+	titleRefineArmed bool
+	titlePrompt      string
+	titleHeuristic   string
+
+	// resumeBriefing is the orientation data injected at the top of the fresh
+	// viewport when a dormant session is resumed. It is rendered on demand so a
+	// terminal resize re-wraps it, and cleared on the first prompt submission
+	// that starts a new conversation.
+	resumeBriefing *resumeBriefingData
+
 	// Window dimensions
 	width     int
 	height    int
@@ -1032,6 +1069,16 @@ type model struct {
 	// harnesses without the driver wired — those fall back to the legacy
 	// single-shot executor path.
 	autonomousDriver autonomousDriver
+	// ── CONTEXT DOMAIN (Phase 11.x) ─────────────────────────────────
+	// contextSpec is the composition-bound Context Domain Control Plane. It
+	// lazily compiles the conversation's semantic state (ContextSpec) and freezes
+	// a bounded ExecutionSpec at the explicit execution hand-off. Nil in
+	// harnesses without the pipeline wired; the hand-off is then a no-op and the
+	// canonical executor path is unchanged.
+	contextSpec *contextspec.Pipeline
+	// lastExecutionSpec is the most recently frozen execution contract, exposed
+	// read-only to /spec. It carries no authority.
+	lastExecutionSpec *contextspec.ExecutionSpec
 	// autonomousActive is true while a driver Run command is in flight
 	// (executing or parked). It gates duplicate-start protection in the UI.
 	autonomousActive bool
@@ -1531,6 +1578,21 @@ type model struct {
 	// view). Reads synchronously from the atomic Registry RAM snapshot.
 	showModelPicker bool
 	modelPicker     model_picker.Model
+
+	// Standalone Settings modal. The widget owns only Response Style, CoT
+	// visibility, and viewport auto-scroll; provider/model registry state
+	// remains exclusively in modelPicker.
+	showSettings  bool
+	settingsModel settings_widget.Model
+	// Standalone status modal. The widget owns only presentation state and
+	// responsive bounds; the UI model owns visibility and focus.
+	showStatus          bool
+	statusView          status_widget.StatusView
+	statusRequest       uint64
+	statusCommandBuffer string
+	hideThinkingBlocks  bool
+	viewportManager     ViewportManager
+
 	// modelRegistry is the cache-first RAM catalog backing the picker.
 	// Lazily created on /models from the local JSON cache (zero network);
 	// background sync is owned by the app layer.
@@ -4392,6 +4454,15 @@ func (m *model) refreshViewportContent() {
 			chrome.WriteString("\n")
 		}
 	}
+	// RESUME BRIEFING: orientation banner for a freshly resumed session. It is
+	// pinned at the top of the fresh viewport until the first user prompt
+	// clears it. Legacy chat history is never re-rendered into the buffer.
+	if m.resumeBriefing != nil {
+		if b := m.renderResumeBriefing(); b != "" {
+			chrome.WriteString(b)
+			chrome.WriteString("\n")
+		}
+	}
 	if ctx := m.renderContextHeader(); ctx != "" {
 		chrome.WriteString(ctx)
 	}
@@ -5045,6 +5116,9 @@ func (m *model) renderTailPanelLines() []string {
 			b.WriteString(dimmedStyle.Render("── Execution Log ──"))
 			b.WriteString("\n")
 			for _, entry := range entries {
+				if m.hideThinkingBlocks {
+					entry.Thinking = ""
+				}
 				b.WriteString(RenderEntry(entry, m.width, m.dotFrame))
 				b.WriteString("\n")
 			}
@@ -5064,7 +5138,10 @@ func (m *model) renderTailPanelLines() []string {
 	}
 
 	// ── Streaming reasoning (typed thinking blocks + inline thinking) ──
-	if m.streaming {
+	// CoT content is retained in memory for inspection/debugging, but the
+	// presentation preference can hide every reasoning block without changing
+	// stream ingestion or the model's data path.
+	if m.streaming && !m.hideThinkingBlocks {
 		// Content blocks already render through docLayout's streaming tail;
 		// only the dimmed KindThinking blocks are appended here.
 		inlineThinking := m.streamBlocks != nil && m.streamBlocks.HasThinking()
@@ -5091,7 +5168,7 @@ func (m *model) renderTailPanelLines() []string {
 	}
 
 	// ── Persisted collapsible thought block (after streaming) ──────
-	if !m.streaming && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+	if !m.streaming && !m.hideThinkingBlocks && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
 		if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
 			b.WriteString(thoughts)
 			b.WriteString("\n")
@@ -5130,6 +5207,9 @@ func (m *model) renderTailPanelLines() []string {
 // typed stream buffer (content blocks are rendered through docLayout's
 // streaming tail, never duplicated here).
 func (m *model) renderStreamThinkingOnly(width int) string {
+	if m.hideThinkingBlocks {
+		return ""
+	}
 	if m.streamBlocks == nil || m.streamBlocks.Len() == 0 {
 		return ""
 	}
@@ -5173,7 +5253,10 @@ func (m *model) calculateEffectiveYOffset(total int) int {
 		}
 		return off
 	}
-	if !m.userScrolledAway && !m.userScrollLocked {
+	if m.viewportManager.ShouldFollowTail(
+		m.userScrolledAway || m.userScrollLocked,
+		m.mouseSel.Active && m.mouseSel.Dragging,
+	) {
 		return maxOff
 	}
 	off := m.docScrollOffset
@@ -5670,7 +5753,17 @@ func (m *model) gotoBottomIfAllowed() {
 	if !m.Ready {
 		return
 	}
-	if m.userIsScrollingUp || m.mouseSel.Dragging {
+	if m.mouseSel.Dragging {
+		return
+	}
+	// Automatic tail-follow honors the workspace-owned policy. Manual
+	// navigation uses scrollBy directly and is never routed through this
+	// helper, so Off cannot be accidentally overridden by a stream or a
+	// terminal event handler.
+	if !m.viewportManager.ShouldFollowTail(
+		m.userIsScrollingUp || m.userScrollLocked,
+		false,
+	) {
 		return
 	}
 	m.followTail()

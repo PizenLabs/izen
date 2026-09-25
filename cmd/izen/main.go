@@ -73,6 +73,7 @@ func printMinimalistHelp() {
 	fmt.Println("  /investigate  Debug bugs, failures, regressions")
 	fmt.Println("  /review       Audit changes, detect risks")
 	fmt.Println("  /help         Show interactive help")
+	fmt.Println("  /status       Inspect workspace, VCS, index, session, and authority state")
 	fmt.Println("  /mode <name>  Switch mode")
 	fmt.Println("  /q            Exit Izen")
 	fmt.Println("  !<cmd>        Run a shell command")

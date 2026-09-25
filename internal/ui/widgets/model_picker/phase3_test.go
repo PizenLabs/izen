@@ -32,9 +32,12 @@ func TestPhase3ContextualRender(t *testing.T) {
 	if !strings.Contains(vNone, "Tab") || !strings.Contains(vNone, "API key") {
 		t.Errorf("browsing footer must show Tab and API key hints, got:\n%s", vNone)
 	}
-	// Active line shows provider/model
-	if !strings.Contains(vNone, "Active:") {
-		t.Errorf("browsing view must show Active line, got:\n%s", vNone)
+	// Active line shows model + explicit provider (no filter prefix)
+	if !strings.Contains(vNone, "Active Model:") {
+		t.Errorf("browsing view must show Active Model line, got:\n%s", vNone)
+	}
+	if !strings.Contains(vNone, "Provider:") {
+		t.Errorf("browsing view must show explicit Provider line, got:\n%s", vNone)
 	}
 	// Detail view shows MODEL DETAILS with specs
 	openai := registry.ModelDescriptor{ID: "openai/o1", Provider: "openai", Name: "o1"}

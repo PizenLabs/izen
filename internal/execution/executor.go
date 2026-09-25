@@ -609,6 +609,15 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 	} else {
 		x.verifier = NewVerifier(root)
 	}
+	// Inject the execution-pipeline read-only tool runner into providers that
+	// accept one, enabling the adaptive tool loop for agentic-harness models.
+	if provider != nil {
+		if setter, ok := provider.(interface {
+			SetToolRunner(ai.ToolRunner)
+		}); ok {
+			setter.SetToolRunner(NewReadOnlyToolRunner(root))
+		}
+	}
 	return x
 }
 
@@ -806,7 +815,19 @@ func (x *RuntimeExecutor) resolveSessionID(req ExecuteRequest) string {
 }
 
 // SetProvider re-binds the provider (provider switching is a runtime concern).
+//
+// Providers that accept read-only tools receive the execution-pipeline runner
+// so agentic-harness models can execute their tool calls and complete the
+// answer in-process. The injection is transparent through the context-compiler
+// facade.
 func (x *RuntimeExecutor) SetProvider(p ai.Provider) {
+	if p != nil {
+		if setter, ok := p.(interface {
+			SetToolRunner(ai.ToolRunner)
+		}); ok {
+			setter.SetToolRunner(NewReadOnlyToolRunner(x.root))
+		}
+	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	x.provider = p

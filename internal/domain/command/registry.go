@@ -214,6 +214,9 @@ func NewDefault() *Registry {
 	r.RegisterAlias(MarkerSlash, "q", "quit")
 	r.RegisterAlias(MarkerSlash, "?", "help")
 	r.RegisterAlias(MarkerSlash, "model", "models")
+	// Preserve the established /s shorthand for /session now that /settings
+	// also begins with s; exact aliases win over prefix disambiguation.
+	r.RegisterAlias(MarkerSlash, "s", "session")
 	return r
 }
 
@@ -267,7 +270,9 @@ func officialCommands() []CommandDescriptor {
 		// Global commands (/).
 		{Marker: MarkerSlash, Name: "help", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "render the mode and command reference"},
 		{Marker: MarkerSlash, Name: "usage", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "display runtime usage, tokens, and provider status"},
+		{Marker: MarkerSlash, Name: "status", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "inspect workspace, VCS, symbol, session, and authority state"},
 		{Marker: MarkerSlash, Name: "models", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "switch or pick the active model/provider"},
+		{Marker: MarkerSlash, Name: "settings", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "open response and viewport preferences"},
 		{Marker: MarkerSlash, Name: "provider", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "switch provider (deprecated, use /models)"},
 		{Marker: MarkerSlash, Name: "objective", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "create a budget-guarded session objective"},
 		{Marker: MarkerSlash, Name: "new", Kind: KindGlobal, RequiredPerms: PermissionSet(PermRead), Description: "create and activate a fresh session (SESSION.md §9) — the previous session stays resumable"},

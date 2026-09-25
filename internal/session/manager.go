@@ -509,17 +509,33 @@ func (m *Manager) SetCompactContext(ctx context.Context, s SlotID, cc *CompactCo
 
 // SlotInfo is a read-only projection of one slot for /session listing.
 type SlotInfo struct {
-	Slot       SlotID    `json:"slot"`
-	Active     bool      `json:"active"`
-	Exists     bool      `json:"exists"`
-	Lifecycle  string    `json:"lifecycle,omitempty"`
-	Objective  string    `json:"objective,omitempty"`
-	SessionID  string    `json:"session_id,omitempty"`
-	UpdatedAt  time.Time `json:"updated_at,omitempty"`
-	TurnCount  int       `json:"turn_count"`
-	DirtyCount int       `json:"dirty_count"`
-	Recovered  bool      `json:"recovered,omitempty"`
-	Error      string    `json:"error,omitempty"`
+	Slot      SlotID `json:"slot"`
+	Active    bool   `json:"active"`
+	Exists    bool   `json:"exists"`
+	Lifecycle string `json:"lifecycle,omitempty"`
+	Title     string `json:"title,omitempty"`
+	Objective string `json:"objective,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	// Model is the active model assigned to the session at its last accepted
+	// turn. Empty for sessions that predate model tracking.
+	Model string `json:"model,omitempty"`
+	// Tokens is a deterministic chars/4 estimate of the session's raw-history
+	// prompt footprint. It backs the Session Manager detail preview.
+	Tokens int `json:"tokens,omitempty"`
+	// Turns is the number of accepted human turns in the session history.
+	Turns int `json:"turns,omitempty"`
+	// LastPrompt is a sanitized, single-line snippet of the most recent user
+	// turn, or "" when the session has no human turn.
+	LastPrompt string `json:"last_prompt,omitempty"`
+	// ContextWindow is the model context window used as the denominator for the
+	// detail preview percentage. Zero means unknown; the presentation layer
+	// decorates it from the model catalog.
+	ContextWindow int       `json:"context_window,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
+	TurnCount     int       `json:"turn_count"`
+	DirtyCount    int       `json:"dirty_count"`
+	Recovered     bool      `json:"recovered,omitempty"`
+	Error         string    `json:"error,omitempty"`
 }
 
 // List projects both slots for observability. It never mutates state and
@@ -539,8 +555,13 @@ func (m *Manager) List(ctx context.Context) []SlotInfo {
 			info.Error = err.Error()
 		case sess != nil:
 			info.Exists = true
+			info.Title = sess.Title
 			info.Objective = sess.ObjectiveIntent()
 			info.SessionID = sess.SessionID
+			info.Model = sess.Model
+			info.Tokens = EstimatedHistoryTokens(sess.History)
+			info.Turns = UserTurns(sess.History)
+			info.LastPrompt = LastUserPrompt(sess.History)
 			info.UpdatedAt = sess.UpdatedAt
 			info.TurnCount = len(sess.History)
 			info.Recovered = sess.recoveredFromRawHistory()

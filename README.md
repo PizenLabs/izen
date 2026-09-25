@@ -81,7 +81,7 @@ go test -bench=. ./...
 
 ### Configuration
 
-Global config at `~/.izen/izen.conf.yml`:
+Global config at `~/.izen/config.yml`:
 
 ```yaml
 models:
@@ -98,6 +98,38 @@ lynx:
 mcp:
   enabled: false
 ```
+
+#### Role fallback chain
+
+Izen never reverts a model implicitly. The only model switch is the explicit
+chain you declare per role:
+
+```yaml
+roles:
+  plan:
+    model: "openrouter/thinkingmachines/inkling-small:free"
+    fallback: "openrouter/anthropic/claude-3.5-sonnet"
+  default:
+    fallback: "openrouter/anthropic/claude-3.5-sonnet"
+```
+
+Model values are either bare IDs (resolved against the active provider) or
+`provider/model` slugs. A role's `model` declares the primary the chain belongs
+to; omit it to apply the `fallback` to every turn of that role.
+
+The chain fires **only** on network-transient failures — timeouts, HTTP 429, and
+HTTP 5xx — and never rewrites your active binding. The switch is always reported
+in the trace view:
+
+```
+[fallback] Primary model failed (rate limit (HTTP 429)). Switched to openrouter/anthropic/claude-3.5-sonnet.
+```
+
+Client errors (400/401/403/404) never trigger it: a bad request is a request
+bug, not a reason to try another model. Wire-policy requirements are also not a
+trigger — models that require an agentic harness (such as
+`thinkingmachines/inkling-small:free`) execute natively through Dynamic Contract
+Promotion, which binds Izen's read-only tools before dispatch.
 
 ---
 

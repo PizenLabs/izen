@@ -155,6 +155,18 @@ func (m *model) dispatchAutonomyTrace(trace autonomy.Trace) tea.Cmd {
 // dispatches the objective to that workspace's engine. Workspace selection is
 // capability-driven (autonomy package); the UI only executes.
 func (m *model) executeAutonomyWorkspace(trace autonomy.Trace) tea.Cmd {
+	// ── CONTEXT DOMAIN HAND-OFF (Phase 11.x) ──────────────────────────
+	// Crossing from conversation to execution is an explicit boundary: ensure
+	// the compiled ContextSpec is fresh (lazy compilation), freeze a bounded
+	// ExecutionSpec against the CURRENT workspace snapshot and validate it. The
+	// untrusted spec carries no authority; a typed hand-off failure blocks
+	// execution instead of silently proceeding on stale context.
+	if err := m.handoffExecutionContext(trace.Input); err != nil {
+		m.push(roleError, "[context] execution hand-off refused: "+err.Error())
+		m.refreshViewportContent()
+		m.Viewport.GotoBottom()
+		return nil
+	}
 	mode, ok := modeForAutonomyWorkspace(trace.Route.Workspace)
 	if !ok {
 		return m.handleMessageContent(trace.Input)

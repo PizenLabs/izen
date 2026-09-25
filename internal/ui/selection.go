@@ -636,7 +636,7 @@ func (m *model) isModalForMouse() bool {
 	if m.state == StateAwaitingApproval || m.state == StateHotfixAmbiguous {
 		return true
 	}
-	if m.showModelPicker {
+	if m.showModelPicker || m.showSettings || m.showStatus {
 		return true
 	}
 	if m.pendingBuildApproval || m.pendingBuildTask != nil {

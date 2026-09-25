@@ -480,8 +480,10 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		}
 		if ring != nil {
 			switch msg.(type) {
-			case streamDoneMsg, streamErrMsg:
-				// pinned to the channel: terminal messages never enter the ring
+			case streamDoneMsg, streamErrMsg, roleFallbackNoticeMsg:
+				// pinned to the channel: terminal messages and the explicit
+				// role-fallback switch never enter the ring, so the switch line
+				// always precedes the fallback model's first token.
 			default:
 				if ring.Push(msg) {
 					return
@@ -531,6 +533,12 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	if isCasual {
 		req.Tools = nil
 	}
+
+	// EXPLICIT ROLE FALLBACK CHAIN (no implicit reversion): resolve the
+	// user-configured fallback for this turn on the UI goroutine. It is applied
+	// only when the primary dispatch fails with a network-transient error
+	// (timeout / HTTP 429 / HTTP 5xx) and never changes the active binding.
+	fallbackPlan := m.planRoleFallback(req)
 
 	// The request context is derived from the active operation (when one is
 	// registered, e.g. a build-context stream) so Ctrl+C cancels the provider
@@ -586,7 +594,11 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		defer close(streamCh)
 		defer cancel()
 
-		rawStream, err := m.provider.ExecuteStream(ctx, req)
+		rawStream, err := executeStreamWithRoleFallback(ctx, m.provider, req, fallbackPlan, func(sw roleFallbackMsg) {
+			// Terminal-priority dispatch: the switch is reported before the
+			// fallback runs so the trace never shows a silent model change.
+			send(roleFallbackNoticeMsg{notice: fallbackNotice(sw), primary: sw.Primary, fallback: sw.Fallback, reason: sw.Reason, role: sw.Role})
+		})
 		if err != nil {
 			send(streamErrMsg{err: err})
 			return

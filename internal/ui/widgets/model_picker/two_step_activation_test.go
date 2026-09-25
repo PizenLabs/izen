@@ -30,8 +30,14 @@ func TestEnterInListOpensDetails(t *testing.T) {
 	}
 	// Browsing footer advertises the 2-step contract.
 	view := New(seedSnapshot(testModels())).View()
-	if !strings.Contains(view, "configure & activate") {
-		t.Fatalf("browsing footer must show 'Enter configure & activate', got:\n%s", view)
+	if !strings.Contains(view, "Enter") || !strings.Contains(view, "activate") {
+		t.Fatalf("browsing footer must show 'Enter activate', got:\n%s", view)
+	}
+	if !strings.Contains(view, "Esc close") {
+		t.Fatalf("browsing footer must show full 'Esc close' without truncation, got:\n%s", view)
+	}
+	if strings.Contains(view, "Esc clos\n") || strings.Contains(view, "Esc clos\u001b") {
+		t.Fatalf("browsing footer must not truncate Esc close, got:\n%s", view)
 	}
 	if strings.Contains(view, "activate / save key") {
 		t.Fatalf("browsing footer must NOT show legacy 'activate / save key':\n%s", view)

@@ -66,6 +66,9 @@ func (m *model) isInterruptModalActive() bool {
 	if m.showModelPicker {
 		return true
 	}
+	if m.showStatus {
+		return true
+	}
 	if m.showSessionPicker {
 		return true
 	}

@@ -392,6 +392,10 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		// status. Without this reset the TUI would keep rendering BUILDING
 		// after the engine halted (the reported state-desync defect).
 		m.unwindBuildFailure()
+		// A cancellation is a clean stop; every other terminal failure is
+		// reported verbatim. There is no model reversion on this path — the
+		// only model switch is the explicit role fallback chain, which happens
+		// at dispatch time and is logged as its own event.
 		if outcome == OpOutcomeCancelled {
 			m.push(roleSystem, infoStyle.Render("Cancelled. No files were modified."))
 		} else {

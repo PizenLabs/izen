@@ -125,7 +125,11 @@ func (m Model) renderBrowsingLayout() string {
 	b.WriteString("\n")
 	b.WriteString(m.clipLine(m.renderActiveLine()))
 	b.WriteString("\n")
+	b.WriteString(m.clipLine(m.renderProviderLine()))
+	b.WriteString("\n")
 	b.WriteString(m.clipLine(m.renderVariantLine()))
+	b.WriteString("\n")
+	b.WriteString(m.clipLine(m.renderRuntimePathLine()))
 	b.WriteString("\n")
 
 	if m.status != "" {
@@ -199,6 +203,10 @@ func (m Model) footerText() string {
 }
 
 // renderBrowsingFooter delivers the dual-pane keybinding footer.
+// Plain width is capped at 84 cells (min(84, windowWidth-4) contract) so the
+// full hint line — including the trailing "Esc close" — survives without
+// wrapping or truncation at normal modal sizes. On narrow bounds middle
+// segments are dropped first, always preserving Tab-select and Esc-close.
 func (m Model) renderBrowsingFooter() string {
 	keyStyle := lipgloss.NewStyle().Foreground(colorText).Bold(true)
 	descStyle := lipgloss.NewStyle().Foreground(colorSubtext0)
@@ -211,17 +219,44 @@ func (m Model) renderBrowsingFooter() string {
 		inner = 64
 	}
 
-	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s   %s %s   %s %s",
-		keyStyle.Render("Tab"), descStyle.Render("select pane"),
-		keyStyle.Render("↑/↓"), descStyle.Render("navigate"),
-		keyStyle.Render("Enter"), descStyle.Render("configure & activate"),
-		keyStyle.Render("Alt+A"), descStyle.Render("set API key"),
-		keyStyle.Render("Alt+i"), descStyle.Render("details"),
-		keyStyle.Render("Esc"), descStyle.Render("close"),
-	)
-	if m.innerWidth <= 0 && m.width <= 0 {
-		return help
+	segments := [][2]string{
+		{"Tab", "select"},
+		{"↑/↓", "nav"},
+		{"Enter", "activate"},
+		{"Alt+A", "API key"},
+		{"Alt+i", "details"},
+		{"Esc", "close"},
 	}
+	buildStyled := func(segs [][2]string) string {
+		parts := make([]string, 0, len(segs))
+		for _, s := range segs {
+			parts = append(parts, keyStyle.Render(s[0])+" "+descStyle.Render(s[1]))
+		}
+		return strings.Join(parts, "   ")
+	}
+	buildPlain := func(segs [][2]string) string {
+		parts := make([]string, 0, len(segs))
+		for _, s := range segs {
+			parts = append(parts, s[0]+" "+s[1])
+		}
+		return strings.Join(parts, "   ")
+	}
+	if m.innerWidth <= 0 && m.width <= 0 {
+		return buildStyled(segments)
+	}
+	// Adaptively drop middle hints until the plain line fits, preserving
+	// the leading Tab and trailing Esc-close anchors.
+	for lipgloss.Width(buildPlain(segments)) > inner && len(segments) > 3 {
+		idx := len(segments) / 2
+		if idx <= 0 {
+			idx = 1
+		}
+		if idx >= len(segments)-1 {
+			idx = len(segments) - 2
+		}
+		segments = append(segments[:idx], segments[idx+1:]...)
+	}
+	help := buildStyled(segments)
 	return truncateStyled(help, inner)
 }
 
@@ -266,6 +301,16 @@ func (m Model) renderDetailView() string {
 	}
 	capsStr := formatCapabilities(caps)
 
+	// Raw provider capabilities are the unmodified catalog flags (never the
+	// classifier-enriched effective set) so the inspector stays truthful.
+	rawCapsStr := formatCapabilities(model.Capabilities)
+
+	runtimePath := registry.RuntimePathFor(*model)
+	runtimePathStyled := valueStyle.Render(runtimePath)
+	if registry.RequiresAgenticHarness(*model) {
+		runtimePathStyled = agenticBadgeStyle.Render(runtimePath)
+	}
+
 	specLines := []string{
 		"",
 		sectionStyle.Render("SPECIFICATIONS"),
@@ -273,6 +318,21 @@ func (m Model) renderDetailView() string {
 		labelStyle.Render("  Context Window  : ") + valueStyle.Render(ctxWin+" tokens"),
 		labelStyle.Render("  Pricing         : ") + valueStyle.Render(price+" per 1M tokens"),
 		labelStyle.Render("  Capabilities    : ") + capsStr,
+	}
+
+	// ── IZEN CONTRACT MAPPING section ──
+	// The dynamic contract mapping the adaptive runtime will resolve for this
+	// model: its execution path, provider wire policy and the semantic
+	// interaction contracts it can serve. Informational only — never a
+	// selection barrier.
+	contractLines := []string{
+		"",
+		sectionStyle.Render("IZEN CONTRACT MAPPING"),
+		"",
+		labelStyle.Render("  Runtime Path     : ") + runtimePathStyled,
+		labelStyle.Render("  Wire Policy      : ") + valueStyle.Render(registry.WirePolicyLabel(*model)),
+		labelStyle.Render("  Interaction Path : ") + valueStyle.Render("DirectCompletion / AgenticLoop"),
+		labelStyle.Render("  Raw Provider Caps: ") + valueStyle.Render(rawCapsStr),
 	}
 
 	// ── REASONING POLICY section ──
@@ -289,6 +349,7 @@ func (m Model) renderDetailView() string {
 
 	// ── Assemble card ──
 	allLines := append([]string{title, providerLine}, specLines...)
+	allLines = append(allLines, contractLines...)
 	allLines = append(allLines, reasoningLines...)
 	body := lipgloss.JoinVertical(lipgloss.Left, allLines...)
 
@@ -477,16 +538,17 @@ func (m Model) snapshotModels() []registry.ModelDescriptor {
 
 // paneHeight returns the height available for the dual-pane content area.
 // Chrome above and below the panes: header(1) + divider(1) + divider(1) +
-// active(1) + variant(1) = 5 lines, plus padFooter's 1-line footer = 6 total.
+// active(1) + provider(1) + variant(1) + runtime path(1) = 7 lines, plus
+// padFooter's 1-line footer = 8 total.
 func (m Model) paneHeight() int {
 	innerH := m.innerHeight
 	if innerH <= 0 {
 		innerH = m.height
 	}
 	if innerH <= 0 {
-		return 16
+		return 15
 	}
-	return max(3, innerH-6)
+	return max(3, innerH-8)
 }
 
 // renderLeftPane dispatches the left pane: the Roles policy list when the
@@ -507,12 +569,32 @@ const (
 )
 
 // Tabular column widths for the MODELS pane: Model ID (flexible), Context
-// Window (fixed), Pricing (fixed), Capability flags (leftover, capped).
+// Window (fixed), Pricing (fixed), Capability badges (dynamic).
+//
+// The badge column is NOT a fixed width: it is derived from the total viewport
+// width and the badge cells actually on screen every render (see badgeLayout).
 const (
 	tableCtxColW   = 6
 	tablePriceColW = 12
-	tableFlagsMaxW = 16
 	tableIDMinW    = 10
+	// minCtxColW / minPriceColW are the narrowest natural widths for the
+	// context and price columns ("1M" / "free"): enough for the common case
+	// without stealing cells from the model ID.
+	minCtxColW   = 3
+	minPriceColW = 4
+	// tableColumnGap is the number of spaces between the four columns.
+	tableColumnGap = 3
+	// wideViewportCols is the total viewport width at (and above) which the
+	// badges column expands to its full natural width. Below it the compact
+	// badge vocabulary ([Ag] [Th] [Vis] [Tl]) is used so capability truth is
+	// never clipped away by a narrow terminal.
+	wideViewportCols = 100
+	// minBadgesColW is the narrowest badges column that can still render a
+	// single compact badge without clipping.
+	minBadgesColW = 4
+	// maxBadgesColW bounds the badges container so a pathological badge set can
+	// never eat the ID column.
+	maxBadgesColW = 36
 )
 
 // renderProvidersPane renders the left pane: the synthetic [All models] entry
@@ -699,7 +781,7 @@ func (m Model) renderModelsPane() string {
 		case selected:
 			lines = append(lines, selectedRowStyle.Render(cell))
 		default:
-			lines = append(lines, mutedStyle.Render(cell))
+			lines = append(lines, mutedStyle.Render(m.styleAgenticBadge(cell, d)))
 		}
 	}
 
@@ -725,60 +807,345 @@ func (m Model) renderModelsPane() string {
 // mutedStyle) is applied atomically by the caller (renderModelsPane) so
 // individual cells never introduce partial ANSI sequences that could break
 // on truncation.
+//
+// Every column but the ID is sized from the data actually on screen (see
+// tableColumns), and the ID absorbs the remainder:
+//
+//	ctx / price = the widest formatted cell in the window (capped),
+//	badges     = min(widest badge cell in the window, remaining budget),
+//	id         = everything else, never below tableIDMinW.
+//
+// Consequences: a 140-column terminal expands the badges container to its
+// natural width and long model IDs keep their full name, while an 80-column
+// terminal falls back to the compact badge vocabulary so capability truth stays
+// legible. Badges are never clipped mid-word: a cell that cannot fit drops its
+// trailing badges instead of rendering "[Think\u2026", and an over-long model ID is
+// middle-truncated so the vendor prefix and the variant tail both survive.
 func (m Model) renderModelRow(item registry.ModelDescriptor, rightPaneW int) string {
-	ctxW := tableCtxColW
-	priceW := tablePriceColW
-	flagsW := tableFlagsMaxW
-	spacing := 3 // spaces between 4 columns
+	cols := m.tableColumns(rightPaneW)
+	gap := strings.Repeat(" ", tableColumnGap)
 
-	idW := rightPaneW - (ctxW + priceW + flagsW + spacing)
-	if idW < tableIDMinW {
-		idW = tableIDMinW
-	}
+	paddedID := padRightExact(middleTruncate(item.ID, cols.id), cols.id)
+	paddedCtx := padLeftExact(formatContextWindow(item.ContextWindow), cols.ctx)
+	paddedPrice := padLeftExact(formatPricing(item.InputCostPerM, item.OutputCostPerM), cols.price)
+	paddedBadges := padRightExact(badgeCell(item, cols.vocab, cols.badges), cols.badges)
 
-	// 1. Hard-truncate Model ID first.
-	truncatedID := runewidth.Truncate(item.ID, idW, "…")
-	paddedID := padRightExact(truncatedID, idW)
-
-	// 2. Format remaining columns with exact fixed widths.
-	paddedCtx := padLeftExact(formatContextWindow(item.ContextWindow), ctxW)
-	paddedPrice := padLeftExact(formatPricing(item.InputCostPerM, item.OutputCostPerM), priceW)
-	paddedFlags := padRightExact(runewidth.Truncate(capabilityFlags(item), flagsW, "…"), flagsW)
-
-	// 3. Assemble single plain string.
-	plainRow := paddedID + " " + paddedCtx + " " + paddedPrice + " " + paddedFlags
-
-	// 4. Force exact fit to rightPaneW.
+	// Force exact fit to rightPaneW so every row shares one visible width.
+	plainRow := paddedID + gap + paddedCtx + gap + paddedPrice + gap + paddedBadges
 	return padOrTruncateExact(plainRow, rightPaneW)
 }
 
-// capabilityFlags renders the [Thinking]/[Vision]/[Tools] badge set for a
-// model, derived strictly from its ModelDescriptor capabilities (falling back
-// to the classifier for unlisted but detectable caps).
-func capabilityFlags(d registry.ModelDescriptor) string {
-	caps := d.Capabilities
-	if len(caps) == 0 {
-		for _, c := range registry.EffectiveCapabilitiesOf(d) {
-			caps = append(caps, registry.ModelCapability(string(c)))
+// tableColumns is the resolved geometry of the four-column models table for
+// one render: the ID column takes the remainder, every other column is sized
+// to the data actually on screen.
+type tableColumns struct {
+	id     int
+	ctx    int
+	price  int
+	badges int
+	vocab  badgeSet
+}
+
+// tableColumns resolves the column geometry for a models pane of paneW cells.
+//
+// Priority order, from least to most negotiable:
+//  1. the gaps (tableColumnGap) and the ID minimum are reserved first,
+//  2. context and price shrink to their natural cell width (capped),
+//  3. the badges container takes what is left, capped by the widest badge cell
+//     it can actually show \u2014 so a roomy terminal expands the container
+//     instead of padding it.
+func (m Model) tableColumns(paneW int) tableColumns {
+	gaps := tableColumnGap * 3
+	ctxW := naturalColumnWidth(m.filtered,
+		func(d registry.ModelDescriptor) string { return formatContextWindow(d.ContextWindow) },
+		minCtxColW, tableCtxColW)
+	priceW := naturalColumnWidth(m.filtered,
+		func(d registry.ModelDescriptor) string { return formatPricing(d.InputCostPerM, d.OutputCostPerM) },
+		minPriceColW, tablePriceColW)
+
+	// Budget left for the badges once the ID minimum and the gaps are reserved.
+	budget := paneW - (tableIDMinW + ctxW + priceW + gaps)
+	budget = min(max(budget, minBadgesColW), maxBadgesColW)
+	vocab, badgesW := m.badgeVocabularyFor(budget)
+
+	idW := paneW - (ctxW + priceW + badgesW + gaps)
+	if idW < tableIDMinW {
+		idW = tableIDMinW
+	}
+	return tableColumns{id: idW, ctx: ctxW, price: priceW, badges: badgesW, vocab: vocab}
+}
+
+// naturalColumnWidth reports the widest formatted cell in the window, clamped
+// to [minW, maxW]. An empty window falls back to minW.
+func naturalColumnWidth(window []registry.ModelDescriptor, cell func(registry.ModelDescriptor) string, minW, maxW int) int {
+	w := minW
+	for _, d := range window {
+		if cw := runewidth.StringWidth(cell(d)); cw > w {
+			w = cw
 		}
 	}
-	if len(caps) == 0 {
-		return "—"
+	return min(w, maxW)
+}
+
+// badgeSet is the badge vocabulary for one render pass: full labels on a wide
+// viewport, compact indicators when horizontal space is constrained.
+type badgeSet struct {
+	agentic  string
+	thinking string
+	vision   string
+	tools    string
+}
+
+// fullBadgeSet is the verbose vocabulary, used when the viewport can host it.
+func fullBadgeSet() badgeSet {
+	return badgeSet{
+		agentic:  registry.AgenticBadge,
+		thinking: "[Thinking]",
+		vision:   "[Vision]",
+		tools:    "[Tools]",
 	}
-	var parts []string
-	for _, c := range caps {
+}
+
+// compactBadgeSet keeps every capability legible in a narrow column without
+// ever clipping a word.
+func compactBadgeSet() badgeSet {
+	return badgeSet{agentic: "[Ag]", thinking: "[Th]", vision: "[Vis]", tools: "[Tl]"}
+}
+
+// badgeLayout is the resolved badges column for one render: which vocabulary
+// the rows speak and how many cells the column owns.
+type badgeLayout struct {
+	vocab badgeSet
+	width int
+}
+
+// badgeVocabularyFor resolves the badges column for a cell budget of `budget`
+// cells.
+//
+// The full vocabulary wins when the viewport is wide (> wideViewportCols) AND
+// the widest full badge cell in the window genuinely fits; otherwise the
+// compact vocabulary is used and sized to its own natural width. That is what
+// keeps a wide terminal free of clipped words and a narrow one free of
+// ellipsis soup.
+func (m Model) badgeVocabularyFor(budget int) (badgeSet, int) {
+	full, compact := fullBadgeSet(), compactBadgeSet()
+	if m.viewportCols() > wideViewportCols {
+		if natural := widestBadgeCell(m.filtered, full); natural <= budget {
+			return full, natural
+		}
+	}
+	width := min(widestBadgeCell(m.filtered, compact), budget)
+	return compact, max(width, minBadgesColW)
+}
+
+// badgeVocabulary reports the vocabulary this viewport renders with: full above
+// wideViewportCols, compact at or below it.
+func (m Model) badgeVocabulary() badgeSet {
+	if m.viewportCols() > wideViewportCols {
+		return fullBadgeSet()
+	}
+	return compactBadgeSet()
+}
+
+// viewportCols reports the TOTAL viewport width the picker renders into (the
+// modal box width, falling back to the inner width, then to the unbounded
+// headless default).
+func (m Model) viewportCols() int {
+	if m.modalW > 0 {
+		return m.modalW
+	}
+	if m.innerWidth > 0 {
+		return m.innerWidth
+	}
+	return m.width
+}
+
+// badgeLayout resolves the badges column for a pane of paneW cells.
+//
+// The ID column minimum is reserved FIRST so the badges can never starve it;
+// whatever budget remains is what the badges container may expand into. The
+// full vocabulary is chosen only when it genuinely fits \u2014 that is what keeps
+// a wide terminal free of clipped words and a narrow one free of ellipsis soup.
+func (m Model) badgeLayout(paneW int) badgeLayout {
+	cols := m.tableColumns(paneW)
+	return badgeLayout{vocab: cols.vocab, width: cols.badges}
+}
+
+// widestBadgeCell reports the natural (unclipped) width of the largest badge
+// cell in the window under the given vocabulary. An empty window still reserves
+// room for one badge so the column never collapses to a sliver.
+func widestBadgeCell(window []registry.ModelDescriptor, vocab badgeSet) int {
+	widest := 0
+	for _, d := range window {
+		if w := runewidth.StringWidth(strings.Join(modelBadgeLabels(d, vocab), " ")); w > widest {
+			widest = w
+		}
+	}
+	return max(widest, minBadgesColW)
+}
+
+// modelBadgeLabels returns the badge cells a model renders under the given
+// vocabulary, in stable order: agentic wire policy first, then semantic
+// capabilities. An unknown capability keeps its literal name (bracketed) so a
+// newly classified flag is never silently dropped.
+func modelBadgeLabels(d registry.ModelDescriptor, labels badgeSet) []string {
+	var out []string
+	if registry.RequiresAgenticHarness(d) && labels.agentic != "" {
+		out = append(out, labels.agentic)
+	}
+	for _, c := range effectiveCaps(d) {
 		switch c {
 		case registry.CapThinking:
-			parts = append(parts, "[Thinking]")
+			out = append(out, labels.thinking)
 		case registry.CapVision:
-			parts = append(parts, "[Vision]")
+			out = append(out, labels.vision)
 		case registry.CapTools:
-			parts = append(parts, "[Tools]")
+			out = append(out, labels.tools)
 		default:
-			parts = append(parts, "["+string(c)+"]")
+			out = append(out, "["+string(c)+"]")
 		}
 	}
-	return strings.Join(parts, " ")
+	return out
+}
+
+// effectiveCaps returns the descriptor's capabilities, falling back to the
+// classifier for unlisted but detectable caps (never empty for a real model).
+func effectiveCaps(d registry.ModelDescriptor) []registry.ModelCapability {
+	if len(d.Capabilities) > 0 {
+		return d.Capabilities
+	}
+	var caps []registry.ModelCapability
+	for _, c := range registry.EffectiveCapabilitiesOf(d) {
+		caps = append(caps, registry.ModelCapability(string(c)))
+	}
+	return caps
+}
+
+// badgeCell renders one model's badge set into a cell of at most `width` visible
+// cells (the caller pads it to the column width). Badges are added left to
+// right while they fit and the remainder is dropped, so a capability is never
+// rendered as a clipped word like "[Think\u2026".
+func badgeCell(d registry.ModelDescriptor, vocab badgeSet, width int) string {
+	labels := modelBadgeLabels(d, vocab)
+	if len(labels) == 0 {
+		return "\u2014"
+	}
+	if width <= 0 {
+		return strings.Join(labels, " ")
+	}
+	var kept []string
+	used := 0
+	for _, l := range labels {
+		add := runewidth.StringWidth(l)
+		if len(kept) > 0 {
+			add++ // separating space
+		}
+		if len(kept) > 0 && used+add > width {
+			break
+		}
+		if len(kept) == 0 && used+add > width {
+			// Column narrower than a single badge: clip this one honestly
+			// rather than overflowing the row.
+			kept = append(kept, runewidth.Truncate(l, width, "\u2026"))
+			break
+		}
+		kept = append(kept, l)
+		used += add
+	}
+	return strings.Join(kept, " ")
+}
+
+// capabilityFlags renders the [Agentic]/[Thinking]/[Vision]/[Tools] badge set
+// for a model in the FULL vocabulary, derived strictly from its
+// ModelDescriptor capabilities (falling back to the classifier for unlisted
+// but detectable caps) plus the provider wire policy.
+//
+// [Agentic] is emitted first so it survives the badges column even when the
+// model also advertises several semantic capabilities. It marks a model whose
+// provider wire policy requires an agentic harness; it is informational only
+// and never hides or disables the model.
+func capabilityFlags(d registry.ModelDescriptor) string {
+	labels := modelBadgeLabels(d, fullBadgeSet())
+	if len(labels) == 0 {
+		return "\u2014"
+	}
+	return strings.Join(labels, " ")
+}
+
+// middleTruncate shortens s to w visible cells by eliding the MIDDLE, keeping
+// the leading vendor/namespace and the trailing version-variant tail both
+// readable ("models/gemini-3.8-pro-exte…extended-thinking"). Widths below the
+// ellipsis budget fall back to right truncation so a row never exceeds its
+// column. Pure text, no ANSI.
+func middleTruncate(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if runewidth.StringWidth(s) <= w {
+		return s
+	}
+	const ell = "…"
+	if w <= runewidth.StringWidth(ell) {
+		return runewidth.Truncate(s, w, "")
+	}
+	budget := w - runewidth.StringWidth(ell)
+	head := budget/2 + budget%2 // the extra cell goes to the head side
+	tail := budget - head
+	return headCells(s, head) + ell + tailCells(s, tail)
+}
+
+// headCells returns at most the first w visible cells of s.
+func headCells(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	used := 0
+	end := 0
+	for i, r := range runes {
+		rw := runewidth.RuneWidth(r)
+		if used+rw > w {
+			break
+		}
+		used += rw
+		end = i + 1
+	}
+	return string(runes[:end])
+}
+
+// tailCells returns at most the last w visible cells of s.
+func tailCells(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	used := 0
+	start := len(runes)
+	for i := len(runes) - 1; i >= 0; i-- {
+		rw := runewidth.RuneWidth(runes[i])
+		if used+rw > w {
+			break
+		}
+		used += rw
+		start = i
+	}
+	return string(runes[start:])
+}
+
+// styleAgenticBadge colors the agentic token ([Agentic] on wide viewports,
+// [Ag] on narrow ones) within an already-rendered row. It runs before the row is
+// wrapped in mutedStyle: the badge is the first badges token, so its ANSI reset
+// only affects trailing spaces (invisible), never a sibling badge. Widths are
+// preserved because ANSI cells contribute zero width.
+func (m Model) styleAgenticBadge(row string, d registry.ModelDescriptor) string {
+	if !registry.RequiresAgenticHarness(d) {
+		return row
+	}
+	token := m.badgeVocabulary().agentic
+	if token == "" || !strings.Contains(row, token) {
+		return row
+	}
+	return strings.Replace(row, token, agenticBadgeStyle.Render(token), 1)
 }
 
 // recentSectionLines renders the pinned RECENTLY USED block (up to 3 rows)
@@ -860,8 +1227,9 @@ func (m Model) buildVerticalSeparator() string {
 	return strings.Join(lines, "\n")
 }
 
-// renderActiveLine shows the currently highlighted provider and model. In
-// Roles mode it surfaces the highlighted role policy override instead.
+// renderActiveLine shows the currently active model ID without the filter
+// category prefix (no "All models /" prefix). In Roles mode it surfaces the
+// highlighted role policy override instead.
 func (m Model) renderActiveLine() string {
 	if m.showingRoles {
 		role := m.HighlightedRole()
@@ -871,32 +1239,75 @@ func (m Model) renderActiveLine() string {
 		}
 		return mutedStyle.Render("Role: ") + accentStyle.Render(role) + mutedStyle.Render(suffix)
 	}
-	prov := m.highlightedProvider()
-	if prov == "" {
-		prov = "All models"
-	}
 	modelID := "—"
 	if hl := m.Highlighted(); hl != nil {
 		modelID = hl.ID
+	} else if sel := m.SelectedModel(); sel != nil {
+		modelID = sel.ID
 	}
-	return mutedStyle.Render("Active: ") + accentStyle.Render(prov) + mutedStyle.Render(" / ") + accentStyle.Render(modelID)
+	return mutedStyle.Render("Active Model: ") + accentStyle.Render(modelID)
+}
+
+// activeProviderID resolves the underlying execution provider for the
+// currently active model, so the "All models" global scope still shows an
+// explicit provider (e.g. openrouter, ollama, openai).
+func (m Model) activeProviderID() string {
+	if hl := m.Highlighted(); hl != nil && hl.Provider != "" {
+		return hl.Provider
+	}
+	if sel := m.SelectedModel(); sel != nil && sel.Provider != "" {
+		return sel.Provider
+	}
+	return m.highlightedProvider()
+}
+
+// renderProviderLine shows the resolved execution provider for the active
+// model. The label carries faint/muted styling while the provider name uses
+// the primary accent.
+func (m Model) renderProviderLine() string {
+	provider := m.activeProviderID()
+	if provider == "" {
+		provider = "—"
+	}
+	return mutedStyle.Render("Provider:     ") + accentStyle.Render(provider)
 }
 
 // renderVariantLine shows the reasoning policy variant for the highlighted model.
 func (m Model) renderVariantLine() string {
 	sel := m.Highlighted()
 	if sel == nil {
-		return mutedStyle.Render("Variant: —")
+		return mutedStyle.Render("Variant:      ") + accentStyle.Render("—")
 	}
 	opt, ok := m.CurrentReasoningOption()
 	if !ok {
-		return mutedStyle.Render("Variant: Fixed")
+		return mutedStyle.Render("Variant:      ") + accentStyle.Render("Fixed")
 	}
 	label := opt
 	if label == "" {
 		label = "Default"
 	}
-	return mutedStyle.Render("Variant: ") + accentStyle.Render(label)
+	return mutedStyle.Render("Variant:      ") + accentStyle.Render(label)
+}
+
+// renderRuntimePathLine renders the adaptive execution path for the highlighted
+// (or pinned) model. It is the bottom metadata preview's execution-path
+// capability: models whose provider wire policy requires an agentic harness
+// show their auto-promote strategy; every other model shows the standard
+// DirectCompletion / AgenticLoop path. It never disables the model.
+func (m Model) renderRuntimePathLine() string {
+	d := m.Highlighted()
+	if d == nil {
+		d = m.SelectedModel()
+	}
+	path := registry.RuntimePathStandard
+	style := accentStyle
+	if d != nil {
+		path = registry.RuntimePathFor(*d)
+		if registry.RequiresAgenticHarness(*d) {
+			style = agenticBadgeStyle
+		}
+	}
+	return mutedStyle.Render("Runtime Path: ") + style.Render(path)
 }
 
 // renderHeader renders the registry title with total count and sync state:
@@ -999,9 +1410,9 @@ func (m Model) syncIndicator() (string, interface {
 }
 
 // visibleWindow computes the dynamic viewport: chrome-aware budget from
-// innerHeight with cursor-following scroll offset. Spec: Total Chrome = 6
-// (Title, Search, Divider, Reasoning, Bindings, Help footer).
-// listRowBudget = max(3, innerHeight - 6). Zero height = show all.
+// innerHeight with cursor-following scroll offset. Spec: Total Chrome = 8
+// (Title, Divider, Divider, Active Model, Provider, Variant, Runtime Path,
+// Help footer). listRowBudget = max(3, innerHeight - 8). Zero height = show all.
 //
 //nolint:unused // retained as the pane-agnostic contract ancestor of visibleWindowBudget
 func (m Model) visibleWindow() (start, end int) {
@@ -1018,7 +1429,7 @@ func (m Model) visibleWindow() (start, end int) {
 		if m.listRowBudget > 0 {
 			budget = m.listRowBudget
 		} else {
-			budget = max(3, innerH-6)
+			budget = max(3, innerH-8)
 		}
 		if budget > total {
 			budget = total

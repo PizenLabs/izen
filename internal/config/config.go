@@ -103,6 +103,13 @@ type Config struct {
 	// Unified model binding (single source of truth)
 	Bindings BindingsConfig `yaml:"bindings"`
 
+	// Roles is the explicit, user-configurable role fallback chain keyed by
+	// semantic role (plan, default, ...). Each entry declares a primary model
+	// and/or a fallback model; see role_fallback.go. Izen never reverts a model
+	// implicitly — the only switch is this chain, and it fires exclusively on
+	// network-transient failures (timeout / HTTP 429 / HTTP 5xx).
+	Roles map[string]RoleFallbackConfig `yaml:"roles,omitempty"`
+
 	AI        AIConfig        `yaml:"ai"`
 	Models    ModelConfig     `yaml:"models"`
 	Execution ExecutionConfig `yaml:"execution"`
@@ -110,8 +117,12 @@ type Config struct {
 	Fallback  FallbackConfig  `yaml:"fallback"`
 	Lynx      LynxConfig      `yaml:"lynx"`
 	MCP       MCPConfig       `yaml:"mcp"`
-	Style     string          `yaml:"style"`
-	Username  string          `yaml:"username"`
+	// UI stores only presentation preferences exposed by the standalone
+	// settings modal. Runtime application remains owned by the UI workspace
+	// viewport/renderer, not by the config store.
+	UI       UIConfig `yaml:"ui,omitempty"`
+	Style    string   `yaml:"style"`
+	Username string   `yaml:"username"`
 }
 
 // TimeoutConfig carries user-overridable connection timeouts. Durations
@@ -509,11 +520,17 @@ func Default() *Config {
 		MCP: MCPConfig{
 			Enabled: false,
 		},
+		UI: UIConfig{
+			AutoScroll: AutoScrollSmart,
+		},
 		Style: "balanced",
 	}
 }
 
 func Save(cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("cannot save nil config")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -531,6 +548,33 @@ func Save(cfg *Config) error {
 	}
 
 	return os.WriteFile(path, data, 0644)
+}
+
+// PersistGlobalConfig writes the canonical global configuration to
+// ~/.izen/config.yml. The optional pointer form lets a runtime owner persist
+// the same live config object it is already using; the zero-argument form is
+// the common settings-modal path and persists the process-wide global config.
+// A successful write also publishes the pointer as the in-memory global
+// snapshot so subsequent settings commits cannot be overwritten by a stale
+// object.
+func PersistGlobalConfig(configs ...*Config) error {
+	var cfg *Config
+	if len(configs) > 0 {
+		if configs[0] == nil {
+			return fmt.Errorf("global config unavailable")
+		}
+		cfg = configs[0]
+	} else {
+		cfg = GetGlobalConfig()
+	}
+	if cfg == nil {
+		return fmt.Errorf("global config unavailable")
+	}
+	if err := Save(cfg); err != nil {
+		return err
+	}
+	globalConfig = cfg
+	return nil
 }
 
 type ConfigChangeMsg struct{}

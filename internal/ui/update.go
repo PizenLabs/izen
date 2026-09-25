@@ -38,8 +38,10 @@ import (
 	"github.com/PizenLabs/izen/internal/providers"
 	riview "github.com/PizenLabs/izen/internal/review"
 	"github.com/PizenLabs/izen/internal/session"
+	statuscommand "github.com/PizenLabs/izen/internal/ui/commands"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
+	settings_widget "github.com/PizenLabs/izen/internal/ui/widgets/settings"
 	verification "github.com/PizenLabs/izen/internal/verification"
 )
 
@@ -81,6 +83,7 @@ func (m *model) Init() tea.Cmd {
 	// provider. Open the model picker immediately so the user can select
 	// a model instead of staring at a blank input bar.
 	if m.bootErr != nil {
+		m.showSettings = false
 		m.showModelPicker = true
 		m.modelPicker = newModelPickerFromCache(m)
 		cmds = append(cmds, m.modelPicker.Init())
@@ -118,7 +121,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	// render flag so text input restores the active blinking cursor on the
 	// very next frame — no waiting for the release timer.
 	m.scrollChromeDirty = true
-	if _, ok := msg.(tea.KeyMsg); ok {
+	if _, ok := msg.(tea.KeyMsg); ok && !m.showStatus {
 		m.endScrollBurst()
 	}
 
@@ -168,6 +171,74 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	if m.pendingQuitConfirm {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			return m, m.handleQuitConfirmKey(keyMsg)
+		}
+	}
+
+	// ── STANDALONE STATUS MODAL INTERCEPT ─────────────────────────────
+	// Status owns the complete keyboard surface while open. Only the two
+	// explicit dismissal keys escape; every other key is consumed so text,
+	// scrolling, vi navigation, and workspace shortcuts cannot leak through
+	// the popup. WindowSizeMsg intentionally falls through so the parent
+	// viewport and modal can re-center on resize.
+	if m.showStatus {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			m.handleStatusKey(msg)
+			return m, nil
+		case tea.MouseMsg:
+			return m, nil
+		}
+	}
+
+	// ── GLOBAL SETTINGS SHORTCUT ──────────────────────────────────────
+	// Ctrl+P is owned by the workspace, not by the model picker. Handle it
+	// before picker routing so it toggles Settings everywhere in the primary
+	// workspace and closes cleanly when pressed again.
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		if cmd, handled := m.handleSettingsShortcut(keyMsg); handled {
+			return m, cmd
+		}
+	}
+
+	// ── STANDALONE SETTINGS MODAL ──────────────────────────────────────
+	// A commit is applied even if an Esc raced the command, so a value change
+	// is never silently lost after the modal has already begun teardown.
+	if commit, ok := msg.(settings_widget.CommitMsg); ok {
+		m.applySettingsCommit(commit)
+		return m, nil
+	}
+
+	// Settings owns keyboard focus while open, but background stream/events
+	// continue to fall through so an in-flight response is not frozen behind
+	// the dialog. The widget is intentionally independent of model_picker.
+	if m.showSettings {
+		switch msg := msg.(type) {
+		case settings_widget.CloseMsg:
+			m.closeSettings()
+			return m, nil
+		case tea.KeyMsg:
+			updated, cmd := m.settingsModel.Update(msg)
+			if sm, ok := updated.(settings_widget.Model); ok {
+				m.settingsModel = sm
+			}
+			if m.settingsModel.Done() {
+				m.closeSettings()
+				// The parent has already torn down the modal; consume the
+				// widget's close event so a delayed message cannot close a
+				// newly opened settings surface.
+				return m, nil
+			}
+			return m, cmd
+		case tea.WindowSizeMsg:
+			updated, _ := m.settingsModel.Update(msg)
+			if sm, ok := updated.(settings_widget.Model); ok {
+				m.settingsModel = sm
+			}
+			// Let the workspace resize path run as well.
+		case tea.MouseMsg:
+			// The modal owns the interaction surface; underlying workspace
+			// scrolling/selection must not receive mouse events.
+			return m, nil
 		}
 	}
 
@@ -346,7 +417,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	}
 
 	// ── VI-MODE INTERCEPT: route all key events to the vi-mode handler ──
-	if keyMsg, ok := msg.(tea.KeyMsg); ok && m.inViMode {
+	if keyMsg, ok := msg.(tea.KeyMsg); ok && m.inViMode && (!m.showSessionPicker || m.sessionPicker == nil) {
 		return m.handleViModeKey(keyMsg)
 	}
 
@@ -360,10 +431,21 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		switch msg.(type) {
 		case sessionPickerResumeMsg, sessionPickerNewMsg, sessionPickerRenameMsg, sessionPickerArchiveMsg, sessionPickerDeleteMsg, sessionPickerCompactMsg, sessionPickerCloseMsg:
 			// fall through to main switch
+		case sessionPickerEditorMsg:
+			// Only editor-owned async messages are consumed here; unrelated
+			// runtime/tick/background messages must reach the main switch.
+			updated, cmd := m.sessionPicker.Update(msg)
+			m.sessionPicker = updated
+			return m, cmd
 		case tea.WindowSizeMsg:
-			// fall through to main switch (resize adapts modal via render)
+			// Let the widget consume resize events before the main model
+			// updates its viewport. This keeps column widths and scroll bounds
+			// correct even when the modal is rendered before the next frame.
+			updated, _ := m.sessionPicker.Update(msg)
+			m.sessionPicker = updated
+			// fall through to main switch (the parent viewport also resizes)
 		default:
-			return m, nil
+			// Unrelated messages continue to the parent update loop.
 		}
 	}
 
@@ -466,7 +548,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// type switch below. Without this, gitInitResultMsg gets swallowed
 		// and the init stage never advances after pressing 'Y'.
 		switch msg.(type) {
-		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg, domainEventMsg, controlFactMsg:
+		case tea.WindowSizeMsg, gitInitResultMsg, providerSwitchMsg, graphBuiltMsg, graphIndexingMsg, domainEventMsg, controlFactMsg, statuscommand.ResultMsg:
 			// fall through to main type switch
 		default:
 			return m, nil
@@ -506,6 +588,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+
+	case statuscommand.ResultMsg:
+		m.handleStatusResult(msg)
+		return m, nil
 
 	case configLoadedMsg:
 		// Defensive workspace loader result (dispatched once per startup from
@@ -625,19 +711,59 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case sessionPickerResumeMsg:
-		return m, m.handleSessionPickerResume(msg.slot)
+		if m.showSessionPicker && m.sessionPicker != nil && m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, m.handleSessionPickerResume(msg.slot)
+		}
+		return m, nil
 	case sessionPickerNewMsg:
-		return m, m.handleSessionPickerNew()
+		if !m.showSessionPicker || m.sessionPicker == nil || !m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, nil
+		}
+		if msg.begin && !msg.commit {
+			// n opens the inline title editor; it is not a session boundary
+			// until Enter emits the commit phase.
+			return m, nil
+		}
+		if msg.commit && msg.inputID != 0 && msg.inputID == m.sessionPicker.pendingNewID {
+			m.sessionPicker.pendingNewID = 0
+			return m, m.handleSessionPickerNew(msg.title)
+		}
+		// Ignore a zero-value or stale command after the editor was canceled or
+		// the modal was closed; session boundaries must never be replayable.
+		return m, nil
 	case sessionPickerRenameMsg:
+		if !m.showSessionPicker || m.sessionPicker == nil || !m.sessionPicker.ownsMessage(msg.pickerID) ||
+			msg.inputID == 0 || msg.inputID != m.sessionPicker.pendingRenameID {
+			return m, nil
+		}
+		m.sessionPicker.pendingRenameID = 0
 		return m, m.handleSessionPickerRename(msg.slot, msg.title)
 	case sessionPickerArchiveMsg:
-		return m, m.handleSessionPickerArchive(msg.slot)
+		if m.showSessionPicker && m.sessionPicker != nil && m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, m.handleSessionPickerArchive(msg.slot)
+		}
+		return m, nil
 	case sessionPickerDeleteMsg:
-		return m, m.handleSessionPickerDelete(msg.slot)
+		if m.showSessionPicker && m.sessionPicker != nil && m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, m.handleSessionPickerDelete(msg.slot)
+		}
+		return m, nil
 	case sessionPickerCompactMsg:
-		return m, m.handleSessionPickerCompact(msg.slot)
+		if m.showSessionPicker && m.sessionPicker != nil && m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, m.handleSessionPickerCompact(msg.slot)
+		}
+		return m, nil
 	case sessionPickerCloseMsg:
-		return m, m.closeSessionPicker()
+		if m.showSessionPicker && m.sessionPicker != nil && m.sessionPicker.ownsMessage(msg.pickerID) {
+			return m, m.closeSessionPicker()
+		}
+		return m, nil
+
+	case sessionTitleRefinedMsg:
+		// Stage 2 completion: apply on the UI goroutine only when the result is
+		// fresh and the user has not renamed the session in the meantime.
+		m.handleSessionTitleRefined(msg)
+		return m, nil
 
 	case runtimeResultMsg:
 		// GENERATION EPOCH ISOLATION: silently drop stale worker results
@@ -669,6 +795,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.resizeStatusView(msg.Width, msg.Height)
+		if m.showSessionPicker && m.sessionPicker != nil {
+			// Keep the widget's responsive layout in lockstep with the parent
+			// viewport, even when a direct resize reaches the root model.
+			m.sessionPicker.SetViewportSize(msg.Width, msg.Height)
+		}
 		padding := 4
 		w := msg.Width - padding
 		if w < 20 {
@@ -3259,6 +3391,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamLiveTokens = 0
 		m.streamBaseInputTokens = 0
 
+		// ── STAGE 2: ASYNC SESSION TITLE REFINEMENT ────────────────
+		// After the first stream turn completes, dispatch the non-blocking
+		// Commit/Fast summarization. It runs off the UI goroutine and returns a
+		// sessionTitleRefinedMsg; the handler only applies it when the session
+		// is still the same and the title is still the Stage 1 heuristic.
+		var titleCmd tea.Cmd
+		if m.titleRefineArmed {
+			m.titleRefineArmed = false
+			titleCmd = m.refineTitleCmd()
+		}
+
 		// ── MANDATORY SYNCHRONOUS FLUSH (STREAM COMPLETION) ─────────
 		// The final frame must render NOW, on this turn — never deferred to a
 		// pending repaintTickMsg that could be dropped, starved, or processed
@@ -3270,7 +3413,17 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.refreshViewportContentImmediate()
 		// Full stream transparency: mark the live thought block complete so the
 		// Ctrl+O drawer collapses to its "▸ Thought for Xs (N tokens)" summary.
-		return m, m.thoughtUpdateCmd("", true)
+		return m, tea.Batch(m.thoughtUpdateCmd("", true), titleCmd)
+
+	case roleFallbackNoticeMsg:
+		// EXPLICIT ROLE FALLBACK EVENT: the turn switched to the role's
+		// configured fallback model after a network-transient primary failure.
+		// This is an informational trace line — the user's active binding is
+		// never rewritten by a fallback.
+		m.push(roleSystem, infoStyle.Render(msg.notice))
+		m.refreshViewportContent()
+		m.gotoBottomIfAllowed()
+		return m, nil
 
 	case streamErrMsg:
 		// Handle executor streaming error separately.
@@ -3348,6 +3501,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			return m, nil
 		}
 
+		// ── NETWORK-TRANSIENT FAILURES ─────────────────────────────────
+		// A primary model that failed on a network timeout / rate limit /
+		// server error is retried on the role's configured fallback model
+		// (see role_fallback.go) at the dispatch site, so a streamErrMsg
+		// reaching this point means the whole chain failed. Surface the real
+		// cause — never an implicit model reversion.
+
 		if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.CurrentStatus == domain.ObjectiveExecuting {
 			m.sess.ObjectiveState.CurrentStatus = domain.ObjectivePlanned
 			m.sess.SetObjectiveState(m.sess.ObjectiveState)
@@ -3364,11 +3524,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.err != nil {
 			sanitizedErr = providers.SanitizeAPIError(msg.err)
 		}
-		if errors.Is(msg.err, providers.ErrOpenRouterAuth) {
+		switch {
+		case errors.Is(msg.err, providers.ErrOpenRouterAuth):
 			m.push(roleError, errorStyle.Render("✗ OpenRouter Authorization Failed"))
 			m.push(roleSystem, infoStyle.Render("Invalid or missing OPENROUTER_API_KEY. Please check your environment variables or run:"))
 			m.push(roleSystem, infoStyle.Render("  export OPENROUTER_API_KEY=<your_key>"))
-		} else {
+		case errors.Is(msg.err, providers.ErrOpenRouterAgenticGate):
+			// Provider-side access policy, NOT a model incompatibility and NOT
+			// a reason to change models: OpenRouter serves this model's free
+			// endpoints only to agentic harnesses it has registered (its
+			// "Gate Free Endpoints by Agentic Harness" routing step, a
+			// User-Agent allowlist). Izen keeps the user's binding and names
+			// the three real remedies.
+			m.push(roleError, errorStyle.Render(
+				fmt.Sprintf("✗ %s is served only to registered agentic harnesses (OpenRouter routing gate).", m.getActiveModelName())))
+			m.push(roleSystem, infoStyle.Render("  Your active model is unchanged — this is a provider access policy, not an Izen model reversion."))
+			m.push(roleSystem, infoStyle.Render("  • use the non-gated model id in the same family, e.g. openrouter/thinkingmachines/inkling-small"))
+			m.push(roleSystem, infoStyle.Render("  • or declare a fallback in ~/.izen/config.yml: roles.<role>.fallback"))
+			m.push(roleSystem, infoStyle.Render("  • or list Izen at https://openrouter.ai/apps to be registered as a harness"))
+			m.pruneFailedPromptFromHistory()
+		default:
 			sanitized := sanitizedErr
 			// TTFT Timeout: no first byte arrived and the failure is a
 			// deadline, the first-byte idle watchdog firing, or a
@@ -3607,7 +3782,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case config.ConfigChangeMsg:
 		newCfg, err := config.Load()
 		if err == nil {
-			m.cfg = newCfg
+			m.applyLoadedConfig(newCfg)
 		}
 		// A config file change may have altered the active provider or the
 		// intent-tier models; re-pin the pipeline router so mode commands

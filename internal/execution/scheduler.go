@@ -43,7 +43,8 @@ func NewScheduler(bus *events.Bus) *Scheduler {
 
 func IsReadOnlyTool(name string) bool {
 	switch name {
-	case "read_file", "glob", "grep", "fetch_web", "list_files", "search":
+	case ai.ToolReadFile, ai.ToolListDirectory, ai.ToolSearchCodebase, ai.ToolSymbolLookup,
+		"glob", "grep", "fetch_web", "list_files", "search":
 		return true
 	default:
 		return false

@@ -22,12 +22,14 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
+	"github.com/PizenLabs/izen/internal/prompt"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
 	compose "github.com/PizenLabs/izen/internal/runtime/compose"
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
 	"github.com/PizenLabs/izen/internal/tui/tips"
+	settings_widget "github.com/PizenLabs/izen/internal/ui/widgets/settings"
 )
 
 // NewProgramWithApp initializes the model bound to the externally wired
@@ -200,11 +202,15 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		orch:                app.Orchestrator,
 		autonomy:            app.Autonomy,
 		autonomousDriver:    app.Autonomous,
+		contextSpec:         app.ContextSpec(),
 		pipelineEngine:      app.Pipeline,
 		patchEngine:         app.Patch,
 		viewState:           presentation.NewWorkflowViewState(),
 		toolCallBuffer:      execution.NewToolCallBuffer(root),
 		thinkingPanel:       NewThinkingPanel(),
+		settingsModel:       settings_widget.New(),
+		hideThinkingBlocks:  cfg.UI.HideThinking,
+		viewportManager:     newViewportManager(cfg.UI.AutoScroll),
 		liveCodePreview:     NewLiveCodePreview(),
 		shimmerAnim:         shimmer.New(""),
 		tipProvider:         tips.Default(),
@@ -212,6 +218,9 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		plannerMu:           &sync.Mutex{},
 		traceVerbose:        IsTraceVerbose(),
 	}
+	// Keep the presentation bootstrap aligned with the persisted style even
+	// when the program is constructed outside cmd/izen (tests/embedded hosts).
+	prompt.SetActiveStyle(cfg.ActiveStylePolicy())
 	if initStage == initIdentity {
 		m.initIdentityInput = textinput.New()
 		m.initIdentityInput.Prompt = ""

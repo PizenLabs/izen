@@ -287,6 +287,9 @@ func (m *model) viModeLabel() string {
 // the ThinkingBuffer (event-driven) in renderStreamingContent. This block is
 // the expanded/collapsible version for reviewing after streaming ends.
 func (m *model) renderReasoningBlock(width int) string {
+	if m.hideThinkingBlocks {
+		return ""
+	}
 	if m.thinkingPanel == nil {
 		return ""
 	}

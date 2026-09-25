@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -106,19 +107,29 @@ func containsSlash(s string) bool {
 	return false
 }
 
-// TestIneligibleModelRemainsBlocked pins the prior OpenRouter eligibility
-// repair through the refactored activation paths:
-// thinkingmachines/inkling:free (harness-only) is rejected at selection
-// time, while thinkingmachines/inkling-small:free remains selectable (its
-// provider-side 403 is a separate compatibility concern, not a binding
-// defect).
-func TestIneligibleModelRemainsBlocked(t *testing.T) {
+// TestAgenticModelIsSelectable pins the Adaptive Runtime contract: an
+// agentic-harness model is rendered neutrally and activates directly, with no
+// local modal warning or rejection. The provider pre-flight guard (not the
+// picker) owns execution eligibility.
+func TestAgenticModelIsSelectable(t *testing.T) {
+	persisted := stubPersistBinding(t)
 	m := newBindingTestModel(t)
-	if !m.rejectIneligibleModel("openrouter", "thinkingmachines/inkling:free") {
-		t.Fatal("harness-only inkling:free must be rejected at selection time")
+	m.provider = stubBindingProvider{name: "openrouter"}
+
+	cmd := m.commitModelAssignment(model_picker.ModelAssignmentRequestedMsg{
+		ModelID:  "thinkingmachines/inkling-small:free",
+		Provider: "openrouter",
+	})
+	_ = cmd
+
+	if len(*persisted) != 1 || (*persisted)[0].Model != "thinkingmachines/inkling-small:free" {
+		t.Fatalf("agentic model must activate (persisted), got %+v", *persisted)
 	}
-	if m.rejectIneligibleModel("openrouter", "thinkingmachines/inkling-small:free") {
-		t.Fatal("inkling-small:free must remain selectable")
+	if got := m.modelAuthority.ActiveBinding().ModelID; got != "thinkingmachines/inkling-small:free" {
+		t.Fatalf("authority binding = %q, want the agentic model", got)
+	}
+	if text := recordsText(m); strings.Contains(text, "unavailable") {
+		t.Fatalf("agentic activation must not be rejected locally, got:\n%s", text)
 	}
 }
 
