@@ -378,6 +378,33 @@ func (v *OCCVerifier) TreeDigest(targets []string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// TargetHashes returns the per-target sha256 content hash of the CURRENT
+// workspace, encoded as lowercase hex ("" marks an absent target). It reuses the
+// same fingerprint cache and cleaning rules as TreeDigest, so it is the
+// per-target view of exactly the digest the OCC boundary enforces — it is not a
+// parallel hashing system.
+func (v *OCCVerifier) TargetHashes(targets []string) map[string]string {
+	if v == nil {
+		return nil
+	}
+	cleaned := make([]string, 0, len(targets))
+	seen := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		t = filepath.ToSlash(filepath.Clean(strings.TrimSpace(t)))
+		if t == "" || t == "." || seen[t] {
+			continue
+		}
+		seen[t] = true
+		cleaned = append(cleaned, t)
+	}
+	out := make(map[string]string, len(cleaned))
+	for _, t := range cleaned {
+		fp, _ := v.fingerprint(t)
+		out[t] = fp.hash
+	}
+	return out
+}
+
 // fingerprint observes one target: stat + content hash, using the cached hash
 // when size and mtime are unchanged since the last observation. The second
 // return reports whether the cached observation was reused (a telemetry cache

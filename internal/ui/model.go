@@ -24,6 +24,7 @@ import (
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
 	"github.com/PizenLabs/izen/internal/contextcompiler"
+	"github.com/PizenLabs/izen/internal/contextspec"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/runtime"
@@ -1032,6 +1033,16 @@ type model struct {
 	// harnesses without the driver wired — those fall back to the legacy
 	// single-shot executor path.
 	autonomousDriver autonomousDriver
+	// ── CONTEXT DOMAIN (Phase 11.x) ─────────────────────────────────
+	// contextSpec is the composition-bound Context Domain Control Plane. It
+	// lazily compiles the conversation's semantic state (ContextSpec) and freezes
+	// a bounded ExecutionSpec at the explicit execution hand-off. Nil in
+	// harnesses without the pipeline wired; the hand-off is then a no-op and the
+	// canonical executor path is unchanged.
+	contextSpec *contextspec.Pipeline
+	// lastExecutionSpec is the most recently frozen execution contract, exposed
+	// read-only to /spec. It carries no authority.
+	lastExecutionSpec *contextspec.ExecutionSpec
 	// autonomousActive is true while a driver Run command is in flight
 	// (executing or parked). It gates duplicate-start protection in the UI.
 	autonomousActive bool

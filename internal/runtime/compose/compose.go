@@ -24,6 +24,7 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/contextcompiler"
+	"github.com/PizenLabs/izen/internal/contextspec"
 	"github.com/PizenLabs/izen/internal/control"
 	"github.com/PizenLabs/izen/internal/core/artifact"
 	"github.com/PizenLabs/izen/internal/core/authorization"
@@ -55,6 +56,7 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime"
 	"github.com/PizenLabs/izen/internal/runtime/authority"
 	runtimeAutonomy "github.com/PizenLabs/izen/internal/runtime/autonomy"
+	"github.com/PizenLabs/izen/internal/runtime/contextpipeline"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	"github.com/PizenLabs/izen/internal/session"
@@ -205,6 +207,15 @@ type Application struct {
 	// canonical loop.transition event. It is a consumer of the executor — never
 	// a second execution authority. Headless runs and the UI both consume it.
 	Autonomous *runtimeAutonomy.Driver
+
+	// ── Context Domain (Phase 11.x) ────────────────────────────────────
+	// ContextSpecPipeline is the Control Plane of the compiled semantic state
+	// that sits between the unbounded conversation and the Execution Domain. It
+	// lazily compiles ContextSpec candidates, CAS-commits them and freezes
+	// bounded ExecutionSpec contracts at explicit hand-off boundaries. It holds
+	// no execution authority: it cannot write, patch, shell or reach the
+	// RuntimeExecutor.
+	ContextSpecPipeline *contextspec.Pipeline
 
 	// provider is the resolved default AI provider from Manager. It is nil
 	// when no provider is configured.
@@ -392,6 +403,16 @@ func (a *Application) ContextCompiler() *contextcompiler.Compiler {
 		return nil
 	}
 	return a.Compiler
+}
+
+// ContextSpec returns the Context Domain Control Plane (Phase 11.x): the lazy
+// semantic-state compiler, CAS store and ExecutionSpec freezing boundary. It is
+// nil only when no workspace root was provided (harness mode).
+func (a *Application) ContextSpec() *contextspec.Pipeline {
+	if a == nil {
+		return nil
+	}
+	return a.ContextSpecPipeline
 }
 
 // Manager returns the AI provider manager the engine tree was wired from.
@@ -600,6 +621,15 @@ func Wire(opts ...Option) (*Application, error) {
 	a.Executor = execution.NewRuntimeExecutor(a.Inputs.Root, a.Inputs.Config, a.provider, a.Bus, a.Inputs.LanguageID)
 	a.Executor.SetContextCompiler(a.Compiler)
 	a.Gateway = execution.NewIntentGateway(a.Inputs.Root)
+	// ── CONTEXT DOMAIN (Phase 11.x) ─────────────────────────────────────
+	// The Context Pipeline reuses the executor's existing OCC hashing for its
+	// workspace snapshot port; it owns no filesystem or execution code. The
+	// registry is the only place the pipeline is constructed.
+	a.ContextSpecPipeline = contextspec.NewPipeline(contextspec.PipelineOptions{
+		Compiler: contextspec.NewRuleCompiler(),
+		Snapshot: contextpipeline.NewOCCSnapshotPort(a.Executor.OCC()),
+		Audit:    contextpipeline.NewBusAuditSink(a.Bus),
+	})
 	// INV-SESSION-10: resolve the originating session for every execution at
 	// admission so the proof, terminal evidence and lifecycle events correlate
 	// with the active session — including autonomous/headless submissions.

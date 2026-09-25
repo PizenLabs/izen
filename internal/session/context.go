@@ -48,6 +48,9 @@ type CompactContext struct {
 	SessionID string `json:"session_id"`
 	Objective string `json:"objective,omitempty"`
 	Mode      string `json:"mode,omitempty"`
+	// Revision is the conversation revision clock carried across the compact
+	// fast-path so a hydrated session keeps the same freshness position.
+	Revision uint64 `json:"revision,omitempty"`
 	// Summary is a compacted digest of the conversational state (the last
 	// user turn plus a bounded run-length summary).
 	Summary string `json:"summary,omitempty"`
@@ -105,6 +108,7 @@ func deriveCompactContext(s *Session) *CompactContext {
 		CreatedAt:    s.CreatedAt,
 		UpdatedAt:    s.UpdatedAt,
 		LastUserTurn: lastUserTurn(s),
+		Revision:     s.Revision,
 		Generation:   1,
 		EventCount:   len(s.History),
 		Recent:       append([]Message(nil), s.History...),
@@ -177,6 +181,12 @@ func hydrateSession(cc *CompactContext) *Session {
 		s.History = append(s.History, Message{
 			Role: "user", Content: cc.LastUserTurn, Timestamp: now,
 		})
+	}
+	// Restore the conversation revision; reconstruct it from the carried
+	// history when the compact payload predates the clock.
+	s.Revision = cc.Revision
+	if s.Revision == 0 {
+		s.Revision = userTurnCount(s.History)
 	}
 	if cc.RunNumber > 0 {
 		s.RunNumber = cc.RunNumber

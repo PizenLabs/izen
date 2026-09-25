@@ -26,7 +26,13 @@ type Session struct {
 	// SessionID is a stable identity for the session record. It is assigned at
 	// creation and preserved across persists; a recovered session re-derives
 	// it from the raw-history/checkpoint ladder when the record is lost.
-	SessionID          string            `json:"session_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	// Revision is the monotonically increasing conversation revision. It is
+	// incremented exactly once for every ACCEPTED user conversation turn and is
+	// the sole freshness clock of the Context Domain: a compiled ContextSpec is
+	// fresh iff its ConversationRevision equals this value. It is intentionally
+	// NOT a semantic signal and never decremented except by a full Purge.
+	Revision           uint64            `json:"revision,omitempty"`
 	Objective          string            `json:"objective"`
 	ObjectiveState     *domain.Objective `json:"objective_state,omitempty"`
 	Mode               modes.Mode        `json:"mode"`
@@ -148,6 +154,13 @@ func Load() (*Session, error) {
 	}
 	if s.Objective == "" && s.ObjectiveState != nil {
 		s.Objective = s.ObjectiveState.RawIntent
+	}
+	// Bootstrap the conversation revision for records written before the
+	// revision clock existed (or recovered from raw history): the revision is
+	// the count of accepted human turns, so it is always reconstructible from
+	// the durable history without a semantic pass.
+	if s.Revision == 0 {
+		s.Revision = userTurnCount(s.History)
 	}
 	// Apply retention policy to checkpoints and patches directories.
 	_ = RunRetentionPolicy(filepath.Join(".izen", "checkpoints"), 15)
@@ -342,6 +355,11 @@ func (s *Session) SaveReview(data []byte) error {
 }
 
 // AddMessage appends a new message to the history and enforces the sliding window limit.
+//
+// A USER turn advances ConversationRevision: revision coherence (not semantic
+// classification) is what makes a compiled ContextSpec stale. Assistant/system
+// turns never advance it — they are outputs of the conversation, not human
+// corrections to its semantic state.
 func (s *Session) AddMessage(role, content string, maxTurns int) {
 	msg := Message{
 		Role:      role,
@@ -349,6 +367,9 @@ func (s *Session) AddMessage(role, content string, maxTurns int) {
 		Timestamp: time.Now(),
 	}
 	s.History = append(s.History, msg)
+	if role == "user" {
+		s.Revision++
+	}
 
 	// Calculate maximum number of messages to keep (user-assistant pairs * 2)
 	maxMessages := maxTurns * 2
@@ -356,6 +377,40 @@ func (s *Session) AddMessage(role, content string, maxTurns int) {
 		// Keep only the most recent maxMessages messages
 		s.History = s.History[len(s.History)-maxMessages:]
 	}
+}
+
+// ConversationRevision returns the current monotonic conversation revision. It
+// is the freshness clock the Context Domain reads; it is never derived from
+// conversation semantics.
+func (s *Session) ConversationRevision() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.Revision
+}
+
+// userTurnCount returns the number of accepted human turns in a history slice.
+// It is the deterministic reconstruction of ConversationRevision when a record
+// predates the revision clock or was rebuilt from raw history.
+func userTurnCount(history []Message) uint64 {
+	var n uint64
+	for _, m := range history {
+		if m.Role == "user" {
+			n++
+		}
+	}
+	return n
+}
+
+// AcceptUserTurn is the explicit revision-advancing turn commit. It is
+// equivalent to AddMessage("user", ...) and exists so callers can express the
+// "accepted human turn" boundary without relying on the role string.
+func (s *Session) AcceptUserTurn(content string, maxTurns int) uint64 {
+	if s == nil {
+		return 0
+	}
+	s.AddMessage("user", content, maxTurns)
+	return s.Revision
 }
 
 // GetLLMMessages returns the conversation history slice that should be
@@ -574,6 +629,7 @@ func (s *Session) LogDir() string {
 // deleted. Only transient files (session.json, context_ledger.json) are
 // cleared by CleanupLocalState on shutdown if needed.
 func (s *Session) Purge() {
+	s.Revision = 0
 	s.Objective = ""
 	s.ObjectiveState = nil
 	s.Mode = modes.ModeAsk

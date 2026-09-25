@@ -95,6 +95,7 @@ var validSystemCommands = map[string]struct{}{
 	"/arch":             {},
 	"/explain-decision": {},
 	"/decide":           {},
+	"/spec":             {},
 	"/copy":             {},
 	"/compact":          {},
 }
@@ -2049,6 +2050,9 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  $prompt <objective>  enter the autonomous runtime (intent → capability → workspace → decision → execution)"))
 		m.push(roleSystem, infoStyle.Render("  $decide <prompt>     run the intent → workspace → decision trace"))
 		m.push(roleSystem, "")
+		m.push(roleSystem, labelBoldStyle.Render("context"))
+		m.push(roleSystem, infoStyle.Render("  /spec  inspect the compiled conversation context (read-only)"))
+		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
 		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /objective  /drop  /clear  /quit  /copy  /compact"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>"))
@@ -2103,6 +2107,12 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		// an internal compatibility seam; the /grant token is not a registry
 		// command and is not reachable through the parser pipeline.
 		return m.handleAutonomyGrant("")
+
+	case cmd == "/spec":
+		// Read-only ContextSpec inspection: status, revisions, goal, targets,
+		// active constraints/decisions and open questions. It never authorizes
+		// or executes.
+		return m.runSpecCmd()
 
 	case strings.HasPrefix(cmd, "/decide"):
 		content := strings.TrimSpace(strings.TrimPrefix(cmd, "/decide"))
