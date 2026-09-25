@@ -437,6 +437,9 @@ func NewContractDescriptor(contract InteractionContract, options ...DescriptorOp
 	if !validAuthorityCeiling(authority) {
 		return ContractDescriptor{}, fmt.Errorf("%w: unknown authority ceiling %q", ErrInvalidContract, authority)
 	}
+	if !validPromptProfile(promptProfile) {
+		return ContractDescriptor{}, fmt.Errorf("%w: unknown prompt profile %q", ErrInvalidContract, promptProfile)
+	}
 	if !validOutputSchema(outputSchema) {
 		return ContractDescriptor{}, fmt.Errorf("%w: unknown output schema %q", ErrInvalidContract, outputSchema)
 	}
@@ -564,6 +567,15 @@ func validCapability(capability Capability) bool {
 func validOutputSchema(schema OutputSchema) bool {
 	switch schema {
 	case SchemaText, SchemaJSON, SchemaPlanJSON, SchemaTaskBlocks:
+		return true
+	default:
+		return false
+	}
+}
+
+func validPromptProfile(profile PromptProfile) bool {
+	switch profile {
+	case PromptProfileFull, PromptProfileCompact, PromptProfileMinimal:
 		return true
 	default:
 		return false
@@ -922,6 +934,26 @@ func CompactPlanInstructions(schema string, archetype Archetype, maxTasks int) s
 	}.PlanInstructions(schema)
 }
 
+// ModeAllowsInteraction reports whether a semantic contract is permitted by a
+// presentation mode's authority ceiling. It is deliberately separate from
+// provider capability selection: a model that supports tools cannot promote a
+// read-only /ask turn into a tool or agentic interaction. The build/execute
+// modes may use any contract for an individual bounded step; their runtime
+// admission still decides whether a concrete operation is authorized.
+func ModeAllowsInteraction(mode string, contract InteractionContract) bool {
+	if !contract.Valid() {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "ask", "review", "investigate", "plan":
+		return contract == DirectCompletion || contract == StructuredCompletion
+	case "build", "execute", "autonomy":
+		return true
+	default:
+		return true
+	}
+}
+
 // hasCapability matches a capability token without requiring callers to use
 // one exact spelling. It intentionally treats only semantic capability names
 // as hints; provider capability records are not consulted here.
@@ -959,7 +991,7 @@ func SelectInteractionContract(intent, mode string, requiredCapabilities ...stri
 	if modeLower == "plan" {
 		return StructuredCompletion
 	}
-	if modeLower == "build" {
+	if modeLower == "build" || modeLower == "execute" {
 		return AgenticLoop
 	}
 	// A required mutation capability is an explicit agentic-loop request in

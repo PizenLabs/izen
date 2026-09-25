@@ -238,6 +238,15 @@ func admissionContractError(descriptor protocol.ContractDescriptor, action admis
 	}
 }
 
+func modeContractError(descriptor protocol.ContractDescriptor, mode string) error {
+	return &AuthorityExceededError{
+		Contract:         descriptor.Contract,
+		Operation:        "mode_contract",
+		AuthorityCeiling: descriptor.AuthorityCeiling,
+		Reason:           fmt.Sprintf("interaction contract %q is outside the %q mode ceiling", descriptor.Contract, mode),
+	}
+}
+
 func resolveAdmissionContract(req ExecuteRequest, supplied []*protocol.ContractDescriptor) (protocol.ContractDescriptor, bool, error) {
 	if len(supplied) > 1 {
 		return protocol.ContractDescriptor{}, false, fmt.Errorf("%w: admission received multiple contract descriptors", protocol.ErrInvalidContract)
@@ -258,10 +267,32 @@ func resolveAdmissionContract(req ExecuteRequest, supplied []*protocol.ContractD
 		descriptor := protocol.Describe(req.InteractionContract)
 		candidate = &descriptor
 	}
+	// A presentation mode is a hard semantic ceiling when a caller attaches
+	// staged operations. Derive its conservative contract before looking at
+	// those operations; otherwise a legacy caller could smuggle
+	// FILE_MUTATE/SHELL_EXEC through /ask by relying on the generic "staged
+	// task => agentic" fallback. Requests without staged scopes retain the
+	// historical strategy-driven execution lane (Mode remains presentation
+	// metadata for that compatibility path).
+	if candidate == nil && len(req.StagedSubTasks) > 0 {
+		var modeContract protocol.InteractionContract
+		switch strings.ToLower(strings.TrimSpace(req.Mode)) {
+		case "ask", "review", "investigate":
+			modeContract = protocol.DirectCompletion
+		case "plan":
+			modeContract = protocol.StructuredCompletion
+		case "build", "execute", "autonomy":
+			modeContract = protocol.AgenticLoop
+		}
+		if modeContract.Valid() {
+			descriptor := protocol.Describe(modeContract)
+			candidate = &descriptor
+		}
+	}
 	// A staged autonomy request has a semantic contract even when a legacy
 	// caller omitted the enum. Derive the conservative agentic descriptor
 	// here so the admission layer never treats staged scopes as an untyped
-	// legacy mutation.
+	// legacy mutation when no mode ceiling is available.
 	if candidate == nil && len(req.StagedSubTasks) > 0 {
 		descriptor := protocol.Describe(protocol.AgenticLoop)
 		candidate = &descriptor
@@ -296,6 +327,9 @@ func resolveAdmissionContract(req ExecuteRequest, supplied []*protocol.ContractD
 	}
 	if req.InteractionContract != "" && normalized.Contract != req.InteractionContract {
 		return protocol.ContractDescriptor{}, false, fmt.Errorf("%w: request contract %q does not match descriptor %q", protocol.ErrInvalidContract, req.InteractionContract, normalized.Contract)
+	}
+	if len(req.StagedSubTasks) > 0 && !protocol.ModeAllowsInteraction(req.Mode, normalized.Contract) {
+		return protocol.ContractDescriptor{}, false, modeContractError(normalized, req.Mode)
 	}
 	return normalized, true, nil
 }

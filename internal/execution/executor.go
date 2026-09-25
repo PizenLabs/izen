@@ -1141,7 +1141,7 @@ func defaultExecutionContract(req ExecuteRequest, profile strategy.ExecutionStra
 		return protocol.DirectCompletion
 	case "plan":
 		return protocol.StructuredCompletion
-	case "build", "autonomy":
+	case "build", "execute", "autonomy":
 		return protocol.AgenticLoop
 	}
 	switch profile.Strategy {
@@ -1169,6 +1169,9 @@ func validateExecutionContract(req ExecuteRequest, profile strategy.ExecutionStr
 	descriptor, err := req.Contract.Clone().Normalize()
 	if err != nil {
 		return err
+	}
+	if len(req.StagedSubTasks) > 0 && !protocol.ModeAllowsInteraction(req.Mode, descriptor.Contract) {
+		return modeContractError(descriptor, req.Mode)
 	}
 	if err := validateAdmissionBudget(req, profile, descriptor); err != nil {
 		return err
