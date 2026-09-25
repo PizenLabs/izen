@@ -33,8 +33,59 @@ import (
 // msg.ModelID/Provider flow straight from the event payload into
 // ValidateBinding and PersistActiveBinding: no fallback layer overrides the
 // assigned model with a default.
+// rejectIneligibleModel enforces the ModelEligibility boundary at selection
+// time: a discovered-but-ineligible model (e.g. agentic-harness-only) can
+// never become the active executable binding through picker, direct, or
+// role-override flows. It reports true when the binding was rejected.
+func (m *model) rejectIneligibleModel(provider, id string) bool {
+	inelig := registry.CheckExecutable(provider, id)
+	if inelig == nil {
+		return false
+	}
+	m.push(roleError, fmt.Sprintf("[✗] Model unavailable for Izen's current execution path: %s/%s is %s", provider, id, inelig.Reason))
+	m.refreshViewportContent()
+	m.gotoBottomIfAllowed()
+	return true
+}
+
+// persistActiveBindingFn persists the unified active binding. It defaults to
+// config.PersistActiveBinding and is stubbed in tests so activation paths
+// never touch the real home directory.
+var persistActiveBindingFn = config.PersistActiveBinding
+
+// persistAndActivateBinding performs the atomic provider/model/variant
+// binding transaction shared by every model activation path (picker
+// assignment, picker Enter activation, widget activate command, /model
+// direct switch):
+//
+//  1. Persist (disk + global store) — abort without mutating runtime.
+//  2. Mirror into the live session config (m.cfg.Bindings.Active) so every
+//     config-derived reader observes the new binding in the same turn.
+//  3. Activate the RuntimeAuthority (the execution-time binding source).
+//  4. Re-pin pipeline tiers.
+//
+// Steps 1–3 keep the three runtime binding representations (persisted store,
+// session config, authority) atomically consistent: no execution path can
+// observe provider=openrouter with a stale ollama model, or provider=ollama
+// with a new OpenRouter model. Callers run validation and the eligibility
+// gate before invoking this helper.
+func (m *model) persistAndActivateBinding(binding authority.ModelBinding) error {
+	if err := persistActiveBindingFn(string(binding.ProviderID), string(binding.ModelID), string(binding.VariantParams)); err != nil {
+		return err
+	}
+	if m.cfg != nil {
+		m.cfg.Bindings.Active = config.ActiveBindingConfig{
+			Provider: string(binding.ProviderID),
+			Model:    string(binding.ModelID),
+			Variant:  string(binding.VariantParams),
+		}
+	}
+	m.ensureModelAuthority().Activate(binding)
+	m.syncPipelineTiers()
+	return nil
+}
+
 func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedMsg) tea.Cmd {
-	auth := m.ensureModelAuthority()
 	binding := authority.ModelBinding{
 		ProviderID:    authority.ProviderID(msg.Provider),
 		ModelID:       authority.ModelID(msg.ModelID),
@@ -46,15 +97,15 @@ func (m *model) commitModelAssignment(msg model_picker.ModelAssignmentRequestedM
 		m.gotoBottomIfAllowed()
 		return nil
 	}
-	if err := config.PersistActiveBinding(msg.Provider, msg.ModelID, string(msg.Policy.Reasoning)); err != nil {
+	if m.rejectIneligibleModel(msg.Provider, msg.ModelID) {
+		return nil
+	}
+	if err := m.persistAndActivateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
 		return nil
 	}
-	auth.Activate(binding)
-	// Sync pipeline intent tiers to the new binding.
-	m.syncPipelineTiers()
 	// Record the activation in the RECENTLY USED list (with variant) so the
 	// models pane pins it, then persist the MRU to ~/.izen/state.json.
 	m.modelPicker = m.modelPicker.AddRecentModel(msg.ModelID, msg.Provider)
@@ -88,7 +139,10 @@ func newModelPickerFromCache(m *model) model_picker.Model {
 		m.modelRegistry = registry.NewRegistry()
 		_ = m.modelRegistry.LoadCache()
 	}
-	mp := model_picker.NewFromRegistry(m.modelRegistry)
+	// Executable view only: discovered-but-ineligible models (e.g.
+	// agentic-harness-only) are filtered before the picker ever sees them.
+	// The full raw catalog stays in the registry snapshot and on disk.
+	mp := model_picker.New(m.modelRegistry.LoadExecutable())
 	if m.resolver != nil {
 		mp = mp.SetActiveWorkspace(m.resolver.Current().String())
 		m.ensureModelAuthority()
@@ -129,7 +183,6 @@ func (m *model) applyPickerActivation(um model_picker.Model) tea.Cmd {
 		}
 	}
 
-	auth := m.ensureModelAuthority()
 	variant := um.ReasoningPolicy()
 	binding := authority.ModelBinding{
 		ProviderID:    authority.ProviderID(provider),
@@ -140,12 +193,13 @@ func (m *model) applyPickerActivation(um model_picker.Model) tea.Cmd {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
 		return nil
 	}
-	if err := config.PersistActiveBinding(provider, id, variant); err != nil {
+	if m.rejectIneligibleModel(provider, id) {
+		return nil
+	}
+	if err := m.persistAndActivateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
 		return nil
 	}
-	auth.Activate(binding)
-	m.syncPipelineTiers()
 	m.persistPickerState()
 
 	var cmds []tea.Cmd
@@ -199,14 +253,14 @@ func (m *model) refreshModelRegistryCmd() tea.Cmd {
 			defer cancel()
 			_ = svc.RefreshRegistry(ctx)
 			_ = reg.LoadCache()
-			return model_picker.SnapshotMsg{Snap: reg.Load()}
+			return model_picker.SnapshotMsg{Snap: reg.LoadExecutable()}
 		}
 	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		_ = reg.Sync(ctx, discovery.DiscoverProviders(ctx))
-		return model_picker.SnapshotMsg{Snap: reg.Load()}
+		return model_picker.SnapshotMsg{Snap: reg.LoadExecutable()}
 	}
 }
 
@@ -235,7 +289,6 @@ func (m *model) pickerActivateCmd(cmd modelapp.ActivateModelCommand) tea.Cmd {
 	um := m.modelPicker
 	m.ti.Focus()
 	if um.ActivatedModelID() == "" {
-		auth := m.ensureModelAuthority()
 		variant := ""
 		if cmd.Reasoning != nil {
 			variant = cmd.Reasoning.Option
@@ -252,12 +305,13 @@ func (m *model) pickerActivateCmd(cmd modelapp.ActivateModelCommand) tea.Cmd {
 			m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
 			return nil
 		}
-		if err := config.PersistActiveBinding(cmd.Provider, cmd.ModelID, variant); err != nil {
+		if m.rejectIneligibleModel(cmd.Provider, cmd.ModelID) {
+			return nil
+		}
+		if err := m.persistAndActivateBinding(binding); err != nil {
 			m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
 			return nil
 		}
-		auth.Activate(binding)
-		m.syncPipelineTiers()
 		m.persistPickerState()
 		m.push(roleSystem, accentStyle.Render(fmt.Sprintf("✓ Model set to %s", cmd.ModelID)))
 		m.refreshViewportContent()
@@ -396,6 +450,9 @@ func (m *model) applyRoleOverride(msg model_picker.RolePolicyOverrideMsg) tea.Cm
 	}
 	if err := authority.ValidateBinding(binding); err != nil {
 		m.push(roleError, fmt.Sprintf("[✗] Role override rejected: %s", err.Error()))
+		return nil
+	}
+	if m.rejectIneligibleModel(msg.Provider, msg.ModelID) {
 		return nil
 	}
 	if m.cfg != nil {

@@ -27,6 +27,13 @@ type Recorder struct {
 	// Topology cache counters (hits vs misses) for topology_cache_hit_rate.
 	cacheHits   int64
 	cacheMisses int64
+
+	// Phase 12 protocol/observability evidence. These fields are structural
+	// metadata only; Recorder never retains prompt or response text.
+	protocolBinding ProtocolBinding
+	compileResult   *CompileResult
+	admissionEvents []AdmissionEvent
+	providerEvents  []ProviderEvent
 }
 
 // NewRecorder returns an empty recorder.
@@ -109,6 +116,10 @@ func (r *Recorder) Reset() {
 	r.firstStreamStart = time.Time{}
 	r.cacheHits = 0
 	r.cacheMisses = 0
+	r.protocolBinding = ProtocolBinding{}
+	r.compileResult = nil
+	r.admissionEvents = nil
+	r.providerEvents = nil
 }
 
 // RecordCacheHit records a topology cache hit.

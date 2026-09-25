@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"errors"
+
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // ErrPayloadTruncated is returned when finish_reason == "length" is observed.
@@ -16,7 +18,21 @@ import (
 // LLMResponse accompanying this error carries the verbatim partial Content
 // plus token counts, and callers MUST surface it with a UI boundary badge
 // instead of clearing/swallowing the buffer.
-var ErrPayloadTruncated = errors.New("model output exceeded max_tokens limit: ErrPayloadTruncated")
+var ErrPayloadTruncated = protocol.ErrOutputTruncated
+
+// ErrOutputTruncated is the protocol-level alias used by newer callers.
+var ErrOutputTruncated = protocol.ErrOutputTruncated
+
+type OutputTruncatedError = protocol.OutputTruncatedError
+
+// IsOutputTruncated reports whether err carries the canonical output-ceiling
+// signal across the legacy and protocol provider stacks.
+func IsOutputTruncated(err error) bool { return errors.Is(err, ErrOutputTruncated) }
+
+// NewOutputTruncated constructs the protocol-level typed truncation error.
+func NewOutputTruncated(provider, reason string) error {
+	return protocol.NewOutputTruncated(provider, reason)
+}
 
 // IsPayloadTruncated reports whether err wraps ErrPayloadTruncated.
 func IsPayloadTruncated(err error) bool {
@@ -30,6 +46,13 @@ type PromptRequest struct {
 	Stream      bool
 	MaxTokens   int
 	Temperature float64
+
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
+	// SchemaMode optionally forces native schema or compact prompt fallback.
+	// Empty preserves the provider's automatic choice.
+	SchemaMode    string
+	ModelMetadata *protocol.ModelMetadata
 
 	CacheSystem   bool
 	CacheMessages []int
@@ -59,6 +82,15 @@ type LLMResponse struct {
 	CacheReadTokens  int
 	TotalCostUSD     float64
 	DurationMs       int64
+	// Provider/Model and the contract fields are the legacy stack's
+	// standardized metadata wrapper. They are descriptive only.
+	Provider            string
+	Model               string
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
+	NativeSchema        bool
+	Schema              string
+	InlineConstraint    string
 	// FinishReason is the provider-native terminal reason ("stop", "length",
 	// "tool_calls", ...). "length" maps to the universal PARTIAL outcome.
 	FinishReason string
@@ -97,13 +129,24 @@ func (a *ProviderAdapter) GenerateResponse(ctx context.Context, req PromptReques
 	if err != nil {
 		return LLMResponse{}, err
 	}
-	return LLMResponse{
+	return stampAdapterResponse(LLMResponse{
 		Content:          content,
 		TokenInput:       tokenIn,
 		TokenOutput:      tokenOut,
 		CacheWriteTokens: cacheWrite,
 		CacheReadTokens:  cacheRead,
-	}, nil
+	}, a.name, req), nil
+}
+
+func stampAdapterResponse(response LLMResponse, provider string, req PromptRequest) LLMResponse {
+	response.Provider = provider
+	response.Model = req.Model
+	response.InteractionContract = req.InteractionContract
+	if req.Contract != nil {
+		copy := req.Contract.Clone()
+		response.Contract = &copy
+	}
+	return response
 }
 
 func (a *ProviderAdapter) StreamResponse(ctx context.Context, req PromptRequest, handler StreamHandler) (LLMResponse, error) {
@@ -114,10 +157,10 @@ func (a *ProviderAdapter) StreamResponse(ctx context.Context, req PromptRequest,
 	if err != nil {
 		return LLMResponse{}, err
 	}
-	return LLMResponse{
+	return stampAdapterResponse(LLMResponse{
 		TokenInput:       tokenIn,
 		TokenOutput:      tokenOut,
 		CacheWriteTokens: cacheWrite,
 		CacheReadTokens:  cacheRead,
-	}, nil
+	}, a.name, req), nil
 }

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -60,6 +59,9 @@ func (p *NineRouterProvider) resolveAPIKey() string {
 }
 
 func (p *NineRouterProvider) buildMessages(req ai.Request) []ninerouterMessage {
+	if prepared, _, err := PrepareContractRequest("9router", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]ninerouterMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, ninerouterMessage{Role: "system", Content: req.System})
@@ -72,6 +74,7 @@ func (p *NineRouterProvider) buildMessages(req ai.Request) []ninerouterMessage {
 }
 
 func (p *NineRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
@@ -81,17 +84,23 @@ func (p *NineRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	if key == "" {
 		return nil, fmt.Errorf("9router: api key is empty — set 9ROUTER_API_KEY or configure api_key in provider config")
 	}
+	prepared, plan, err := PrepareContractRequest("9router", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
 	body := ninerouterRequest{
-		Model:       model,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      false,
-		ExtraParams: req.ExtraParams,
+		Model:          model,
+		Messages:       msgs,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		Stop:           req.Stop,
+		Stream:         false,
+		ResponseFormat: req.ResponseFormat,
+		ExtraParams:    req.ExtraParams,
 	}
 
 	// INVARIANT 1: casual minimal prompts must never carry tools.
@@ -126,7 +135,6 @@ func (p *NineRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		return nil, fmt.Errorf("9router: do: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -165,7 +173,7 @@ func (p *NineRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if nrResp.Usage != nil {
 		tokenIn = nrResp.Usage.PromptTokens
 		tokenOut = nrResp.Usage.CompletionTokens
@@ -177,16 +185,22 @@ func (p *NineRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 		usage.FirstTokenAt = usage.CompletedAt
 	}
 
-	return &ai.Response{
+	response := &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
 		ToolCalls:   toolCalls,
 		Usage:       usage,
-	}, nil
+	}
+	StampResponseMetadata(response, "9router", model, plan, nrResp.Choices[0].FinishReason)
+	if response.Truncated {
+		return response, ai.NewOutputTruncated("9router", "length")
+	}
+	return response, nil
 }
 
 func (p *NineRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
@@ -196,18 +210,24 @@ func (p *NineRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	if key == "" {
 		return nil, fmt.Errorf("9router: api key is empty — set 9ROUTER_API_KEY or configure api_key in provider config")
 	}
+	prepared, plan, err := PrepareContractRequest("9router", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
 	body := ninerouterRequest{
-		Model:         model,
-		Messages:      msgs,
-		MaxTokens:     req.MaxTokens,
-		Temperature:   req.Temperature,
-		Stop:          req.Stop,
-		Stream:        true,
-		StreamOptions: &streamOptions{IncludeUsage: true},
-		ExtraParams:   req.ExtraParams,
+		Model:          model,
+		Messages:       msgs,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		Stop:           req.Stop,
+		Stream:         true,
+		StreamOptions:  &streamOptions{IncludeUsage: true},
+		ResponseFormat: req.ResponseFormat,
+		ExtraParams:    req.ExtraParams,
 	}
 
 	// INVARIANT 1: casual minimal prompts must never carry tools.
@@ -249,16 +269,15 @@ func (p *NineRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		return nil, NewProviderError("ninerouter", resp.StatusCode, respBody)
 	}
 
 	sr := &ninerouterSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &NineRouterStreamResult{ReadCloser: sr, sr: sr}, nil
+	return &NineRouterStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("9router", model, plan)}, nil
 }
 
 type ninerouterMessage struct {
@@ -267,14 +286,15 @@ type ninerouterMessage struct {
 }
 
 type ninerouterRequest struct {
-	Model         string              `json:"model"`
-	Messages      []ninerouterMessage `json:"messages"`
-	MaxTokens     int                 `json:"max_tokens,omitempty"`
-	Temperature   float64             `json:"temperature,omitempty"`
-	Stop          []string            `json:"stop,omitempty"`
-	Stream        bool                `json:"stream,omitempty"`
-	StreamOptions *streamOptions      `json:"stream_options,omitempty"`
-	Tools         []json.RawMessage   `json:"tools,omitempty"`
+	Model          string              `json:"model"`
+	Messages       []ninerouterMessage `json:"messages"`
+	MaxTokens      int                 `json:"max_tokens,omitempty"`
+	Temperature    float64             `json:"temperature,omitempty"`
+	Stop           []string            `json:"stop,omitempty"`
+	Stream         bool                `json:"stream,omitempty"`
+	StreamOptions  *streamOptions      `json:"stream_options,omitempty"`
+	ResponseFormat *ai.ResponseFormat  `json:"response_format,omitempty"`
+	Tools          []json.RawMessage   `json:"tools,omitempty"`
 	// ExtraParams carries arbitrary provider-native JSON fields merged
 	// directly into the HTTP POST body (generic passthrough).
 	ExtraParams map[string]any `json:"-"`
@@ -359,12 +379,13 @@ func (u *ninerouterUsage) ProviderUsage() ai.ProviderUsage {
 
 type NineRouterStreamResult struct {
 	io.ReadCloser
-	sr *ninerouterSSEReader
+	sr       *ninerouterSSEReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *NineRouterStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -373,9 +394,25 @@ func (r *NineRouterStreamResult) Usage() ai.ProviderUsage {
 // ("stop", "length", "tool_calls", ...), or "" if none was seen.
 func (r *NineRouterStreamResult) FinishReason() string {
 	if r.sr != nil {
-		return r.sr.finishReason
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// this stream.
+func (r *NineRouterStreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
+}
+
+func (r *NineRouterStreamResult) TruncationError() error {
+	if r == nil {
+		return nil
+	}
+	return streamTruncationError("9router", r.FinishReason())
 }
 
 type ninerouterSSEReader struct {
@@ -432,11 +469,8 @@ func (s *ninerouterSSEReader) closeTerminal(reason string) {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
 	s.closed = true
+	_ = closeSSERequest(s.cancel, s.body, nil)
 }
 
 func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
@@ -458,9 +492,24 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.usage.markInterrupted()
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" {
+				s.closed = true
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				s.stopIdle()
+				s.usage.markCompleted(time.Now(), s.finishReason)
+				_ = closeSSERequest(s.cancel, s.body, nil)
+				return 0, io.EOF
 			}
+			s.usage.markInterrupted()
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
+			s.closed = true
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -476,12 +525,13 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
-			if s.cancel != nil {
-				s.cancel()
-			}
-			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
 			s.usage.markCompleted(time.Now(), s.finishReason)
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, io.EOF
 		}
 
@@ -518,11 +568,8 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 				if s.lifecycle != nil {
 					s.lifecycle.MarkClosed()
 				}
-				if s.cancel != nil {
-					s.cancel()
-				}
-				_, _ = io.Copy(io.Discard, s.body)
 				s.closed = true
+				_ = closeSSERequest(s.cancel, s.body, nil)
 				return n, nil
 			}
 			s.closeTerminal(chunk.Choices[0].FinishReason)
@@ -601,14 +648,13 @@ func (s *ninerouterSSEReader) Read(p []byte) (int, error) {
 }
 
 func (s *ninerouterSSEReader) Close() error {
+	if s.closed {
+		return nil
+	}
 	s.closed = true
 	if s.lifecycle != nil {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
-	return s.body.Close()
+	return closeSSERequest(s.cancel, s.body, nil)
 }

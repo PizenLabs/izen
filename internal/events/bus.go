@@ -39,7 +39,9 @@ const (
 func IsControlEventType(eventType string) bool {
 	switch eventType {
 	case EventTaskStarted, EventTaskCompleted, EventTaskFailed, EventTaskCanceled,
-		EventClarificationRequired, EventStateCheckpoint:
+		EventClarificationRequired, EventStateCheckpoint,
+		EventAdmissionDecision, EventContextCompilation, EventProviderExecution,
+		EventExecutionFailed:
 		return true
 	}
 	return false

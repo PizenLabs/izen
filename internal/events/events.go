@@ -7,7 +7,11 @@
 // the event stream.
 package events
 
-import "time"
+import (
+	"time"
+
+	"github.com/PizenLabs/izen/internal/protocol"
+)
 
 // DomainEvent is the contract every domain event satisfies. The payload is a
 // strongly-typed struct defined alongside the event constructor so consumers
@@ -160,6 +164,17 @@ const (
 	// unrecoverable IO/parse error. Execution must halt and route to
 	// awaiting_human / error.
 	EventPreflightFailed = "preflight.failed"
+	// EventAdmissionDecision is the structured, non-prompt-bearing audit
+	// record for one strategy/action admission pass. It is emitted for both
+	// accepted and rejected requests, including ErrAuthorityExceeded.
+	EventAdmissionDecision = "execution.admission.decision"
+	// EventContextCompilation carries the compiler's content-free budget and
+	// fitting metrics for one prepared prompt projection.
+	EventContextCompilation = "execution.context.compilation"
+	// EventProviderExecution is the terminal provider invocation record. It
+	// carries duration, usage, schema serialization choice and truncation
+	// provenance, including failed/cancelled calls.
+	EventProviderExecution = "execution.provider.execution"
 
 	// ── PREFLIGHT / RECOVERY / DECISION-SURFACE / AUTONOMY TELEMETRY ──────
 	// These are the STRUCTURED lifecycle events of the preflight-failure
@@ -227,15 +242,19 @@ const (
 
 // CommandReceivedPayload carries an incoming user command entering an engine.
 type CommandReceivedPayload struct {
-	Command string
-	Mode    string
+	Command            string
+	Mode               string
+	CommandChars       int    `json:"command_chars,omitempty"`
+	CommandFingerprint string `json:"command_fingerprint,omitempty"`
 }
 
 // IntentParsedPayload carries the result of classifying a raw request.
 type IntentParsedPayload struct {
-	Intent     string
-	Raw        string
-	Confidence float64
+	Intent         string
+	Raw            string
+	Confidence     float64
+	RawChars       int    `json:"raw_chars,omitempty"`
+	RawFingerprint string `json:"raw_fingerprint,omitempty"`
 }
 
 // PlanStagedPayload carries a staged execution plan (task targets).
@@ -243,6 +262,12 @@ type PlanStagedPayload struct {
 	TaskCount int
 	Tasks     []string
 	Stage     string
+	// InteractionContract and Contract preserve the semantic descriptor that
+	// authorized the staged proposal. They are evidence metadata, not an
+	// execution grant.
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
+	ProtocolTelemetry
 }
 
 // PatchAttemptedPayload carries an attempt to apply a mutation.
@@ -262,9 +287,12 @@ type PatchAppliedPayload struct {
 
 // ExecutionFailedPayload carries a failure and its mandatory classification.
 type ExecutionFailedPayload struct {
-	Classification FailureClassification
-	Error          string
-	Stage          string
+	Classification   FailureClassification
+	Error            string
+	Stage            string
+	ErrorChars       int    `json:"error_chars,omitempty"`
+	ErrorFingerprint string `json:"error_fingerprint,omitempty"`
+	ProtocolTelemetry
 }
 
 // StepStartedPayload opens one bounded reasoning step. Model is the provider
@@ -434,8 +462,10 @@ type ApprovalRequestedPayload struct {
 // IsComplete is true on the terminal event that closes the reasoning block
 // (its Chunk is empty).
 type ReasoningPayload struct {
-	Chunk      string
-	IsComplete bool
+	Chunk            string
+	IsComplete       bool
+	ChunkChars       int    `json:"chunk_chars,omitempty"`
+	ChunkFingerprint string `json:"chunk_fingerprint,omitempty"`
 }
 
 // PlanFallbackPayload carries the outcome of a heuristic plan extraction that
@@ -459,16 +489,111 @@ type StreamUsagePayload struct {
 	OutputTokens int
 	Interrupted  bool
 	Reason       string
+	ProtocolTelemetry
 }
 
 // ExecutionStartedPayload opens a runtime execution. RequestID links every
 // subsequent lifecycle event of the same execution. SessionID correlates the
 // execution with its originating session (INV-SESSION-10).
+// ProtocolTelemetry is the shared identity/metadata envelope embedded in
+// structured runtime events. It deliberately contains structural facts only;
+// no prompt, completion, reasoning or tool arguments belong in this envelope.
+type ProtocolTelemetry = protocol.ObservabilityBinding
+
+// AdmissionDecisionPayload is the bounded audit record for one admission pass.
+// ReasonCode is stable for routing; Reason is a human-readable explanation that
+// must never contain prompt or command contents.
+type AdmissionDecisionPayload struct {
+	RequestID      string `json:"request_id,omitempty"`
+	SessionID      string `json:"session_id,omitempty"`
+	Strategy       string `json:"strategy,omitempty"`
+	Allowed        bool   `json:"allowed"`
+	RequestedScope string `json:"requested_scope,omitempty"`
+	Action         string `json:"action,omitempty"`
+	ActionSource   string `json:"action_source,omitempty"`
+	Capability     string `json:"capability,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+	ReasonCode     string `json:"reason_code,omitempty"`
+	ProtocolTelemetry
+}
+
+// ContextCompilationPayload is the structured, content-free projection of a
+// contextcompiler.CompileResult. The old ContextPreparedPayload remains the
+// compatibility projection consumed by the UI.
+type ContextCompilationPayload struct {
+	RequestID          string   `json:"request_id,omitempty"`
+	SessionID          string   `json:"session_id,omitempty"`
+	Phase              string   `json:"phase,omitempty"`
+	Policy             string   `json:"policy,omitempty"`
+	Scope              string   `json:"scope,omitempty"`
+	FittedContextScope string   `json:"fitted_context_scope,omitempty"`
+	Lineage            string   `json:"lineage,omitempty"`
+	BudgetTokens       int      `json:"budget_tokens,omitempty"`
+	ReservedTokens     int      `json:"reserved_tokens,omitempty"`
+	AvailableTokens    int      `json:"available_tokens,omitempty"`
+	UsedTokens         int      `json:"used_tokens,omitempty"`
+	ContextTokens      int      `json:"context_tokens,omitempty"`
+	SystemTokens       int      `json:"system_tokens,omitempty"`
+	SchemaTokens       int      `json:"schema_tokens,omitempty"`
+	ToolTokens         int      `json:"tool_tokens,omitempty"`
+	Truncated          bool     `json:"truncated,omitempty"`
+	TruncatedFiles     []string `json:"truncated_files,omitempty"`
+	TruncatedFileCount int      `json:"truncated_file_count,omitempty"`
+	DropCount          int      `json:"drop_count,omitempty"`
+	SectionCount       int      `json:"section_count,omitempty"`
+	Sources            []string `json:"sources,omitempty"`
+	PromptChars        int      `json:"prompt_chars,omitempty"`
+	PromptFingerprint  string   `json:"prompt_fingerprint,omitempty"`
+	ProtocolTelemetry
+}
+
+// ProviderExecutionPayload is the terminal, structured provider telemetry
+// record. It intentionally omits raw prompt/response bytes and instead records
+// structural counts, timing and a prompt fingerprint.
+type ProviderExecutionPayload struct {
+	RequestID          string        `json:"request_id,omitempty"`
+	SessionID          string        `json:"session_id,omitempty"`
+	Provider           string        `json:"provider,omitempty"`
+	Model              string        `json:"model,omitempty"`
+	RequestStartedAt   time.Time     `json:"request_started_at,omitempty"`
+	FirstTokenAt       time.Time     `json:"first_token_at,omitempty"`
+	CompletedAt        time.Time     `json:"completed_at,omitempty"`
+	RequestDuration    time.Duration `json:"request_duration_ns,omitempty"`
+	Duration           time.Duration `json:"duration_ns,omitempty"`
+	FirstTokenLatency  time.Duration `json:"first_token_latency_ns,omitempty"`
+	StreamingDuration  time.Duration `json:"streaming_duration_ns,omitempty"`
+	UsageKnown         bool          `json:"usage_known"`
+	PromptTokens       int           `json:"prompt_tokens,omitempty"`
+	CompletionTokens   int           `json:"completion_tokens,omitempty"`
+	TotalTokens        int           `json:"total_tokens,omitempty"`
+	CachedTokens       int           `json:"cached_tokens,omitempty"`
+	ReasoningTokens    int           `json:"reasoning_tokens,omitempty"`
+	FinishReason       string        `json:"finish_reason,omitempty"`
+	Truncated          bool          `json:"truncated,omitempty"`
+	NativeSchema       bool          `json:"native_schema,omitempty"`
+	SchemaMode         string        `json:"schema_mode,omitempty"`
+	SchemaFallback     bool          `json:"schema_fallback,omitempty"`
+	PromptChars        int           `json:"prompt_chars,omitempty"`
+	OutputChars        int           `json:"output_chars,omitempty"`
+	PromptFingerprint  string        `json:"prompt_fingerprint,omitempty"`
+	HTTPAttempts       int           `json:"http_attempts,omitempty"`
+	RateLimitedRetries int           `json:"rate_limited_retries,omitempty"`
+	ErrorCode          string        `json:"error_code,omitempty"`
+	ProtocolTelemetry
+}
+
+// ExecutionStartedPayload carries only the correlation and structural prompt
+// size/fingerprint. Prompt remains as a legacy field for in-process UI callers,
+// but audit writers should use the fingerprint/character count for durable
+// records; new telemetry events never copy the prompt body.
 type ExecutionStartedPayload struct {
-	RequestID string
-	Mode      string
-	Prompt    string
-	SessionID string
+	RequestID         string
+	Mode              string
+	Prompt            string
+	SessionID         string
+	PromptChars       int
+	PromptFingerprint string
+	ProtocolTelemetry
 }
 
 // StrategySelectedPayload records the deterministic strategy decision the
@@ -479,6 +604,7 @@ type StrategySelectedPayload struct {
 	Strategy       string
 	ModelRequired  bool
 	StrategyReason string
+	ProtocolTelemetry
 }
 
 // TargetResolvedPayload records one deterministically resolved mutation target.
@@ -487,14 +613,31 @@ type TargetResolvedPayload struct {
 	Target    string
 	Exists    bool
 	Source    string
+	ProtocolTelemetry
 }
 
 // ContextPreparedPayload records the minimum-sufficient context compiled
 // before any model invocation.
 type ContextPreparedPayload struct {
-	RequestID string
-	Channels  []string
-	Tokens    int
+	RequestID          string
+	Channels           []string
+	Tokens             int
+	Phase              string
+	Policy             string
+	Scope              string
+	FittedContextScope string
+	Lineage            string
+	BudgetTokens       int
+	ReservedTokens     int
+	AvailableTokens    int
+	ContextTokens      int
+	Truncated          bool
+	TruncatedFiles     []string
+	TruncatedFileCount int
+	DropCount          int
+	PromptChars        int
+	PromptFingerprint  string
+	ProtocolTelemetry
 }
 
 // ModelInvokedPayload records a single provider invocation. TokenInput/Output
@@ -504,6 +647,7 @@ type ModelInvokedPayload struct {
 	Model       string
 	TokenInput  int
 	TokenOutput int
+	ProtocolTelemetry
 }
 
 // ProviderResponsePayload records a SUCCESSFUL provider response with the
@@ -511,10 +655,23 @@ type ModelInvokedPayload struct {
 // invocation returned without error — an artifact can never exist before this
 // event, and a failed invocation never emits it.
 type ProviderResponsePayload struct {
-	RequestID   string
-	Model       string
-	TokenInput  int
-	TokenOutput int
+	RequestID         string
+	Model             string
+	TokenInput        int
+	TokenOutput       int
+	UsageKnown        bool
+	FinishReason      string
+	Truncated         bool
+	RequestDuration   time.Duration
+	FirstTokenLatency time.Duration
+	StreamingDuration time.Duration
+	NativeSchema      bool
+	SchemaMode        string
+	SchemaFallback    bool
+	PromptChars       int
+	OutputChars       int
+	PromptFingerprint string
+	ProtocolTelemetry
 }
 
 // ArtifactProducedPayload records a parsed artifact (e.g. a patch) produced by
@@ -523,12 +680,14 @@ type ArtifactProducedPayload struct {
 	RequestID string
 	Kind      string // "patch", "plan", "explanation", ...
 	Target    string
+	ProtocolTelemetry
 }
 
 // MutationStartedPayload records that the runtime began applying a mutation.
 type MutationStartedPayload struct {
 	RequestID string
 	Targets   []string
+	ProtocolTelemetry
 }
 
 // MutationCompletedPayload records a mutation outcome. Outcome uses the
@@ -538,6 +697,7 @@ type MutationCompletedPayload struct {
 	RequestID string
 	Target    string
 	Outcome   string
+	ProtocolTelemetry
 }
 
 // VerificationCompletedPayload records the deterministic verification result of
@@ -547,6 +707,7 @@ type VerificationCompletedPayload struct {
 	RequestID string
 	Passed    bool
 	Steps     []string
+	ProtocolTelemetry
 }
 
 // ExecutionFinishedPayload is the terminal event of a runtime execution.
@@ -555,6 +716,7 @@ type ExecutionFinishedPayload struct {
 	RequestID string
 	Success   bool
 	Outcome   string
+	ProtocolTelemetry
 }
 
 // ExecutionEvidencePayload is the authoritative terminal record of one
@@ -580,6 +742,7 @@ type ExecutionEvidencePayload struct {
 	TransactionID    string
 	StartedAt        time.Time
 	FinishedAt       time.Time
+	ProtocolTelemetry
 }
 
 // ApprovalRequiredPayload carries a RuntimeExecutor approval-gate request.
@@ -587,6 +750,7 @@ type ApprovalRequiredPayload struct {
 	RequestID string
 	Target    string
 	Preview   string
+	ProtocolTelemetry
 }
 
 // ApprovalRejectedPayload carries a human rejection of a held RuntimeExecutor
@@ -595,6 +759,7 @@ type ApprovalRejectedPayload struct {
 	RequestID string
 	Target    string
 	Reason    string
+	ProtocolTelemetry
 }
 
 // ProviderWaitingPayload records that a provider round-trip is in flight
@@ -603,6 +768,7 @@ type ApprovalRejectedPayload struct {
 type ProviderWaitingPayload struct {
 	RequestID string
 	Model     string
+	ProtocolTelemetry
 }
 
 // ProviderFirstTokenPayload records the arrival of the first provider byte of
@@ -612,6 +778,7 @@ type ProviderFirstTokenPayload struct {
 	RequestID string
 	Model     string
 	Latency   time.Duration
+	ProtocolTelemetry
 }
 
 // ProviderStreamDeltaPayload carries one content delta of a live provider
@@ -619,8 +786,11 @@ type ProviderFirstTokenPayload struct {
 // travels on the ExecutionResult, so a dropped delta never loses execution
 // truth.
 type ProviderStreamDeltaPayload struct {
-	RequestID string
-	Delta     string
+	RequestID        string
+	Delta            string
+	DeltaChars       int    `json:"delta_chars,omitempty"`
+	DeltaFingerprint string `json:"delta_fingerprint,omitempty"`
+	ProtocolTelemetry
 }
 
 // ProviderUsageUpdatePayload carries the cumulative provider-reported usage of
@@ -632,6 +802,7 @@ type ProviderUsageUpdatePayload struct {
 	InputTokens     int
 	OutputTokens    int
 	ReasoningTokens int
+	ProtocolTelemetry
 }
 
 // ReasoningTelemetryPayload carries reasoning TELEMETRY ONLY: the wall-clock
@@ -643,6 +814,7 @@ type ReasoningTelemetryPayload struct {
 	Model     string
 	Duration  time.Duration
 	Tokens    int
+	ProtocolTelemetry
 }
 
 // AutonomyDecisionPayload carries an autonomy controller verdict. Decision is
@@ -720,27 +892,40 @@ func newEvent(typ string, payload interface{}) DomainEvent {
 // NewCommandReceived publishes that a command entered an engine pipeline.
 func NewCommandReceived(command, mode string) DomainEvent {
 	return newEvent(EventCommandReceived, CommandReceivedPayload{
-		Command: command,
-		Mode:    mode,
+		Command:            command,
+		Mode:               mode,
+		CommandChars:       len(command),
+		CommandFingerprint: protocol.Fingerprint(command),
 	})
 }
 
 // NewIntentParsed publishes that a raw request was classified into an intent.
 func NewIntentParsed(intent, raw string, confidence float64) DomainEvent {
 	return newEvent(EventIntentParsed, IntentParsedPayload{
-		Intent:     intent,
-		Raw:        raw,
-		Confidence: confidence,
+		Intent:         intent,
+		Raw:            raw,
+		Confidence:     confidence,
+		RawChars:       len(raw),
+		RawFingerprint: protocol.Fingerprint(raw),
 	})
 }
 
-// NewPlanStaged publishes that a plan was staged into runnable tasks.
-func NewPlanStaged(taskCount int, tasks []string, stage string) DomainEvent {
-	return newEvent(EventPlanStaged, PlanStagedPayload{
+// NewPlanStaged publishes that a plan was staged into runnable tasks.  The
+// optional descriptor preserves the contract identity for ledger/event
+// consumers without changing the historical three-argument call form.
+func NewPlanStaged(taskCount int, tasks []string, stage string, descriptors ...*protocol.ContractDescriptor) DomainEvent {
+	payload := PlanStagedPayload{
 		TaskCount: taskCount,
 		Tasks:     tasks,
 		Stage:     stage,
-	})
+	}
+	if len(descriptors) > 0 && descriptors[0] != nil {
+		copy := descriptors[0].Clone()
+		payload.Contract = &copy
+		payload.InteractionContract = copy.Contract
+		payload.ProtocolTelemetry = protocol.NewObservabilityBinding(copy.Contract, &copy, "", "", "auto")
+	}
+	return newEvent(EventPlanStaged, payload)
 }
 
 // NewPatchAttempted publishes that a mutation attempt started.
@@ -763,16 +948,22 @@ func NewPatchApplied(file string, linesAdd, linesDel int, elapsed time.Duration)
 }
 
 // NewExecutionFailed publishes a failure with its mandatory classification.
-func NewExecutionFailed(classification FailureClassification, err error, stage string) DomainEvent {
+func NewExecutionFailed(classification FailureClassification, err error, stage string, bindings ...protocol.ObservabilityBinding) DomainEvent {
 	msg := ""
 	if err != nil {
 		msg = err.Error()
 	}
-	return newEvent(EventExecutionFailed, ExecutionFailedPayload{
-		Classification: classification,
-		Error:          msg,
-		Stage:          stage,
-	})
+	payload := ExecutionFailedPayload{
+		Classification:   classification,
+		Error:            msg,
+		Stage:            stage,
+		ErrorChars:       len(msg),
+		ErrorFingerprint: protocol.Fingerprint(msg),
+	}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventExecutionFailed, payload)
 }
 
 // NewStepStarted opens a bounded reasoning step with its enforced output budget.
@@ -898,8 +1089,10 @@ func NewEngineTelemetry(ev interface{}) DomainEvent {
 // the reasoning block.
 func NewReasoningStream(chunk string, isComplete bool) DomainEvent {
 	return newEvent(EventReasoningStream, ReasoningPayload{
-		Chunk:      chunk,
-		IsComplete: isComplete,
+		Chunk:            chunk,
+		IsComplete:       isComplete,
+		ChunkChars:       len(chunk),
+		ChunkFingerprint: protocol.Fingerprint(chunk),
 	})
 }
 
@@ -978,14 +1171,18 @@ func NewPlanFallback(kind, reason string) DomainEvent {
 // stream (context deadline / cancellation). It is the transport for
 // "Explicit Over Implicit" token accounting: tokens billed by the provider are
 // surfaced even when the request never completed.
-func NewStreamUsage(model string, inputTokens, outputTokens int, interrupted bool, reason string) DomainEvent {
-	return newEvent(EventStreamUsage, StreamUsagePayload{
+func NewStreamUsage(model string, inputTokens, outputTokens int, interrupted bool, reason string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := StreamUsagePayload{
 		Model:        model,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 		Interrupted:  interrupted,
 		Reason:       reason,
-	})
+	}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventStreamUsage, payload)
 }
 
 // ── Runtime execution lifecycle constructors ────────────────────────────────
@@ -993,64 +1190,164 @@ func NewStreamUsage(model string, inputTokens, outputTokens int, interrupted boo
 // NewExecutionStarted publishes the start of a runtime execution. sessionID is
 // the originating session (INV-SESSION-10); it may be empty when no session
 // authority is wired.
-func NewExecutionStarted(requestID, mode, prompt, sessionID string) DomainEvent {
-	return newEvent(EventExecutionStarted, ExecutionStartedPayload{RequestID: requestID, Mode: mode, Prompt: prompt, SessionID: sessionID})
+func NewExecutionStarted(requestID, mode, prompt, sessionID string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ExecutionStartedPayload{
+		RequestID:         requestID,
+		Mode:              mode,
+		Prompt:            prompt,
+		SessionID:         sessionID,
+		PromptChars:       len(prompt),
+		PromptFingerprint: protocol.Fingerprint(prompt),
+	}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+		if payload.Mode == "" {
+			payload.Mode = payload.ProtocolTelemetry.Mode
+		}
+	}
+	return newEvent(EventExecutionStarted, payload)
 }
 
 // NewStrategySelected publishes the deterministic strategy decision.
-func NewStrategySelected(requestID, strategy string, modelRequired bool, reason string) DomainEvent {
-	return newEvent(EventStrategySelected, StrategySelectedPayload{
+func NewStrategySelected(requestID, strategy string, modelRequired bool, reason string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := StrategySelectedPayload{
 		RequestID: requestID, Strategy: strategy, ModelRequired: modelRequired, StrategyReason: reason,
-	})
+	}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventStrategySelected, payload)
 }
 
 // NewTargetResolved publishes one resolved mutation target.
-func NewTargetResolved(requestID, target string, exists bool, source string) DomainEvent {
-	return newEvent(EventTargetResolved, TargetResolvedPayload{RequestID: requestID, Target: target, Exists: exists, Source: source})
+func NewTargetResolved(requestID, target string, exists bool, source string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := TargetResolvedPayload{RequestID: requestID, Target: target, Exists: exists, Source: source}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventTargetResolved, payload)
 }
 
 // NewContextPrepared publishes the compiled context envelope.
-func NewContextPrepared(requestID string, channels []string, tokens int) DomainEvent {
-	return newEvent(EventContextPrepared, ContextPreparedPayload{RequestID: requestID, Channels: channels, Tokens: tokens})
+func NewContextPrepared(requestID string, channels []string, tokens int, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ContextPreparedPayload{RequestID: requestID, Channels: channels, Tokens: tokens}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventContextPrepared, payload)
+}
+
+// NewContextPreparedWithTelemetry publishes the legacy context.prepared event
+// together with the full compiler metric projection.
+func NewContextPreparedWithTelemetry(payload ContextPreparedPayload) DomainEvent {
+	payload.Channels = append([]string(nil), payload.Channels...)
+	payload.TruncatedFiles = append([]string(nil), payload.TruncatedFiles...)
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventContextPrepared, payload)
+}
+
+// NewContextCompilation publishes the dedicated compiler metric event. It has
+// no prompt content and is safe for durable audit persistence.
+func NewContextCompilation(payload ContextCompilationPayload) DomainEvent {
+	payload.TruncatedFiles = append([]string(nil), payload.TruncatedFiles...)
+	payload.Sources = append([]string(nil), payload.Sources...)
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventContextCompilation, payload)
+}
+
+// NewAdmissionDecision publishes the structured admission verdict. The
+// constructor defensively normalizes protocol metadata and never accepts a raw
+// prompt or command payload.
+func NewAdmissionDecision(payload AdmissionDecisionPayload) DomainEvent {
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventAdmissionDecision, payload)
 }
 
 // NewModelInvoked publishes that a provider invocation began with the resolved
 // model. It is emitted BEFORE the provider call; authoritative usage travels on
 // NewProviderResponse.
-func NewModelInvoked(requestID, model string, tokenInput, tokenOutput int) DomainEvent {
-	return newEvent(EventModelInvoked, ModelInvokedPayload{RequestID: requestID, Model: model, TokenInput: tokenInput, TokenOutput: tokenOutput})
+func NewModelInvoked(requestID, model string, tokenInput, tokenOutput int, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ModelInvokedPayload{RequestID: requestID, Model: model, TokenInput: tokenInput, TokenOutput: tokenOutput}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventModelInvoked, payload)
 }
 
 // NewProviderResponse publishes a successful provider response with its
 // authoritative usage. It is emitted AFTER the invocation completes and MUST
 // precede any artifact.produced event of the same execution.
-func NewProviderResponse(requestID, model string, tokenInput, tokenOutput int) DomainEvent {
-	return newEvent(EventProviderResponse, ProviderResponsePayload{RequestID: requestID, Model: model, TokenInput: tokenInput, TokenOutput: tokenOutput})
+func NewProviderResponse(requestID, model string, tokenInput, tokenOutput int, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ProviderResponsePayload{RequestID: requestID, Model: model, TokenInput: tokenInput, TokenOutput: tokenOutput}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventProviderResponse, payload)
+}
+
+// NewProviderResponseWithTelemetry publishes an enriched provider response
+// while preserving the canonical provider.response event type.
+func NewProviderResponseWithTelemetry(payload ProviderResponsePayload) DomainEvent {
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventProviderResponse, payload)
+}
+
+// NewProviderExecution publishes one terminal provider telemetry record. The
+// payload is already structural; the constructor only detaches slices and
+// normalizes the protocol binding.
+func NewProviderExecution(payload ProviderExecutionPayload) DomainEvent {
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventProviderExecution, payload)
 }
 
 // NewArtifactProduced publishes a parsed artifact from a model invocation.
-func NewArtifactProduced(requestID, kind, target string) DomainEvent {
-	return newEvent(EventArtifactProduced, ArtifactProducedPayload{RequestID: requestID, Kind: kind, Target: target})
+func NewArtifactProduced(requestID, kind, target string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ArtifactProducedPayload{RequestID: requestID, Kind: kind, Target: target}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventArtifactProduced, payload)
 }
 
 // NewMutationStarted publishes the start of a mutation application.
-func NewMutationStarted(requestID string, targets []string) DomainEvent {
-	return newEvent(EventMutationStarted, MutationStartedPayload{RequestID: requestID, Targets: targets})
+func NewMutationStarted(requestID string, targets []string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := MutationStartedPayload{RequestID: requestID, Targets: append([]string(nil), targets...)}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventMutationStarted, payload)
 }
 
 // NewMutationCompleted publishes a mutation outcome for one target.
-func NewMutationCompleted(requestID, target, outcome string) DomainEvent {
-	return newEvent(EventMutationCompleted, MutationCompletedPayload{RequestID: requestID, Target: target, Outcome: outcome})
+func NewMutationCompleted(requestID, target, outcome string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := MutationCompletedPayload{RequestID: requestID, Target: target, Outcome: outcome}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventMutationCompleted, payload)
 }
 
 // NewVerificationCompleted publishes the verifier's real result.
-func NewVerificationCompleted(requestID string, passed bool, steps []string) DomainEvent {
-	return newEvent(EventVerificationCompleted, VerificationCompletedPayload{RequestID: requestID, Passed: passed, Steps: steps})
+func NewVerificationCompleted(requestID string, passed bool, steps []string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := VerificationCompletedPayload{RequestID: requestID, Passed: passed, Steps: append([]string(nil), steps...)}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventVerificationCompleted, payload)
 }
 
 // NewExecutionFinished publishes the terminal outcome of a runtime execution.
-func NewExecutionFinished(requestID string, success bool, outcome string) DomainEvent {
-	return newEvent(EventExecutionFinished, ExecutionFinishedPayload{RequestID: requestID, Success: success, Outcome: outcome})
+func NewExecutionFinished(requestID string, success bool, outcome string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ExecutionFinishedPayload{RequestID: requestID, Success: success, Outcome: outcome}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventExecutionFinished, payload)
 }
 
 // NewExecutionEvidence publishes the authoritative terminal record of one
@@ -1061,44 +1358,77 @@ func NewExecutionEvidence(p ExecutionEvidencePayload) DomainEvent {
 }
 
 // NewApprovalRequired publishes a RuntimeExecutor approval-gate request.
-func NewApprovalRequired(requestID, target, preview string) DomainEvent {
-	return newEvent(EventApprovalRequired, ApprovalRequiredPayload{RequestID: requestID, Target: target, Preview: preview})
+func NewApprovalRequired(requestID, target, preview string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ApprovalRequiredPayload{RequestID: requestID, Target: target, Preview: preview}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventApprovalRequired, payload)
 }
 
 // NewApprovalRejected publishes that the human rejected the held RuntimeExecutor
 // proposal at the approval gate.
-func NewApprovalRejected(requestID, target, reason string) DomainEvent {
-	return newEvent(EventApprovalRejected, ApprovalRejectedPayload{RequestID: requestID, Target: target, Reason: reason})
+func NewApprovalRejected(requestID, target, reason string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ApprovalRejectedPayload{RequestID: requestID, Target: target, Reason: reason}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventApprovalRejected, payload)
 }
 
 // NewProviderWaiting publishes that a provider round-trip is in flight.
-func NewProviderWaiting(requestID, model string) DomainEvent {
-	return newEvent(EventProviderWaiting, ProviderWaitingPayload{RequestID: requestID, Model: model})
+func NewProviderWaiting(requestID, model string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ProviderWaitingPayload{RequestID: requestID, Model: model}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventProviderWaiting, payload)
 }
 
 // NewProviderFirstToken publishes the arrival of the first provider byte.
-func NewProviderFirstToken(requestID, model string, latency time.Duration) DomainEvent {
-	return newEvent(EventProviderFirstToken, ProviderFirstTokenPayload{RequestID: requestID, Model: model, Latency: latency})
+func NewProviderFirstToken(requestID, model string, latency time.Duration, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ProviderFirstTokenPayload{RequestID: requestID, Model: model, Latency: latency}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventProviderFirstToken, payload)
 }
 
 // NewProviderStreamDelta publishes one content delta of a live provider stream
 // (evidence transport only).
-func NewProviderStreamDelta(requestID, delta string) DomainEvent {
-	return newEvent(EventProviderStreamDelta, ProviderStreamDeltaPayload{RequestID: requestID, Delta: delta})
+func NewProviderStreamDelta(requestID, delta string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ProviderStreamDeltaPayload{
+		RequestID:        requestID,
+		Delta:            delta,
+		DeltaChars:       len(delta),
+		DeltaFingerprint: protocol.Fingerprint(delta),
+	}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventProviderStreamDelta, payload)
 }
 
 // NewProviderUsageUpdate publishes the cumulative provider-reported usage of a
 // live stream.
-func NewProviderUsageUpdate(requestID, model string, inputTokens, outputTokens, reasoningTokens int) DomainEvent {
-	return newEvent(EventProviderUsageUpdate, ProviderUsageUpdatePayload{
+func NewProviderUsageUpdate(requestID, model string, inputTokens, outputTokens, reasoningTokens int, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ProviderUsageUpdatePayload{
 		RequestID: requestID, Model: model, InputTokens: inputTokens, OutputTokens: outputTokens, ReasoningTokens: reasoningTokens,
-	})
+	}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventProviderUsageUpdate, payload)
 }
 
 // NewReasoningTelemetry publishes reasoning TELEMETRY only (duration + token
 // count when provided) — never reasoning text.
-func NewReasoningTelemetry(requestID, model string, duration time.Duration, tokens int) DomainEvent {
-	return newEvent(EventReasoningTelemetry, ReasoningTelemetryPayload{RequestID: requestID, Model: model, Duration: duration, Tokens: tokens})
+func NewReasoningTelemetry(requestID, model string, duration time.Duration, tokens int, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := ReasoningTelemetryPayload{RequestID: requestID, Model: model, Duration: duration, Tokens: tokens}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventReasoningTelemetry, payload)
 }
 
 // NewAutonomyDecision publishes an autonomy controller verdict.
@@ -1164,10 +1494,12 @@ func NewContextCompiledIntel(path, kind string, findingCount int, language, stra
 // scan or budget estimation. Latency to this event is the UI admission SLO
 // (<10ms).
 type PromptAdmittedPayload struct {
-	Prompt    string
-	Intent    string
-	Timestamp time.Time
-	Latency   time.Duration
+	Prompt            string
+	Intent            string
+	Timestamp         time.Time
+	Latency           time.Duration
+	PromptChars       int    `json:"prompt_chars,omitempty"`
+	PromptFingerprint string `json:"prompt_fingerprint,omitempty"`
 }
 
 // StructuralSnapshotPayload carries the BackgroundPreflight result published to
@@ -1269,10 +1601,12 @@ type AutonomousLifecyclePayload struct {
 // path. Latency is the wall-clock time spent inside submit_prompt.
 func NewPromptAdmitted(prompt, intent string, latency time.Duration) DomainEvent {
 	return newEvent(EventPromptAdmitted, PromptAdmittedPayload{
-		Prompt:    prompt,
-		Intent:    intent,
-		Timestamp: time.Now(),
-		Latency:   latency,
+		Prompt:            prompt,
+		Intent:            intent,
+		Timestamp:         time.Now(),
+		Latency:           latency,
+		PromptChars:       len(prompt),
+		PromptFingerprint: protocol.Fingerprint(prompt),
 	})
 }
 

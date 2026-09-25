@@ -111,16 +111,20 @@ type ContextPlanner interface {
 }
 
 type InvestigationResult struct {
-	Problem    string           `json:"problem"`
-	RootCause  string           `json:"root_cause,omitempty"`
-	Resolved   bool             `json:"resolved"`
-	Conclusion string           `json:"conclusion"`
-	Hypotheses []Hypothesis     `json:"hypotheses"`
-	Evidence   []Evidence       `json:"evidence"`
-	Proximity  []ProximitySlice `json:"proximity,omitempty"`
-	Loops      int              `json:"loops"`
-	Duration   string           `json:"duration"`
-	Error      string           `json:"error,omitempty"`
+	Problem string `json:"problem"`
+	// Archetype is the workspace language/shape observed during the
+	// investigation. Plan consumes this fact to keep deterministic fallbacks
+	// inside the same domain as the evidence.
+	Archetype  recon.ProjectArchetype `json:"archetype,omitempty"`
+	RootCause  string                 `json:"root_cause,omitempty"`
+	Resolved   bool                   `json:"resolved"`
+	Conclusion string                 `json:"conclusion"`
+	Hypotheses []Hypothesis           `json:"hypotheses"`
+	Evidence   []Evidence             `json:"evidence"`
+	Proximity  []ProximitySlice       `json:"proximity,omitempty"`
+	Loops      int                    `json:"loops"`
+	Duration   string                 `json:"duration"`
+	Error      string                 `json:"error,omitempty"`
 }
 
 type Retriever interface {
@@ -327,10 +331,14 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	e.emit(events.NewCommandReceived(e.Problem, "investigate"))
 
 	// Detect workspace archetype at run start. When VANILLA_WEB, Go-specific
-	// diagnostic patterns are skipped entirely.
+	// diagnostic patterns are skipped entirely. Reset the previous run's
+	// classification first so a reused engine cannot inherit a stale guard.
+	e.vanillaWeb = false
+	e.Ledger.Archetype = recon.UNKNOWN_GENERIC
 	ac, err := recon.DetectArchetype(e.root)
 	if err == nil && ac != nil {
 		e.vanillaWeb = (ac.Type == recon.VANILLA_WEB)
+		e.Ledger.Archetype = ac.Type
 	}
 
 	// Also check the capability registry if available. This extends the
@@ -354,7 +362,11 @@ func (e *Engine) RunContext(ctx context.Context) (*InvestigationResult, error) {
 	}
 
 	result := &InvestigationResult{
-		Problem: e.Problem,
+		Problem:   e.Problem,
+		Archetype: recon.UNKNOWN_GENERIC,
+	}
+	if ac != nil {
+		result.Archetype = ac.Type
 	}
 
 	// ── DEADLOCK PREVENTION: NON-BUG INTENT SHORT-CIRCUIT ──────────────

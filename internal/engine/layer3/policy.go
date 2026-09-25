@@ -29,6 +29,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/domain/policy"
 	"github.com/PizenLabs/izen/internal/engine/layer1"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // Intent classifies a user request into an execution category.
@@ -136,6 +137,10 @@ type Request struct {
 	// Scope optionally restricts a deterministic rewrite to the given files.
 	// When empty the impact set is derived from the workspace graph.
 	Scope []string
+	// InteractionContract and Contract carry the semantic turn descriptor into
+	// the worker boundary. They are metadata, never execution authority.
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 }
 
 // CapabilityReader is the read-only capability surface of a workspace. It is

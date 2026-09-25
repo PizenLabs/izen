@@ -37,6 +37,8 @@ import (
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
 	"github.com/PizenLabs/izen/internal/modes/review"
+	"github.com/PizenLabs/izen/internal/protocol"
+	oregistry "github.com/PizenLabs/izen/internal/provider/registry"
 	"github.com/PizenLabs/izen/internal/providers"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	riview "github.com/PizenLabs/izen/internal/review"
@@ -1534,7 +1536,11 @@ func (m *model) runPlanEngineCmd(handoffSource, problem, modelName string, hando
 		select {
 		case o := <-outCh:
 			cancel()
-			return planResultMsg{Tasks: o.tasks, Err: o.err, Handoff: handoff, TokenInput: o.tokIn, TokenOutput: o.tokOut}
+			var contract *protocol.ContractDescriptor
+			if m.planEngine != nil {
+				contract = m.planEngine.LastContract()
+			}
+			return planResultMsg{Tasks: o.tasks, Err: o.err, Handoff: handoff, TokenInput: o.tokIn, TokenOutput: o.tokOut, Contract: contract}
 		case <-ftCtx.Done():
 			// First-token deadline missed: the provider is unresponsive.
 			cancel()
@@ -2316,15 +2322,31 @@ func (m *model) switchModelDirect(modelName string) tea.Cmd {
 		resolvedProvider = m.inferProviderFromModel(modelName)
 	}
 
-	// Activate via authority and persist.
-	auth := m.ensureModelAuthority()
+	// Activate via the atomic binding transaction: persist (disk) first,
+	// then mirror into the session config and commit to the authority, so
+	// provider and model transition as one unit.
 	binding := authority.ModelBinding{
 		ProviderID: authority.ProviderID(resolvedProvider),
 		ModelID:    authority.ModelID(modelName),
 	}
-	auth.Activate(binding)
-	_ = config.PersistActiveBinding(resolvedProvider, modelName, "")
-	m.syncPipelineTiers()
+	if err := authority.ValidateBinding(binding); err != nil {
+		m.push(roleError, fmt.Sprintf("[✗] Model assignment rejected: %s", err.Error()))
+		m.refreshViewportContent()
+		m.gotoBottomIfAllowed()
+		return nil
+	}
+	if inelig := oregistry.CheckExecutable(resolvedProvider, modelName); inelig != nil {
+		m.push(roleError, fmt.Sprintf("[✗] Model unavailable for Izen's current execution path: %s is %s", modelName, inelig.Reason))
+		m.refreshViewportContent()
+		m.gotoBottomIfAllowed()
+		return nil
+	}
+	if err := m.persistAndActivateBinding(binding); err != nil {
+		m.push(roleError, fmt.Sprintf("[✗] Model assignment persist failed: %s", err.Error()))
+		m.refreshViewportContent()
+		m.gotoBottomIfAllowed()
+		return nil
+	}
 
 	// If the provider changed, switch providers.
 	if resolvedProvider != "" {
@@ -4264,8 +4286,9 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 				Messages: []ai.Message{
 					{Role: "user", Content: string(logData)},
 				},
-				Stream: false,
-				System: providers.DiagnoseSystemPrompt,
+				Stream:       false,
+				ContextPhase: "investigate",
+				System:       providers.DiagnoseSystemPrompt,
 			})
 			cancel()
 			if err != nil {

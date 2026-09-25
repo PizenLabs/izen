@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -43,13 +42,15 @@ type openaiMessage struct {
 }
 
 type openaiRequest struct {
-	Model         string          `json:"model"`
-	Messages      []openaiMessage `json:"messages"`
-	MaxTokens     int             `json:"max_tokens,omitempty"`
-	Temperature   float64         `json:"temperature,omitempty"`
-	Stop          []string        `json:"stop,omitempty"`
-	Stream        bool            `json:"stream,omitempty"`
-	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
+	Model          string             `json:"model"`
+	Messages       []openaiMessage    `json:"messages"`
+	MaxTokens      int                `json:"max_tokens,omitempty"`
+	Temperature    float64            `json:"temperature,omitempty"`
+	Stop           []string           `json:"stop,omitempty"`
+	Stream         bool               `json:"stream,omitempty"`
+	StreamOptions  *streamOptions     `json:"stream_options,omitempty"`
+	ResponseFormat *ai.ResponseFormat `json:"response_format,omitempty"`
+	Tools          []json.RawMessage  `json:"tools,omitempty"`
 	// ReasoningEffort is the native OpenAI qualitative reasoning control
 	// (low / medium / high / xhigh). It is injected from the dynamically
 	// resolved effort directive; empty omits the field.
@@ -108,6 +109,9 @@ func (u *openaiUsage) ProviderUsage() ai.ProviderUsage {
 }
 
 func (p *OpenAIProvider) buildMessages(req ai.Request) []openaiMessage {
+	if prepared, _, err := PrepareContractRequest("openai", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]openaiMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, openaiMessage{Role: "system", Content: req.System})
@@ -120,10 +124,16 @@ func (p *OpenAIProvider) buildMessages(req ai.Request) []openaiMessage {
 }
 
 func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model := req.Model
 	if model == "" {
 		return nil, fmt.Errorf("openai: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
+	prepared, plan, err := PrepareContractRequest("openai", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -134,8 +144,13 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		Temperature:     req.Temperature,
 		Stop:            req.Stop,
 		Stream:          false,
+		ResponseFormat:  req.ResponseFormat,
+		Tools:           marshalContractTools(req.Tools),
 		ReasoningEffort: req.Reasoning.LevelOrDefault(),
 		ExtraParams:     req.ExtraParams,
+	}
+	if isCasualSystemPrompt(req.System) {
+		body.Tools = nil
 	}
 
 	payload, err := json.Marshal(body)
@@ -158,7 +173,6 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		return nil, fmt.Errorf("openai: do request: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -184,7 +198,7 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if openaiResp.Usage != nil {
 		tokenIn = openaiResp.Usage.PromptTokens
 		tokenOut = openaiResp.Usage.CompletionTokens
@@ -192,37 +206,36 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	}
 	usage.CompletedAt = time.Now()
 	usage.FinishReason = openaiResp.Choices[0].FinishReason
-	// Task 1: fail fast on truncated payload before envelope parsing, but
-	// PRESERVE the canonical partial buffer. Universal Stream Outcome:
-	// length -> PARTIAL across all tiers; never clear/swallow the buffer.
-	if openaiResp.Choices[0].FinishReason == "length" {
-		if usage.FirstTokenAt.IsZero() {
-			usage.FirstTokenAt = usage.CompletedAt
-		}
-		return &ai.Response{
-			Content:     content,
-			TokenInput:  tokenIn,
-			TokenOutput: tokenOut,
-			Usage:       usage,
-		}, fmt.Errorf("%w: finish_reason=length", ai.ErrPayloadTruncated)
-	}
 	if usage.FirstTokenAt.IsZero() {
 		usage.FirstTokenAt = usage.CompletedAt
 	}
-
-	return &ai.Response{
+	response := &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
 		Usage:       usage,
-	}, nil
+	}
+	StampResponseMetadata(response, "openai", model, plan, openaiResp.Choices[0].FinishReason)
+	if response.Truncated {
+		// The response wrapper is returned alongside the typed error so the
+		// caller can retain verbatim partial bytes while refusing structural
+		// parsing.
+		return response, ai.NewOutputTruncated("openai", "length")
+	}
+	return response, nil
 }
 
 func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model := req.Model
 	if model == "" {
 		return nil, fmt.Errorf("openai: no model assigned to target node (empty ModelBinding.ModelID)")
 	}
+	prepared, plan, err := PrepareContractRequest("openai", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -234,8 +247,13 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Stop:            req.Stop,
 		Stream:          true,
 		StreamOptions:   &streamOptions{IncludeUsage: true},
+		ResponseFormat:  req.ResponseFormat,
+		Tools:           marshalContractTools(req.Tools),
 		ReasoningEffort: req.Reasoning.LevelOrDefault(),
 		ExtraParams:     req.ExtraParams,
+	}
+	if isCasualSystemPrompt(req.System) {
+		body.Tools = nil
 	}
 
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -265,27 +283,27 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		return nil, NewProviderError("openai", resp.StatusCode, respBody)
 	}
 
 	sr := &openaiSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant: commit the estimated
 	// prompt count BEFORE entering the SSE chunk read loop.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &OpenAIStreamResult{ReadCloser: sr, sr: sr}, nil
+	return &OpenAIStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("openai", model, plan)}, nil
 }
 
 type OpenAIStreamResult struct {
 	io.ReadCloser
-	sr *openaiSSEReader
+	sr       *openaiSSEReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *OpenAIStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -294,9 +312,27 @@ func (r *OpenAIStreamResult) Usage() ai.ProviderUsage {
 // ("stop", "length", "tool_calls", ...), or "" if none was seen.
 func (r *OpenAIStreamResult) FinishReason() string {
 	if r.sr != nil {
-		return r.sr.finishReason
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// callers that consume a stream through the ai.Provider interface.
+func (r *OpenAIStreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
+}
+
+// TruncationError exposes the typed output-ceiling signal while retaining EOF
+// as the terminal io.Reader result for compatibility.
+func (r *OpenAIStreamResult) TruncationError() error {
+	if r == nil {
+		return nil
+	}
+	return streamTruncationError("openai", r.FinishReason())
 }
 
 type openaiSSEReader struct {
@@ -398,7 +434,7 @@ func (s *openaiSSEReader) drainTrailingUsage() {
 }
 
 // closeTerminal records a terminal finish_reason and tears the channel
-// down immediately: cancel context, drain body, mark closed, complete
+// down immediately: cancel context, close the body, mark closed, and complete
 // usage. Callers return io.EOF right after (or flush pending first).
 func (s *openaiSSEReader) closeTerminal(reason string) {
 	s.finishReason = reason
@@ -407,11 +443,8 @@ func (s *openaiSSEReader) closeTerminal(reason string) {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
 	s.closed = true
+	_ = closeSSERequest(s.cancel, s.body, nil)
 }
 
 func (s *openaiSSEReader) Read(p []byte) (int, error) {
@@ -427,9 +460,24 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.usage.markInterrupted()
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" {
+				s.closed = true
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				s.stopIdle()
+				s.usage.markCompleted(time.Now(), s.finishReason)
+				_ = closeSSERequest(s.cancel, s.body, nil)
+				return 0, io.EOF
 			}
+			s.usage.markInterrupted()
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
+			s.closed = true
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -445,12 +493,13 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
-			if s.cancel != nil {
-				s.cancel()
-			}
-			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
 			s.usage.markCompleted(time.Now(), s.finishReason)
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, io.EOF
 		}
 
@@ -501,11 +550,8 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 				if s.lifecycle != nil {
 					s.lifecycle.MarkClosed()
 				}
-				if s.cancel != nil {
-					s.cancel()
-				}
-				_, _ = io.Copy(io.Discard, s.body)
 				s.closed = true
+				_ = closeSSERequest(s.cancel, s.body, nil)
 				// If the caller's buffer was too small the tail is dropped
 				// here only for this coalesced edge; providers emit the
 				// terminal reason on its own chunk in practice.
@@ -557,14 +603,13 @@ func (s *openaiSSEReader) Read(p []byte) (int, error) {
 }
 
 func (s *openaiSSEReader) Close() error {
+	if s.closed {
+		return nil
+	}
 	s.closed = true
 	if s.lifecycle != nil {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
-	return s.body.Close()
+	return closeSSERequest(s.cancel, s.body, nil)
 }

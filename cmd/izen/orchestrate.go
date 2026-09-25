@@ -14,6 +14,7 @@ import (
 	legacyaudit "github.com/PizenLabs/izen/internal/audit"
 	"github.com/PizenLabs/izen/internal/cli"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/contextcompiler"
 	"github.com/PizenLabs/izen/internal/runtime/orchestrator"
 )
 
@@ -96,6 +97,7 @@ func runOrchestrateCommand(args []string) error {
 		}
 		return nil
 	}
+	provider = contextcompiler.New().WrapProvider(provider)
 	fmt.Fprintf(os.Stderr, "izen v%s: orchestrator provider=%s model=%s root=%s\n", Version, provider.Name(), model, dir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -177,10 +179,11 @@ func (s *stubNoopProvider) Complete(_ context.Context, _, _ string) (string, err
 // Complete implements cli.LLMProvider.
 func (a *orchestrateAdapter) Complete(ctx context.Context, system, prompt string) (string, error) {
 	resp, err := a.provider.Execute(ctx, ai.Request{
-		Model:    a.model,
-		System:   system,
-		Messages: []ai.Message{{Role: "user", Content: prompt}},
-		Stream:   false,
+		Model:        a.model,
+		System:       system,
+		Messages:     []ai.Message{{Role: "user", Content: prompt}},
+		Stream:       false,
+		ContextPhase: "execute",
 	})
 	if err != nil {
 		return "", err

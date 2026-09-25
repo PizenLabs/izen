@@ -44,6 +44,9 @@ type Envelope struct {
 	// every line of the NDJSON audit log maps to the session that produced it.
 	// Empty when no session authority is wired (harness/headless).
 	SessionID string `json:"session_id,omitempty"`
+	// Redacted marks an envelope whose raw prompt/output fields were removed
+	// before persistence. Structural metadata and fingerprints remain.
+	Redacted bool `json:"redacted,omitempty"`
 }
 
 // Type derives the granular bus discriminator for the envelope:

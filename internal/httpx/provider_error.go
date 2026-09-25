@@ -68,6 +68,30 @@ func title(s string) string {
 	}
 }
 
+// agenticHarnessMarker is the provider-side eligibility refusal OpenRouter
+// returns when a model restricted to agentic harnesses is invoked through
+// an ordinary API-key client (HTTP 403).
+const agenticHarnessMarker = "agentic harness"
+
+// IsModelCompatibility reports whether the provider error is a
+// model/execution-path compatibility refusal rather than a generic failure:
+// HTTP 403 carrying an agentic-harness eligibility message. Callers use it
+// to surface "unavailable for Izen's current execution path" instead of a
+// generic streaming failure. The raw message is never altered.
+func (e *ProviderError) IsModelCompatibility() bool {
+	if e == nil {
+		return false
+	}
+	if e.StatusCode != 403 {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(e.RawMessage))
+	if msg == "" {
+		msg = strings.ToLower(strings.TrimSpace(e.RawBody))
+	}
+	return strings.Contains(msg, agenticHarnessMarker)
+}
+
 // FormatProviderError renders the TUI status banner for any error, preferring
 // the structured ProviderError form when available.
 func FormatProviderError(provider string, statusCode int, rawMessage string) string {

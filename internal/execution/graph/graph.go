@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // StageKind is the bounded set of runtime execution stages. Adding a stage is
@@ -150,6 +151,9 @@ type Graph struct {
 	Edges []Edge
 	// emit is the event emitter (may be nil to disable emission).
 	emit Emitter
+	// protocolBinding is the structural protocol identity stamped onto every
+	// lifecycle event. It is updated once admission resolves ContractID.
+	protocolBinding protocol.ObservabilityBinding
 	// StartedAt / FinishedAt bound the whole execution.
 	StartedAt  time.Time
 	FinishedAt time.Time
@@ -291,6 +295,24 @@ func (g *Graph) SetSessionID(sessionID string) {
 	g.SessionID = sessionID
 }
 
+// SetProtocolBinding stamps or replaces the structural protocol metadata used
+// by subsequent lifecycle events. The binding is cloned defensively.
+func (g *Graph) SetProtocolBinding(binding protocol.ObservabilityBinding) {
+	if g == nil {
+		return
+	}
+	g.protocolBinding = binding.Normalize()
+}
+
+// ProtocolBinding returns a detached copy of the graph's current protocol
+// metadata.
+func (g *Graph) ProtocolBinding() protocol.ObservabilityBinding {
+	if g == nil {
+		return protocol.ObservabilityBinding{}
+	}
+	return g.protocolBinding.Clone()
+}
+
 // Start opens the execution: the graph enters running and emits
 // execution.started. It is the first transition of every execution.
 func (g *Graph) Start(mode, prompt string) {
@@ -299,7 +321,7 @@ func (g *Graph) Start(mode, prompt string) {
 	}
 	g.Phase = PhaseRunning
 	g.StartedAt = time.Now()
-	g.emitEvent(events.NewExecutionStarted(g.RequestID, mode, prompt, g.SessionID))
+	g.emitEvent(events.NewExecutionStarted(g.RequestID, mode, prompt, g.SessionID, g.ProtocolBinding()))
 }
 
 // CompleteUserIntent closes the user-intent stage (no canonical event — the
@@ -312,28 +334,51 @@ func (g *Graph) CompleteUserIntent() {
 // strategy.selected.
 func (g *Graph) CompleteStrategy(strategy string, modelRequired bool, reason string) {
 	g.Complete(StageStrategySelection, strategy)
-	g.emitEvent(events.NewStrategySelected(g.RequestID, strategy, modelRequired, reason))
+	g.emitEvent(events.NewStrategySelected(g.RequestID, strategy, modelRequired, reason, g.ProtocolBinding()))
 }
 
 // CompleteTarget closes the target-resolution stage (per resolved target) and
 // emits target.resolved.
 func (g *Graph) CompleteTarget(target string, exists bool, source string) {
 	g.Complete(StageTargetResolution, target)
-	g.emitEvent(events.NewTargetResolved(g.RequestID, target, exists, source))
+	g.emitEvent(events.NewTargetResolved(g.RequestID, target, exists, source, g.ProtocolBinding()))
 }
 
 // CompleteContext closes the context-compilation stage and emits
-// context.prepared.
+// context.prepared. The detailed compiler metrics are emitted separately by
+// CompileContext; this method remains as the compatibility projection.
 func (g *Graph) CompleteContext(channels []string, tokens int) {
 	g.Complete(StageContextCompilation, fmt.Sprintf("%d channels, %d tokens", len(channels), tokens))
-	g.emitEvent(events.NewContextPrepared(g.RequestID, channels, tokens))
+	g.emitEvent(events.NewContextPrepared(g.RequestID, channels, tokens, g.ProtocolBinding()))
+}
+
+// CompleteContextWithMetrics closes the context stage and publishes both the
+// compatibility event and the content-free compiler metric event.
+func (g *Graph) CompleteContextWithMetrics(payload events.ContextPreparedPayload, metrics events.ContextCompilationPayload) {
+	payload.RequestID = g.RequestID
+	payload.ProtocolTelemetry = g.ProtocolBinding()
+	g.Complete(StageContextCompilation, fmt.Sprintf("%d channels, %d tokens", len(payload.Channels), payload.Tokens))
+	g.emitEvent(events.NewContextPreparedWithTelemetry(payload))
+	metrics.RequestID = g.RequestID
+	metrics.SessionID = g.SessionID
+	metrics.ProtocolTelemetry = g.ProtocolBinding()
+	g.emitEvent(events.NewContextCompilation(metrics))
+}
+
+// CompileContext publishes compiler metrics for a continuation or another
+// prepared request without reopening an already-completed graph stage.
+func (g *Graph) CompileContext(metrics events.ContextCompilationPayload) {
+	metrics.RequestID = g.RequestID
+	metrics.SessionID = g.SessionID
+	metrics.ProtocolTelemetry = g.ProtocolBinding()
+	g.emitEvent(events.NewContextCompilation(metrics))
 }
 
 // BeginModel opens the model-invocation stage and emits model.invoked BEFORE
 // the provider call.
 func (g *Graph) BeginModel(model string) {
 	g.Begin(StageModelInvocation)
-	g.emitEvent(events.NewModelInvoked(g.RequestID, model, 0, 0))
+	g.emitEvent(events.NewModelInvoked(g.RequestID, model, 0, 0, g.ProtocolBinding()))
 }
 
 // CompleteModel closes the model-invocation stage on a successful response and
@@ -341,7 +386,16 @@ func (g *Graph) BeginModel(model string) {
 // never reaches this transition.
 func (g *Graph) CompleteModel(model string, tokenInput, tokenOutput int) {
 	g.Complete(StageModelInvocation, model)
-	g.emitEvent(events.NewProviderResponse(g.RequestID, model, tokenInput, tokenOutput))
+	g.emitEvent(events.NewProviderResponse(g.RequestID, model, tokenInput, tokenOutput, g.ProtocolBinding()))
+}
+
+// CompleteModelWithMetadata closes the model stage and publishes the enriched
+// provider response projection.
+func (g *Graph) CompleteModelWithMetadata(payload events.ProviderResponsePayload) {
+	payload.RequestID = g.RequestID
+	payload.ProtocolTelemetry = g.ProtocolBinding()
+	g.Complete(StageModelInvocation, payload.Model)
+	g.emitEvent(events.NewProviderResponseWithTelemetry(payload))
 }
 
 // BeginWaiting emits provider.waiting — the provider round-trip is in flight
@@ -349,67 +403,80 @@ func (g *Graph) CompleteModel(model string, tokenInput, tokenOutput int) {
 // invocation begins so the model stage truthfully reads "waiting", never a
 // fabricated thinking/processing claim.
 func (g *Graph) BeginWaiting(model string) {
-	g.emitEvent(events.NewProviderWaiting(g.RequestID, model))
+	g.emitEvent(events.NewProviderWaiting(g.RequestID, model, g.ProtocolBinding()))
 }
 
 // FirstToken emits provider.first_token when the first provider byte arrives.
 // Latency is measured from invocation begin (BeginModel/BeginWaiting) to the
 // first byte — the truthful first-token latency of the model stage.
 func (g *Graph) FirstToken(model string, latency time.Duration) {
-	g.emitEvent(events.NewProviderFirstToken(g.RequestID, model, latency))
+	g.emitEvent(events.NewProviderFirstToken(g.RequestID, model, latency, g.ProtocolBinding()))
 }
 
 // StreamDelta emits one content delta of the live provider stream. It is pure
 // evidence transport: the authoritative content always travels on the
 // ExecutionResult, so a dropped delta never loses execution truth.
 func (g *Graph) StreamDelta(delta string) {
-	g.emitEvent(events.NewProviderStreamDelta(g.RequestID, delta))
+	g.emitEvent(events.NewProviderStreamDelta(g.RequestID, delta, g.ProtocolBinding()))
 }
 
 // UpdateUsage emits the cumulative provider-reported usage of the live stream
 // (authoritative counts only — never a local estimate).
 func (g *Graph) UpdateUsage(model string, inputTokens, outputTokens, reasoningTokens int) {
-	g.emitEvent(events.NewProviderUsageUpdate(g.RequestID, model, inputTokens, outputTokens, reasoningTokens))
+	g.emitEvent(events.NewProviderUsageUpdate(g.RequestID, model, inputTokens, outputTokens, reasoningTokens, g.ProtocolBinding()))
+}
+
+// RecordProviderExecution publishes the terminal provider record for every
+// dispatch, including failures and truncation. It is an observation event and
+// does not change the graph stage state.
+func (g *Graph) RecordProviderExecution(payload events.ProviderExecutionPayload) {
+	if g == nil {
+		return
+	}
+	payload.RequestID = g.RequestID
+	payload.SessionID = g.SessionID
+	payload.ProtocolTelemetry = g.ProtocolBinding()
+	g.emitEvent(events.NewProviderExecution(payload))
 }
 
 // ReasoningTelemetry emits reasoning TELEMETRY only: the wall-clock reasoning
 // duration and the provider-reported reasoning token count when available.
 // Raw chain-of-thought text never travels on the event stream.
 func (g *Graph) ReasoningTelemetry(model string, duration time.Duration, tokens int) {
-	g.emitEvent(events.NewReasoningTelemetry(g.RequestID, model, duration, tokens))
+	g.emitEvent(events.NewReasoningTelemetry(g.RequestID, model, duration, tokens, g.ProtocolBinding()))
 }
 
 // CompleteArtifact closes the artifact-validation stage and emits
 // artifact.produced. It can never precede CompleteModel for the same execution.
 func (g *Graph) CompleteArtifact(kind, target string) {
 	g.Complete(StageArtifactValidation, kind)
-	g.emitEvent(events.NewArtifactProduced(g.RequestID, kind, target))
+	g.emitEvent(events.NewArtifactProduced(g.RequestID, kind, target, g.ProtocolBinding()))
 }
 
 // WaitApproval parks the graph at the approval gate and emits approval.required.
 func (g *Graph) WaitApproval(target, preview string) {
 	g.Wait(StageApprovalGate, "awaiting human approval")
-	g.emitEvent(events.NewApprovalRequired(g.RequestID, target, preview))
+	g.emitEvent(events.NewApprovalRequired(g.RequestID, target, preview, g.ProtocolBinding()))
 }
 
 // BeginMutation opens the mutation transaction stage and emits mutation.started.
 func (g *Graph) BeginMutation(targets []string) {
 	g.Resume()
 	g.Begin(StageMutationTransaction)
-	g.emitEvent(events.NewMutationStarted(g.RequestID, targets))
+	g.emitEvent(events.NewMutationStarted(g.RequestID, targets, g.ProtocolBinding()))
 }
 
 // CompleteMutation closes a per-target mutation and emits mutation.completed.
 func (g *Graph) CompleteMutation(target, outcome string) {
 	g.Complete(StageMutationTransaction, target+"="+outcome)
-	g.emitEvent(events.NewMutationCompleted(g.RequestID, target, outcome))
+	g.emitEvent(events.NewMutationCompleted(g.RequestID, target, outcome, g.ProtocolBinding()))
 }
 
 // CompleteVerification closes the verification stage and emits
 // verification.completed with the real verifier result.
 func (g *Graph) CompleteVerification(passed bool, steps []string) {
 	g.Complete(StageVerification, fmt.Sprintf("passed=%t", passed))
-	g.emitEvent(events.NewVerificationCompleted(g.RequestID, passed, steps))
+	g.emitEvent(events.NewVerificationCompleted(g.RequestID, passed, steps, g.ProtocolBinding()))
 }
 
 // RejectApproval records the human's explicit rejection of the held proposal
@@ -425,7 +492,7 @@ func (g *Graph) RejectApproval(target, reason string) {
 		s.Evidence = "rejected: " + reason
 		s.FinishedAt = time.Now()
 	}
-	g.emitEvent(events.NewApprovalRejected(g.RequestID, target, reason))
+	g.emitEvent(events.NewApprovalRejected(g.RequestID, target, reason, g.ProtocolBinding()))
 }
 
 // Skip marks a stage as cleanly unnecessary (its boundary is never reached).
@@ -494,7 +561,7 @@ func (g *Graph) CompleteExecution(outcome string) {
 		s.Evidence = outcome
 		s.FinishedAt = g.FinishedAt
 	}
-	g.emitEvent(events.NewExecutionFinished(g.RequestID, true, outcome))
+	g.emitEvent(events.NewExecutionFinished(g.RequestID, true, outcome, g.ProtocolBinding()))
 }
 
 // FailExecution terminates the graph as a failure: it emits execution.failed
@@ -512,8 +579,8 @@ func (g *Graph) FailExecution(classification events.FailureClassification, err e
 		}
 		s.FinishedAt = g.FinishedAt
 	}
-	g.emitEvent(events.NewExecutionFailed(classification, err, stage))
-	g.emitEvent(events.NewExecutionFinished(g.RequestID, false, string(PhaseFailed)))
+	g.emitEvent(events.NewExecutionFailed(classification, err, stage, g.ProtocolBinding()))
+	g.emitEvent(events.NewExecutionFinished(g.RequestID, false, string(PhaseFailed), g.ProtocolBinding()))
 }
 
 // CancelExecution terminates the graph cleanly (cancellation / clarification /
@@ -530,7 +597,7 @@ func (g *Graph) CancelExecution(outcome string) {
 		s.Evidence = outcome
 		s.FinishedAt = g.FinishedAt
 	}
-	g.emitEvent(events.NewExecutionFinished(g.RequestID, false, outcome))
+	g.emitEvent(events.NewExecutionFinished(g.RequestID, false, outcome, g.ProtocolBinding()))
 }
 
 // Terminal reports whether the graph reached a terminal phase.

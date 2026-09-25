@@ -178,6 +178,13 @@ func sortedKeys(m map[string][]byte) []string {
 // that changed between attempts yields a workspace_drift observation with
 // ZERO provider requests; a stale attempt never re-executes over moved ground.
 func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest) (autonomy.Observation, error) {
+	// The adapter is a dispatcher boundary as well as a translation layer.
+	// Validate before workspace digest checks/provider submission so a caller
+	// cannot bypass the driver's contract guard by invoking the adapter
+	// directly.
+	if err := ValidateDispatchContract(req); err != nil {
+		return autonomy.Observation{}, err
+	}
 	targets := req.Targets
 	if len(targets) == 0 && req.Target != "" {
 		targets = []string{req.Target}
@@ -224,18 +231,20 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		req.MaxOutputTokens = effectiveMax
 	}
 	execReq := execution.ExecuteRequest{
-		RequestID:        req.RequestID,
-		Mode:             "autonomy",
-		Prompt:           prompt,
-		Target:           req.Target,
-		Targets:          req.Targets,
-		Strategy:         strategyPtr,
-		Intent:           req.Intent,
-		IntentConfidence: req.IntentConfidence,
-		TargetConfidence: req.TargetConfidence,
-		Scope:            req.Scope,
-		Evidence:         req.Evidence,
-		StreamCallback:   req.StreamCallback,
+		RequestID:           req.RequestID,
+		Mode:                "autonomy",
+		Prompt:              prompt,
+		Target:              req.Target,
+		Targets:             req.Targets,
+		Strategy:            strategyPtr,
+		Intent:              req.Intent,
+		IntentConfidence:    req.IntentConfidence,
+		TargetConfidence:    req.TargetConfidence,
+		Scope:               req.Scope,
+		InteractionContract: req.InteractionContract,
+		Contract:            req.Contract,
+		Evidence:            req.Evidence,
+		StreamCallback:      req.StreamCallback,
 		// Explicit TargetModel: resolved from the active Workspace Target at
 		// execution time. The executor enforces verbatim pass-through and
 		// rejects empty models locally with ErrUnassignedTargetModel.
@@ -296,6 +305,8 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 		// re-runs the monolithic full-rewrite estimation against the original
 		// target (the false-positive preflight_infeasible leak).
 		execReq.StagedSubTasks = staged
+	} else if len(req.StagedSubTasks) > 0 {
+		execReq.StagedSubTasks = append([]execution.SubTaskScope(nil), req.StagedSubTasks...)
 	}
 	if strategyPtr != nil && (req.RecoveryStrategy == "bounded_patch" || req.MutationStrategy == "bounded_patch" || req.MutationStrategy == "syntax_repair" || req.AllowASTBypass || req.MutationStrategy == string(ProposalInjectLineOffset) || req.RecoveryStrategy == string(ProposalInjectLineOffset)) {
 		// Material artifact-contract change: the recovery attempt MUST produce
@@ -379,6 +390,7 @@ func stagedSubTaskScopes(dag *planner.ExecutionDAG) []execution.SubTaskScope {
 			StartLine:       st.Region.StartLine,
 			EndLine:         st.Region.EndLine,
 			EstimatedTokens: st.EstimatedTokens,
+			Operation:       st.EffectiveOperation(),
 		})
 	}
 	return scopes
@@ -388,14 +400,23 @@ func stagedSubTaskScopes(dag *planner.ExecutionDAG) []execution.SubTaskScope {
 // moved between attempts, so the attempt is refused WITHOUT any execution.
 // No provider is invoked and no artifact exists.
 func (a *ExecutorAdapter) driftObservation(req autonomy.LoopRequest, targets []string) autonomy.Observation {
+	interaction := req.InteractionContract
+	if interaction == "" && req.Contract != nil {
+		interaction = req.Contract.Contract
+		if interaction == "" {
+			interaction = req.Contract.Kind
+		}
+	}
 	return autonomy.Observation{
-		RequestID:        req.RequestID,
-		Intent:           autonomy.Intent(req.Intent),
-		Target:           firstTarget(targets),
-		Evidence:         req.Evidence,
-		Outcome:          autonomy.OutcomeWorkspaceDrift,
-		RecoveryStrategy: req.RecoveryStrategy,
-		AttemptNum:       req.RecoveryAttempt,
+		RequestID:           req.RequestID,
+		Intent:              autonomy.Intent(req.Intent),
+		Target:              firstTarget(targets),
+		Evidence:            req.Evidence,
+		Outcome:             autonomy.OutcomeWorkspaceDrift,
+		RecoveryStrategy:    req.RecoveryStrategy,
+		AttemptNum:          req.RecoveryAttempt,
+		InteractionContract: interaction,
+		Contract:            cloneContract(req.Contract),
 	}
 }
 
@@ -453,7 +474,7 @@ func (a *ExecutorAdapter) observe(req autonomy.LoopRequest, res *execution.Execu
 	// Extract finish reason and budget from the authoritative invocation when present.
 	finishReason := ""
 	maxOut := 0
-	if len(res.Proof.ModelInvocations) > 0 {
+	if res.Proof != nil && len(res.Proof.ModelInvocations) > 0 {
 		finishReason = res.Proof.ModelInvocations[len(res.Proof.ModelInvocations)-1].FinishReason
 	}
 	if len(res.ModelCalls) > 0 {
@@ -465,9 +486,32 @@ func (a *ExecutorAdapter) observe(req autonomy.LoopRequest, res *execution.Execu
 	if req.MaxOutputTokens > 0 {
 		maxOut = req.MaxOutputTokens
 	}
+	interaction := req.InteractionContract
+	if interaction == "" && req.Contract != nil {
+		interaction = req.Contract.Contract
+		if interaction == "" {
+			interaction = req.Contract.Kind
+		}
+	}
+	descriptor := cloneContract(req.Contract)
+	// Approval and rejection are resolved through the held execution result,
+	// not by resubmitting the original LoopRequest.  Recover the descriptor
+	// from the sealed proof when the adapter is projecting those terminal
+	// observations, otherwise the contract would disappear at the approval
+	// seam even though the execution remained under the same authority.
+	if res.Proof != nil {
+		if interaction == "" {
+			interaction = res.Proof.InteractionContract
+		}
+		if descriptor == nil {
+			descriptor = cloneContract(res.Proof.ContractDescriptor)
+		}
+	}
 	return autonomy.Observation{
 		RequestID:             res.RequestID,
 		ContractID:            observationContractID(res),
+		InteractionContract:   interaction,
+		Contract:              descriptor,
 		Intent:                autonomy.Intent(req.Intent),
 		Target:                firstTarget(res.Targets),
 		Evidence:              req.Evidence,

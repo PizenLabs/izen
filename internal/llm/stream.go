@@ -30,6 +30,8 @@ func (r *sseReader) ReadEvent() (string, error) {
 	for {
 		line, err := r.reader.ReadString('\n')
 		if err != nil {
+			r.closed = true
+			r.closeOnce.Do(func() { _ = r.body.Close() })
 			return "", err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -45,14 +47,10 @@ func (r *sseReader) ReadEvent() (string, error) {
 		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
 			r.closed = true
-			// ZERO-DEFER: drain and close synchronously the instant [DONE]
-			// is parsed, so the HTTP session is torn down before any
-			// outer pipeline join. Keep-Alive pooling preserved via
-			// Discard+Close returning the TCP conn to the idle pool.
-			r.closeOnce.Do(func() {
-				_, _ = io.Copy(io.Discard, r.body)
-				_ = r.body.Close()
-			})
+			// [DONE] is terminal. Never drain the HTTP body here: a gateway
+			// may keep the connection open and the drain would wait for the
+			// parent context.
+			r.closeOnce.Do(func() { _ = r.body.Close() })
 			return "", io.EOF
 		}
 
@@ -63,10 +61,7 @@ func (r *sseReader) ReadEvent() (string, error) {
 func (r *sseReader) Close() error {
 	r.closed = true
 	var err error
-	r.closeOnce.Do(func() {
-		_, _ = io.Copy(io.Discard, r.body)
-		err = r.body.Close()
-	})
+	r.closeOnce.Do(func() { err = r.body.Close() })
 	return err
 }
 
@@ -128,12 +123,16 @@ func (r *openAIStreamReader) ReadChunk() (openAIChunk, error) {
 		if r.cancel != nil {
 			r.cancel()
 		}
-		_, _ = io.Copy(io.Discard, r.body)
+		_ = r.reader.Close()
 		return openAIChunk{}, io.EOF
 	}
 	for {
 		data, err := r.reader.ReadEvent()
 		if err != nil {
+			if r.lifecycle != nil {
+				r.lifecycle.MarkClosed()
+			}
+			r.stopIdle()
 			return openAIChunk{}, err
 		}
 

@@ -54,6 +54,12 @@ const (
 	// EventControlTerminated is emitted when the control loop reaches a
 	// terminal directive.
 	EventControlTerminated EventType = "control.terminated"
+	// Protocol observability events. These payloads are structural and safe
+	// for the unified audit adapter; they never contain prompt or output text.
+	EventInteractionTelemetry EventType = "protocol.interaction"
+	EventContextCompilation   EventType = "protocol.context_compilation"
+	EventProviderExecution    EventType = "protocol.provider_execution"
+	EventAdmissionDecision    EventType = "protocol.admission_decision"
 )
 
 // Layer returns the engine layer that produces the event type.
@@ -69,6 +75,8 @@ func (t EventType) Layer() string {
 		return "layer3"
 	case EventValidationDAG:
 		return "layer4"
+	case EventInteractionTelemetry, EventContextCompilation, EventProviderExecution, EventAdmissionDecision:
+		return "protocol"
 	default:
 		return "unknown"
 	}

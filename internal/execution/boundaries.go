@@ -78,7 +78,7 @@ func NormalizeFinishReason(reason string) CanonicalOutcome {
 		return CanonicalUnknown
 	case "stop", "end_turn", "endturn", "stop_sequence":
 		return CanonicalComplete
-	case "length", "max_tokens", "max_output_tokens", "truncated", "token_limit":
+	case "length", "max_tokens", "max tokens", "max output tokens", "max_output_tokens", "max_output", "truncated", "token_limit", "output_limit":
 		return CanonicalOutputExhausted
 	case "content_filter", "refusal", "safety", "moderation", "blocked":
 		return CanonicalProviderRefusal
@@ -144,6 +144,9 @@ type SubTaskScope struct {
 	// EstimatedTokens is this window's generation estimate under the same
 	// accounting as the monolithic formula.
 	EstimatedTokens int
+	// Operation is the semantic operation carried by the staged unit. Empty
+	// retains the legacy FILE_MUTATE default for older callers.
+	Operation string
 }
 
 // PreflightVerdict is the Boundary-2 decision record.
@@ -244,12 +247,10 @@ func preflightTargetBytes(root, target string) int {
 // classification keeps working.
 var ErrOutputExhausted = fmt.Errorf("%w — discarded at the output gate", ErrOutputTruncated)
 
-// ErrPayloadTruncated is the explicit truncation signal required by the
-// LLM stream deadlock fix: finish_reason == "length" must fail fast before
-// JSON/envelope parsing. It wraps the legacy ErrOutputTruncated sentinel so
-// errors.Is checks for both succeed, but its message matches the directive's
-// required string.
-var ErrPayloadTruncated = fmt.Errorf("%w: model output exceeded max_tokens limit", ErrOutputTruncated)
+// ErrPayloadTruncated is the legacy name for the canonical output-ceiling
+// signal. It aliases ErrOutputTruncated so provider and executor errors share
+// one errors.Is identity.
+var ErrPayloadTruncated = ErrOutputTruncated
 
 // ErrProviderRefused is the canonical refusal circuit break: the provider
 // refused or filtered the generation. Nothing was parsed or staged.

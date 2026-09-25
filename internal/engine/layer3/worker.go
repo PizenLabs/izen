@@ -10,6 +10,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/engine/layer2"
 	"github.com/PizenLabs/izen/internal/patch"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // Provider identifies an LLM backend. Providers are labels only: the actual
@@ -70,15 +71,25 @@ type WorkerClient interface {
 
 // CompletionRequest is a single stateless model call.
 type CompletionRequest struct {
-	Provider Provider
-	Model    string
-	Prompt   string
+	Provider            Provider
+	Model               string
+	Prompt              string
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 }
 
 // CompletionResponse is the model's reply to a CompletionRequest.
 type CompletionResponse struct {
 	Text   string
 	Tokens TokenUsage
+}
+
+func cloneProtocolDescriptor(descriptor *protocol.ContractDescriptor) *protocol.ContractDescriptor {
+	if descriptor == nil {
+		return nil
+	}
+	copy := descriptor.Clone()
+	return &copy
 }
 
 // PatchParser interprets a worker's raw completion into proposed patches.
@@ -231,9 +242,11 @@ func (w *StatelessWorker) Execute(ctx context.Context, exec *layer2.ExecutionCon
 	}
 	prompt := BuildPrompt(exec, req, w.maxPrompt)
 	resp, err := w.client.Complete(ctx, &CompletionRequest{
-		Provider: w.provider,
-		Model:    w.model,
-		Prompt:   prompt,
+		Provider:            w.provider,
+		Model:               w.model,
+		Prompt:              prompt,
+		InteractionContract: req.InteractionContract,
+		Contract:            cloneProtocolDescriptor(req.Contract),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("layer3: %s completion: %w", w.Name(), err)

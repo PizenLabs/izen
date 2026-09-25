@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,6 +48,7 @@ type geminiRequest struct {
 	Contents          []geminiMessage          `json:"contents"`
 	SystemInstruction *geminiSystemInstruction `json:"systemInstruction,omitempty"`
 	GenerationConfig  *geminiGenerationConfig  `json:"generationConfig,omitempty"`
+	Tools             []geminiTool             `json:"tools,omitempty"`
 	Stream            bool                     `json:"stream"`
 	// ExtraParams carries arbitrary provider-native JSON fields merged
 	// directly into the HTTP POST body (generic passthrough).
@@ -66,8 +66,35 @@ type geminiSystemInstruction struct {
 }
 
 type geminiGenerationConfig struct {
-	MaxOutputTokens int     `json:"maxOutputTokens,omitempty"`
-	Temperature     float64 `json:"temperature,omitempty"`
+	MaxOutputTokens  int             `json:"maxOutputTokens,omitempty"`
+	Temperature      float64         `json:"temperature,omitempty"`
+	ResponseMimeType string          `json:"responseMimeType,omitempty"`
+	ResponseSchema   json.RawMessage `json:"responseSchema,omitempty"`
+}
+
+type geminiFunctionDeclaration struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+type geminiTool struct {
+	FunctionDeclarations []geminiFunctionDeclaration `json:"functionDeclarations,omitempty"`
+}
+
+func geminiTools(tools []ai.ToolDefinition) []geminiTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	declarations := make([]geminiFunctionDeclaration, 0, len(tools))
+	for _, tool := range tools {
+		declarations = append(declarations, geminiFunctionDeclaration{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			Parameters:  append(json.RawMessage(nil), tool.Function.Parameters...),
+		})
+	}
+	return []geminiTool{{FunctionDeclarations: declarations}}
 }
 
 type geminiResponse struct {
@@ -132,6 +159,9 @@ func finishReasonLabel(candidates []geminiCandidate) string {
 }
 
 func (p *GeminiProvider) buildMessages(req ai.Request) []geminiMessage {
+	if prepared, _, err := PrepareContractRequest("gemini", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]geminiMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		content := sanitizeContent(m.Content)
@@ -158,10 +188,16 @@ func (p *GeminiProvider) apiURL(model string, stream bool) string {
 }
 
 func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
 	}
+	prepared, plan, err := PrepareContractRequest("gemini", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -172,9 +208,17 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	body := geminiRequest{
 		Contents: msgs,
 		Stream:   false,
+		Tools:    geminiTools(req.Tools),
 		GenerationConfig: &geminiGenerationConfig{
 			MaxOutputTokens: maxTokens,
 			Temperature:     req.Temperature,
+			ResponseMimeType: func() string {
+				if plan.NativeSchema {
+					return "application/json"
+				}
+				return ""
+			}(),
+			ResponseSchema: plan.NativeJSONSchema(),
 		},
 		ExtraParams: req.ExtraParams,
 	}
@@ -204,7 +248,6 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		return nil, fmt.Errorf("gemini: do request: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -228,7 +271,7 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if geminiResp.UsageMetadata != nil {
 		tokenIn = geminiResp.UsageMetadata.PromptTokenCount
 		tokenOut = geminiResp.UsageMetadata.CandidatesTokenCount
@@ -240,19 +283,31 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		usage.FirstTokenAt = usage.CompletedAt
 	}
 
-	return &ai.Response{
+	finishReason := finishReasonLabel(geminiResp.Candidates)
+	response := &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
 		Usage:       usage,
-	}, nil
+	}
+	StampResponseMetadata(response, "gemini", model, plan, finishReason)
+	if response.Truncated {
+		return response, ai.NewOutputTruncated("gemini", "length")
+	}
+	return response, nil
 }
 
 func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
 	}
+	prepared, plan, err := PrepareContractRequest("gemini", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -263,9 +318,17 @@ func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	body := geminiRequest{
 		Contents: msgs,
 		Stream:   true,
+		Tools:    geminiTools(req.Tools),
 		GenerationConfig: &geminiGenerationConfig{
 			MaxOutputTokens: maxTokens,
 			Temperature:     req.Temperature,
+			ResponseMimeType: func() string {
+				if plan.NativeSchema {
+					return "application/json"
+				}
+				return ""
+			}(),
+			ResponseSchema: plan.NativeJSONSchema(),
 		},
 		ExtraParams: req.ExtraParams,
 	}
@@ -301,26 +364,26 @@ func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		return nil, NewProviderError("gemini", resp.StatusCode, respBody)
 	}
 
 	sr := &geminiSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &GeminiStreamResult{ReadCloser: sr, sr: sr}, nil
+	return &GeminiStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("gemini", model, plan)}, nil
 }
 
 type GeminiStreamResult struct {
 	io.ReadCloser
-	sr *geminiSSEReader
+	sr       *geminiSSEReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *GeminiStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -331,14 +394,25 @@ func (r *GeminiStreamResult) Usage() ai.ProviderUsage {
 // finishReason ("STOP", "SAFETY", ...) is returned.
 func (r *GeminiStreamResult) FinishReason() string {
 	if r.sr != nil {
-		switch r.sr.finishReason {
-		case "MAX_TOKENS":
-			return "length"
-		default:
-			return r.sr.finishReason
-		}
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// this stream.
+func (r *GeminiStreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
+}
+
+func (r *GeminiStreamResult) TruncationError() error {
+	if r == nil {
+		return nil
+	}
+	return streamTruncationError("gemini", r.FinishReason())
 }
 
 type geminiSSEReader struct {
@@ -389,11 +463,8 @@ func (s *geminiSSEReader) closeTerminal(reason string) {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
 	s.closed = true
+	_ = closeSSERequest(s.cancel, s.body, nil)
 }
 
 func (s *geminiSSEReader) Read(p []byte) (int, error) {
@@ -413,9 +484,24 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.usage.markInterrupted()
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" {
+				s.closed = true
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				s.stopIdle()
+				s.usage.markCompleted(time.Now(), finishReasonLabel(nil))
+				_ = closeSSERequest(s.cancel, s.body, nil)
+				return 0, io.EOF
 			}
+			s.usage.markInterrupted()
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
+			s.closed = true
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -429,6 +515,12 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 		}
 
 		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			// [DONE] is a semantic terminal sentinel for SSE-compatible
+			// gateways. Close immediately; never wait for a server-side EOF.
+			s.closeTerminal(s.finishReason)
+			return 0, io.EOF
+		}
 
 		var event geminiStreamResponse
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
@@ -490,26 +582,22 @@ func (s *geminiSSEReader) Read(p []byte) (int, error) {
 		}
 
 		if len(event.Candidates) > 0 && event.Candidates[0].Content.Role == "" {
-			if s.cancel != nil {
-				s.cancel()
-			}
-			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
 			s.usage.markCompleted(time.Now(), finishReasonLabel(event.Candidates))
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, io.EOF
 		}
 	}
 }
 
 func (s *geminiSSEReader) Close() error {
+	if s.closed {
+		return nil
+	}
 	s.closed = true
 	if s.lifecycle != nil {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
-	return s.body.Close()
+	return closeSSERequest(s.cancel, s.body, nil)
 }

@@ -43,3 +43,26 @@ func TestFormatProviderErrorBanner(t *testing.T) {
 		t.Fatalf("unexpected banner %q", s)
 	}
 }
+
+func TestIsModelCompatibility(t *testing.T) {
+	agentic := ParseProviderError("openrouter", 403, []byte(`{"error":{"message":"thinkingmachines/inkling:free is only available on agentic harnesses.","code":403}}`))
+	if !agentic.IsModelCompatibility() {
+		t.Errorf("agentic-harness 403 must classify as model compatibility")
+	}
+	// Raw message preserved verbatim (transparency invariant).
+	if !strings.Contains(agentic.Error(), "only available on agentic harnesses") {
+		t.Errorf("raw message must survive classification, got %q", agentic.Error())
+	}
+	other403 := ParseProviderError("openrouter", 403, []byte(`{"error":{"message":"Spend limit exceeded","code":403}}`))
+	if other403.IsModelCompatibility() {
+		t.Errorf("non-harness 403 must not classify as compatibility")
+	}
+	rateLimited := ParseProviderError("openrouter", 429, []byte(`{"error":{"message":"only available on agentic harnesses","code":429}}`))
+	if rateLimited.IsModelCompatibility() {
+		t.Errorf("non-403 must not classify as compatibility")
+	}
+	var nilErr *ProviderError
+	if nilErr.IsModelCompatibility() {
+		t.Errorf("nil error must not classify as compatibility")
+	}
+}

@@ -71,8 +71,12 @@ type ollamaRequest struct {
 	Stream        bool            `json:"stream,omitempty"`
 	StreamOptions *streamOptions  `json:"stream_options,omitempty"`
 	Format        string          `json:"format,omitempty"` // "json" for structured output
-	MaxTokens     *int            `json:"max_tokens,omitempty"`
-	Options       *struct {
+	// FormatSchema carries Ollama's native JSON Schema object. It is kept out
+	// of the default tags because Format remains a backwards-compatible string
+	// for callers that explicitly request generic JSON mode.
+	FormatSchema json.RawMessage `json:"-"`
+	MaxTokens    *int            `json:"max_tokens,omitempty"`
+	Options      *struct {
 		NumPredict  int     `json:"num_predict"`
 		Temperature float64 `json:"temperature,omitempty"`
 	} `json:"options,omitempty"`
@@ -84,7 +88,16 @@ type ollamaRequest struct {
 // MarshalJSON merges ExtraParams into the top-level object. Native keys win.
 func (r ollamaRequest) MarshalJSON() ([]byte, error) {
 	type alias ollamaRequest
-	return marshalWithExtra(alias(r), r.ExtraParams)
+	raw, err := marshalWithExtra(alias(r), r.ExtraParams)
+	if err != nil || len(r.FormatSchema) == 0 {
+		return raw, err
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	fields["format"] = json.RawMessage(compactJSON(r.FormatSchema))
+	return json.Marshal(fields)
 }
 
 type ollamaResponse struct {
@@ -169,6 +182,9 @@ func sanitizeContent(s string) string {
 }
 
 func (p *OllamaProvider) buildMessages(req ai.Request) []ollamaMessage {
+	if prepared, _, err := PrepareContractRequest("ollama", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]ollamaMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, ollamaMessage{Role: "system", Content: req.System})
@@ -181,6 +197,7 @@ func (p *OllamaProvider) buildMessages(req ai.Request) []ollamaMessage {
 }
 
 func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model := req.Model
 	if model == "" {
 		return nil, fmt.Errorf("ollama: no model assigned to target node (empty ModelBinding.ModelID)")
@@ -190,6 +207,11 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	if err := rejectNamespacedModel(model); err != nil {
 		return nil, err
 	}
+	prepared, plan, err := PrepareContractRequest("ollama", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -198,11 +220,12 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		maxTokens = 4096
 	}
 	body := ollamaRequest{
-		Model:       model,
-		Messages:    msgs,
-		Stream:      false,
-		MaxTokens:   &maxTokens,
-		ExtraParams: req.ExtraParams,
+		Model:        model,
+		Messages:     msgs,
+		Stream:       false,
+		MaxTokens:    &maxTokens,
+		FormatSchema: plan.NativeJSONSchema(),
+		ExtraParams:  req.ExtraParams,
 		Options: &struct {
 			NumPredict  int     `json:"num_predict"`
 			Temperature float64 `json:"temperature,omitempty"`
@@ -234,7 +257,6 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		return nil, fmt.Errorf("ollama: do request: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -260,7 +282,7 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if ollamaResp.Usage != nil {
 		tokenIn = ollamaResp.Usage.PromptTokens
 		tokenOut = ollamaResp.Usage.CompletionTokens
@@ -291,15 +313,21 @@ func (p *OllamaProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		usage.FirstTokenAt = usage.CompletedAt
 	}
 
-	return &ai.Response{
+	response := &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
 		Usage:       usage,
-	}, nil
+	}
+	StampResponseMetadata(response, "ollama", model, plan, ollamaResp.Choices[0].FinishReason)
+	if response.Truncated {
+		return response, ai.NewOutputTruncated("ollama", "length")
+	}
+	return response, nil
 }
 
 func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model := req.Model
 	if model == "" {
 		return nil, fmt.Errorf("ollama: no model assigned to target node (empty ModelBinding.ModelID)")
@@ -309,6 +337,11 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	if err := rejectNamespacedModel(model); err != nil {
 		return nil, err
 	}
+	prepared, plan, err := PrepareContractRequest("ollama", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -322,6 +355,7 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		Stream:        true,
 		StreamOptions: &streamOptions{IncludeUsage: true},
 		MaxTokens:     &maxTokens,
+		FormatSchema:  plan.NativeJSONSchema(),
 		ExtraParams:   req.ExtraParams,
 		Options: &struct {
 			NumPredict  int     `json:"num_predict"`
@@ -358,26 +392,26 @@ func (p *OllamaProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		return nil, NewProviderError("ollama", resp.StatusCode, respBody)
 	}
 
 	sr := &sseReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &StreamResult{ReadCloser: sr, sr: sr}, nil
+	return &StreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("ollama", model, plan)}, nil
 }
 
 type StreamResult struct {
 	io.ReadCloser
-	sr *sseReader
+	sr       *sseReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *StreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -386,9 +420,25 @@ func (r *StreamResult) Usage() ai.ProviderUsage {
 // ("stop", "length", "tool_calls", ...), or "" if none was seen.
 func (r *StreamResult) FinishReason() string {
 	if r.sr != nil {
-		return r.sr.finishReason
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// this stream.
+func (r *StreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
+}
+
+func (r *StreamResult) TruncationError() error {
+	if r == nil {
+		return nil
+	}
+	return streamTruncationError("ollama", r.FinishReason())
 }
 
 type sseReader struct {
@@ -498,11 +548,8 @@ func (s *sseReader) closeTerminal(reason string) {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
 	s.closed = true
+	_ = closeSSERequest(s.cancel, s.body, nil)
 }
 
 func (s *sseReader) Read(p []byte) (int, error) {
@@ -518,9 +565,24 @@ func (s *sseReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.usage.markInterrupted()
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" {
+				s.closed = true
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				s.stopIdle()
+				s.usage.markCompleted(time.Now(), s.finishReason)
+				_ = closeSSERequest(s.cancel, s.body, nil)
+				return 0, io.EOF
 			}
+			s.usage.markInterrupted()
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
+			s.closed = true
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -536,12 +598,13 @@ func (s *sseReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
-			if s.cancel != nil {
-				s.cancel()
-			}
-			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
 			s.usage.markCompleted(time.Now(), s.finishReason)
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, io.EOF
 		}
 
@@ -585,11 +648,8 @@ func (s *sseReader) Read(p []byte) (int, error) {
 				if s.lifecycle != nil {
 					s.lifecycle.MarkClosed()
 				}
-				if s.cancel != nil {
-					s.cancel()
-				}
-				_, _ = io.Copy(io.Discard, s.body)
 				s.closed = true
+				_ = closeSSERequest(s.cancel, s.body, nil)
 				return n, nil
 			}
 			s.drainTrailingUsage()
@@ -638,16 +698,15 @@ func (s *sseReader) Read(p []byte) (int, error) {
 }
 
 func (s *sseReader) Close() error {
+	if s.closed {
+		return nil
+	}
 	s.closed = true
 	if s.lifecycle != nil {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
-	return s.body.Close()
+	return closeSSERequest(s.cancel, s.body, nil)
 }
 
 // ── Local SLM Bridge ──────────────────────────────────────────────────────────
@@ -703,7 +762,6 @@ func (p *OllamaProvider) Generate(ctx context.Context, system, prompt string) (s
 		return "", fmt.Errorf("ollama generate: connection failed: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 

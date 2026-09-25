@@ -18,6 +18,11 @@ const (
 type Model = ModelDescriptor
 
 // ModelDescriptor describes a single provider model.
+// IneligibleReason marks a discovered-but-not-executable model (see
+// eligibility.go): empty means eligible for selection and execution.
+// The raw catalog entry is always preserved; only the executable view
+// (LoadExecutable/ExecutableModels) and the selection/execution guards
+// consult this field.
 type ModelDescriptor struct {
 	ID              string            `json:"id"`
 	Provider        string            `json:"provider"`
@@ -28,4 +33,8 @@ type ModelDescriptor struct {
 	IsThinking      bool              `json:"is_thinking"`
 	InputCostPerM   float64           `json:"input_cost_per_m"`
 	OutputCostPerM  float64           `json:"output_cost_per_m"`
+	// IneligibleReason is set when the provider catalog lists the model
+	// but it is not executable through Izen's current execution path
+	// (e.g. agentic-harness-only models). Empty = eligible.
+	IneligibleReason string `json:"ineligible_reason,omitempty"`
 }

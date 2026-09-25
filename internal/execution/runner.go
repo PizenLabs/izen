@@ -107,6 +107,9 @@ type Runner struct {
 	riskClassifier *RiskClassifier
 	auth           *authorization.MutationAuthorization
 	budget         *budget.MutationBudget
+	// admissionCheck is installed by a contract-bound Engine facade. It runs
+	// before authorization, process registration, or command execution.
+	admissionCheck func(string) error
 	// pipeline is the Phase 1 Tool Output Intelligence pipeline. Every
 	// command output is normalized, classified, semantically compressed and
 	// (when a workspace tee is attached) logged to `.logs/`. Nil keeps the
@@ -134,6 +137,12 @@ func (r *Runner) WithPipeline(p *output.Pipeline) *Runner {
 
 func (r *Runner) SetAuthorization(auth *authorization.MutationAuthorization) {
 	r.auth = auth
+}
+
+// SetAdmissionCheck installs the pre-command contract gate used by a bound
+// execution Engine. A nil check restores legacy untyped Runner behavior.
+func (r *Runner) SetAdmissionCheck(check func(string) error) {
+	r.admissionCheck = check
 }
 
 func (r *Runner) Authorization() *authorization.MutationAuthorization {
@@ -205,6 +214,11 @@ func (r *Runner) SandboxCheck(command string) error {
 }
 
 func (r *Runner) run(command, dir string) (*RunResult, error) {
+	if r.admissionCheck != nil {
+		if err := r.admissionCheck("SHELL_EXEC"); err != nil {
+			return &RunResult{Command: command, Dir: dir, ExitCode: -1, Stderr: err.Error()}, err
+		}
+	}
 	if err := checkAuthorization(r.auth); err != nil {
 		return &RunResult{
 			Command:  command,
@@ -314,6 +328,11 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 }
 
 func (r *Runner) Run(command string) (*RunResult, error) {
+	if r.admissionCheck != nil {
+		if err := r.admissionCheck("SHELL_EXEC"); err != nil {
+			return &RunResult{Command: command, ExitCode: -1, Stderr: err.Error()}, err
+		}
+	}
 	if err := checkAuthorization(r.auth); err != nil {
 		return &RunResult{
 			Command:  command,
@@ -325,6 +344,11 @@ func (r *Runner) Run(command string) (*RunResult, error) {
 }
 
 func (r *Runner) RunInDir(command, dir string) (*RunResult, error) {
+	if r.admissionCheck != nil {
+		if err := r.admissionCheck("SHELL_EXEC"); err != nil {
+			return &RunResult{Command: command, Dir: dir, ExitCode: -1, Stderr: err.Error()}, err
+		}
+	}
 	if err := checkAuthorization(r.auth); err != nil {
 		return &RunResult{
 			Command:  command,

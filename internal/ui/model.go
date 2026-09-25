@@ -23,6 +23,7 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/contextcompiler"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/runtime"
@@ -48,6 +49,7 @@ import (
 	"github.com/PizenLabs/izen/internal/policy"
 	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/project"
+	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/provider/registry"
 	"github.com/PizenLabs/izen/internal/retrieval"
 	"github.com/PizenLabs/izen/internal/retrieval/symbol"
@@ -302,7 +304,11 @@ type planResultMsg struct {
 	// global status.Tracker so token metrics are never lost to truncation.
 	TokenInput  int
 	TokenOutput int
-	Epoch       uint64 // dispatch generation; drop when Epoch < generationEpoch
+	// Contract is the descriptor that governed synthesis.  It is carried to
+	// the ledger commit boundary so the staged task list cannot be detached
+	// from its structural/authority contract.
+	Contract *protocol.ContractDescriptor
+	Epoch    uint64 // dispatch generation; drop when Epoch < generationEpoch
 }
 
 type agentStartMsg struct{ label string }
@@ -764,6 +770,7 @@ type model struct {
 	// /session compact <id> trigger; its worker never runs on the UI loop.
 	compactionRunner *compaction.Runner
 	provider         ai.Provider
+	contextCompiler  *contextcompiler.Compiler
 	mgr              *ai.Manager
 	resolver         *modes.Resolver
 	gitEng           *git.Engine
@@ -1355,6 +1362,10 @@ type model struct {
 	// graceful cancellation is initiated. A second Ctrl+C before this deadline
 	// hard-exits with status 130.
 	cancelGraceDeadline time.Time
+	// cancelDeadlineSeq invalidates the hard-deadline detach watchdog (§20.2).
+	// It is incremented when a new operation begins (so a stale 250ms tick can
+	// never detach a newer run) and each time a fresh watchdog is armed.
+	cancelDeadlineSeq uint64
 	// program is the owning Bubble Tea program, used to restore the terminal
 	// before a hard force-exit. Nil in harnesses/tests.
 	program *tea.Program
@@ -3034,6 +3045,14 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 		if cmd := m.stopAutonomousDriver(reason); cmd != nil {
 			extra = append(extra, cmd)
 		}
+	}
+	// §20.2 hard-deadline fallback: a cancelled autonomous run whose worker does
+	// not confirm termination within 250ms must be detached so the input lock
+	// and the BUILDING header can never be held by a wedged worker. (The
+	// gated/executor paths are released synchronously by finalizeOperation, so
+	// they need no watchdog.)
+	if m.autonomousActive {
+		extra = append(extra, m.armTerminalDeadline())
 	}
 
 	return m, tea.Batch(append(extra,

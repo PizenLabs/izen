@@ -181,6 +181,10 @@ func durationOf(p interface{}) time.Duration {
 		return v.Duration
 	case *ValidationDAGPayload:
 		return v.Duration
+	case *ContextCompilationPayload:
+		return 0
+	case *ProviderExecutionPayload:
+		return v.Duration
 	default:
 		return 0
 	}
@@ -346,6 +350,56 @@ func describe(ev Event) stepDesc {
 			if p.Err != "" {
 				d.metrics["error"] = p.Err
 			}
+		}
+	case *InteractionPayload:
+		d.decision = "bound interaction contract"
+		d.outcome = p.Binding.Contract.String()
+		d.metrics = map[string]string{
+			"contract_id": p.Binding.ContractID,
+			"mode":        p.Binding.Mode,
+			"authority":   string(p.Binding.AuthorityLevel),
+			"schema_mode": p.Binding.SchemaMode,
+		}
+		d.sign = signPass
+	case *ContextCompilationPayload:
+		d.decision = "compiled bounded context"
+		d.outcome = "scope=" + p.Result.FittedContextScope
+		d.metrics = map[string]string{
+			"reserved_tokens": strconv.Itoa(p.Result.ReservedTokens),
+			"used_tokens":     strconv.Itoa(p.Result.UsedTokens),
+			"drop_count":      strconv.Itoa(p.Result.DropCount),
+			"truncated_files": strconv.Itoa(p.Result.TruncatedFileCount),
+		}
+		d.sign = signPass
+	case *ProviderExecutionPayload:
+		d.decision = "executed provider turn"
+		d.outcome = p.FinishReason
+		d.metrics = map[string]string{
+			"provider":          p.Provider,
+			"model":             p.Model,
+			"request_ns":        p.RequestDuration.String(),
+			"prompt_tokens":     strconv.Itoa(p.Usage.PromptTokens),
+			"completion_tokens": strconv.Itoa(p.Usage.CompletionTokens),
+			"truncated":         strconv.FormatBool(p.Truncated),
+			"schema_fallback":   strconv.FormatBool(p.SchemaFallback),
+		}
+		if p.Truncated {
+			d.sign = signFail
+		} else {
+			d.sign = signPass
+		}
+	case *AdmissionDecisionPayload:
+		d.decision = "evaluated admission scope"
+		d.outcome = p.ReasonCode
+		d.metrics = map[string]string{
+			"strategy": p.Strategy,
+			"action":   p.Action,
+			"scope":    p.RequestedScope,
+		}
+		if p.Allowed {
+			d.sign = signPass
+		} else {
+			d.sign = signFail
 		}
 	}
 	return d

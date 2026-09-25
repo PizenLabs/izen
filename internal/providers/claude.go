@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,6 +48,27 @@ type claudeThinking struct {
 	BudgetTokens int    `json:"budget_tokens"`
 }
 
+type claudeTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+func claudeTools(tools []ai.ToolDefinition) []claudeTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]claudeTool, 0, len(tools))
+	for _, tool := range tools {
+		out = append(out, claudeTool{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			InputSchema: append(json.RawMessage(nil), tool.Function.Parameters...),
+		})
+	}
+	return out
+}
+
 type claudeRequest struct {
 	Model         string          `json:"model"`
 	Messages      []claudeMessage `json:"messages"`
@@ -58,6 +78,7 @@ type claudeRequest struct {
 	System        string          `json:"system,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
 	Thinking      *claudeThinking `json:"thinking,omitempty"`
+	Tools         []claudeTool    `json:"tools,omitempty"`
 	// ExtraParams carries arbitrary provider-native JSON fields merged
 	// directly into the HTTP POST body (generic passthrough).
 	ExtraParams map[string]any `json:"-"`
@@ -137,6 +158,9 @@ type claudeDelta struct {
 }
 
 func (p *ClaudeProvider) buildMessages(req ai.Request) []claudeMessage {
+	if prepared, _, err := PrepareContractRequest("anthropic", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]claudeMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		content := sanitizeContent(m.Content)
@@ -156,10 +180,16 @@ func thinkingFor(req ai.Request) *claudeThinking {
 }
 
 func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
 	}
+	prepared, plan, err := PrepareContractRequest("anthropic", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -176,7 +206,11 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		System:        req.System,
 		StopSequences: req.Stop,
 		Thinking:      thinkingFor(req),
+		Tools:         claudeTools(req.Tools),
 		ExtraParams:   req.ExtraParams,
+	}
+	if isCasualSystemPrompt(req.System) {
+		body.Tools = nil
 	}
 
 	payload, err := json.Marshal(body)
@@ -200,7 +234,6 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		return nil, fmt.Errorf("claude: do request: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -224,7 +257,7 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if claudeResp.Usage != nil {
 		tokenIn = claudeResp.Usage.InputTokens
 		tokenOut = claudeResp.Usage.OutputTokens
@@ -236,19 +269,31 @@ func (p *ClaudeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 		usage.FirstTokenAt = usage.CompletedAt
 	}
 
-	return &ai.Response{
+	finishReason := claudeStopReason(claudeResp.StopReason)
+	response := &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
 		Usage:       usage,
-	}, nil
+	}
+	StampResponseMetadata(response, "anthropic", model, plan, finishReason)
+	if response.Truncated {
+		return response, ai.NewOutputTruncated("anthropic", "length")
+	}
+	return response, nil
 }
 
 func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
 	}
+	prepared, plan, err := PrepareContractRequest("anthropic", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
@@ -265,6 +310,7 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 		System:        req.System,
 		StopSequences: req.Stop,
 		Thinking:      thinkingFor(req),
+		Tools:         claudeTools(req.Tools),
 		ExtraParams:   req.ExtraParams,
 	}
 
@@ -295,26 +341,26 @@ func (p *ClaudeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		return nil, NewProviderError("anthropic", resp.StatusCode, respBody)
 	}
 
 	sr := &claudeSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &ClaudeStreamResult{ReadCloser: sr, sr: sr}, nil
+	return &ClaudeStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("anthropic", model, plan)}, nil
 }
 
 type ClaudeStreamResult struct {
 	io.ReadCloser
-	sr *claudeSSEReader
+	sr       *claudeSSEReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *ClaudeStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -325,14 +371,25 @@ func (r *ClaudeStreamResult) Usage() ai.ProviderUsage {
 // stop_reason ("end_turn", "tool_use", ...) is returned.
 func (r *ClaudeStreamResult) FinishReason() string {
 	if r.sr != nil {
-		switch r.sr.finishReason {
-		case "max_tokens":
-			return "length"
-		default:
-			return r.sr.finishReason
-		}
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// this stream.
+func (r *ClaudeStreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
+}
+
+func (r *ClaudeStreamResult) TruncationError() error {
+	if r == nil {
+		return nil
+	}
+	return streamTruncationError("anthropic", r.FinishReason())
 }
 
 type claudeSSEReader struct {
@@ -383,11 +440,8 @@ func (s *claudeSSEReader) closeTerminal(stopReason string) {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
 	s.closed = true
+	_ = closeSSERequest(s.cancel, s.body, nil)
 }
 
 func (s *claudeSSEReader) Read(p []byte) (int, error) {
@@ -403,9 +457,24 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.usage.markInterrupted()
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" {
+				s.closed = true
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				s.stopIdle()
+				s.usage.markCompleted(time.Now(), claudeStopReason(s.finishReason))
+				_ = closeSSERequest(s.cancel, s.body, nil)
+				return 0, io.EOF
 			}
+			s.usage.markInterrupted()
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
+			s.closed = true
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -419,6 +488,12 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 		}
 
 		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			// [DONE] is a semantic terminal sentinel for SSE-compatible
+			// gateways. Close immediately; never wait for a server-side EOF.
+			s.closeTerminal(s.finishReason)
+			return 0, io.EOF
+		}
 
 		var event claudeStreamEvent
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
@@ -487,14 +562,13 @@ func (s *claudeSSEReader) Read(p []byte) (int, error) {
 }
 
 func (s *claudeSSEReader) Close() error {
+	if s.closed {
+		return nil
+	}
 	s.closed = true
 	if s.lifecycle != nil {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
-	return s.body.Close()
+	return closeSSERequest(s.cancel, s.body, nil)
 }

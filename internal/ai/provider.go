@@ -2,38 +2,205 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
-// ErrPayloadTruncated is the transport-level signal that the provider
-// truncated the response at its max_tokens ceiling (finish_reason ==
-// "length"). Callers must fail fast with this error before any JSON or
-// envelope parsing and must NOT attempt a FULL_REWRITE -> BOUNDED_PATCH
-// transition on the truncated bytes.
-var ErrPayloadTruncated = errors.New("model output exceeded max_tokens limit: ErrPayloadTruncated")
+// ErrPayloadTruncated is the historical transport-level name for an output
+// ceiling.  It aliases the protocol-level sentinel so every provider stack
+// agrees on errors.Is identity.
+var ErrPayloadTruncated = protocol.ErrOutputTruncated
+
+// ErrOutputTruncated is the provider-neutral name used by the Phase 12
+// interaction contract.  Keep both names: older callers and adapters use
+// ErrPayloadTruncated while new structural gates use ErrOutputTruncated.
+var ErrOutputTruncated = protocol.ErrOutputTruncated
+
+// OutputTruncatedError is the typed carrier accepted by all provider stacks.
+type OutputTruncatedError = protocol.OutputTruncatedError
+
+// NewOutputTruncated builds a typed truncation error while preserving the
+// provider-native finish reason for diagnostics.
+func NewOutputTruncated(provider, finishReason string) error {
+	return protocol.NewOutputTruncated(provider, finishReason)
+}
+
+// IsOutputTruncated reports whether err carries the canonical truncation
+// signal.
+func IsOutputTruncated(err error) bool { return errors.Is(err, ErrOutputTruncated) }
 
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type ResponseFormat struct {
-	Type string `json:"type"` // "json_object" or "text"
+// JSONSchemaFormat is the OpenAI-compatible json_schema envelope. Keeping the
+// schema as RawMessage lets a protocol descriptor be forwarded without a
+// lossy map[string]any round trip.
+type JSONSchemaFormat struct {
+	Name   string          `json:"name"`
+	Strict bool            `json:"strict"`
+	Schema json.RawMessage `json:"schema"`
 }
 
+// ResponseFormat is the provider-neutral structured-output request shape. Type
+// may be the legacy "json_object"/"text" value or the OpenAI-compatible
+// "json_schema" value. Name, Strict, and Schema are convenience fields used by
+// adapters; MarshalJSON emits the provider's nested json_schema envelope.
+type ResponseFormat struct {
+	Type       string            `json:"type"` // "json_schema", "json_object", or "text"
+	Name       string            `json:"-"`
+	Strict     bool              `json:"-"`
+	Schema     json.RawMessage   `json:"-"`
+	JSONSchema *JSONSchemaFormat `json:"-"`
+}
+
+// MarshalJSON keeps the old two-field representation byte-for-byte compatible
+// while allowing the native JSON Schema representation to be added without a
+// second request type.
+func (f ResponseFormat) MarshalJSON() ([]byte, error) {
+	if f.Type != "json_schema" {
+		return json.Marshal(struct {
+			Type string `json:"type"`
+		}{Type: f.Type})
+	}
+	format := f.JSONSchema
+	if format == nil {
+		format = &JSONSchemaFormat{}
+	} else {
+		copy := *format
+		format = &copy
+	}
+	if format.Name == "" {
+		format.Name = f.Name
+	}
+	if format.Name == "" {
+		format.Name = "interaction_contract"
+	}
+	if !format.Strict {
+		format.Strict = f.Strict
+	}
+	if len(format.Schema) == 0 {
+		format.Schema = append(json.RawMessage(nil), f.Schema...)
+	}
+	if len(format.Schema) == 0 {
+		format.Schema = json.RawMessage(`{"type":"object"}`)
+	}
+	return json.Marshal(struct {
+		Type       string            `json:"type"`
+		JSONSchema *JSONSchemaFormat `json:"json_schema"`
+	}{Type: f.Type, JSONSchema: format})
+}
+
+// NewJSONSchemaResponseFormat creates the native OpenAI-compatible structured
+// output envelope from a provider-neutral schema document.
+func NewJSONSchemaResponseFormat(name string, schema json.RawMessage) *ResponseFormat {
+	return &ResponseFormat{
+		Type:   "json_schema",
+		Name:   name,
+		Strict: true,
+		Schema: append(json.RawMessage(nil), schema...),
+	}
+}
+
+// UnmarshalJSON accepts both the compact convenience representation and the
+// provider's nested json_schema envelope.
+func (f *ResponseFormat) UnmarshalJSON(data []byte) error {
+	if f == nil {
+		return nil
+	}
+	var wire struct {
+		Type       string            `json:"type"`
+		Name       string            `json:"name"`
+		Strict     bool              `json:"strict"`
+		Schema     json.RawMessage   `json:"schema"`
+		JSONSchema *JSONSchemaFormat `json:"json_schema"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	f.Type = wire.Type
+	f.Name = wire.Name
+	f.Strict = wire.Strict
+	f.Schema = append(json.RawMessage(nil), wire.Schema...)
+	f.JSONSchema = wire.JSONSchema
+	if f.JSONSchema != nil {
+		if f.Name == "" {
+			f.Name = f.JSONSchema.Name
+		}
+		f.Strict = f.JSONSchema.Strict
+		if len(f.Schema) == 0 {
+			f.Schema = append(json.RawMessage(nil), f.JSONSchema.Schema...)
+		}
+	}
+	return nil
+}
+
+// SchemaMode lets an embedding boundary explicitly select the adaptive wire
+// strategy. Empty/Auto is the production default: use native schema support
+// when the adapter knows it, otherwise use the compact prompt fallback.
+type SchemaMode string
+
+const (
+	SchemaModeAuto   SchemaMode = "auto"
+	SchemaModeNative SchemaMode = "native"
+	SchemaModePrompt SchemaMode = "prompt"
+)
+
 type Request struct {
-	Model          string           `json:"model"`
-	Messages       []Message        `json:"messages"`
-	Stream         bool             `json:"stream"`
-	System         string           `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
-	MaxTokens      int              `json:"-"` // 0 = use provider default
-	Stop           []string         `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
-	Temperature    float64          `json:"-"` // 0 = use provider default
-	ResponseFormat *ResponseFormat  `json:"response_format,omitempty"`
-	Tools          []ToolDefinition `json:"-"` // Native LLM function calling tool definitions
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Stream   bool      `json:"stream"`
+	// InteractionContract is the semantic kind of turn requested by the
+	// runtime. It is metadata for the adapter boundary and never grants tool
+	// or execution authority.
+	InteractionContract protocol.InteractionContract `json:"-"`
+	// ContextPhase identifies the semantic phase used by the context budget
+	// compiler ("investigate", "plan", or "execute"). It is intentionally a
+	// string at the transport boundary so lower-level packages can label a
+	// request without importing the compiler implementation.
+	ContextPhase string `json:"-"`
+	// ContextPolicy is the caller-selected workspace projection policy. An
+	// empty value lets the compiler use its conservative repository default;
+	// "none" explicitly forbids workspace/session injection.
+	ContextPolicy string `json:"-"`
+	// ContextPrepared marks a request whose System/Messages projection has
+	// already passed through contextcompiler.Compile. Provider middleware
+	// must not compile the same request a second time.
+	ContextPrepared bool `json:"-"`
+	// Contract carries the normalized per-step descriptor when the caller has
+	// one. A nil value is valid for legacy requests; adapters may derive a
+	// default from InteractionContract without changing dispatch.
+	Contract *protocol.ContractDescriptor `json:"-"`
+	// ContractID is the immutable execution-contract identity resolved by the
+	// runtime. It is metadata only and is never serialized onto a provider wire.
+	ContractID string `json:"-"`
+	// RequestID correlates one provider dispatch with the runtime request.
+	RequestID string `json:"-"`
+	// Mode is the runtime/presentation mode label for audit correlation. It is
+	// descriptive and cannot select execution authority.
+	Mode string `json:"-"`
+	// AuthorityLevel is the descriptor ceiling stamped for observability. It
+	// is not an authorization grant.
+	AuthorityLevel protocol.AuthorityCeiling `json:"-"`
+	System         string                    `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
+	MaxTokens      int                       `json:"-"` // 0 = use provider default
+	Stop           []string                  `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
+	Temperature    float64                   `json:"-"` // 0 = use provider default
+	ResponseFormat *ResponseFormat           `json:"response_format,omitempty"`
+	// SchemaMode optionally overrides the adapter's native-vs-fallback choice.
+	// The default is SchemaModeAuto; it never changes the semantic contract.
+	SchemaMode SchemaMode `json:"-"`
+	// ModelMetadata is an optional provider-catalog fact. An explicit false
+	// SupportsStructuredOutput value forces the prompt fallback even when the
+	// provider family normally accepts a native schema field.
+	ModelMetadata *protocol.ModelMetadata `json:"-"`
+	Tools         []ToolDefinition        `json:"-"` // Native LLM function calling tool definitions
 	// Reasoning carries the resolved reasoning control (effort level, thinking
 	// budget, CoT cap) produced by the decision engine. Providers translate it
 	// into their native API payload (reasoning_effort / thinking.budget_tokens /
@@ -103,6 +270,35 @@ type ProviderUsage struct {
 	RateLimitedRetries int `json:"rate_limited_retries,omitempty"`
 }
 
+// EffectiveContract returns a normalized defensive descriptor or derives a
+// conservative default from the semantic enum. It never mutates the request;
+// malformed or mismatched explicit metadata fails closed as nil.
+func (r Request) EffectiveContract() *protocol.ContractDescriptor {
+	if r.Contract != nil {
+		normalized, err := r.Contract.Clone().Normalize()
+		if err != nil || (r.InteractionContract != "" && r.InteractionContract != normalized.Contract) {
+			return nil
+		}
+		return &normalized
+	}
+	if !r.InteractionContract.Valid() {
+		return nil
+	}
+	d := protocol.Describe(r.InteractionContract)
+	return &d
+}
+
+// StructuralOutputSchema returns the normalized JSON Schema document carried
+// by the request contract. A nil document means the contract is textual or
+// otherwise has no JSON structural output.
+func (r Request) StructuralOutputSchema() (json.RawMessage, error) {
+	descriptor := r.EffectiveContract()
+	if descriptor == nil {
+		return nil, nil
+	}
+	return descriptor.JSONSchema()
+}
+
 // Empty reports whether the usage record carries no known provider usage.
 // This is the "unknown" state and must not render as a literal zero.
 func (u ProviderUsage) Empty() bool {
@@ -124,6 +320,34 @@ type Response struct {
 	TokenInput  int        `json:"token_input"`
 	TokenOutput int        `json:"token_output"`
 	ToolCalls   []ToolCall `json:"tool_calls,omitempty"` // Native LLM function calls from tool_calls finish_reason
+	// Provider and Model identify the wire endpoint that produced this result.
+	// They are metadata only; callers must not infer authority from them.
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+	// InteractionContract and Contract preserve the exact semantic descriptor
+	// used to build the request. Providers return a defensive copy so a caller
+	// cannot mutate admission state through a response value.
+	InteractionContract protocol.InteractionContract `json:"interaction_contract,omitempty"`
+	Contract            *protocol.ContractDescriptor `json:"interaction_contract_descriptor,omitempty"`
+	// ContractMetadata is a compatibility alias for callers that use the
+	// explicit metadata name. It is kept out of JSON to avoid duplicating the
+	// canonical descriptor in serialized evidence.
+	ContractMetadata  *protocol.ContractDescriptor `json:"-"`
+	ContractID        string                       `json:"contract_id,omitempty"`
+	Mode              string                       `json:"mode,omitempty"`
+	AuthorityLevel    protocol.AuthorityCeiling    `json:"authority_level,omitempty"`
+	SchemaMode        SchemaMode                   `json:"schema_mode,omitempty"`
+	SchemaFallback    bool                         `json:"schema_fallback,omitempty"`
+	RequestDuration   time.Duration                `json:"request_duration_ns,omitempty"`
+	Duration          time.Duration                `json:"duration_ns,omitempty"`
+	FirstTokenLatency time.Duration                `json:"first_token_latency_ns,omitempty"`
+	StreamingDuration time.Duration                `json:"streaming_duration_ns,omitempty"`
+	PromptChars       int                          `json:"prompt_chars,omitempty"`
+	OutputChars       int                          `json:"output_chars,omitempty"`
+	PromptFingerprint string                       `json:"prompt_fingerprint,omitempty"`
+	NativeSchema      bool                         `json:"native_schema,omitempty"`
+	Schema            json.RawMessage              `json:"schema,omitempty"`
+	InlineConstraint  string                       `json:"inline_constraint,omitempty"`
 	// FinishReason is the provider's terminal finish_reason when one is
 	// observable ("stop", "length", "tool_calls", ...). Streaming consumers
 	// populate it from the stream's FinishReasonProvider; non-streaming
@@ -132,9 +356,184 @@ type Response struct {
 	// completion ceiling, not finished naturally — so callers can route bounded
 	// continuation instead of blind same-scope retry.
 	FinishReason string `json:"finish_reason,omitempty"`
+	// Truncated is set by a provider adapter when the authoritative provider
+	// metadata reported an output ceiling. It is distinct from merely having a
+	// FinishReason string, which legacy test doubles may populate without
+	// carrying provider truncation provenance.
+	Truncated bool `json:"truncated,omitempty"`
 	// Usage is the authoritative provider-reported usage of this invocation.
 	// Known=false means the provider returned no usage metadata.
 	Usage ProviderUsage `json:"usage,omitempty"`
+}
+
+// OutputError returns the typed truncation error when the response carries
+// output-ceiling metadata. It is safe on nil responses. The explicit
+// Truncated bit remains the strongest provenance signal, while the provider
+// finish reason and authoritative usage reason are also recognized so callers
+// cannot accidentally parse a response whose adapter forgot to set the bit.
+func (r *Response) OutputError() error {
+	if r == nil {
+		return nil
+	}
+	if !r.Truncated &&
+		!protocol.IsOutputTruncatedReason(r.FinishReason) &&
+		!protocol.IsOutputTruncatedReason(r.Usage.FinishReason) {
+		return nil
+	}
+	reason := r.FinishReason
+	if !protocol.IsOutputTruncatedReason(reason) {
+		reason = r.Usage.FinishReason
+	}
+	if !protocol.IsOutputTruncatedReason(reason) {
+		reason = ""
+	} else {
+		reason = "length"
+	}
+	return NewOutputTruncated(r.Provider, reason)
+}
+
+// ValidateOutputCompletion is the response-boundary form of OutputError.
+func ValidateOutputCompletion(resp *Response) error {
+	if resp == nil {
+		return nil
+	}
+	return resp.OutputError()
+}
+
+// ResponseMetadata is the standardized provider payload metadata wrapper. It
+// keeps protocol identity, terminal outcome, and authoritative usage together
+// for non-streaming callers and for stream result implementations.
+type ResponseMetadata struct {
+	Provider            string                       `json:"provider,omitempty"`
+	Model               string                       `json:"model,omitempty"`
+	InteractionContract protocol.InteractionContract `json:"interaction_contract,omitempty"`
+	Contract            *protocol.ContractDescriptor `json:"interaction_contract_descriptor,omitempty"`
+	ContractMetadata    *protocol.ContractDescriptor `json:"-"`
+	ContractID          string                       `json:"contract_id,omitempty"`
+	Mode                string                       `json:"mode,omitempty"`
+	AuthorityLevel      protocol.AuthorityCeiling    `json:"authority_level,omitempty"`
+	SchemaMode          SchemaMode                   `json:"schema_mode,omitempty"`
+	SchemaFallback      bool                         `json:"schema_fallback,omitempty"`
+	RequestDuration     time.Duration                `json:"request_duration_ns,omitempty"`
+	Duration            time.Duration                `json:"duration_ns,omitempty"`
+	FirstTokenLatency   time.Duration                `json:"first_token_latency_ns,omitempty"`
+	StreamingDuration   time.Duration                `json:"streaming_duration_ns,omitempty"`
+	PromptChars         int                          `json:"prompt_chars,omitempty"`
+	OutputChars         int                          `json:"output_chars,omitempty"`
+	PromptFingerprint   string                       `json:"prompt_fingerprint,omitempty"`
+	FinishReason        string                       `json:"finish_reason,omitempty"`
+	Truncated           bool                         `json:"truncated,omitempty"`
+	NativeSchema        bool                         `json:"native_schema,omitempty"`
+	Schema              json.RawMessage              `json:"schema,omitempty"`
+	InlineConstraint    string                       `json:"inline_constraint,omitempty"`
+	Usage               ProviderUsage                `json:"usage,omitempty"`
+}
+
+// ProviderPayload and StandardizedResponse are descriptive aliases for
+// integrations that name the response wrapper after its transport boundary.
+type ProviderPayload = ResponseMetadata
+type StandardizedResponse = ResponseMetadata
+
+// Metadata returns a defensive, uniform view of the response envelope.
+func (r *Response) Metadata() ResponseMetadata {
+	if r == nil {
+		return ResponseMetadata{}
+	}
+	contract := r.Contract
+	if contract == nil {
+		contract = r.ContractMetadata
+	}
+	if contract != nil {
+		copy := contract.Clone()
+		contract = &copy
+	}
+	usage := r.Usage
+	if r.FinishReason != "" && usage.FinishReason == "" {
+		usage.FinishReason = r.FinishReason
+	}
+	if protocol.IsOutputTruncatedReason(usage.FinishReason) {
+		usage.FinishReason = "length"
+	}
+	if r.Truncated && usage.FinishReason == "" {
+		usage.FinishReason = "length"
+	}
+	finishReason := protocol.NormalizeFinishReason(r.FinishReason)
+	if finishReason == "" {
+		finishReason = usage.FinishReason
+	}
+	truncated := r.Truncated || protocol.IsOutputTruncatedReason(finishReason)
+	requestDuration := r.RequestDuration
+	if requestDuration <= 0 && !usage.RequestStartedAt.IsZero() && !usage.CompletedAt.IsZero() {
+		requestDuration = usage.CompletedAt.Sub(usage.RequestStartedAt)
+	}
+	if requestDuration < 0 {
+		requestDuration = 0
+	}
+	firstTokenLatency := r.FirstTokenLatency
+	if firstTokenLatency <= 0 && !usage.RequestStartedAt.IsZero() && !usage.FirstTokenAt.IsZero() {
+		firstTokenLatency = usage.FirstTokenAt.Sub(usage.RequestStartedAt)
+	}
+	if firstTokenLatency < 0 {
+		firstTokenLatency = 0
+	}
+	streamingDuration := r.StreamingDuration
+	if streamingDuration <= 0 && !usage.FirstTokenAt.IsZero() && !usage.CompletedAt.IsZero() {
+		streamingDuration = usage.CompletedAt.Sub(usage.FirstTokenAt)
+	}
+	if streamingDuration < 0 {
+		streamingDuration = 0
+	}
+	return ResponseMetadata{
+		Provider:            r.Provider,
+		Model:               r.Model,
+		InteractionContract: r.InteractionContract,
+		Contract:            contract,
+		ContractMetadata:    contract,
+		ContractID:          r.ContractID,
+		Mode:                r.Mode,
+		AuthorityLevel:      r.AuthorityLevel,
+		SchemaMode:          r.SchemaMode,
+		SchemaFallback:      r.SchemaFallback,
+		RequestDuration:     requestDuration,
+		Duration:            requestDuration,
+		FirstTokenLatency:   firstTokenLatency,
+		StreamingDuration:   streamingDuration,
+		PromptChars:         r.PromptChars,
+		OutputChars:         r.OutputChars,
+		PromptFingerprint:   r.PromptFingerprint,
+		FinishReason:        finishReason,
+		Truncated:           truncated,
+		NativeSchema:        r.NativeSchema,
+		Schema:              append(json.RawMessage(nil), r.Schema...),
+		InlineConstraint:    r.InlineConstraint,
+		Usage:               usage,
+	}
+}
+
+// ProviderPayload returns the standardized transport wrapper under its
+// provider-oriented name.
+func (r *Response) ProviderPayload() ResponseMetadata { return r.Metadata() }
+
+// SetContractMetadata stamps the request identity onto a response without
+// retaining the caller's mutable descriptor pointer.
+func (r *Response) SetContractMetadata(provider, model string, contract protocol.InteractionContract, descriptor *protocol.ContractDescriptor) {
+	if r == nil {
+		return
+	}
+	r.Provider = provider
+	r.Model = model
+	if contract == "" && descriptor != nil {
+		contract = descriptor.Contract
+	}
+	r.InteractionContract = contract
+	if descriptor == nil {
+		r.Contract = nil
+		r.ContractMetadata = nil
+		return
+	}
+	copy := descriptor.Clone()
+	r.Contract = &copy
+	r.ContractMetadata = &copy
 }
 
 type Provider interface {
@@ -149,6 +548,20 @@ type Provider interface {
 // ceiling (finish_reason == "length") rather than finished naturally ("stop").
 type FinishReasonProvider interface {
 	FinishReason() string
+}
+
+// TruncationProvider is implemented by stream results that can expose a typed
+// output-ceiling error without changing io.Reader's historical EOF behavior.
+// Consumers should prefer this over comparing provider-specific strings.
+type TruncationProvider interface {
+	TruncationError() error
+}
+
+// ResponseMetadataProvider is implemented by stream results that can expose
+// the same standardized contract/finish-reason wrapper as a non-streaming
+// response. The core pipeline uses this metadata after the reader reaches EOF.
+type ResponseMetadataProvider interface {
+	ResponseMetadata() ResponseMetadata
 }
 
 // UsageProvider is implemented by stream results that can report the

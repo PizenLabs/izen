@@ -7,6 +7,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // ── RuntimeState ────────────────────────────────────────────────────────────
@@ -203,6 +204,11 @@ type Observation struct {
 	// re-submits with ParentContractID = this ID so the runtime appends a
 	// causally linked recovery contract instead of rewriting history.
 	ContractID string
+	// InteractionContract and Contract preserve the semantic descriptor that
+	// was active for this observation. They are evidence metadata only; the
+	// execution ContractID above remains the authorization/lineage identity.
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 	// Intent is the classified intent (authoritative).
 	Intent Intent
 	// Target is the resolved mutation target (authoritative).
@@ -550,6 +556,11 @@ type LoopRequest struct {
 	IntentConfidence float64
 	TargetConfidence float64
 	Scope            string
+	// InteractionContract and Contract are Phase 12 G2 per-step protocol
+	// metadata. They describe the semantic turn; they do not grant provider
+	// tools or execution authority.
+	InteractionContract protocol.InteractionContract
+	Contract            *protocol.ContractDescriptor
 	// RecoveryAttempt is the 1-indexed attempt number for this request (0 = initial).
 	RecoveryAttempt int
 	// RecoveryReason is the human-readable reason for a recovery re-execution.
@@ -577,6 +588,10 @@ type LoopRequest struct {
 	// evaluated individually and the monolithic full-rewrite estimation of
 	// the original target is suppressed. Nil for non-DAG requests.
 	StagedPlan *planner.ExecutionDAG
+	// StagedSubTasks is the normalized scope view used by alternate callers
+	// that already projected a DAG. It is still subject to the active
+	// contract's authority guard before dispatch.
+	StagedSubTasks []execution.SubTaskScope
 	// ProposalIntent carries the human-selected interactive proposal strategy
 	// (Phase 2 proposal gateway) injected into the execution-context
 	// constraints for this attempt. It is pure data selected on the TUI

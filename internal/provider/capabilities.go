@@ -72,7 +72,7 @@ func MapFinishReason(finishReason string) StreamOutcome {
 	switch strings.ToLower(strings.TrimSpace(finishReason)) {
 	case "stop", "end_turn", "complete", "completed", "tool_calls", "function_call":
 		return StreamComplete
-	case "length", "max_tokens", "max-output-tokens", "output_truncated":
+	case "length", "max_tokens", "max-output-tokens", "max-output-token", "max_output_tokens", "max_output_token", "max output tokens", "max output token", "max_output", "output_truncated", "truncated", "token_limit", "output_limit":
 		return StreamPartial
 	case "error", "failed", "failure":
 		return StreamFailed

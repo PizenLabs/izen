@@ -193,8 +193,11 @@ func (e *Engine) groundCandidateTasks(candidates []Task, ledgerContent string) [
 	candidates = FilterUnsolicitedPkgFiles(candidates, ledgerContent)
 	candidates = FilterUndefinedSymbolShellExec(candidates, ledgerContent)
 	candidates = FilterNonExistentMutationTargets(candidates, e.rootPath)
+	if e.archetype != recon.UNKNOWN_GENERIC {
+		candidates = FilterTasksForArchetype(candidates, e.archetype)
+	}
 	if e.vanillaWeb {
-		candidates = EnforceFrontendDomainIsolation(candidates)
+		candidates = FilterTasksForArchetype(candidates, recon.VANILLA_WEB)
 		candidates = SanitizeTasksForArchetype(candidates, recon.VANILLA_WEB)
 	}
 	return candidates
@@ -214,24 +217,37 @@ func (e *Engine) salvageValidTasks(content, problem, ledgerContent string) []Tas
 	if content == "" {
 		return nil
 	}
+	descriptor := e.LastContract()
+	if descriptor == nil {
+		return nil
+	}
 
 	// Tolerant markdown blocks: Mini/free models emit "- [ ] TASK" lines even
-	// when the JSON was cut off. Accept them through the same validation gates.
-	if md := ParseMarkdownToTasks(content); len(md) > 0 {
-		md = filterValidTasks(md)
-		md = FilterNonExistentMutationTargets(md, e.rootPath)
-		if e.vanillaWeb {
-			md = EnforceFrontendDomainIsolation(md)
-			md = SanitizeTasksForArchetype(md, recon.VANILLA_WEB)
-		}
-		if len(md) > 0 && !hasInvalidShellExecCommand(md) {
-			return md
+	// when the JSON was cut off. Accept them only when the complete task-block
+	// contract validates; partial/prose fragments never become staged state.
+	if err := ValidateContractOutput(content, *descriptor, true); err == nil {
+		if md := ParseMarkdownToTasks(content); len(md) > 0 {
+			md = filterValidTasks(md)
+			md = FilterNonExistentMutationTargets(md, e.rootPath)
+			if e.archetype != recon.UNKNOWN_GENERIC {
+				md = FilterTasksForArchetype(md, e.archetype)
+			}
+			if e.vanillaWeb {
+				md = FilterTasksForArchetype(md, recon.VANILLA_WEB)
+				md = SanitizeTasksForArchetype(md, recon.VANILLA_WEB)
+			}
+			if len(md) > 0 && !hasInvalidShellExecCommand(md) {
+				return md
+			}
 		}
 	}
 
 	// Full JSON plan: a truncation that closed cleanly at a task boundary
 	// (tolerant sanitization/auto-close) yields a valid, complete plan with the
 	// tasks emitted before exhaustion — an independently valid atomic result.
+	if err := ValidateContractOutput(content, *descriptor); err != nil {
+		return nil
+	}
 	jsonResult := ParseJSONPlan(content)
 	if jsonResult.Valid && len(jsonResult.Tasks) > 0 {
 		var candidates []Task
@@ -357,7 +373,8 @@ func (e *Engine) commitStepState(step *synthesisStepState, problem, ledgerConten
 
 // synthesizeBoundedContinuation completes a plan whose FIRST provider response
 // was cut off at the output ceiling (finish_reason="length"). It is the bounded
-// continuity driver:
+// continuity driver for legacy marker-free responses and for the validated
+// state that may be retained for bounded recovery:
 //
 //   - salvageValidTasks commits ONLY validated atomic results (atomic commit).
 //   - No salvage → NO STATE COMMIT → the next step is rescheduled with a
@@ -402,7 +419,21 @@ func (e *Engine) synthesizeBoundedContinuation(ctx context.Context, baseReq ai.R
 		req.Messages[len(req.Messages)-1].Content = boundedContinuationAppend(step.baseUserContent, step.staged, step.taskBudget)
 
 		nextResp, err := e.complete(ctx, req)
-		if err != nil || nextResp == nil || strings.TrimSpace(nextResp.Content) == "" {
+		if err != nil {
+			if ai.IsOutputTruncated(err) {
+				// A provider-authenticated length result is not a valid
+				// continuation artifact. Do not mine its partial buffer or
+				// silently convert the failure into a successful staged plan.
+				// A marker-free legacy double is tolerated only when its JSON
+				// is already complete; the explicit marker is fail-closed.
+				if nextResp == nil || nextResp.Truncated || !completeJSONArtifact(nextResp.Content) {
+					return nil, fmt.Errorf("plan engine: bounded continuation response was truncated: %w", err)
+				}
+			} else {
+				return e.commitStepState(step, problem, ledgerContent)
+			}
+		}
+		if nextResp == nil || strings.TrimSpace(nextResp.Content) == "" {
 			return e.commitStepState(step, problem, ledgerContent)
 		}
 
@@ -424,8 +455,17 @@ func (e *Engine) synthesizeBoundedContinuation(ctx context.Context, baseReq ai.R
 		}
 
 		// Natural stop: the model had room to complete — accept its plan,
-		// merged with the committed staged state.
+		// merged with the committed staged state.  The same structural gate
+		// used by the initial turn runs here as well; continuation never gets
+		// a weaker parser merely because it is a later step.
 		e.emit(events.NewStepCompleted(step.stepOrdinal(), len(step.staged), nextResp.FinishReason))
+		if req.Contract == nil {
+			return e.commitStepState(step, problem, ledgerContent)
+		}
+		if err := ValidateContractOutput(nextResp.Content, *req.Contract); err != nil {
+			return e.commitStepState(step, problem, ledgerContent)
+		}
+		_ = e.store.SaveRawMarkdown("plan", nextResp.Content) //nolint:contextcheck // persist only a schema-valid continuation artifact
 		parsed := ParseJSONPlan(cleanLLMResponse(nextResp.Content))
 		if parsed.Valid && len(parsed.Tasks) > 0 {
 			var cands []Task

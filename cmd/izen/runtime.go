@@ -15,6 +15,7 @@ import (
 	"github.com/PizenLabs/izen/internal/app"
 	"github.com/PizenLabs/izen/internal/app/compiler"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/contextcompiler"
 	"github.com/PizenLabs/izen/internal/events"
 	auditevents "github.com/PizenLabs/izen/internal/events/audit"
 	"github.com/PizenLabs/izen/internal/ir"
@@ -62,10 +63,11 @@ type cliGenerator struct {
 // Complete implements app.Generator.
 func (g *cliGenerator) Complete(ctx context.Context, system, prompt string, _ int) (string, error) {
 	resp, err := g.provider.Execute(ctx, ai.Request{
-		Model:    g.model,
-		System:   system,
-		Messages: []ai.Message{{Role: "user", Content: prompt}},
-		Stream:   false,
+		Model:        g.model,
+		System:       system,
+		Messages:     []ai.Message{{Role: "user", Content: prompt}},
+		Stream:       false,
+		ContextPhase: "execute",
 	})
 	if err != nil {
 		return "", err
@@ -87,10 +89,11 @@ type semanticExtractorAdapter struct {
 // Extract implements compiler.SemanticExtractor.
 func (e *semanticExtractorAdapter) Extract(ctx context.Context, system, prompt string) (string, error) {
 	resp, err := e.provider.Execute(ctx, ai.Request{
-		Model:    e.model,
-		System:   system,
-		Messages: []ai.Message{{Role: "user", Content: prompt}},
-		Stream:   false,
+		Model:        e.model,
+		System:       system,
+		Messages:     []ai.Message{{Role: "user", Content: prompt}},
+		Stream:       false,
+		ContextPhase: "investigate",
 	})
 	if err != nil {
 		return "", err
@@ -155,6 +158,7 @@ func runRuntimeCommand(args []string) error {
 	if err != nil {
 		return err
 	}
+	provider = contextcompiler.New().WrapProvider(provider)
 	fmt.Fprintf(os.Stderr, "izen: v3 engine provider=%s model=%s root=%s\n", provider.Name(), model, dir)
 
 	// A shared RuntimeKnowledge graph caches the workspace scan across the

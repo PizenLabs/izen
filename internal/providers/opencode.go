@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -60,6 +59,9 @@ func (p *OpenCodeProvider) resolveAPIKey() string {
 }
 
 func (p *OpenCodeProvider) buildMessages(req ai.Request) []opencodeMessage {
+	if prepared, _, err := PrepareContractRequest("opencode", req); err == nil {
+		req = prepared
+	}
 	msgs := make([]opencodeMessage, 0, len(req.Messages)+1)
 	if req.System != "" {
 		msgs = append(msgs, opencodeMessage{Role: "system", Content: req.System})
@@ -72,6 +74,7 @@ func (p *OpenCodeProvider) buildMessages(req ai.Request) []opencodeMessage {
 }
 
 func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
@@ -81,17 +84,23 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 	if key == "" {
 		return nil, fmt.Errorf("opencode: api key is empty — set OPENCODE_API_KEY or configure api_key in provider config")
 	}
+	prepared, plan, err := PrepareContractRequest("opencode", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
 	body := opencodeRequest{
-		Model:       model,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stop:        req.Stop,
-		Stream:      false,
-		ExtraParams: req.ExtraParams,
+		Model:          model,
+		Messages:       msgs,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		Stop:           req.Stop,
+		Stream:         false,
+		ResponseFormat: req.ResponseFormat,
+		ExtraParams:    req.ExtraParams,
 	}
 
 	// INVARIANT 1: casual minimal prompts must never carry tools.
@@ -126,7 +135,6 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 		return nil, fmt.Errorf("opencode: do: %w", err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -165,7 +173,7 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if ocResp.Usage != nil {
 		tokenIn = ocResp.Usage.PromptTokens
 		tokenOut = ocResp.Usage.CompletionTokens
@@ -179,16 +187,22 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 		usage.FirstTokenAt = usage.CompletedAt
 	}
 
-	return &ai.Response{
+	response := &ai.Response{
 		Content:     content,
 		TokenInput:  tokenIn,
 		TokenOutput: tokenOut,
 		ToolCalls:   toolCalls,
 		Usage:       usage,
-	}, nil
+	}
+	StampResponseMetadata(response, "opencode", model, plan, ocResp.Choices[0].FinishReason)
+	if response.Truncated {
+		return response, ai.NewOutputTruncated("opencode", "length")
+	}
+	return response, nil
 }
 
 func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
@@ -198,18 +212,24 @@ func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (i
 	if key == "" {
 		return nil, fmt.Errorf("opencode: api key is empty — set OPENCODE_API_KEY or configure api_key in provider config")
 	}
+	prepared, plan, err := PrepareContractRequest("opencode", req)
+	if err != nil {
+		return nil, err
+	}
+	req = prepared
 
 	msgs := p.buildMessages(req)
 
 	body := opencodeRequest{
-		Model:         model,
-		Messages:      msgs,
-		MaxTokens:     req.MaxTokens,
-		Temperature:   req.Temperature,
-		Stop:          req.Stop,
-		Stream:        true,
-		StreamOptions: &streamOptions{IncludeUsage: true},
-		ExtraParams:   req.ExtraParams,
+		Model:          model,
+		Messages:       msgs,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		Stop:           req.Stop,
+		Stream:         true,
+		StreamOptions:  &streamOptions{IncludeUsage: true},
+		ResponseFormat: req.ResponseFormat,
+		ExtraParams:    req.ExtraParams,
 	}
 
 	// INVARIANT 1: casual minimal prompts must never carry tools.
@@ -251,16 +271,15 @@ func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (i
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		cancel()
-		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		return nil, NewProviderError("opencode", resp.StatusCode, respBody)
 	}
 
 	sr := &opencodeSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
-	return &OpenCodeStreamResult{ReadCloser: sr, sr: sr}, nil
+	return &OpenCodeStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("opencode", model, plan)}, nil
 }
 
 type opencodeMessage struct {
@@ -269,14 +288,15 @@ type opencodeMessage struct {
 }
 
 type opencodeRequest struct {
-	Model         string            `json:"model"`
-	Messages      []opencodeMessage `json:"messages"`
-	MaxTokens     int               `json:"max_tokens,omitempty"`
-	Temperature   float64           `json:"temperature,omitempty"`
-	Stop          []string          `json:"stop,omitempty"`
-	Stream        bool              `json:"stream,omitempty"`
-	StreamOptions *streamOptions    `json:"stream_options,omitempty"`
-	Tools         []json.RawMessage `json:"tools,omitempty"`
+	Model          string             `json:"model"`
+	Messages       []opencodeMessage  `json:"messages"`
+	MaxTokens      int                `json:"max_tokens,omitempty"`
+	Temperature    float64            `json:"temperature,omitempty"`
+	Stop           []string           `json:"stop,omitempty"`
+	Stream         bool               `json:"stream,omitempty"`
+	StreamOptions  *streamOptions     `json:"stream_options,omitempty"`
+	ResponseFormat *ai.ResponseFormat `json:"response_format,omitempty"`
+	Tools          []json.RawMessage  `json:"tools,omitempty"`
 	// ExtraParams carries arbitrary provider-native JSON fields merged
 	// directly into the HTTP POST body (generic passthrough).
 	ExtraParams map[string]any `json:"-"`
@@ -352,12 +372,13 @@ func (u *opencodeUsage) ProviderUsage() ai.ProviderUsage {
 
 type OpenCodeStreamResult struct {
 	io.ReadCloser
-	sr *opencodeSSEReader
+	sr       *opencodeSSEReader
+	metadata ai.ResponseMetadata
 }
 
 func (r *OpenCodeStreamResult) Usage() ai.ProviderUsage {
 	if r.sr != nil {
-		return r.sr.usage.Usage()
+		return normalizeUsageMetadata(r.sr.usage.Usage())
 	}
 	return ai.ProviderUsage{}
 }
@@ -366,9 +387,25 @@ func (r *OpenCodeStreamResult) Usage() ai.ProviderUsage {
 // ("stop", "length", "tool_calls", ...), or "" if none was seen.
 func (r *OpenCodeStreamResult) FinishReason() string {
 	if r.sr != nil {
-		return r.sr.finishReason
+		return NormalizeFinishReason(r.sr.finishReason)
 	}
 	return ""
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper for
+// this stream.
+func (r *OpenCodeStreamResult) ResponseMetadata() ai.ResponseMetadata {
+	if r == nil {
+		return ai.ResponseMetadata{}
+	}
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
+}
+
+func (r *OpenCodeStreamResult) TruncationError() error {
+	if r == nil {
+		return nil
+	}
+	return streamTruncationError("opencode", r.FinishReason())
 }
 
 type opencodeSSEReader struct {
@@ -425,11 +462,8 @@ func (s *opencodeSSEReader) closeTerminal(reason string) {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
 	s.closed = true
+	_ = closeSSERequest(s.cancel, s.body, nil)
 }
 
 func (s *opencodeSSEReader) Read(p []byte) (int, error) {
@@ -451,9 +485,24 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 	for {
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.usage.markInterrupted()
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "data: [DONE]" {
+				s.closed = true
+				if s.lifecycle != nil {
+					s.lifecycle.MarkClosed()
+				}
+				s.stopIdle()
+				s.usage.markCompleted(time.Now(), s.finishReason)
+				_ = closeSSERequest(s.cancel, s.body, nil)
+				return 0, io.EOF
 			}
+			s.usage.markInterrupted()
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
+			s.closed = true
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -469,12 +518,13 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 		data := strings.TrimPrefix(line, "data: ")
 
 		if data == "[DONE]" {
-			if s.cancel != nil {
-				s.cancel()
-			}
-			_, _ = io.Copy(io.Discard, s.body)
 			s.closed = true
+			if s.lifecycle != nil {
+				s.lifecycle.MarkClosed()
+			}
+			s.stopIdle()
 			s.usage.markCompleted(time.Now(), s.finishReason)
+			_ = closeSSERequest(s.cancel, s.body, nil)
 			return 0, io.EOF
 		}
 
@@ -511,11 +561,8 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 				if s.lifecycle != nil {
 					s.lifecycle.MarkClosed()
 				}
-				if s.cancel != nil {
-					s.cancel()
-				}
-				_, _ = io.Copy(io.Discard, s.body)
 				s.closed = true
+				_ = closeSSERequest(s.cancel, s.body, nil)
 				return n, nil
 			}
 			s.closeTerminal(chunk.Choices[0].FinishReason)
@@ -594,14 +641,13 @@ func (s *opencodeSSEReader) Read(p []byte) (int, error) {
 }
 
 func (s *opencodeSSEReader) Close() error {
+	if s.closed {
+		return nil
+	}
 	s.closed = true
 	if s.lifecycle != nil {
 		s.lifecycle.MarkClosed()
 	}
 	s.stopIdle()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	_, _ = io.Copy(io.Discard, s.body)
-	return s.body.Close()
+	return closeSSERequest(s.cancel, s.body, nil)
 }

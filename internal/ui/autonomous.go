@@ -94,6 +94,21 @@ type autonomousRunMsg struct {
 
 var _ tea.Msg = autonomousRunMsg{}
 
+// driveAutonomy executes one driver operation and routes its outcome into the
+// Bubble Tea event loop through the terminal-event contract (see terminal.go):
+// an unrecoverable error becomes a strongly-typed TerminalExecutionMsg, while
+// every other outcome (parked boundary, terminal loop state, or a recoverable
+// DecisionSurface selection rejection) stays an autonomousRunMsg. It is the
+// single emission point for the autonomous path, so Esc/Ctrl+C and provider
+// failures both converge on ONE truthful termination path.
+func (m *model) driveAutonomy(run func() (*autonomy.LoopTermination, error)) tea.Msg {
+	term, err := run()
+	if err != nil && !isRecoverableAutonomyErr(err) {
+		return newTerminalExecutionMsg("autonomy", err)
+	}
+	return autonomousRunMsg{term: term, err: err}
+}
+
 // runAutonomousDriver starts a fresh bounded driver run for the objective
 // under a foreground operation. Duplicate-start protection mirrors the
 // driver's own single-lane guard: only one run may be active or parked, so a
@@ -170,8 +185,9 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 	return tea.Batch(
 		readerCmd,
 		func() tea.Msg {
-			term, err := m.autonomousDriver.Run(ctx, objective)
-			return autonomousRunMsg{term: term, err: err}
+			return m.driveAutonomy(func() (*autonomy.LoopTermination, error) {
+				return m.autonomousDriver.Run(ctx, objective)
+			})
 		},
 		m.smoothStreamTickCmd(),
 		m.shimmerTickCmd(),
@@ -248,8 +264,9 @@ func (m *model) resumeAutonomousApprove() tea.Cmd {
 	m.beginAutonomousResume("autonomy apply")
 	ctx := m.operationContext()
 	return m.autonomousResumeCmds(func() tea.Msg {
-		term, err := m.autonomousDriver.ResumeApprove(ctx)
-		return autonomousRunMsg{term: term, err: err}
+		return m.driveAutonomy(func() (*autonomy.LoopTermination, error) {
+			return m.autonomousDriver.ResumeApprove(ctx)
+		})
 	})
 }
 
@@ -263,8 +280,9 @@ func (m *model) resumeAutonomousReject(reason string) tea.Cmd {
 	m.beginAutonomousResume("autonomy reject")
 	ctx := m.operationContext()
 	return m.autonomousResumeCmds(func() tea.Msg {
-		term, err := m.autonomousDriver.ResumeReject(ctx, reason)
-		return autonomousRunMsg{term: term, err: err}
+		return m.driveAutonomy(func() (*autonomy.LoopTermination, error) {
+			return m.autonomousDriver.ResumeReject(ctx, reason)
+		})
 	})
 }
 
@@ -284,8 +302,9 @@ func (m *model) resumeAutonomousClarify() tea.Cmd {
 	m.beginAutonomousResume("autonomy")
 	ctx := m.operationContext()
 	return m.autonomousResumeCmds(func() tea.Msg {
-		term, err := m.autonomousDriver.ResumeClarify(ctx, target)
-		return autonomousRunMsg{term: term, err: err}
+		return m.driveAutonomy(func() (*autonomy.LoopTermination, error) {
+			return m.autonomousDriver.ResumeClarify(ctx, target)
+		})
 	})
 }
 
@@ -303,8 +322,9 @@ func (m *model) resumeAutonomousProposal(intent string) tea.Cmd {
 	m.beginAutonomousResume("autonomy recovery")
 	ctx := m.operationContext()
 	return m.autonomousResumeCmds(func() tea.Msg {
-		term, err := m.autonomousDriver.ResumeWithProposal(ctx, intent)
-		return autonomousRunMsg{term: term, err: err}
+		return m.driveAutonomy(func() (*autonomy.LoopTermination, error) {
+			return m.autonomousDriver.ResumeWithProposal(ctx, intent)
+		})
 	})
 }
 
@@ -353,8 +373,9 @@ func (m *model) resumeAutonomousProposalApprove() tea.Cmd {
 	// goroutine; the batched spin.Tick loops keep the event loop rendering
 	// (spinner frames + shimmer sweep) for the whole transaction.
 	return m.autonomousResumeCmds(func() tea.Msg {
-		term, err := m.autonomousDriver.ResumeApproveProposal(ctx)
-		return autonomousRunMsg{term: term, err: err}
+		return m.driveAutonomy(func() (*autonomy.LoopTermination, error) {
+			return m.autonomousDriver.ResumeApproveProposal(ctx)
+		})
 	})
 }
 
@@ -373,8 +394,9 @@ func (m *model) resumeAutonomousProposalReject(reason string) tea.Cmd {
 	m.beginAutonomousResume("autonomy cancel")
 	ctx := m.operationContext()
 	return m.autonomousResumeCmds(func() tea.Msg {
-		term, err := m.autonomousDriver.ResumeRejectProposal(ctx, reason)
-		return autonomousRunMsg{term: term, err: err}
+		return m.driveAutonomy(func() (*autonomy.LoopTermination, error) {
+			return m.autonomousDriver.ResumeRejectProposal(ctx, reason)
+		})
 	})
 }
 
@@ -485,6 +507,9 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 		}
 		m.autonomousBoundary = nil
 		m.finalizeOperation(OpOutcomeFailure, msg.err)
+		// A terminal driver failure must release the workflow phase: without
+		// this the header would keep rendering BUILDING after the loop halted.
+		m.unwindBuildFailure()
 		m.push(roleError, "[autonomous] "+msg.err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -547,6 +572,9 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("[autonomous] "+greenStyle.Render("completed")+" — "+msg.term.Reason))
 	} else {
 		m.finalizeOperation(OpOutcomeFailure, nil)
+		// An aborted autonomous run is terminal: release the workflow phase
+		// so the BUILDING header status cannot survive the abort.
+		m.unwindBuildFailure()
 		m.push(roleError, "[autonomous] aborted — "+msg.term.Reason)
 		m.push(roleSystem, infoStyle.Render("Interrupted."))
 	}

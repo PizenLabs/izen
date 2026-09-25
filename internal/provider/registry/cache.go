@@ -407,6 +407,13 @@ func (r *Registry) fetchHTTPModels(ctx context.Context, p detector.ProviderConfi
 			Provider: p.Name,
 			Name:     name,
 		}
+		// Eligibility is provider-contract metadata, not catalog presence:
+		// a discovered model may be ineligible for Izen's execution path
+		// (e.g. agentic-harness-only). The descriptor is preserved in the
+		// raw catalog; only the executable view and the guards filter it.
+		if inelig := CheckExecutable(p.Name, m.ID); inelig != nil {
+			d.IneligibleReason = string(inelig.Reason)
+		}
 		switch {
 		case m.ContextLength != nil:
 			d.ContextWindow = *m.ContextLength

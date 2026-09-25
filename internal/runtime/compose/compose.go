@@ -510,11 +510,26 @@ func Wire(opts ...Option) (*Application, error) {
 	a.Knowledge = knowledge.NewStore(a.Inputs.Root)
 	a.Promotion = knowledge.NewPromotionEngine(a.Knowledge, knowledge.DefaultPolicy())
 	a.Compiler = contextcompiler.New()
+	// Manager entries are public seams as well as the selected default. Wrap
+	// every registered provider so callers cannot bypass the compiler by
+	// fetching a provider directly from the manager.
+	if a.Inputs.Manager != nil {
+		for _, name := range a.Inputs.Manager.Names() {
+			if provider, ok := a.Inputs.Manager.Get(name); ok && provider != nil {
+				a.Inputs.Manager.Register(name, a.Compiler.WrapProvider(provider))
+			}
+		}
+	}
 	if a.provider == nil {
 		if def, ok := a.Inputs.Manager.Default(); ok {
 			a.provider = def
 		}
 	}
+	// All production provider callbacks (canonical executor, plan synthesis,
+	// investigate, and the UI) cross the same compiled-request facade. Runtime
+	// paths that already compiled explicitly set ContextPrepared and therefore
+	// do not pay for a second projection.
+	a.provider = a.Compiler.WrapProvider(a.provider)
 
 	// ── RETRIEVAL GLOBAL ROUTER ───────────────────────────────────────
 	// The search router auto-detects lx in PATH and is registered globally so
@@ -583,6 +598,7 @@ func Wire(opts ...Option) (*Application, error) {
 	// events onto the shared bus. The approval command handlers route through
 	// it, so approving a patch applies a REAL mutation.
 	a.Executor = execution.NewRuntimeExecutor(a.Inputs.Root, a.Inputs.Config, a.provider, a.Bus, a.Inputs.LanguageID)
+	a.Executor.SetContextCompiler(a.Compiler)
 	a.Gateway = execution.NewIntentGateway(a.Inputs.Root)
 	// INV-SESSION-10: resolve the originating session for every execution at
 	// admission so the proof, terminal evidence and lifecycle events correlate
@@ -985,8 +1001,9 @@ func pipelineClient(p ai.Provider) *pipeline.FuncClient {
 	}
 	return pipeline.NewFuncClient(func(ctx context.Context, provider, model, prompt string) (string, layer3.TokenUsage, error) {
 		resp, err := p.Execute(ctx, ai.Request{
-			Messages: []ai.Message{{Role: "user", Content: prompt}},
-			Model:    model,
+			Messages:     []ai.Message{{Role: "user", Content: prompt}},
+			Model:        model,
+			ContextPhase: "execute",
 		})
 		if err != nil {
 			return "", layer3.TokenUsage{}, err

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/discovery/recon"
 	"github.com/PizenLabs/izen/internal/session"
 )
 
@@ -46,14 +47,15 @@ type Target struct {
 // root cause targets, evidence, and a conclusion. Atomic task synthesis is
 // exclusively owned by /plan/planner.go.
 type ContextLedger struct {
-	Source      string     `json:"source"`
-	Problem     string     `json:"problem"`
-	RootCause   string     `json:"root_cause,omitempty"`
-	Targets     []Target   `json:"targets"`
-	Evidence    []Evidence `json:"evidence,omitempty"`
-	Conclusion  string     `json:"conclusion,omitempty"`
-	Resolved    bool       `json:"resolved"`
-	Diagnostics string     `json:"diagnostics,omitempty"`
+	Source      string                 `json:"source"`
+	Problem     string                 `json:"problem"`
+	Archetype   recon.ProjectArchetype `json:"archetype,omitempty"`
+	RootCause   string                 `json:"root_cause,omitempty"`
+	Targets     []Target               `json:"targets"`
+	Evidence    []Evidence             `json:"evidence,omitempty"`
+	Conclusion  string                 `json:"conclusion,omitempty"`
+	Resolved    bool                   `json:"resolved"`
+	Diagnostics string                 `json:"diagnostics,omitempty"`
 }
 
 func NewContextLedger() *ContextLedger {
@@ -307,6 +309,11 @@ func (cl *ContextLedger) FormatForPlan() string {
 
 	b.WriteString(cl.Problem)
 	b.WriteByte('\n')
+	if cl.Archetype != "" {
+		b.WriteString("ARCHETYPE: ")
+		b.WriteString(string(cl.Archetype))
+		b.WriteByte('\n')
+	}
 
 	cleanDiag := cl.Diagnostics
 	if cleanDiag != "" {
@@ -340,16 +347,21 @@ func (cl *ContextLedger) FormatForPlan() string {
 	}
 
 	if cleanDiag != "" {
-		diagLines := strings.Split(cleanDiag, "\n")
-		maxLines := 15
-		if len(diagLines) > maxLines {
-			diagLines = diagLines[:maxLines]
-			diagLines = append(diagLines, "...")
+		if cl.Archetype == recon.VANILLA_WEB {
+			cleanDiag = SanitizeDiagnosticsForVanillaWeb(cleanDiag)
 		}
-		for _, dl := range diagLines {
-			b.WriteString("D: ")
-			b.WriteString(dl)
-			b.WriteByte('\n')
+		if cleanDiag != "" {
+			diagLines := strings.Split(cleanDiag, "\n")
+			maxLines := 15
+			if len(diagLines) > maxLines {
+				diagLines = diagLines[:maxLines]
+				diagLines = append(diagLines, "...")
+			}
+			for _, dl := range diagLines {
+				b.WriteString("D: ")
+				b.WriteString(dl)
+				b.WriteByte('\n')
+			}
 		}
 	}
 

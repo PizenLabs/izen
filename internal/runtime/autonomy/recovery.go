@@ -275,6 +275,10 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 //     strategy so the executor's admission resolves the SAME ContractID and
 //     deterministically increments AttemptID.
 func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.LoopRequest, error) {
+	// Recovery creates a new attempt, but never a new authority. Clone the
+	// descriptor at this seam so a caller cannot mutate the active ceiling while
+	// the repair is being assembled.
+	req.Contract = cloneContract(req.Contract)
 	if isAnchorContinuation(o) {
 		if o.AttemptNum >= 1 {
 			return req, fmt.Errorf("%w: line-offset recovery exhausted for %s", ErrRecoveryHalted, o.Target)

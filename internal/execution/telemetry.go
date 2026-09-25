@@ -6,6 +6,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/PizenLabs/izen/internal/contextcompiler"
+	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // ── Execution Telemetry (Phase 3) ──────────────────────────────────────────
@@ -27,6 +31,11 @@ import (
 // operation ID so every event is traceable to its operation, an invocation
 // counter so duplicate provider calls are detectable, and a retry counter so
 // retry latency is attributed to the retry.
+
+// CompileResult and ProtocolBinding are the execution-telemetry names for
+// the content-free compiler and protocol metadata projections.
+type CompileResult = contextcompiler.CompileResult
+type ProtocolBinding = protocol.ObservabilityBinding
 
 // StageState is the truthful state of a stage at a marker boundary.
 type StageState string
@@ -94,22 +103,40 @@ type ProviderSpan struct {
 	Streaming    time.Duration `json:"streaming"`
 	State        StageState    `json:"state"`
 	Tokens       int           `json:"tokens,omitempty"`
+	// Protocol/provider metadata is structural audit evidence; it never
+	// contains prompt or response text.
+	InteractionContract protocol.InteractionContract `json:"interaction_contract,omitempty"`
+	ContractID          string                       `json:"contract_id,omitempty"`
+	Mode                string                       `json:"mode,omitempty"`
+	AuthorityLevel      protocol.AuthorityCeiling    `json:"authority_level,omitempty"`
+	SchemaMode          string                       `json:"schema_mode,omitempty"`
+	SchemaFallback      bool                         `json:"schema_fallback,omitempty"`
+	FinishReason        string                       `json:"finish_reason,omitempty"`
+	Truncated           bool                         `json:"truncated,omitempty"`
+	Duration            time.Duration                `json:"duration,omitempty"`
+	PromptChars         int                          `json:"prompt_chars,omitempty"`
+	OutputChars         int                          `json:"output_chars,omitempty"`
+	PromptFingerprint   string                       `json:"prompt_fingerprint,omitempty"`
 }
 
 // TelemetrySnapshot is an immutable copy of a Telemetry record, safe to render
 // from any goroutine.
 type TelemetrySnapshot struct {
-	OpID        string         `json:"op_id"`
-	Kind        string         `json:"kind"`
-	StartedAt   time.Time      `json:"started_at"`
-	CompletedAt time.Time      `json:"completed_at"`
-	Outcome     string         `json:"outcome"`
-	Stages      []StageSpan    `json:"stages"`
-	Providers   []ProviderSpan `json:"providers"`
-	Invocations int            `json:"invocations"`
-	Retries     int            `json:"retries"`
-	LiveWorkers []string       `json:"live_workers"`
-	Elapsed     time.Duration  `json:"elapsed"`
+	OpID               string                            `json:"op_id"`
+	Kind               string                            `json:"kind"`
+	StartedAt          time.Time                         `json:"started_at"`
+	CompletedAt        time.Time                         `json:"completed_at"`
+	Outcome            string                            `json:"outcome"`
+	Stages             []StageSpan                       `json:"stages"`
+	Providers          []ProviderSpan                    `json:"providers"`
+	Invocations        int                               `json:"invocations"`
+	Retries            int                               `json:"retries"`
+	LiveWorkers        []string                          `json:"live_workers"`
+	Elapsed            time.Duration                     `json:"elapsed"`
+	Protocol           protocol.ObservabilityBinding     `json:"protocol"`
+	Compile            *contextcompiler.CompileResult    `json:"compile,omitempty"`
+	Admissions         []events.AdmissionDecisionPayload `json:"admissions,omitempty"`
+	ProviderExecutions []events.ProviderExecutionPayload `json:"provider_executions,omitempty"`
 }
 
 // Telemetry is the authoritative per-operation execution record. It is safe
@@ -125,6 +152,10 @@ type Telemetry struct {
 	finalized   bool
 	outcome     string
 	completedAt time.Time
+	protocol    protocol.ObservabilityBinding
+	compile     *contextcompiler.CompileResult
+	admissions  []events.AdmissionDecisionPayload
+	providers   []events.ProviderExecutionPayload
 
 	workers *WorkerTracker
 }
@@ -132,6 +163,14 @@ type Telemetry struct {
 // NewTelemetry starts a fresh execution record for the given operation.
 func NewTelemetry(opID, kind string) *Telemetry {
 	return NewTelemetryAt(opID, kind, time.Now)
+}
+
+// NewTelemetryWithProtocol starts an execution record with a detached
+// InteractionContract observability binding.
+func NewTelemetryWithProtocol(opID, kind string, binding protocol.ObservabilityBinding) *Telemetry {
+	tm := NewTelemetry(opID, kind)
+	tm.BindProtocol(binding)
+	return tm
 }
 
 // NewTelemetryAt starts a record with an injectable clock (test seam).
@@ -154,6 +193,68 @@ func (t *Telemetry) Workers() *WorkerTracker {
 		return nil
 	}
 	return t.workers
+}
+
+// BindProtocol stamps the structural interaction identity on this record.
+func (t *Telemetry) BindProtocol(binding protocol.ObservabilityBinding) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.protocol = binding.Normalize()
+	t.mu.Unlock()
+}
+
+// Protocol returns a detached copy of the active protocol binding.
+func (t *Telemetry) Protocol() protocol.ObservabilityBinding {
+	if t == nil {
+		return protocol.ObservabilityBinding{}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.protocol.Clone()
+}
+
+// RecordCompileResult stores the content-free contextcompiler projection. The
+// input is copied so later compiler mutation cannot rewrite audit evidence.
+func (t *Telemetry) RecordCompileResult(result *contextcompiler.CompileResult) {
+	if t == nil || result == nil {
+		return
+	}
+	copy := result.Normalize()
+	t.mu.Lock()
+	if !t.finalized {
+		t.compile = &copy
+	}
+	t.mu.Unlock()
+}
+
+// RecordAdmission appends one bounded admission verdict.
+func (t *Telemetry) RecordAdmission(payload events.AdmissionDecisionPayload) {
+	if t == nil {
+		return
+	}
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	t.mu.Lock()
+	if !t.finalized {
+		t.admissions = append(t.admissions, payload)
+	}
+	t.mu.Unlock()
+}
+
+// RecordProviderExecution appends one structured provider invocation record.
+func (t *Telemetry) RecordProviderExecution(payload events.ProviderExecutionPayload) {
+	if t == nil {
+		return
+	}
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	t.mu.Lock()
+	if !t.finalized {
+		t.providers = append(t.providers, payload)
+	}
+	t.mu.Unlock()
 }
 
 // Record appends one execution-boundary marker. It is a no-op after the record
@@ -245,7 +346,14 @@ func (t *Telemetry) Snapshot() TelemetrySnapshot {
 		StartedAt:   t.StartedAt,
 		CompletedAt: t.completedAt,
 		Outcome:     t.outcome,
+		Protocol:    t.protocol.Clone(),
 	}
+	if t.compile != nil {
+		compile := t.compile.Normalize()
+		snap.Compile = &compile
+	}
+	snap.Admissions = append([]events.AdmissionDecisionPayload(nil), t.admissions...)
+	snap.ProviderExecutions = append([]events.ProviderExecutionPayload(nil), t.providers...)
 	if !snap.CompletedAt.IsZero() {
 		snap.Elapsed = snap.CompletedAt.Sub(snap.StartedAt)
 		if snap.Elapsed < 0 {
@@ -259,6 +367,24 @@ func (t *Telemetry) Snapshot() TelemetrySnapshot {
 	stages, providers, invocations := foldMarkers(t.markers)
 	snap.Stages = stages
 	snap.Providers = providers
+	for i := range snap.Providers {
+		if i >= len(t.providers) {
+			break
+		}
+		record := t.providers[i]
+		snap.Providers[i].InteractionContract = record.Contract
+		snap.Providers[i].ContractID = record.ContractID
+		snap.Providers[i].Mode = record.Mode
+		snap.Providers[i].AuthorityLevel = record.AuthorityLevel
+		snap.Providers[i].SchemaMode = record.SchemaMode
+		snap.Providers[i].SchemaFallback = record.SchemaFallback
+		snap.Providers[i].FinishReason = record.FinishReason
+		snap.Providers[i].Truncated = record.Truncated
+		snap.Providers[i].Duration = record.Duration
+		snap.Providers[i].PromptChars = record.PromptChars
+		snap.Providers[i].OutputChars = record.OutputChars
+		snap.Providers[i].PromptFingerprint = record.PromptFingerprint
+	}
 	snap.Invocations = invocations
 	if invocations > 1 {
 		snap.Retries = invocations - 1
@@ -484,6 +610,16 @@ func (s TelemetrySnapshot) RenderTimeline() string {
 		}
 	}
 	fmt.Fprintf(&b, "Execution: %s\n", s.OpID)
+	if s.Protocol.Contract != "" {
+		fmt.Fprintf(&b, "Contract: %s mode=%s authority=%s schema_mode=%s", s.Protocol.Contract, s.Protocol.Mode, s.Protocol.AuthorityLevel, s.Protocol.SchemaMode)
+		if s.Protocol.ContractID != "" {
+			fmt.Fprintf(&b, " contract_id=%s", s.Protocol.ContractID)
+		}
+		b.WriteByte('\n')
+	}
+	if s.Compile != nil {
+		fmt.Fprintf(&b, "Context: reserved=%d used=%d truncated_files=%d drops=%d scope=%s\n", s.Compile.ReservedTokens, s.Compile.UsedTokens, s.Compile.TruncatedFileCount, s.Compile.DropCount, s.Compile.FittedContextScope)
+	}
 	fmt.Fprintf(&b, "State: %s\n", state)
 	if !s.StartedAt.IsZero() {
 		fmt.Fprintf(&b, "Elapsed: %s\n", formatTelemetryDuration(s.Elapsed))
