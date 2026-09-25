@@ -171,8 +171,9 @@ func llmClassify(ctx context.Context, provider ai.Provider, model, log string) (
 		Messages: []ai.Message{
 			{Role: "user", Content: truncate(log, 4000)},
 		},
-		Stream: false,
-		System: dispatchSystemPrompt() + "\n\n" + providers.DiagnoseSystemPrompt,
+		Stream:       false,
+		ContextPhase: "investigate",
+		System:       dispatchSystemPrompt() + "\n\n" + providers.DiagnoseSystemPrompt,
 	})
 	if err != nil || resp == nil || strings.TrimSpace(resp.Content) == "" {
 		return Strategy{}, false

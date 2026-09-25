@@ -4286,8 +4286,9 @@ func (m *model) runDiagnoseCmd() tea.Cmd {
 				Messages: []ai.Message{
 					{Role: "user", Content: string(logData)},
 				},
-				Stream: false,
-				System: providers.DiagnoseSystemPrompt,
+				Stream:       false,
+				ContextPhase: "investigate",
+				System:       providers.DiagnoseSystemPrompt,
 			})
 			cancel()
 			if err != nil {

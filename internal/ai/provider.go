@@ -160,6 +160,19 @@ type Request struct {
 	// runtime. It is metadata for the adapter boundary and never grants tool
 	// or execution authority.
 	InteractionContract protocol.InteractionContract `json:"-"`
+	// ContextPhase identifies the semantic phase used by the context budget
+	// compiler ("investigate", "plan", or "execute"). It is intentionally a
+	// string at the transport boundary so lower-level packages can label a
+	// request without importing the compiler implementation.
+	ContextPhase string `json:"-"`
+	// ContextPolicy is the caller-selected workspace projection policy. An
+	// empty value lets the compiler use its conservative repository default;
+	// "none" explicitly forbids workspace/session injection.
+	ContextPolicy string `json:"-"`
+	// ContextPrepared marks a request whose System/Messages projection has
+	// already passed through contextcompiler.Compile. Provider middleware
+	// must not compile the same request a second time.
+	ContextPrepared bool `json:"-"`
 	// Contract carries the normalized per-step descriptor when the caller has
 	// one. A nil value is valid for legacy requests; adapters may derive a
 	// default from InteractionContract without changing dispatch.

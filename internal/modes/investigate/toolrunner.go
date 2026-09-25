@@ -203,8 +203,9 @@ func (r *ToolRunner) runDiagnose(ctx context.Context, target string) ToolResult 
 		Messages: []ai.Message{
 			{Role: "user", Content: r.diagnostics},
 		},
-		Stream: false,
-		System: providers.DiagnoseSystemPrompt,
+		Stream:       false,
+		ContextPhase: "investigate",
+		System:       providers.DiagnoseSystemPrompt,
 	})
 	if err != nil || resp == nil {
 		// Provider unreachable — still preserve the raw log so the chain ends

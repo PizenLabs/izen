@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +17,7 @@ import (
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/changeset"
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/contextcompiler"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/core/stream"
@@ -141,6 +141,9 @@ type ExecuteRequest struct {
 	// metadata only; admission and authorization remain here.
 	InteractionContract protocol.InteractionContract
 	Contract            *protocol.ContractDescriptor
+	// ModelMetadata carries optional provider-catalog context/output limits into
+	// the context compiler. Explicit metadata wins over family heuristics.
+	ModelMetadata *protocol.ModelMetadata
 	// Evidence is the authoritative bounded evidence ledger compiled for the
 	// target set (structural findings, redundancy ledger). It is authoritative
 	// evidence; the full-file context the runtime reads is supporting context
@@ -511,6 +514,10 @@ type RuntimeExecutor struct {
 	// mutation artifacts. It is injected so P1 NormalizingValidator decorators
 	// can wrap it without modifying execution loops.
 	artifactValidator ArtifactValidator
+	// contextCompiler is the sole prompt-context compilation authority. The
+	// composition root replaces the zero-value compatibility instance with the
+	// application-owned compiler.
+	contextCompiler *contextcompiler.Compiler
 	// mutationBoundary is the explicit workspace-integrity assertion surface
 	// used after any rollback to cryptographically verify base digest recovery.
 	mutationBoundary MutationBoundary
@@ -553,6 +560,7 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		contracts:         NewContractRegistry(),
 		occ:               NewOCCVerifier(root),
 		artifactValidator: validator,
+		contextCompiler:   &contextcompiler.Compiler{},
 		pending:           make(map[string]*pendingMutation),
 	}
 	// Wire the normalizer to consume the observe snapshot cache, eliminating
@@ -1389,12 +1397,10 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 
 	// ── 6. Context compilation ─────────────────────────────────────────
-	// The strategy owns the context contract: profile.ContextPolicy and
-	// profile.ContextBudget decide what crosses (zero for direct_response,
-	// target content for a targeted mutation, repository evidence for
-	// investigation). The generic compiler never decides.
-	contextChannels, contextTokens := x.compileContext(profile, targets)
-	g.CompleteContext(contextChannels, contextTokens)
+	// The concrete prompt is compiled immediately before each provider
+	// dispatch by invokeReadOnly/invokeMutation/InvokeManifestPass. Keeping
+	// the call at the dispatch boundary is what makes model limits, contract
+	// schemas and the final workspace projection part of the same budget.
 
 	// ── 7. Read-only strategies (targeted_reasoning / direct_response /
 	// multi_file_planning / repository_investigation): one bounded invocation,
@@ -2226,42 +2232,6 @@ func (x *RuntimeExecutor) resolveLocalConstraints(profile strategy.ExecutionStra
 	return strategy.ResolveConstraints(profile, astCorrupt, required, maxOut)
 }
 
-// compileContext assembles the minimum-sufficient context envelope for the
-// target set. The STRATEGY owns the context contract: profile.ContextPolicy
-// decides what may be read. A ContextPolicyNone strategy (direct_response /
-// casual chat) compiles ZERO channels and reads no file — no workspace scan,
-// no repository context. A target_file_only policy reads exactly the resolved
-// targets. A repository policy admits the wider evidence channels. Provider
-// usage is never estimated here — this is context-accounting, not billing.
-func (x *RuntimeExecutor) compileContext(profile strategy.ExecutionStrategyProfile, targets []string) (channels []string, tokens int) {
-	switch profile.Policy() {
-	case strategy.ContextPolicyNone:
-		// Zero context: no workspace scan, no file channels, no repository
-		// context. "hi" prepares nothing.
-		return nil, 0
-	case strategy.ContextPolicyRepository:
-		channels = append(channels, "user_intent", "explicit_targets", "target_content",
-			"dependency_evidence", "repository_constraints")
-	default: // target_file_only
-		channels = append(channels, "user_intent", "explicit_targets", "target_content")
-	}
-	var b strings.Builder
-	for _, t := range targets {
-		var data []byte
-		if cached, ok := x.getSnapshotContent(t); ok {
-			data = cached
-		} else {
-			continue
-		}
-		if len(data) > maxExecutorContextBytes {
-			data = data[:maxExecutorContextBytes]
-		}
-		b.Write(data)
-		b.WriteByte('\n')
-	}
-	return channels, estimateTokens(b.String())
-}
-
 // effectiveMaxOutput returns the max tokens to use for a request. It prefers
 // the explicitly-set request budget, falling back to the profile budget so that
 // UI callers that omit max_tokens on the wire still receive the strategy-owned
@@ -2309,6 +2279,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	patches := make([]*Patch, 0, len(targets))
 	invs := make([]ModelInvocation, 0, len(targets))
 	diffs := make([]string, 0, len(targets))
+	contextReported := false
 	// trace carries the forensic transport-normalization record of the most
 	// recent model invocation (nil until the first stream returns). It is
 	// returned so the executor can attach it to the active ExecutionEvidence
@@ -2420,8 +2391,16 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 
 		system := boundedMutationSystemPrompt() + "\nSystem: You are strictly modifying ONE file: " + target + ". Do NOT output code or patches for any other files in this response."
 		outputContract := "full_file_or_patch"
-		user := buildMutationUserPrompt(req.Prompt, target, original, req.Evidence)
-		contextBytes := len(original)
+		// The target bytes are supplied as an explicit workspace file to the
+		// Context Compiler. Do not embed them a second time in the hand-built
+		// prompt: one authority owns projection, truncation and accounting.
+		user := buildMutationBaseUserPrompt(req.Prompt, req.Evidence)
+		if !patchOnly && original == "" {
+			// A new/empty target has no snapshot bytes to project, but the
+			// model still needs the explicit create-file contract that the
+			// former inline prompt carried.
+			user += "\n\n### TARGET FILE\n(file is empty or does not exist yet — provide the full new content)\n"
+		}
 		// judgedContent is exactly the context the model was asked to judge.
 		// Under the bounded patch contract that is the small line-aligned
 		// window — the no-op semantics classifier evaluates the claim against
@@ -2466,7 +2445,6 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 				window.totalLines++
 			}
 			user = buildBoundedPatchUserPrompt(req.Prompt, req.Evidence, target, window)
-			contextBytes = len(window.content)
 			judgedContent = window.content
 			windowStart, windowEnd = window.startLine, window.endLine
 			if offsetRecovery {
@@ -2480,6 +2458,24 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			}
 		}
 		user += "\n" + symbolBaseline.Context()
+		var contextFiles []contextcompiler.FileContext
+		if !patchOnly {
+			contextFiles = x.workspaceFiles([]string{target}, true)
+		}
+		compiledReq, compiledAgent, compileErr := x.compileRequest(
+			ctx, req, profile, model, system, user, contextFiles, maxOut,
+		)
+		if compileErr != nil {
+			return nil, nil, nil, trace, fmt.Errorf("executor: context compilation: %w", compileErr)
+		}
+		if compiledUser, ok := lastUserMessage(compiledReq); ok {
+			user = compiledUser
+		}
+		contextBytes := len(compiledAgent.Compiled.ContextOnly())
+		if !contextReported {
+			g.CompleteContext(compiledAgent.Compiled.ContextChannels(), compiledAgent.Compiled.UsedTokens)
+			contextReported = true
+		}
 		disableReasoning := false
 		if patchOnly {
 			// Reasoning models spend the SHARED output budget on hidden
@@ -2500,14 +2496,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// field claims.
 		log.Printf("[execution] request=%s attempt=%d target=%s strategy=%s artifact_kind=%s output_contract=%s context_bytes=%d prompt_bytes=%d max_output=%d reasoning=%s recovery=%s",
 			requestID, attempt, target, profile.Strategy, profile.Artifact.Kind, outputContract, contextBytes, len(user), maxOut, reasoningMode, recoveryLabel)
-		aiReq := ai.Request{
-			Model:               model,
-			System:              system,
-			Messages:            []ai.Message{{Role: "user", Content: user}},
-			MaxTokens:           maxOut,
-			InteractionContract: req.InteractionContract,
-			Contract:            req.Contract,
-		}
+		aiReq := compiledReq
+		aiReq.Model = model
+		aiReq.MaxTokens = maxOut
 		if disableReasoning {
 			aiReq.Reasoning = &ai.ReasoningConfig{Disabled: true}
 		}
@@ -2908,12 +2899,9 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 	var user strings.Builder
 	user.WriteString("USER OBJECTIVE:\n")
 	user.WriteString(strings.TrimSpace(prompt))
-	user.WriteString("\n\nTARGET FILE (read-only, " + strconv.Itoa(len(targetContent)) + " bytes):\n")
-	user.WriteString("```\n")
-	user.Write(targetContent)
-	user.WriteString("\n```\n")
+	user.WriteString("\n")
 	manifestDescriptor := protocol.Describe(protocol.StructuredCompletion)
-	req := ai.Request{
+	manifestReq := ai.Request{
 		Model:               model,
 		System:              x.manifestSystemPromptFor(),
 		Messages:            []ai.Message{{Role: "user", Content: user.String()}},
@@ -2924,7 +2912,24 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 		// spend the bounded output budget before any JSON appears.
 		Reasoning: &ai.ReasoningConfig{Disabled: true},
 	}
-	resp, err := p.Execute(ctx, req)
+	compiledReq, _, compileErr := x.contextCompilerInstance().CompileRequest(ctx, manifestReq, contextcompiler.RequestCompileOptions{
+		Phase:                 contextcompiler.PhaseExecute,
+		Provider:              p.Name(),
+		WorkflowState:         "manifest",
+		ContextPolicy:         "repository",
+		RequestedOutputTokens: manifestPassMaxTokens,
+		Files: []contextcompiler.FileContext{{
+			Path:     "target",
+			Size:     len(targetContent),
+			Content:  string(targetContent),
+			Critical: false,
+		}},
+	})
+	if compileErr != nil {
+		return "", fmt.Errorf("executor: context compilation: %w", compileErr)
+	}
+	compiledReq.ContextPrepared = true
+	resp, err := p.Execute(ctx, compiledReq)
 	if err != nil {
 		return "", fmt.Errorf("executor: manifest pass invocation: %w", err)
 	}
@@ -2979,29 +2984,6 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		return "", nil, nil, fmt.Errorf("executor: no provider configured for read-only invocation")
 	}
 
-	var b strings.Builder
-	b.WriteString(readOnlySystemPrompt(profile.Strategy))
-	for _, t := range targets {
-		var data []byte
-		if cached, ok := x.getSnapshotContent(t); ok {
-			data = cached
-		} else {
-			continue
-		}
-		if len(data) > maxExecutorContextBytes {
-			data = data[:maxExecutorContextBytes]
-		}
-		b.WriteString("\n### TARGET FILE: ")
-		b.WriteString(t)
-		b.WriteString("\n```\n")
-		b.Write(data)
-		b.WriteString("\n```\n")
-	}
-	b.WriteString("\n### USER REQUEST\n")
-	b.WriteString(req.Prompt)
-	b.WriteString("\n")
-	baseTurn := b.String()
-
 	model, modelErr := x.resolveModel(req)
 	if modelErr != nil {
 		return "", nil, nil, modelErr
@@ -3020,21 +3002,43 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	// Compact continuation state: the ONLY context a continuation rebuilds
 	// from. Never the transcript, never the whole conversation.
 	rs := llmstep.NewResponseState(req.Prompt, "findings / needed adjustments / reason / optional concise example")
+	system := readOnlySystemPrompt(profile.Strategy)
+	baseReq, baseAgent, compileErr := x.compileRequest(
+		ctx, req, profile, model, system, req.Prompt, x.workspaceFiles(targets, false), maxRead,
+	)
+	if compileErr != nil {
+		return "", nil, nil, fmt.Errorf("executor: context compilation: %w", compileErr)
+	}
+	baseTurn, ok := lastUserMessage(baseReq)
+	if !ok {
+		return "", nil, nil, fmt.Errorf("executor: context compilation produced no user turn")
+	}
+	g.CompleteContext(baseAgent.Compiled.ContextChannels(), baseAgent.Compiled.UsedTokens)
 
 	var accumulated strings.Builder
 	for {
-		userTurn := baseTurn
-		if step.Ordinal() > 1 {
-			userTurn = llmstep.ContinuationUserTurn(baseTurn, step.Committed(), rs.PendingTopics, rs.ResponseFormat, step.MaxTokens())
+		var aiReq ai.Request
+		if step.Ordinal() == 1 {
+			// The initial projection was compiled with the complete workspace
+			// file set above. Reuse that private request verbatim; compiling its
+			// already-rendered user turn a second time would turn file context
+			// into a new mandatory user request and can double-count headers.
+			aiReq = baseReq
+		} else {
+			userTurn := llmstep.ContinuationUserTurn(baseTurn, step.Committed(), rs.PendingTopics, rs.ResponseFormat, step.MaxTokens())
+			// Re-compile every continuation as a separate provider request. The
+			// continuation state is prompt material too, and must not escape the
+			// same model-aware budget as the initial turn.
+			var compileErr error
+			aiReq, _, compileErr = x.compileRequest(
+				ctx, req, profile, model, system, userTurn, nil, step.MaxTokens(),
+			)
+			if compileErr != nil {
+				return "", nil, nil, fmt.Errorf("executor: context compilation: %w", compileErr)
+			}
 		}
-		aiReq := ai.Request{
-			Model:               model,
-			System:              readOnlySystemPrompt(profile.Strategy),
-			Messages:            []ai.Message{{Role: "user", Content: userTurn}},
-			MaxTokens:           step.MaxTokens(),
-			InteractionContract: req.InteractionContract,
-			Contract:            req.Contract,
-		}
+		aiReq.Model = model
+		aiReq.MaxTokens = step.MaxTokens()
 		x.emit(events.NewStepStarted(model, step.Ordinal(), step.MaxTokens()))
 		if step.Ordinal() > 1 {
 			x.emit(events.NewContinuationStarted(step.Ordinal(), step.MaxTokens()))
@@ -3960,16 +3964,6 @@ func contextInclusionReason(k strategy.ContextKind) string {
 // prompt so a single execution can never swallow an unbounded file.
 const maxExecutorContextBytes = 200 * 1024
 
-// estimateTokens is a coarse context-accounting heuristic (chars/4). It is
-// NEVER used for provider billing — authoritative usage comes from the
-// provider's Usage record.
-func estimateTokens(s string) int {
-	if s == "" {
-		return 0
-	}
-	return len(s) / 4
-}
-
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
@@ -4003,7 +3997,7 @@ func patchOnlyArtifact(p strategy.ExecutionStrategyProfile) bool {
 	return p.Artifact.Bounded && p.Artifact.Kind == "search_replace"
 }
 
-func buildMutationUserPrompt(request, target, original, evidence string) string {
+func buildMutationBaseUserPrompt(request, evidence string) string {
 	var b strings.Builder
 	b.WriteString("### USER REQUEST\n")
 	b.WriteString(request)
@@ -4011,20 +4005,7 @@ func buildMutationUserPrompt(request, target, original, evidence string) string 
 	if strings.TrimSpace(evidence) == "" {
 		b.WriteString("(no deterministic evidence compiled — resolve from the target content below)\n")
 	} else {
-		// The deterministic evidence ledger is authoritative: structural
-		// findings, redundancy blocks and line ranges the model must reason
-		// over. It never re-discovers deterministic facts from raw text.
 		b.WriteString(evidence)
-	}
-	b.WriteString("\n\n### TARGET FILE: ")
-	b.WriteString(target)
-	b.WriteString("\n")
-	if strings.TrimSpace(original) == "" {
-		b.WriteString("(file is empty or does not exist yet — provide the full new content)\n")
-	} else {
-		b.WriteString("```\n")
-		b.WriteString(original)
-		b.WriteString("\n```\n")
 	}
 	return b.String()
 }

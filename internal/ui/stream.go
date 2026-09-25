@@ -491,12 +491,28 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		streamCh <- msg // blocking fallback (drained by the read loop)
 	}
 
+	contextPolicy := "repository"
+	if isCasual {
+		contextPolicy = "none"
+	}
+	contextPhase := "investigate"
+	switch m.resolver.Current() {
+	case modes.ModePlan:
+		contextPhase = "plan"
+	case modes.ModeBuild:
+		contextPhase = "execute"
+	}
+	if m.pipelineRunning && m.pipelineStep == "blueprinting" {
+		contextPhase = "plan"
+	}
 	req := ai.Request{
-		Model:     m.getActiveModelName(),
-		Messages:  msgs,
-		Stream:    true,
-		System:    systemPrompt,
-		MaxTokens: maxTokens,
+		Model:         m.getActiveModelName(),
+		Messages:      msgs,
+		Stream:        true,
+		System:        systemPrompt,
+		MaxTokens:     maxTokens,
+		ContextPhase:  contextPhase,
+		ContextPolicy: contextPolicy,
 		ReasoningHandler: func(chunk string) error {
 			if m.bus != nil {
 				m.bus.Publish(events.NewReasoningStream(chunk, false))

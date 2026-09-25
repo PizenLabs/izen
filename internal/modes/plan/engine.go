@@ -730,6 +730,23 @@ func (e *Engine) complete(ctx context.Context, req ai.Request) (*ai.Response, er
 		copy := req.Contract.Clone()
 		req.Contract = &copy
 	}
+	// The composed provider facade uses this semantic label to apply the Plan
+	// phase budget. Standalone provider callbacks remain source-compatible.
+	req.ContextPhase = "plan"
+	// Carry catalog facts across the provider boundary when they identify this
+	// exact model. The context compiler can then lower the Plan phase budget
+	// for the real context/output window instead of relying only on a name
+	// heuristic. A stale record is ignored; synthesisBudget applies the same
+	// identity rule above.
+	if e != nil {
+		e.contractMu.RLock()
+		metadata := e.modelMetadata
+		e.contractMu.RUnlock()
+		if metadata.ID == "" || strings.EqualFold(strings.TrimSpace(metadata.ID), strings.TrimSpace(req.Model)) {
+			copy := metadata
+			req.ModelMetadata = &copy
+		}
+	}
 	// Strict per-attempt deadline for free/cloud models: a hung provider must be
 	// cut off fast so the caller can fail over to heuristic plan synthesis
 	// instead of blocking the TUI for minutes. Each synthesis attempt gets a

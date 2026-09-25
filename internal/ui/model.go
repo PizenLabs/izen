@@ -23,6 +23,7 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/config"
 	ctxpkg "github.com/PizenLabs/izen/internal/context"
+	"github.com/PizenLabs/izen/internal/contextcompiler"
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/core/runtime"
@@ -769,6 +770,7 @@ type model struct {
 	// /session compact <id> trigger; its worker never runs on the UI loop.
 	compactionRunner *compaction.Runner
 	provider         ai.Provider
+	contextCompiler  *contextcompiler.Compiler
 	mgr              *ai.Manager
 	resolver         *modes.Resolver
 	gitEng           *git.Engine

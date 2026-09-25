@@ -139,6 +139,7 @@ func (m *model) switchProvider(name string) tea.Cmd {
 		oldName = m.provider.Name()
 	}
 
+	provider = m.contextCompiler.WrapProvider(provider)
 	m.provider = provider
 	m.cfg.AI.DefaultProvider = name
 
@@ -318,6 +319,7 @@ func (m *model) hotReloadProviderKey(provider, apiKey string) {
 	if inst == nil {
 		return
 	}
+	inst = m.contextCompiler.WrapProvider(inst)
 	if m.mgr != nil {
 		m.mgr.Register(provider, inst)
 		if got, ok := m.mgr.Get(provider); ok {

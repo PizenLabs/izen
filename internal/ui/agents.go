@@ -772,9 +772,10 @@ func (m *model) runCommitCmdAgent(userMsg string) tea.Cmd {
 					{Role: "user", Content: payload},
 				}
 				req := ai.Request{
-					Model:    m.cfg.ActiveModelName(),
-					Messages: msgs,
-					Stream:   false,
+					Model:        m.cfg.ActiveModelName(),
+					Messages:     msgs,
+					Stream:       false,
+					ContextPhase: "execute",
 				}
 				ctx, cancel := context.WithTimeout(m.operationContext(), buildGenerationTimeout)
 				resp, err := m.provider.Execute(ctx, req)
