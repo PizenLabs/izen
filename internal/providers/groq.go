@@ -40,6 +40,7 @@ func (p *GroqProvider) Name() string {
 }
 
 func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model := req.Model
 	if model == "" {
 		return nil, fmt.Errorf("groq: no model assigned to target node (empty ModelBinding.ModelID)")
@@ -109,7 +110,7 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if groqResp.Usage != nil {
 		tokenIn = groqResp.Usage.PromptTokens
 		tokenOut = groqResp.Usage.CompletionTokens
@@ -135,6 +136,7 @@ func (p *GroqProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respons
 }
 
 func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model := req.Model
 	if model == "" {
 		return nil, fmt.Errorf("groq: no model assigned to target node (empty ModelBinding.ModelID)")
@@ -192,7 +194,7 @@ func (p *GroqProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.Re
 	}
 
 	sr := &groqSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
 	return &GroqStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("groq", model, plan)}, nil
@@ -307,11 +309,7 @@ func (r *GroqStreamResult) ResponseMetadata() ai.ResponseMetadata {
 	if r == nil {
 		return ai.ResponseMetadata{}
 	}
-	metadata := r.metadata
-	metadata.FinishReason = r.FinishReason()
-	metadata.Truncated = isOutputLength(metadata.FinishReason)
-	metadata.Usage = normalizeUsageMetadata(r.Usage())
-	return metadata
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
 }
 
 func (r *GroqStreamResult) TruncationError() error {

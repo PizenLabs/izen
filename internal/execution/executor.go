@@ -141,6 +141,9 @@ type ExecuteRequest struct {
 	// metadata only; admission and authorization remain here.
 	InteractionContract protocol.InteractionContract
 	Contract            *protocol.ContractDescriptor
+	// ContractID is stamped after admission and carried to provider telemetry.
+	// It is an execution correlation identity, not an authority grant.
+	ContractID string
 	// ModelMetadata carries optional provider-catalog context/output limits into
 	// the context compiler. Explicit metadata wins over family heuristics.
 	ModelMetadata *protocol.ModelMetadata
@@ -219,6 +222,19 @@ type ModelInvocation struct {
 	CachedTokens        int                          `json:"cached_tokens,omitempty"`
 	ReasoningTokens     int                          `json:"reasoning_tokens,omitempty"`
 	FinishReason        string                       `json:"finish_reason,omitempty"`
+	Truncated           bool                         `json:"truncated,omitempty"`
+	RequestDuration     time.Duration                `json:"request_duration_ns,omitempty"`
+	FirstTokenLatency   time.Duration                `json:"first_token_latency_ns,omitempty"`
+	StreamingDuration   time.Duration                `json:"streaming_duration_ns,omitempty"`
+	SchemaMode          string                       `json:"schema_mode,omitempty"`
+	SchemaFallback      bool                         `json:"schema_fallback,omitempty"`
+	NativeSchema        bool                         `json:"native_schema,omitempty"`
+	PromptChars         int                          `json:"prompt_chars,omitempty"`
+	OutputChars         int                          `json:"output_chars,omitempty"`
+	PromptFingerprint   string                       `json:"prompt_fingerprint,omitempty"`
+	ContractID          string                       `json:"contract_id,omitempty"`
+	Mode                string                       `json:"mode,omitempty"`
+	AuthorityLevel      protocol.AuthorityCeiling    `json:"authority_level,omitempty"`
 	InteractionContract protocol.InteractionContract `json:"interaction_contract,omitempty"`
 	ContractDescriptor  *protocol.ContractDescriptor `json:"interaction_contract_descriptor,omitempty"`
 	// HTTPAttempts is the number of transport round-trips this single LOGICAL
@@ -518,6 +534,10 @@ type RuntimeExecutor struct {
 	// composition root replaces the zero-value compatibility instance with the
 	// application-owned compiler.
 	contextCompiler *contextcompiler.Compiler
+	// telemetrySink is an optional per-operation execution telemetry record.
+	// It is fed structural protocol/compiler/provider evidence only; it is not
+	// an execution authority and may be nil in headless mode.
+	telemetrySink *Telemetry
 	// mutationBoundary is the explicit workspace-integrity assertion surface
 	// used after any rollback to cryptographically verify base digest recovery.
 	mutationBoundary MutationBoundary
@@ -563,6 +583,7 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		contextCompiler:   &contextcompiler.Compiler{},
 		pending:           make(map[string]*pendingMutation),
 	}
+	x.admission.SetAuditSink(x.emitAdmissionAudit)
 	// Wire the normalizer to consume the observe snapshot cache, eliminating
 	// redundant os.ReadFile disk hits during artifact validation. The closure
 	// captures x but is only called during Execute (after x is fully
@@ -797,6 +818,55 @@ func (x *RuntimeExecutor) emit(ev events.DomainEvent) {
 	if x != nil && x.bus != nil && ev != nil {
 		x.bus.Publish(ev)
 	}
+}
+
+func (x *RuntimeExecutor) emitAdmissionAudit(req ExecuteRequest, profile strategy.ExecutionStrategyProfile, decision AdmissionDecision, err error) {
+	if x == nil {
+		return
+	}
+	bindingReq := req
+	if decision.Contract != nil {
+		bindingReq.Contract = cloneExecutionDescriptor(decision.Contract)
+	}
+	if decision.InteractionContract != "" {
+		bindingReq.InteractionContract = decision.InteractionContract
+	}
+	payload := events.AdmissionDecisionPayload{
+		RequestID:      req.RequestID,
+		SessionID:      req.SessionID,
+		Strategy:       string(profile.Strategy),
+		Allowed:        decision.Allowed && err == nil,
+		RequestedScope: decision.Requested.String(),
+		Reason:         admissionAuditReason(decision.Reason, err),
+		ReasonCode:     AdmissionReasonCode(err),
+		ProtocolTelemetry: protocol.NewObservabilityBinding(
+			bindingReq.InteractionContract,
+			bindingReq.Contract,
+			bindingReq.ContractID,
+			bindingReq.Mode,
+			string(ai.SchemaModeAuto),
+		),
+	}
+	if actions := admissionActions(req, profile); len(actions) > 0 {
+		payload.Action = string(actions[0].operation)
+		payload.ActionSource = actions[0].source
+		payload.Capability = string(capabilityForOperation(actions[0].operation))
+	}
+	if sink := x.telemetry(); sink != nil {
+		sink.RecordAdmission(payload)
+	}
+	x.emit(events.NewAdmissionDecision(payload))
+}
+
+func admissionAuditReason(reason string, err error) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" && err != nil {
+		reason = AdmissionReasonCode(err)
+	}
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	return reason
 }
 
 func (x *RuntimeExecutor) nextID() string {
@@ -1177,6 +1247,8 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		requestID = x.nextID()
 	}
 	sid := x.resolveSessionID(req)
+	req.RequestID = requestID
+	req.SessionID = sid
 	res := &ExecutionResult{
 		RequestID: requestID,
 		Mode:      req.Mode,
@@ -1202,6 +1274,16 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// stage evidence becomes the proof timeline. The UI only projects.
 	g := runtimegraph.New(requestID, x.emit)
 	g.SetSessionID(sid)
+	g.SetProtocolBinding(protocol.NewObservabilityBinding(
+		req.InteractionContract,
+		req.Contract,
+		req.ContractID,
+		req.Mode,
+		string(ai.SchemaModeAuto),
+	))
+	if sink := x.telemetry(); sink != nil {
+		sink.BindProtocol(g.ProtocolBinding())
+	}
 	setProofGraph(res, g)
 	g.Start(req.Mode, req.Prompt)
 	g.CompleteUserIntent()
@@ -1266,6 +1348,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// selected strategy/staged scopes before admission or provider work.
 	if err := validateExecutionContract(req, profile, contractDeclared); err != nil {
 		wrapped := fmt.Errorf("executor: interaction contract: %w", err)
+		x.emitAdmissionAudit(req, profile, AdmissionDecision{Requested: ScopeWorkspaceMutate, Reason: admissionAuditReason("", err)}, err)
 		g.FailExecution(events.FailurePermanent, wrapped, "executor.contract")
 		res.Err = wrapped
 		res.Proof.Outcome = OutcomeFailed
@@ -1343,6 +1426,12 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		return x.finalizeResult(res), err
 	}
 	stampContractIdentity(res, contract, attempt)
+	req.ContractID = contract.ID().String()
+	binding := g.ProtocolBinding().WithContractID(req.ContractID)
+	g.SetProtocolBinding(binding)
+	if sink := x.telemetry(); sink != nil {
+		sink.BindProtocol(binding)
+	}
 
 	// ── 3. Human clarification (no model, no mutation) ────────────────
 	// HumanClarification is authoritative and MUST be handled before the
@@ -1816,10 +1905,14 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	if approvalDescriptor != nil {
 		profile := strategy.ExecutionStrategyProfile{Strategy: strategy.ExecutionStrategy(pm.strategy)}
 		admissionReq := ExecuteRequest{
+			RequestID:           pm.requestID,
+			SessionID:           pm.sessionID,
+			Mode:                pm.mode,
 			Targets:             append([]string(nil), pm.targets...),
 			Operation:           string(protocol.OperationFileMutate),
 			InteractionContract: pm.interactionContract,
 			Contract:            cloneExecutionDescriptor(approvalDescriptor),
+			ContractID:          pm.contract.ID().String(),
 		}
 		if _, admissionErr := x.admission.Admit(admissionReq, x.root, profile, approvalDescriptor); admissionErr != nil {
 			err := fmt.Errorf("executor: approval rejected request %s: %w", pm.requestID, admissionErr)
@@ -2473,7 +2566,9 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		}
 		contextBytes := len(compiledAgent.Compiled.ContextOnly())
 		if !contextReported {
-			g.CompleteContext(compiledAgent.Compiled.ContextChannels(), compiledAgent.Compiled.UsedTokens)
+			x.recordContextTelemetry(req, compiledAgent)
+			preparedContext, contextMetrics := contextTelemetry(req, compiledAgent)
+			g.CompleteContextWithMetrics(preparedContext, contextMetrics)
 			contextReported = true
 		}
 		disableReasoning := false
@@ -2505,7 +2600,8 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		// model.invoked is emitted when the invocation BEGINS — before the
 		// provider call — so the event stream truthfully records the start.
 		g.BeginModel(model)
-		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
+		var providerMetadata ai.ResponseMetadata
+		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, &providerMetadata)
 		trace = itrace
 		// The invocation evidence is built from the stream outcome REGARDLESS
 		// of the artifact result: the provider billed these tokens whether the
@@ -2519,16 +2615,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			InteractionContract: req.InteractionContract,
 			ContractDescriptor:  cloneExecutionDescriptor(req.Contract),
 		}
-		if usage.Known {
-			inv.Known = true
-			inv.TokenInput = usage.PromptTokens
-			inv.TokenOutput = usage.CompletionTokens
-			inv.CachedTokens = usage.CachedTokens
-			inv.ReasoningTokens = usage.ReasoningTokens
-		}
-		inv.FinishReason = usage.FinishReason
-		inv.HTTPAttempts = usage.HTTPAttempts
-		inv.RateLimitedRetries = usage.RateLimitedRetries
+		populateInvocationTelemetry(&inv, aiReq, usage, providerMetadata)
 		log.Printf("[execution] result request=%s target=%s input=%d output=%d finish_reason=%s",
 			requestID, target, inv.TokenInput, inv.TokenOutput, inv.FinishReason)
 		if callErr != nil {
@@ -2538,7 +2625,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		}
 		// provider.response is emitted ONLY on a successful response — the
 		// authoritative usage travels here. No artifact may precede it.
-		g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
+		g.CompleteModelWithMetadata(providerResponseEvent(x.providerName(), aiReq, usage, providerMetadata, len(raw)))
 		invs = append(invs, inv)
 
 		// ── BOUNDARY 3 — OUTPUT GATE (I1) ───────────────────────────
@@ -2742,6 +2829,163 @@ func artifactDiagnostic(target string, gateErr error, retryable bool) Diagnostic
 		retryable)
 }
 
+func populateInvocationTelemetry(inv *ModelInvocation, req ai.Request, usage ai.ProviderUsage, metadata ai.ResponseMetadata) {
+	if inv == nil {
+		return
+	}
+	if inv.Model == "" {
+		inv.Model = req.Model
+	}
+	inv.ContractID = req.ContractID
+	inv.Mode = req.Mode
+	inv.AuthorityLevel = contractAuthority(req.Contract)
+	inv.SchemaMode = string(ai.SchemaModeForTelemetry(req.SchemaMode))
+	inv.PromptChars = ai.RequestChars(req)
+	inv.PromptFingerprint = ai.RequestFingerprint(req)
+	inv.RequestDuration = metadata.RequestDuration
+	if inv.RequestDuration <= 0 {
+		inv.RequestDuration = ai.UsageDuration(usage)
+	}
+	inv.FirstTokenLatency = metadata.FirstTokenLatency
+	inv.StreamingDuration = metadata.StreamingDuration
+	inv.FinishReason = protocol.NormalizeFinishReason(usage.FinishReason)
+	if inv.FinishReason == "" {
+		inv.FinishReason = protocol.NormalizeFinishReason(metadata.FinishReason)
+	}
+	inv.Truncated = protocol.IsOutputTruncatedReason(inv.FinishReason) || metadata.Truncated
+	inv.SchemaFallback = metadata.SchemaFallback
+	inv.NativeSchema = metadata.NativeSchema
+	if metadata.OutputChars > 0 {
+		inv.OutputChars = metadata.OutputChars
+	}
+	if usage.Known {
+		inv.Known = true
+		inv.TokenInput = usage.PromptTokens
+		inv.TokenOutput = usage.CompletionTokens
+		inv.CachedTokens = usage.CachedTokens
+		inv.ReasoningTokens = usage.ReasoningTokens
+	}
+	inv.HTTPAttempts = usage.HTTPAttempts
+	inv.RateLimitedRetries = usage.RateLimitedRetries
+}
+
+func providerResponseEvent(providerName string, req ai.Request, usage ai.ProviderUsage, metadata ai.ResponseMetadata, outputChars int) events.ProviderResponsePayload {
+	detail := providerExecutionPayload(providerName, req, usage, metadata, outputChars, nil)
+	return events.ProviderResponsePayload{
+		RequestID:         req.RequestID,
+		Model:             detail.Model,
+		TokenInput:        detail.PromptTokens,
+		TokenOutput:       detail.CompletionTokens,
+		UsageKnown:        detail.UsageKnown,
+		FinishReason:      detail.FinishReason,
+		Truncated:         detail.Truncated,
+		RequestDuration:   detail.RequestDuration,
+		FirstTokenLatency: detail.FirstTokenLatency,
+		StreamingDuration: detail.StreamingDuration,
+		NativeSchema:      detail.NativeSchema,
+		SchemaMode:        detail.SchemaMode,
+		SchemaFallback:    detail.SchemaFallback,
+		PromptChars:       detail.PromptChars,
+		OutputChars:       detail.OutputChars,
+		PromptFingerprint: detail.PromptFingerprint,
+		ProtocolTelemetry: detail.ProtocolTelemetry,
+	}
+}
+
+func providerExecutionPayload(providerName string, req ai.Request, usage ai.ProviderUsage, metadata ai.ResponseMetadata, outputChars int, callErr error) events.ProviderExecutionPayload {
+	if metadata.Provider == "" {
+		metadata.Provider = providerName
+	}
+	if metadata.Model == "" {
+		metadata.Model = req.Model
+	}
+	if metadata.InteractionContract == "" {
+		metadata.InteractionContract = req.InteractionContract
+	}
+	if metadata.ContractID == "" {
+		metadata.ContractID = req.ContractID
+	}
+	if metadata.Mode == "" {
+		metadata.Mode = req.Mode
+	}
+	if metadata.AuthorityLevel == "" {
+		metadata.AuthorityLevel = contractAuthority(req.Contract)
+	}
+	if metadata.SchemaMode == "" {
+		metadata.SchemaMode = ai.SchemaModeForTelemetry(req.SchemaMode)
+	}
+	if metadata.PromptChars == 0 {
+		metadata.PromptChars = ai.RequestChars(req)
+	}
+	if metadata.PromptFingerprint == "" {
+		metadata.PromptFingerprint = ai.RequestFingerprint(req)
+	}
+	if metadata.FinishReason == "" {
+		metadata.FinishReason = protocol.NormalizeFinishReason(usage.FinishReason)
+	}
+	if !metadata.Usage.Known && usage.Known {
+		metadata.Usage = usage
+	}
+	ai.ApplyResponseTiming(&metadata, metadata.Usage)
+	if metadata.OutputChars == 0 {
+		metadata.OutputChars = outputChars
+	}
+	truncated := metadata.Truncated || protocol.IsOutputTruncatedReason(metadata.FinishReason)
+	errorCode := telemetryErrorCode(callErr)
+	if errorCode == "" && truncated {
+		errorCode = "output_truncated"
+	}
+	descriptor := metadata.Contract
+	if descriptor == nil {
+		descriptor = req.Contract
+	}
+	return events.ProviderExecutionPayload{
+		Provider:           metadata.Provider,
+		Model:              metadata.Model,
+		RequestStartedAt:   metadata.Usage.RequestStartedAt,
+		FirstTokenAt:       metadata.Usage.FirstTokenAt,
+		CompletedAt:        metadata.Usage.CompletedAt,
+		RequestDuration:    metadata.RequestDuration,
+		Duration:           metadata.Duration,
+		FirstTokenLatency:  metadata.FirstTokenLatency,
+		StreamingDuration:  metadata.StreamingDuration,
+		UsageKnown:         metadata.Usage.Known,
+		PromptTokens:       metadata.Usage.PromptTokens,
+		CompletionTokens:   metadata.Usage.CompletionTokens,
+		TotalTokens:        metadata.Usage.TotalTokens,
+		CachedTokens:       metadata.Usage.CachedTokens,
+		ReasoningTokens:    metadata.Usage.ReasoningTokens,
+		FinishReason:       metadata.FinishReason,
+		Truncated:          truncated,
+		NativeSchema:       metadata.NativeSchema,
+		SchemaMode:         string(metadata.SchemaMode),
+		SchemaFallback:     metadata.SchemaFallback,
+		PromptChars:        metadata.PromptChars,
+		OutputChars:        metadata.OutputChars,
+		PromptFingerprint:  metadata.PromptFingerprint,
+		HTTPAttempts:       metadata.Usage.HTTPAttempts,
+		RateLimitedRetries: metadata.Usage.RateLimitedRetries,
+		ErrorCode:          errorCode,
+		ProtocolTelemetry:  protocol.NewObservabilityBinding(metadata.InteractionContract, descriptor, metadata.ContractID, metadata.Mode, string(metadata.SchemaMode)),
+	}
+}
+
+func telemetryErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "cancelled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case isOutputExhausted(err):
+		return "output_truncated"
+	default:
+		return "provider_error"
+	}
+}
+
 // lastOutputTokens returns the provider-reported output tokens of the most
 // recent invocation (0 when usage is unknown).
 func lastOutputTokens(invs []ModelInvocation) int {
@@ -2908,6 +3152,10 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 		MaxTokens:           manifestPassMaxTokens,
 		InteractionContract: manifestDescriptor.Contract,
 		Contract:            &manifestDescriptor,
+		ContractID:          "manifest",
+		RequestID:           "manifest",
+		Mode:                "manifest",
+		AuthorityLevel:      manifestDescriptor.AuthorityCeiling,
 		// The manifest is a tiny JSON object; a hidden reasoning pass would
 		// spend the bounded output budget before any JSON appears.
 		Reasoning: &ai.ReasoningConfig{Disabled: true},
@@ -2930,6 +3178,22 @@ func (x *RuntimeExecutor) InvokeManifestPass(ctx context.Context, prompt string,
 	}
 	compiledReq.ContextPrepared = true
 	resp, err := p.Execute(ctx, compiledReq)
+	var manifestMetadata ai.ResponseMetadata
+	var manifestUsage ai.ProviderUsage
+	if resp != nil {
+		manifestMetadata = resp.Metadata()
+		manifestUsage = resp.Usage
+	}
+	manifestProviderEvent := providerExecutionPayload(p.Name(), compiledReq, manifestUsage, manifestMetadata, func() int {
+		if resp == nil {
+			return 0
+		}
+		return len(resp.Content)
+	}(), err)
+	if sink := x.telemetry(); sink != nil {
+		sink.RecordProviderExecution(manifestProviderEvent)
+	}
+	x.emit(events.NewProviderExecution(manifestProviderEvent))
 	if err != nil {
 		return "", fmt.Errorf("executor: manifest pass invocation: %w", err)
 	}
@@ -3013,7 +3277,9 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	if !ok {
 		return "", nil, nil, fmt.Errorf("executor: context compilation produced no user turn")
 	}
-	g.CompleteContext(baseAgent.Compiled.ContextChannels(), baseAgent.Compiled.UsedTokens)
+	x.recordContextTelemetry(req, baseAgent)
+	preparedContext, contextMetrics := contextTelemetry(req, baseAgent)
+	g.CompleteContextWithMetrics(preparedContext, contextMetrics)
 
 	var accumulated strings.Builder
 	for {
@@ -3030,12 +3296,16 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 			// continuation state is prompt material too, and must not escape the
 			// same model-aware budget as the initial turn.
 			var compileErr error
-			aiReq, _, compileErr = x.compileRequest(
+			var continuationAgent *contextcompiler.AgentContext
+			aiReq, continuationAgent, compileErr = x.compileRequest(
 				ctx, req, profile, model, system, userTurn, nil, step.MaxTokens(),
 			)
 			if compileErr != nil {
 				return "", nil, nil, fmt.Errorf("executor: context compilation: %w", compileErr)
 			}
+			x.recordContextTelemetry(req, continuationAgent)
+			_, continuationMetrics := contextTelemetry(req, continuationAgent)
+			g.CompileContext(continuationMetrics)
 		}
 		aiReq.Model = model
 		aiReq.MaxTokens = step.MaxTokens()
@@ -3047,7 +3317,8 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		// provider call — so the event stream truthfully records the start.
 		g.BeginModel(model)
 
-		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback)
+		var providerMetadata ai.ResponseMetadata
+		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, &providerMetadata)
 		if itrace != nil {
 			trace = itrace
 		}
@@ -3059,18 +3330,11 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 			InteractionContract: req.InteractionContract,
 			ContractDescriptor:  cloneExecutionDescriptor(req.Contract),
 		}
-		if usage.Known {
-			inv.Known = true
-			inv.TokenInput = usage.PromptTokens
-			inv.TokenOutput = usage.CompletionTokens
-			inv.CachedTokens = usage.CachedTokens
-			inv.ReasoningTokens = usage.ReasoningTokens
-		}
-		inv.FinishReason = usage.FinishReason
+		populateInvocationTelemetry(&inv, aiReq, usage, providerMetadata)
 		if callErr == nil || isOutputExhausted(callErr) {
 			// The provider responded (payload possibly truncated at the gate);
 			// provider.response carries the authoritative usage.
-			g.CompleteModel(model, inv.TokenInput, inv.TokenOutput)
+			g.CompleteModelWithMetadata(providerResponseEvent(x.providerName(), aiReq, usage, providerMetadata, len(raw)))
 		}
 		invs = append(invs, inv)
 
@@ -3156,7 +3420,7 @@ func isOutputExhausted(err error) bool {
 // reasoning.telemetry event on completion. The accumulated visible content and
 // the authoritative provider usage are returned; the authoritative artifact
 // always travels on the ExecutionResult afterwards.
-func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback) (raw string, usage ai.ProviderUsage, trace *ingestion.IngestionTrace, err error) {
+func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback, metadataOut ...*ai.ResponseMetadata) (raw string, usage ai.ProviderUsage, trace *ingestion.IngestionTrace, err error) {
 	// Provider adapters are untrusted callers. Keep their descriptor mutation
 	// confined to a private request copy so the executor's active ceiling and
 	// the pending approval proof cannot be changed after admission.
@@ -3206,6 +3470,33 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	// provider.waiting: the round-trip is in flight before the first byte.
 	g.BeginWaiting(model)
 	began := time.Now()
+	var responseMetadata ai.ResponseMetadata
+	defer func() {
+		if usage.RequestStartedAt.IsZero() {
+			usage.RequestStartedAt = began
+		}
+		if usage.CompletedAt.IsZero() {
+			usage.CompletedAt = time.Now()
+		}
+		if usage.Known || !responseMetadata.Usage.Known || !usage.RequestStartedAt.IsZero() || !usage.CompletedAt.IsZero() {
+			responseMetadata.Usage = usage
+		}
+		if responseMetadata.FinishReason == "" {
+			responseMetadata.FinishReason = protocol.NormalizeFinishReason(usage.FinishReason)
+		}
+		responseMetadata = ai.ResponseMetadataWithUsage(responseMetadata, usage, responseMetadata.FinishReason)
+		if len(metadataOut) > 0 && metadataOut[0] != nil {
+			*metadataOut[0] = responseMetadata
+		}
+		if g == nil {
+			return
+		}
+		providerEvent := providerExecutionPayload(x.providerName(), req, usage, responseMetadata, content.Len(), err)
+		g.RecordProviderExecution(providerEvent)
+		if sink := x.telemetry(); sink != nil {
+			sink.RecordProviderExecution(providerEvent)
+		}
+	}()
 	rawStream, err := x.provider.ExecuteStream(ctx, req)
 	if err != nil || rawStream == nil {
 		// Streaming is not available (the provider failed to start a stream
@@ -3229,8 +3520,9 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			return "", ai.ProviderUsage{}, nil, err
 		}
 		usage := resp.Usage
-		if metadata := resp.Metadata(); usage.FinishReason == "" {
-			usage.FinishReason = metadata.FinishReason
+		responseMetadata = resp.Metadata()
+		if usage.FinishReason == "" {
+			usage.FinishReason = responseMetadata.FinishReason
 		}
 		if !usage.Known && (resp.TokenInput > 0 || resp.TokenOutput > 0) {
 			// Legacy usage transport: some adapters/mocks report usage on the
@@ -3559,7 +3851,6 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			usage = u
 		}
 	}
-	var responseMetadata ai.ResponseMetadata
 	if metadataUp != nil {
 		responseMetadata = metadataUp.ResponseMetadata()
 		if responseMetadata.Usage.Known {
@@ -3854,6 +4145,13 @@ func (x *RuntimeExecutor) emitEvidenceEvent(res *ExecutionResult, ev *ExecutionE
 		TransactionID:    ev.Mutations().TransactionID,
 		StartedAt:        ev.StartedAt(),
 		FinishedAt:       ev.FinishedAt(),
+		ProtocolTelemetry: protocol.NewObservabilityBinding(
+			res.Proof.InteractionContract,
+			res.Proof.ContractDescriptor,
+			res.Proof.ContractID,
+			res.Mode,
+			string(ai.SchemaModeAuto),
+		),
 	}))
 }
 

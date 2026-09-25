@@ -124,6 +124,7 @@ func (p *OpenAIProvider) buildMessages(req ai.Request) []openaiMessage {
 }
 
 func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model := req.Model
 	if model == "" {
 		return nil, fmt.Errorf("openai: no model assigned to target node (empty ModelBinding.ModelID)")
@@ -197,7 +198,7 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if openaiResp.Usage != nil {
 		tokenIn = openaiResp.Usage.PromptTokens
 		tokenOut = openaiResp.Usage.CompletionTokens
@@ -225,6 +226,7 @@ func (p *OpenAIProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 }
 
 func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model := req.Model
 	if model == "" {
 		return nil, fmt.Errorf("openai: no model assigned to target node (empty ModelBinding.ModelID)")
@@ -286,7 +288,7 @@ func (p *OpenAIProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	}
 
 	sr := &openaiSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant: commit the estimated
 	// prompt count BEFORE entering the SSE chunk read loop.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
@@ -321,11 +323,7 @@ func (r *OpenAIStreamResult) ResponseMetadata() ai.ResponseMetadata {
 	if r == nil {
 		return ai.ResponseMetadata{}
 	}
-	metadata := r.metadata
-	metadata.FinishReason = r.FinishReason()
-	metadata.Truncated = isOutputLength(metadata.FinishReason)
-	metadata.Usage = normalizeUsageMetadata(r.Usage())
-	return metadata
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
 }
 
 // TruncationError exposes the typed output-ceiling signal while retaining EOF

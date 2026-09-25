@@ -321,11 +321,16 @@ func ReadOnlyAdmittedCapabilities() *AdmittedCapabilities {
 	return &AdmittedCapabilities{ReadOnly: true}
 }
 
+type admissionAuditHolder struct {
+	fn AdmissionAuditFunc
+}
+
 // AdmissionGateway is the deterministic admission gate over the RuntimeExecutor
 // entry point. It is stateless beyond its admitted capability set (swapped
 // atomically) and safe for concurrent use.
 type AdmissionGateway struct {
-	caps atomic.Pointer[AdmittedCapabilities]
+	caps  atomic.Pointer[AdmittedCapabilities]
+	audit atomic.Pointer[admissionAuditHolder]
 }
 
 // NewAdmissionGateway wires an admission gateway over the given capability
@@ -334,6 +339,30 @@ func NewAdmissionGateway(caps *AdmittedCapabilities) *AdmissionGateway {
 	g := &AdmissionGateway{}
 	g.SetCapabilities(caps)
 	return g
+}
+
+// SetAuditSink wires the structured admission audit callback. A nil callback
+// disables audit emission while leaving admission behavior unchanged.
+func (g *AdmissionGateway) SetAuditSink(fn AdmissionAuditFunc) {
+	if g == nil {
+		return
+	}
+	if fn == nil {
+		g.audit.Store(nil)
+		return
+	}
+	g.audit.Store(&admissionAuditHolder{fn: fn})
+}
+
+func (g *AdmissionGateway) auditSink() AdmissionAuditFunc {
+	if g == nil {
+		return nil
+	}
+	holder := g.audit.Load()
+	if holder == nil {
+		return nil
+	}
+	return holder.fn
 }
 
 // SetCapabilities replaces the admitted capability set atomically (test seam /

@@ -176,12 +176,23 @@ type Request struct {
 	// Contract carries the normalized per-step descriptor when the caller has
 	// one. A nil value is valid for legacy requests; adapters may derive a
 	// default from InteractionContract without changing dispatch.
-	Contract       *protocol.ContractDescriptor `json:"-"`
-	System         string                       `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
-	MaxTokens      int                          `json:"-"` // 0 = use provider default
-	Stop           []string                     `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
-	Temperature    float64                      `json:"-"` // 0 = use provider default
-	ResponseFormat *ResponseFormat              `json:"response_format,omitempty"`
+	Contract *protocol.ContractDescriptor `json:"-"`
+	// ContractID is the immutable execution-contract identity resolved by the
+	// runtime. It is metadata only and is never serialized onto a provider wire.
+	ContractID string `json:"-"`
+	// RequestID correlates one provider dispatch with the runtime request.
+	RequestID string `json:"-"`
+	// Mode is the runtime/presentation mode label for audit correlation. It is
+	// descriptive and cannot select execution authority.
+	Mode string `json:"-"`
+	// AuthorityLevel is the descriptor ceiling stamped for observability. It
+	// is not an authorization grant.
+	AuthorityLevel protocol.AuthorityCeiling `json:"-"`
+	System         string                    `json:"-"` // Explicit system prompt (top-level for Anthropic, prepended for OpenAI-compatible)
+	MaxTokens      int                       `json:"-"` // 0 = use provider default
+	Stop           []string                  `json:"-"` // Optional stop sequences (e.g. [">>>>>>>"])
+	Temperature    float64                   `json:"-"` // 0 = use provider default
+	ResponseFormat *ResponseFormat           `json:"response_format,omitempty"`
 	// SchemaMode optionally overrides the adapter's native-vs-fallback choice.
 	// The default is SchemaModeAuto; it never changes the semantic contract.
 	SchemaMode SchemaMode `json:"-"`
@@ -321,10 +332,22 @@ type Response struct {
 	// ContractMetadata is a compatibility alias for callers that use the
 	// explicit metadata name. It is kept out of JSON to avoid duplicating the
 	// canonical descriptor in serialized evidence.
-	ContractMetadata *protocol.ContractDescriptor `json:"-"`
-	NativeSchema     bool                         `json:"native_schema,omitempty"`
-	Schema           json.RawMessage              `json:"schema,omitempty"`
-	InlineConstraint string                       `json:"inline_constraint,omitempty"`
+	ContractMetadata  *protocol.ContractDescriptor `json:"-"`
+	ContractID        string                       `json:"contract_id,omitempty"`
+	Mode              string                       `json:"mode,omitempty"`
+	AuthorityLevel    protocol.AuthorityCeiling    `json:"authority_level,omitempty"`
+	SchemaMode        SchemaMode                   `json:"schema_mode,omitempty"`
+	SchemaFallback    bool                         `json:"schema_fallback,omitempty"`
+	RequestDuration   time.Duration                `json:"request_duration_ns,omitempty"`
+	Duration          time.Duration                `json:"duration_ns,omitempty"`
+	FirstTokenLatency time.Duration                `json:"first_token_latency_ns,omitempty"`
+	StreamingDuration time.Duration                `json:"streaming_duration_ns,omitempty"`
+	PromptChars       int                          `json:"prompt_chars,omitempty"`
+	OutputChars       int                          `json:"output_chars,omitempty"`
+	PromptFingerprint string                       `json:"prompt_fingerprint,omitempty"`
+	NativeSchema      bool                         `json:"native_schema,omitempty"`
+	Schema            json.RawMessage              `json:"schema,omitempty"`
+	InlineConstraint  string                       `json:"inline_constraint,omitempty"`
 	// FinishReason is the provider's terminal finish_reason when one is
 	// observable ("stop", "length", "tool_calls", ...). Streaming consumers
 	// populate it from the stream's FinishReasonProvider; non-streaming
@@ -386,6 +409,18 @@ type ResponseMetadata struct {
 	InteractionContract protocol.InteractionContract `json:"interaction_contract,omitempty"`
 	Contract            *protocol.ContractDescriptor `json:"interaction_contract_descriptor,omitempty"`
 	ContractMetadata    *protocol.ContractDescriptor `json:"-"`
+	ContractID          string                       `json:"contract_id,omitempty"`
+	Mode                string                       `json:"mode,omitempty"`
+	AuthorityLevel      protocol.AuthorityCeiling    `json:"authority_level,omitempty"`
+	SchemaMode          SchemaMode                   `json:"schema_mode,omitempty"`
+	SchemaFallback      bool                         `json:"schema_fallback,omitempty"`
+	RequestDuration     time.Duration                `json:"request_duration_ns,omitempty"`
+	Duration            time.Duration                `json:"duration_ns,omitempty"`
+	FirstTokenLatency   time.Duration                `json:"first_token_latency_ns,omitempty"`
+	StreamingDuration   time.Duration                `json:"streaming_duration_ns,omitempty"`
+	PromptChars         int                          `json:"prompt_chars,omitempty"`
+	OutputChars         int                          `json:"output_chars,omitempty"`
+	PromptFingerprint   string                       `json:"prompt_fingerprint,omitempty"`
 	FinishReason        string                       `json:"finish_reason,omitempty"`
 	Truncated           bool                         `json:"truncated,omitempty"`
 	NativeSchema        bool                         `json:"native_schema,omitempty"`
@@ -427,12 +462,45 @@ func (r *Response) Metadata() ResponseMetadata {
 		finishReason = usage.FinishReason
 	}
 	truncated := r.Truncated || protocol.IsOutputTruncatedReason(finishReason)
+	requestDuration := r.RequestDuration
+	if requestDuration <= 0 && !usage.RequestStartedAt.IsZero() && !usage.CompletedAt.IsZero() {
+		requestDuration = usage.CompletedAt.Sub(usage.RequestStartedAt)
+	}
+	if requestDuration < 0 {
+		requestDuration = 0
+	}
+	firstTokenLatency := r.FirstTokenLatency
+	if firstTokenLatency <= 0 && !usage.RequestStartedAt.IsZero() && !usage.FirstTokenAt.IsZero() {
+		firstTokenLatency = usage.FirstTokenAt.Sub(usage.RequestStartedAt)
+	}
+	if firstTokenLatency < 0 {
+		firstTokenLatency = 0
+	}
+	streamingDuration := r.StreamingDuration
+	if streamingDuration <= 0 && !usage.FirstTokenAt.IsZero() && !usage.CompletedAt.IsZero() {
+		streamingDuration = usage.CompletedAt.Sub(usage.FirstTokenAt)
+	}
+	if streamingDuration < 0 {
+		streamingDuration = 0
+	}
 	return ResponseMetadata{
 		Provider:            r.Provider,
 		Model:               r.Model,
 		InteractionContract: r.InteractionContract,
 		Contract:            contract,
 		ContractMetadata:    contract,
+		ContractID:          r.ContractID,
+		Mode:                r.Mode,
+		AuthorityLevel:      r.AuthorityLevel,
+		SchemaMode:          r.SchemaMode,
+		SchemaFallback:      r.SchemaFallback,
+		RequestDuration:     requestDuration,
+		Duration:            requestDuration,
+		FirstTokenLatency:   firstTokenLatency,
+		StreamingDuration:   streamingDuration,
+		PromptChars:         r.PromptChars,
+		OutputChars:         r.OutputChars,
+		PromptFingerprint:   r.PromptFingerprint,
 		FinishReason:        finishReason,
 		Truncated:           truncated,
 		NativeSchema:        r.NativeSchema,

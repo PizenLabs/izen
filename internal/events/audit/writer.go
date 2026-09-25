@@ -1,9 +1,11 @@
 package audit
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -220,6 +222,88 @@ func (l *AuditLogger) Err() error {
 	return nil
 }
 
+// redactAuditPayload removes raw user/model bytes while retaining the
+// structural counters and fingerprints carried by the event. This is applied
+// only at the durable audit boundary; in-process projections still receive the
+// original typed event.
+func redactAuditPayload(payload any) (any, bool) {
+	switch value := payload.(type) {
+	case events.ExecutionStartedPayload:
+		value.Prompt = ""
+		return value, true
+	case events.IntentParsedPayload:
+		value.Raw = ""
+		return value, true
+	case events.CommandReceivedPayload:
+		value.Command = ""
+		return value, true
+	case events.PromptAdmittedPayload:
+		value.Prompt = ""
+		return value, true
+	case events.ProviderStreamDeltaPayload:
+		value.Delta = ""
+		return value, true
+	case events.ReasoningPayload:
+		value.Chunk = ""
+		return value, true
+	case events.ApprovalRequiredPayload:
+		value.Preview = ""
+		return value, true
+	case events.ExecutionFailedPayload:
+		value.Error = ""
+		return value, true
+	default:
+		return redactGenericPayload(payload)
+	}
+}
+
+func redactGenericPayload(payload any) (any, bool) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return payload, false
+	}
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return payload, false
+	}
+	redacted, changed := redactJSONValue(value)
+	if !changed {
+		return payload, false
+	}
+	return redacted, true
+}
+
+func redactJSONValue(value any) (any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		changed := false
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			switch strings.ToLower(key) {
+			case "prompt", "raw", "command", "delta", "chunk", "content", "output", "preview", "error":
+				out[key] = ""
+				changed = true
+				continue
+			}
+			redacted, childChanged := redactJSONValue(child)
+			out[key] = redacted
+			changed = changed || childChanged
+		}
+		return out, changed
+	case []any:
+		changed := false
+		out := make([]any, 0, len(typed))
+		for _, child := range typed {
+			redacted, childChanged := redactJSONValue(child)
+			out = append(out, redacted)
+			changed = changed || childChanged
+		}
+		return out, changed
+	default:
+		return value, false
+	}
+}
+
 // handle runs on the bus dispatch goroutine. It forwards every envelope onto
 // the internal channel with a non-blocking push so a stalled disk worker can
 // never block the publisher or the TUI projection. The channel is never
@@ -242,6 +326,10 @@ func (l *AuditLogger) handle(ev events.DomainEvent) {
 			Kind:      events.DomainKindSystem,
 			Payload:   ev.Payload(),
 		}
+	}
+	if safe, redacted := redactAuditPayload(env.Payload); redacted {
+		env.Payload = safe
+		env.Redacted = true
 	}
 	if l.sessionID != nil {
 		if sid := l.sessionID(); sid != "" {

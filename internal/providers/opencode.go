@@ -74,6 +74,7 @@ func (p *OpenCodeProvider) buildMessages(req ai.Request) []opencodeMessage {
 }
 
 func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
@@ -172,7 +173,7 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if ocResp.Usage != nil {
 		tokenIn = ocResp.Usage.PromptTokens
 		tokenOut = ocResp.Usage.CompletionTokens
@@ -201,6 +202,7 @@ func (p *OpenCodeProvider) Execute(ctx context.Context, req ai.Request) (*ai.Res
 }
 
 func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
@@ -274,7 +276,7 @@ func (p *OpenCodeProvider) ExecuteStream(ctx context.Context, req ai.Request) (i
 	}
 
 	sr := &opencodeSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
 	return &OpenCodeStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("opencode", model, plan)}, nil
@@ -396,11 +398,7 @@ func (r *OpenCodeStreamResult) ResponseMetadata() ai.ResponseMetadata {
 	if r == nil {
 		return ai.ResponseMetadata{}
 	}
-	metadata := r.metadata
-	metadata.FinishReason = r.FinishReason()
-	metadata.Truncated = isOutputLength(metadata.FinishReason)
-	metadata.Usage = normalizeUsageMetadata(r.Usage())
-	return metadata
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
 }
 
 func (r *OpenCodeStreamResult) TruncationError() error {

@@ -24,16 +24,23 @@ type ResponseEnvelope = ai.ResponseMetadata
 // can inspect exactly what an adapter sent without reaching into provider wire
 // structs.
 type ContractSerialization struct {
-	Provider         string                       `json:"provider,omitempty"`
-	Contract         protocol.InteractionContract `json:"contract,omitempty"`
-	Descriptor       *protocol.ContractDescriptor `json:"descriptor,omitempty"`
-	Schema           json.RawMessage              `json:"schema,omitempty"`
-	ResponseFormat   *ai.ResponseFormat           `json:"response_format,omitempty"`
-	InlineConstraint string                       `json:"inline_constraint,omitempty"`
-	NativeSchema     bool                         `json:"native_schema,omitempty"`
-	StructuredOutput bool                         `json:"structured_output,omitempty"`
-	OutputSchema     protocol.OutputSchema        `json:"output_schema,omitempty"`
-	SchemaVersion    string                       `json:"schema_version,omitempty"`
+	Provider          string                       `json:"provider,omitempty"`
+	Contract          protocol.InteractionContract `json:"contract,omitempty"`
+	Descriptor        *protocol.ContractDescriptor `json:"descriptor,omitempty"`
+	Schema            json.RawMessage              `json:"schema,omitempty"`
+	ResponseFormat    *ai.ResponseFormat           `json:"response_format,omitempty"`
+	InlineConstraint  string                       `json:"inline_constraint,omitempty"`
+	NativeSchema      bool                         `json:"native_schema,omitempty"`
+	SchemaFallback    bool                         `json:"schema_fallback,omitempty"`
+	StructuredOutput  bool                         `json:"structured_output,omitempty"`
+	OutputSchema      protocol.OutputSchema        `json:"output_schema,omitempty"`
+	SchemaVersion     string                       `json:"schema_version,omitempty"`
+	ContractID        string                       `json:"contract_id,omitempty"`
+	Mode              string                       `json:"mode,omitempty"`
+	AuthorityLevel    protocol.AuthorityCeiling    `json:"authority_level,omitempty"`
+	SchemaMode        ai.SchemaMode                `json:"schema_mode,omitempty"`
+	PromptChars       int                          `json:"prompt_chars,omitempty"`
+	PromptFingerprint string                       `json:"prompt_fingerprint,omitempty"`
 }
 
 // PrepareContractRequest validates and normalizes the semantic contract, then
@@ -46,13 +53,21 @@ func PrepareContractRequest(provider string, req ai.Request) (ai.Request, Contra
 	if err != nil {
 		return ai.Request{}, ContractSerialization{}, err
 	}
-	plan := ContractSerialization{Provider: strings.ToLower(strings.TrimSpace(provider))}
+	plan := ContractSerialization{
+		Provider:          strings.ToLower(strings.TrimSpace(provider)),
+		ContractID:        strings.TrimSpace(req.ContractID),
+		Mode:              strings.TrimSpace(req.Mode),
+		SchemaMode:        ai.SchemaModeForTelemetry(req.SchemaMode),
+		PromptChars:       ai.RequestChars(req),
+		PromptFingerprint: ai.RequestFingerprint(req),
+	}
 	if descriptor != nil {
 		copy := descriptor.Clone()
 		plan.Contract = copy.Contract
 		plan.Descriptor = &copy
 		plan.OutputSchema = copy.OutputSchema
 		plan.SchemaVersion = copy.SchemaVersion
+		plan.AuthorityLevel = copy.AuthorityCeiling
 		plan.StructuredOutput = copy.StructuredOutput || copy.OutputSchema != protocol.SchemaText
 	}
 
@@ -69,6 +84,7 @@ func PrepareContractRequest(provider string, req ai.Request) (ai.Request, Contra
 		}
 	}
 	if plan.Descriptor == nil || !plan.StructuredOutput {
+		plan.SchemaFallback = false
 		return req, plan, nil
 	}
 
@@ -86,6 +102,7 @@ func PrepareContractRequest(provider string, req ai.Request) (ai.Request, Contra
 	native := nativeSchemaSupported(plan.Provider, req.Model, req.SchemaMode, req.ModelMetadata)
 	if native && len(schema) > 0 {
 		plan.NativeSchema = true
+		plan.SchemaFallback = false
 		plan.ResponseFormat = ai.NewJSONSchemaResponseFormat(schemaName(*plan.Descriptor), schema)
 		req.ResponseFormat = plan.ResponseFormat
 		// A caller may have supplied a generic json_object hint. The contract
@@ -97,6 +114,7 @@ func PrepareContractRequest(provider string, req ai.Request) (ai.Request, Contra
 	// supported response_format field. It remains a semantic constraint, not a
 	// capability downgrade.
 	plan.NativeSchema = false
+	plan.SchemaFallback = true
 	// A contract-bound fallback must not accidentally retain a stale native
 	// response_format supplied by a previous attempt.
 	req.ResponseFormat = nil
@@ -288,6 +306,13 @@ func newResponseMetadata(provider, model string, plan ContractSerialization) ai.
 		Provider:            provider,
 		Model:               model,
 		InteractionContract: plan.Contract,
+		ContractID:          plan.ContractID,
+		Mode:                plan.Mode,
+		AuthorityLevel:      plan.AuthorityLevel,
+		SchemaMode:          plan.SchemaMode,
+		SchemaFallback:      plan.SchemaFallback,
+		PromptChars:         plan.PromptChars,
+		PromptFingerprint:   plan.PromptFingerprint,
 		FinishReason:        "",
 		NativeSchema:        plan.NativeSchema,
 		Schema:              append(json.RawMessage(nil), plan.Schema...),
@@ -299,6 +324,14 @@ func newResponseMetadata(provider, model string, plan ContractSerialization) ai.
 		metadata.ContractMetadata = &copy
 	}
 	return metadata
+}
+
+// streamResponseMetadata normalizes the shared stream envelope after the
+// reader has observed its terminal state. Keeping this in one helper makes
+// duration, truncation and schema-fallback reporting identical across all
+// provider adapters.
+func streamResponseMetadata(metadata ai.ResponseMetadata, usage ai.ProviderUsage, finishReason string) ai.ResponseMetadata {
+	return ai.ResponseMetadataWithUsage(metadata, normalizeUsageMetadata(usage), finishReason)
 }
 
 // StampResponseMetadata applies the standardized contract and finish-reason
@@ -322,9 +355,24 @@ func StampResponseMetadata(response *ai.Response, provider, model string, plan C
 	} else {
 		response.SetContractMetadata(provider, model, plan.Contract, nil)
 	}
+	response.ContractID = plan.ContractID
+	response.Mode = plan.Mode
+	response.AuthorityLevel = plan.AuthorityLevel
+	response.SchemaMode = plan.SchemaMode
+	response.SchemaFallback = plan.SchemaFallback
+	response.PromptChars = plan.PromptChars
+	response.PromptFingerprint = plan.PromptFingerprint
+	response.OutputChars = len(response.Content)
 	response.NativeSchema = plan.NativeSchema
 	response.Schema = append(json.RawMessage(nil), plan.Schema...)
 	response.InlineConstraint = plan.InlineConstraint
+	if !response.Usage.RequestStartedAt.IsZero() && !response.Usage.CompletedAt.IsZero() {
+		response.RequestDuration = response.Usage.CompletedAt.Sub(response.Usage.RequestStartedAt)
+		if response.RequestDuration < 0 {
+			response.RequestDuration = 0
+		}
+	}
+	response.Duration = response.RequestDuration
 	return response
 }
 

@@ -388,6 +388,31 @@ func evaluateAdmissionRisk(req ExecuteRequest, profile strategy.ExecutionStrateg
 	return combined
 }
 
+// AdmissionReasonCode returns a stable, non-sensitive reason code for an
+// admission rejection. It is suitable for dashboards and audit routing.
+func AdmissionReasonCode(err error) string {
+	if err == nil {
+		return "admitted"
+	}
+	switch {
+	case errors.Is(err, ErrAuthorityExceeded), errors.Is(err, protocol.ErrAuthorityCeilingExceeded):
+		return "authority_exceeded"
+	case errors.Is(err, ErrRiskScopeExceeded):
+		return "risk_scope_exceeded"
+	case errors.Is(err, ErrContextIntegrity):
+		return "context_integrity"
+	case errors.Is(err, protocol.ErrInvalidContract):
+		return "invalid_contract"
+	default:
+		return "admission_rejected"
+	}
+}
+
+// AdmissionAuditFunc receives one bounded admission verdict. The callback is
+// deliberately structural: it receives policy facts and a sanitized reason,
+// never the raw prompt or command body.
+type AdmissionAuditFunc func(req ExecuteRequest, profile strategy.ExecutionStrategyProfile, decision AdmissionDecision, err error)
+
 // AdmitWithContract is the explicit descriptor-threading form of Admit. It is
 // equivalent to passing the descriptor as Admit's optional final argument and
 // keeps call sites self-documenting at dispatch boundaries.
@@ -401,7 +426,12 @@ func (g *AdmissionGateway) AdmitWithContract(req ExecuteRequest, root string, pr
 // optional descriptor is an explicit thread point for callers that normalize a
 // contract before constructing the ExecuteRequest; when omitted, the request's
 // own Contract/InteractionContract fields are authoritative.
-func (g *AdmissionGateway) Admit(req ExecuteRequest, root string, profile strategy.ExecutionStrategyProfile, supplied ...*protocol.ContractDescriptor) (AdmissionDecision, error) {
+func (g *AdmissionGateway) Admit(req ExecuteRequest, root string, profile strategy.ExecutionStrategyProfile, supplied ...*protocol.ContractDescriptor) (decision AdmissionDecision, err error) {
+	defer func() {
+		if sink := g.auditSink(); sink != nil {
+			sink(req, profile, decision, err)
+		}
+	}()
 	snapshot, err := verifyIntentContext(req, root)
 	if err != nil {
 		return AdmissionDecision{Requested: ScopeDestructive, Reason: "context fidelity verification failed"}, err
@@ -412,7 +442,7 @@ func (g *AdmissionGateway) Admit(req ExecuteRequest, root string, profile strate
 		return AdmissionDecision{Requested: ScopeDestructive, Reason: "interaction contract descriptor is invalid"}, err
 	}
 	verdict := evaluateAdmissionRisk(req, profile)
-	decision := AdmissionDecision{Requested: verdict.Scope, Snapshot: snapshot}
+	decision = AdmissionDecision{Requested: verdict.Scope, Snapshot: snapshot}
 	if hasContract {
 		descriptorCopy := descriptor.Clone()
 		decision.Contract = &descriptorCopy

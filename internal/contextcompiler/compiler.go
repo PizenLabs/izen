@@ -134,6 +134,12 @@ type CompiledContext struct {
 	CacheHit     bool
 	CompiledAt   time.Time
 
+	// TruncatedFiles records only source-side file provenance. It contains
+	// paths, never file contents, and is safe to project into audit telemetry.
+	TruncatedFiles []string
+	// Policy is the caller-selected context policy that produced this result.
+	Policy string
+
 	Phase      Phase
 	Model      string
 	Provider   string
@@ -155,7 +161,10 @@ type AgentContext struct {
 	Budget     Budget
 	Compiled   *CompiledContext
 	Context    *CompiledContext
-	Rendered   string
+	// Result is the content-free compiler projection consumed by telemetry
+	// and audit sinks. It is a defensive snapshot of the same compilation.
+	Result   *CompileResult
+	Rendered string
 
 	// Context* aliases mirror the vocabulary used by the AgentTurn design
 	// document and make the facade self-describing to non-Go callers.
@@ -280,6 +289,7 @@ func (c *Compiler) CompileAgentContext(ctx context.Context, in Input) (*AgentCon
 	exclusions := append([]string(nil), compiled.Exclusions...)
 	budget := compiled.Budget
 	budget.BySource = cloneSourceMap(compiled.Budget.BySource)
+	result := compiled.Metrics()
 	return &AgentContext{
 		Phase:             compiled.Phase,
 		Sources:           sources,
@@ -289,6 +299,7 @@ func (c *Compiler) CompileAgentContext(ctx context.Context, in Input) (*AgentCon
 		Budget:            budget,
 		Compiled:          compiled,
 		Context:           compiled,
+		Result:            &result,
 		Rendered:          compiled.RenderedPrompt(),
 		ContextSources:    append([]Source(nil), sources...),
 		ContextBudget:     budget,
@@ -459,9 +470,15 @@ func (c *Compiler) Compile(ctx context.Context, in Input) (*CompiledContext, err
 		Phase:      normalized.Phase,
 		Model:      normalized.Model,
 		Provider:   normalized.Provider,
+		Policy:     normalized.ContextPolicy,
 		Scope:      normalized.Scope,
 		Lineage:    normalized.Lineage,
 		Exclusions: append([]string(nil), normalized.Exclusions...),
+	}
+	for _, file := range normalized.Artifacts {
+		if file.Truncated && strings.TrimSpace(file.Path) != "" {
+			out.TruncatedFiles = append(out.TruncatedFiles, file.Path)
+		}
 	}
 	out.Dropped = excludedFiles
 	for _, section := range critical {
@@ -549,8 +566,9 @@ func (c *Compiler) Compile(ctx context.Context, in Input) (*CompiledContext, err
 			out.Sections = append(out.Sections, *requiredArtifactSection)
 			out.ContextTokens += requiredArtifactSection.Tokens
 		}
-		content, dropped := c.fitSource(src, normalized, share)
+		content, dropped, truncatedFiles := c.fitSource(src, normalized, share)
 		out.Dropped += dropped
+		out.TruncatedFiles = appendUniqueStrings(out.TruncatedFiles, truncatedFiles...)
 		if content == "" {
 			out.Truncated = out.Truncated || (src == SourceArtifacts && dropped > 0)
 			continue
@@ -561,6 +579,13 @@ func (c *Compiler) Compile(ctx context.Context, in Input) (*CompiledContext, err
 		// telemetry instead of reporting a false "complete" projection.
 		if src == SourceArtifacts && dropped > 0 {
 			truncated = true
+		}
+		if src == SourceArtifacts && truncated {
+			for _, file := range normalized.Artifacts {
+				if file.Path != "" {
+					out.TruncatedFiles = appendUniqueStrings(out.TruncatedFiles, file.Path)
+				}
+			}
 		}
 		if content == "" {
 			out.Truncated = out.Truncated || truncated
@@ -866,34 +891,45 @@ func sourceAllowedByPolicy(policy string, src Source) bool {
 	}
 }
 
-func (c *Compiler) fitSource(src Source, in Input, share int) (string, int) {
+func (c *Compiler) fitSource(src Source, in Input, share int) (string, int, []string) {
 	if share <= 0 {
 		switch src {
 		case SourceUserRequest, SourceWorkflow, SourceRecentTurns, SourceSessionCompact, SourceArtifacts, SourceProjectKnowledge:
-			return "", 1
+			if src == SourceArtifacts {
+				paths := make([]string, 0, len(in.Artifacts))
+				for _, file := range in.Artifacts {
+					if file.Path != "" {
+						paths = append(paths, file.Path)
+					}
+				}
+				return "", 1, paths
+			}
+			return "", 1, nil
 		default:
-			return "", 0
+			return "", 0, nil
 		}
 	}
 	switch src {
 	case SourceUserRequest:
-		return in.UserRequest, 0
+		return in.UserRequest, 0, nil
 	case SourceWorkflow:
-		return in.WorkflowState, 0
+		return in.WorkflowState, 0, nil
 	case SourceRecentTurns:
-		return renderTurns(in.RecentTurns, share)
+		content, dropped := renderTurns(in.RecentTurns, share)
+		return content, dropped, nil
 	case SourceSessionCompact:
 		content := renderCompact(in.SessionCompact)
 		if EstimateTokens(content) > share {
-			return content, 1
+			return content, 1, nil
 		}
-		return content, 0
+		return content, 0, nil
 	case SourceArtifacts:
 		return renderArtifacts(in.Artifacts, share)
 	case SourceProjectKnowledge:
-		return selectKnowledge(in.Knowledge, share)
+		content, dropped := selectKnowledge(in.Knowledge, share)
+		return content, dropped, nil
 	default:
-		return "", 0
+		return "", 0, nil
 	}
 }
 
@@ -972,6 +1008,24 @@ func trimToTotal(out *CompiledContext, total int) error {
 		out.Dropped++
 	}
 	return nil
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	seen := make(map[string]struct{}, len(dst)+len(values))
+	for _, value := range dst {
+		seen[value] = struct{}{}
+	}
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		dst = append(dst, value)
+	}
+	return dst
 }
 
 func sourceTokens(sections []Section) map[Source]int {
@@ -1123,9 +1177,15 @@ func renderArtifactBlocks(refs []ArtifactRef) string {
 	return b.String()
 }
 
-func renderArtifacts(refs []ArtifactRef, share int) (string, int) {
+func renderArtifacts(refs []ArtifactRef, share int) (string, int, []string) {
+	truncatedFiles := make([]string, 0)
 	if share <= 0 {
-		return "", len(refs)
+		for _, file := range sortedArtifacts(refs) {
+			if file.Path != "" {
+				truncatedFiles = append(truncatedFiles, file.Path)
+			}
+		}
+		return "", len(refs), truncatedFiles
 	}
 	var b strings.Builder
 	used := 0
@@ -1133,10 +1193,16 @@ func renderArtifacts(refs []ArtifactRef, share int) (string, int) {
 	for _, file := range sortedArtifacts(refs) {
 		if file.Truncated {
 			dropped++
+			if file.Path != "" {
+				truncatedFiles = append(truncatedFiles, file.Path)
+			}
 		}
 		content := renderArtifactBlock(file)
 		toks := EstimateTokens(content)
 		if used+toks > share {
+			if file.Path != "" {
+				truncatedFiles = append(truncatedFiles, file.Path)
+			}
 			if b.Len() == 0 {
 				prefix := ""
 				if file.Path != "" {
@@ -1160,7 +1226,7 @@ func renderArtifacts(refs []ArtifactRef, share int) (string, int) {
 		b.WriteString(content)
 		used += toks
 	}
-	return b.String(), dropped
+	return b.String(), dropped, appendUniqueStrings(nil, truncatedFiles...)
 }
 
 // fingerprint is a SHA-256 over the canonical encoding of every underlying
@@ -1250,6 +1316,7 @@ func cloneCompiled(in *CompiledContext) *CompiledContext {
 	}
 	out := *in
 	out.Sections = append([]Section(nil), in.Sections...)
+	out.TruncatedFiles = append([]string(nil), in.TruncatedFiles...)
 	out.Exclusions = append([]string(nil), in.Exclusions...)
 	out.Budget.BySource = cloneSourceMap(in.Budget.BySource)
 	return &out

@@ -188,6 +188,7 @@ func (p *GeminiProvider) apiURL(model string, stream bool) string {
 }
 
 func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
@@ -270,7 +271,7 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if geminiResp.UsageMetadata != nil {
 		tokenIn = geminiResp.UsageMetadata.PromptTokenCount
 		tokenOut = geminiResp.UsageMetadata.CandidatesTokenCount
@@ -297,6 +298,7 @@ func (p *GeminiProvider) Execute(ctx context.Context, req ai.Request) (*ai.Respo
 }
 
 func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model := p.model
 	if req.Model != "" {
 		model = req.Model
@@ -367,7 +369,7 @@ func (p *GeminiProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.
 	}
 
 	sr := &geminiSSEReader{body: resp.Body, cancel: cancel, reasoningHandler: req.ReasoningHandler}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant.
 	sr.usage.recordPromptEstimate(EstimatePromptTokensForRequest(req.System, req.Messages))
 	return &GeminiStreamResult{ReadCloser: sr, sr: sr, metadata: newResponseMetadata("gemini", model, plan)}, nil
@@ -403,11 +405,7 @@ func (r *GeminiStreamResult) ResponseMetadata() ai.ResponseMetadata {
 	if r == nil {
 		return ai.ResponseMetadata{}
 	}
-	metadata := r.metadata
-	metadata.FinishReason = r.FinishReason()
-	metadata.Truncated = isOutputLength(metadata.FinishReason)
-	metadata.Usage = normalizeUsageMetadata(r.Usage())
-	return metadata
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
 }
 
 func (r *GeminiStreamResult) TruncationError() error {

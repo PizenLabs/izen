@@ -209,6 +209,7 @@ func (p *OpenRouterProvider) resolveAPIKey() string {
 }
 
 func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
+	requestStarted := time.Now()
 	model, err := p.resolveModel(req.Model)
 	if err != nil {
 		return nil, err
@@ -286,7 +287,7 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 	tokenIn := 0
 	tokenOut := 0
 	var usage ai.ProviderUsage
-	usage.RequestStartedAt = time.Now()
+	usage.RequestStartedAt = requestStarted
 	if openaiResp.Usage != nil {
 		tokenIn = openaiResp.Usage.PromptTokens
 		tokenOut = openaiResp.Usage.CompletionTokens
@@ -317,6 +318,7 @@ func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.R
 }
 
 func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) (io.ReadCloser, error) {
+	requestStarted := time.Now()
 	model, err := p.resolveModel(req.Model)
 	if err != nil {
 		return nil, err
@@ -365,7 +367,7 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		cancel:         cancel,
 		closeTransport: p.closeIdleConnections,
 	}
-	sr.usage.markRequestStarted(time.Now())
+	sr.usage.markRequestStarted(requestStarted)
 	// Phase 6.4.4 Optimistic Prompt Token Invariant: commit the estimated
 	// prompt count BEFORE entering the SSE chunk read loop so prompt cost
 	// is never lost on early stream cancellation. Authoritative usage
@@ -975,11 +977,7 @@ func (r *OpenRouterStreamResult) ResponseMetadata() ai.ResponseMetadata {
 	if r == nil {
 		return ai.ResponseMetadata{}
 	}
-	metadata := r.metadata
-	metadata.FinishReason = r.FinishReason()
-	metadata.Truncated = isOutputLength(metadata.FinishReason)
-	metadata.Usage = normalizeUsageMetadata(r.Usage())
-	return metadata
+	return streamResponseMetadata(r.metadata, r.Usage(), r.FinishReason())
 }
 
 // TruncationError exposes the typed output-ceiling signal without changing

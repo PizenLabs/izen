@@ -26,6 +26,8 @@ type InvocationRequest struct {
 	Reasoning           domain.ReasoningOption
 	InteractionContract protocol.InteractionContract
 	Contract            *protocol.ContractDescriptor
+	ContractID          string
+	Mode                string
 }
 
 // Validate enforces that ModelID is explicitly bound. An empty ModelID is a
@@ -52,11 +54,16 @@ func (r InvocationRequest) Validate() error {
 // the explicit ModelID binding preserved verbatim. The Model field travels to
 // the provider without fallback substitution.
 func (r InvocationRequest) ToExecuteRequest() ExecuteRequest {
+	mode := r.Mode
+	if mode == "" {
+		mode = string(r.Target)
+	}
 	return ExecuteRequest{
 		Prompt:              r.Prompt,
-		Mode:                string(r.Target),
+		Mode:                mode,
 		Model:               r.ModelID,
 		InteractionContract: r.InteractionContract,
 		Contract:            cloneExecutionDescriptor(r.Contract),
+		ContractID:          r.ContractID,
 	}
 }

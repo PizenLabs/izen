@@ -6,7 +6,9 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/contextcompiler"
+	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
+	"github.com/PizenLabs/izen/internal/protocol"
 )
 
 // AgentContext is the execution-facing name for the compiler-owned bounded
@@ -48,6 +50,27 @@ func (x *RuntimeExecutor) SetContextCompiler(compiler *contextcompiler.Compiler)
 // ContextCompiler exposes the wired compiler for observability and embedders.
 func (x *RuntimeExecutor) ContextCompiler() *contextcompiler.Compiler {
 	return x.contextCompilerInstance()
+}
+
+// SetTelemetrySink attaches the optional per-operation execution telemetry
+// record used by the inspect/audit projection. Passing nil disables the sink.
+func (x *RuntimeExecutor) SetTelemetrySink(sink *Telemetry) {
+	if x == nil {
+		return
+	}
+	x.mu.Lock()
+	x.telemetrySink = sink
+	x.mu.Unlock()
+}
+
+func (x *RuntimeExecutor) telemetry() *Telemetry {
+	if x == nil {
+		return nil
+	}
+	x.mu.Lock()
+	sink := x.telemetrySink
+	x.mu.Unlock()
+	return sink
 }
 
 func contextPhaseForStrategy(value strategy.ExecutionStrategy) contextcompiler.Phase {
@@ -124,6 +147,10 @@ func (x *RuntimeExecutor) compileRequest(
 		MaxTokens:           requestedOutput,
 		InteractionContract: req.InteractionContract,
 		Contract:            req.Contract,
+		ContractID:          req.ContractID,
+		RequestID:           req.RequestID,
+		Mode:                req.Mode,
+		AuthorityLevel:      contractAuthority(req.Contract),
 	}, contextcompiler.RequestCompileOptions{
 		Phase:                 contextPhaseForStrategy(profile.Strategy),
 		Provider:              limits.Provider,
@@ -144,6 +171,79 @@ func (x *RuntimeExecutor) compileRequest(
 	compiled.ContextPrepared = true
 	compiled.ContextPhase = string(contextPhaseForStrategy(profile.Strategy))
 	return compiled, agent, nil
+}
+
+func contextTelemetry(req ExecuteRequest, agent *contextcompiler.AgentContext) (events.ContextPreparedPayload, events.ContextCompilationPayload) {
+	result := agent.CompileResult()
+	binding := protocol.NewObservabilityBinding(req.InteractionContract, req.Contract, req.ContractID, req.Mode, string(ai.SchemaModeAuto))
+	prepared := events.ContextPreparedPayload{
+		RequestID:          req.RequestID,
+		Channels:           append([]string(nil), agent.Compiled.ContextChannels()...),
+		Tokens:             result.UsedTokens,
+		Phase:              string(result.Phase),
+		Policy:             result.Policy,
+		Scope:              result.Scope,
+		FittedContextScope: result.FittedContextScope,
+		Lineage:            result.Lineage,
+		BudgetTokens:       result.BudgetTotal,
+		ReservedTokens:     result.ReservedTokens,
+		AvailableTokens:    result.AvailableTokens,
+		ContextTokens:      result.ContextTokens,
+		Truncated:          result.Truncated,
+		TruncatedFiles:     append([]string(nil), result.TruncatedFiles...),
+		TruncatedFileCount: result.TruncatedFileCount,
+		DropCount:          result.DropCount,
+		PromptChars:        result.PromptChars,
+		PromptFingerprint:  result.PromptFingerprint,
+		ProtocolTelemetry:  binding,
+	}
+	metrics := events.ContextCompilationPayload{
+		RequestID:          req.RequestID,
+		Phase:              string(result.Phase),
+		Policy:             result.Policy,
+		Scope:              result.Scope,
+		FittedContextScope: result.FittedContextScope,
+		Lineage:            result.Lineage,
+		BudgetTokens:       result.BudgetTotal,
+		ReservedTokens:     result.ReservedTokens,
+		AvailableTokens:    result.AvailableTokens,
+		UsedTokens:         result.UsedTokens,
+		ContextTokens:      result.ContextTokens,
+		SystemTokens:       result.SystemTokens,
+		SchemaTokens:       result.SchemaTokens,
+		ToolTokens:         result.ToolTokens,
+		Truncated:          result.Truncated,
+		TruncatedFiles:     append([]string(nil), result.TruncatedFiles...),
+		TruncatedFileCount: result.TruncatedFileCount,
+		DropCount:          result.DropCount,
+		SectionCount:       result.SectionCount,
+		Sources:            make([]string, 0, len(result.Sources)),
+		PromptChars:        result.PromptChars,
+		PromptFingerprint:  result.PromptFingerprint,
+		ProtocolTelemetry:  binding,
+	}
+	for _, source := range result.Sources {
+		metrics.Sources = append(metrics.Sources, string(source))
+	}
+	return prepared, metrics
+}
+
+func contractAuthority(descriptor *protocol.ContractDescriptor) protocol.AuthorityCeiling {
+	if descriptor == nil {
+		return ""
+	}
+	return descriptor.AuthorityCeiling
+}
+
+func (x *RuntimeExecutor) recordContextTelemetry(req ExecuteRequest, agent *contextcompiler.AgentContext) {
+	if x == nil || agent == nil {
+		return
+	}
+	if sink := x.telemetry(); sink != nil {
+		sink.BindProtocol(protocol.NewObservabilityBinding(req.InteractionContract, req.Contract, req.ContractID, req.Mode, string(ai.SchemaModeAuto)))
+		result := agent.CompileResult()
+		sink.RecordCompileResult(&result)
+	}
 }
 
 func contextLineage(req ExecuteRequest) string {
