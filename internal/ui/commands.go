@@ -84,6 +84,7 @@ var validSystemCommands = map[string]struct{}{
 	"/usage":            {},
 	"/provider":         {},
 	"/models":           {},
+	"/settings":         {},
 	"/objective":        {},
 	"/clear":            {},
 	"/drop":             {},
@@ -213,15 +214,20 @@ func (m *model) handleInput(line string) tea.Cmd {
 
 	// Rigid active guards to block spamming inputs during background processes
 	if m.streaming || m.agentRunning {
-		// $inspect is a read-only observational directive: it renders the
-		// telemetry of the most recently finalized operation without starting
-		// any work. It is exempt from the busy-input guard so the developer can
-		// always inspect the authoritative execution record.
-		if !strings.HasPrefix(line, "$inspect") {
-			m.push(roleSystem, "Input blocked: task active.")
-			m.refreshViewportContent()
-			m.gotoBottomIfAllowed()
-			return nil
+		// Settings is a presentation-only modal and remains available during a
+		// live stream so CoT visibility and viewport policy can change without
+		// interrupting the response.
+		if line != "/settings" && !strings.HasPrefix(line, "/settings ") {
+			// $inspect is a read-only observational directive: it renders the
+			// telemetry of the most recently finalized operation without starting
+			// any work. It is exempt from the busy-input guard so the developer can
+			// always inspect the authoritative execution record.
+			if !strings.HasPrefix(line, "$inspect") {
+				m.push(roleSystem, "Input blocked: task active.")
+				m.refreshViewportContent()
+				m.gotoBottomIfAllowed()
+				return nil
+			}
 		}
 	}
 
@@ -2054,7 +2060,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /spec  inspect the compiled conversation context (read-only)"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("commands"))
-		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /objective  /drop  /clear  /quit  /copy  /compact"))
+		m.push(roleSystem, infoStyle.Render("  /help  /usage  /models  /settings  /objective  /drop  /clear  /quit  /copy  /compact"))
 		m.push(roleSystem, infoStyle.Render("  /undo  /commit  /checkpoint  /arch <layer|pkg>"))
 		m.push(roleSystem, "")
 		m.push(roleSystem, labelBoldStyle.Render("sessions"))
@@ -2073,6 +2079,7 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, infoStyle.Render("  /objective approve  approve budget-guarded objective"))
 		m.push(roleSystem, infoStyle.Render("  /usage           inspect token usage and provider status"))
 		m.push(roleSystem, infoStyle.Render("  /models      interactive model picker (fuzzy search)"))
+		m.push(roleSystem, infoStyle.Render("  /settings    response and viewport preferences"))
 		m.push(roleSystem, infoStyle.Render("  /models <name> switch active model directly (e.g. /models claude-3-5-sonnet)"))
 		m.push(roleSystem, infoStyle.Render("  !<cmd>  run a shell command"))
 		m.push(roleSystem, "")
@@ -2136,12 +2143,20 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 		m.push(roleSystem, mutedStyle.Render("💡 Tip: Provider switching is automatic! Use /models to pick any model, or /usage to inspect provider API keys."))
 		return m.runUsageCmd()
 
+	case cmd == "/settings":
+		// Standalone reduced-schema settings surface. It owns only response
+		// style, CoT visibility, and viewport auto-scroll; registry state stays
+		// exclusively in the /models picker.
+		m.showModelPicker = false
+		return m.openSettings()
+
 	case cmd == "/models":
 		// Phase 3 contextual picker: cache-first, never blocking. Reads
 		// synchronously from the atomic Registry RAM snapshot (<2ms); zero
 		// network I/O, zero Fetching screen. On a cold start (zero cached
 		// models) the picker's Init emits SyncRequestedMsg so background
 		// workers pull provider APIs without blocking the TUI.
+		m.showSettings = false
 		m.showModelPicker = true
 		m.modelPicker = newModelPickerFromCache(m)
 		return m.modelPicker.Init()

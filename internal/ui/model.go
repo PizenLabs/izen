@@ -68,6 +68,7 @@ import (
 	uitool "github.com/PizenLabs/izen/internal/ui/tool"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
 	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
+	settings_widget "github.com/PizenLabs/izen/internal/ui/widgets/settings"
 )
 
 // ── Init stage types ──────────────────────────────────────────────────────────
@@ -1542,6 +1543,15 @@ type model struct {
 	// view). Reads synchronously from the atomic Registry RAM snapshot.
 	showModelPicker bool
 	modelPicker     model_picker.Model
+
+	// Standalone Settings modal. The widget owns only Response Style, CoT
+	// visibility, and viewport auto-scroll; provider/model registry state
+	// remains exclusively in modelPicker.
+	showSettings       bool
+	settingsModel      settings_widget.Model
+	hideThinkingBlocks bool
+	viewportManager    ViewportManager
+
 	// modelRegistry is the cache-first RAM catalog backing the picker.
 	// Lazily created on /models from the local JSON cache (zero network);
 	// background sync is owned by the app layer.
@@ -5056,6 +5066,9 @@ func (m *model) renderTailPanelLines() []string {
 			b.WriteString(dimmedStyle.Render("── Execution Log ──"))
 			b.WriteString("\n")
 			for _, entry := range entries {
+				if m.hideThinkingBlocks {
+					entry.Thinking = ""
+				}
 				b.WriteString(RenderEntry(entry, m.width, m.dotFrame))
 				b.WriteString("\n")
 			}
@@ -5075,7 +5088,10 @@ func (m *model) renderTailPanelLines() []string {
 	}
 
 	// ── Streaming reasoning (typed thinking blocks + inline thinking) ──
-	if m.streaming {
+	// CoT content is retained in memory for inspection/debugging, but the
+	// presentation preference can hide every reasoning block without changing
+	// stream ingestion or the model's data path.
+	if m.streaming && !m.hideThinkingBlocks {
 		// Content blocks already render through docLayout's streaming tail;
 		// only the dimmed KindThinking blocks are appended here.
 		inlineThinking := m.streamBlocks != nil && m.streamBlocks.HasThinking()
@@ -5102,7 +5118,7 @@ func (m *model) renderTailPanelLines() []string {
 	}
 
 	// ── Persisted collapsible thought block (after streaming) ──────
-	if !m.streaming && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+	if !m.streaming && !m.hideThinkingBlocks && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
 		if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
 			b.WriteString(thoughts)
 			b.WriteString("\n")
@@ -5141,6 +5157,9 @@ func (m *model) renderTailPanelLines() []string {
 // typed stream buffer (content blocks are rendered through docLayout's
 // streaming tail, never duplicated here).
 func (m *model) renderStreamThinkingOnly(width int) string {
+	if m.hideThinkingBlocks {
+		return ""
+	}
 	if m.streamBlocks == nil || m.streamBlocks.Len() == 0 {
 		return ""
 	}
@@ -5184,7 +5203,10 @@ func (m *model) calculateEffectiveYOffset(total int) int {
 		}
 		return off
 	}
-	if !m.userScrolledAway && !m.userScrollLocked {
+	if m.viewportManager.ShouldFollowTail(
+		m.userScrolledAway || m.userScrollLocked,
+		m.mouseSel.Active && m.mouseSel.Dragging,
+	) {
 		return maxOff
 	}
 	off := m.docScrollOffset
@@ -5681,7 +5703,17 @@ func (m *model) gotoBottomIfAllowed() {
 	if !m.Ready {
 		return
 	}
-	if m.userIsScrollingUp || m.mouseSel.Dragging {
+	if m.mouseSel.Dragging {
+		return
+	}
+	// Automatic tail-follow honors the workspace-owned policy. Manual
+	// navigation uses scrollBy directly and is never routed through this
+	// helper, so Off cannot be accidentally overridden by a stream or a
+	// terminal event handler.
+	if !m.viewportManager.ShouldFollowTail(
+		m.userIsScrollingUp || m.userScrollLocked,
+		false,
+	) {
 		return
 	}
 	m.followTail()

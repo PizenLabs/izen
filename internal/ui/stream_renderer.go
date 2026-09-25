@@ -358,6 +358,9 @@ func renderCodeBlock(language string, lines []string, width int) string {
 // The spinner uses a snowflake character (✻/❆) to match the inline status
 // spinner, ensuring visual consistency across the viewport body.
 func (m *model) renderLiveThinking(width int) string {
+	if m.hideThinkingBlocks {
+		return ""
+	}
 	if m.thinkingBuffer == nil || m.thinkingBuffer.Len() == 0 {
 		return ""
 	}
@@ -763,6 +766,9 @@ func (m *model) renderStreamBlocks(width int) string {
 // wrapped to the inner width and anchored with a low-contrast gutter so it
 // reads as a subordinate stream rather than part of the answer.
 func (m *model) renderThinkingBlock(text string, width int) string {
+	if m.hideThinkingBlocks {
+		return ""
+	}
 	text = sanitizeText(text)
 	if text == "" {
 		return ""

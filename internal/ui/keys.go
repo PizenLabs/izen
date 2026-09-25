@@ -164,6 +164,11 @@ func (m *model) toggleThoughtBlock() bool {
 		}
 		return true
 	}
+	// The settings preference is authoritative: Alt+O/Ctrl+O must not reveal
+	// hidden CoT content through a second control path.
+	if m.hideThinkingBlocks {
+		return true
+	}
 	switch {
 	case m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0:
 		m.thinkingBuffer.Toggle()
@@ -222,6 +227,11 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		return m, nil
+	}
+	// Keep the global shortcut available to direct handleKey callers as well
+	// as the normal Update path (which handles it before modal routing).
+	if cmd, handled := m.handleSettingsShortcut(msg); handled {
+		return m, cmd
 	}
 	// ── TRACE OVERLAY DISMISSAL ──────────────────────────────────────
 	if m.showTraceOverlay {
@@ -1286,6 +1296,7 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		m.push(roleStatus, "⚠ No active model set for provider. Please select a model to begin.")
 		m.refreshViewportContent()
 		m.ti.Focus()
+		m.showSettings = false
 		m.showModelPicker = true
 		m.modelPicker = newModelPickerFromCache(m)
 		return m, m.modelPicker.Init()

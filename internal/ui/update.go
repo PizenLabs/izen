@@ -40,6 +40,7 @@ import (
 	"github.com/PizenLabs/izen/internal/session"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
+	settings_widget "github.com/PizenLabs/izen/internal/ui/widgets/settings"
 	verification "github.com/PizenLabs/izen/internal/verification"
 )
 
@@ -81,6 +82,7 @@ func (m *model) Init() tea.Cmd {
 	// provider. Open the model picker immediately so the user can select
 	// a model instead of staring at a blank input bar.
 	if m.bootErr != nil {
+		m.showSettings = false
 		m.showModelPicker = true
 		m.modelPicker = newModelPickerFromCache(m)
 		cmds = append(cmds, m.modelPicker.Init())
@@ -168,6 +170,58 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	if m.pendingQuitConfirm {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			return m, m.handleQuitConfirmKey(keyMsg)
+		}
+	}
+
+	// ── GLOBAL SETTINGS SHORTCUT ──────────────────────────────────────
+	// Ctrl+P is owned by the workspace, not by the model picker. Handle it
+	// before picker routing so it toggles Settings everywhere in the primary
+	// workspace and closes cleanly when pressed again.
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		if cmd, handled := m.handleSettingsShortcut(keyMsg); handled {
+			return m, cmd
+		}
+	}
+
+	// ── STANDALONE SETTINGS MODAL ──────────────────────────────────────
+	// A commit is applied even if an Esc raced the command, so a value change
+	// is never silently lost after the modal has already begun teardown.
+	if commit, ok := msg.(settings_widget.CommitMsg); ok {
+		m.applySettingsCommit(commit)
+		return m, nil
+	}
+
+	// Settings owns keyboard focus while open, but background stream/events
+	// continue to fall through so an in-flight response is not frozen behind
+	// the dialog. The widget is intentionally independent of model_picker.
+	if m.showSettings {
+		switch msg := msg.(type) {
+		case settings_widget.CloseMsg:
+			m.closeSettings()
+			return m, nil
+		case tea.KeyMsg:
+			updated, cmd := m.settingsModel.Update(msg)
+			if sm, ok := updated.(settings_widget.Model); ok {
+				m.settingsModel = sm
+			}
+			if m.settingsModel.Done() {
+				m.closeSettings()
+				// The parent has already torn down the modal; consume the
+				// widget's close event so a delayed message cannot close a
+				// newly opened settings surface.
+				return m, nil
+			}
+			return m, cmd
+		case tea.WindowSizeMsg:
+			updated, _ := m.settingsModel.Update(msg)
+			if sm, ok := updated.(settings_widget.Model); ok {
+				m.settingsModel = sm
+			}
+			// Let the workspace resize path run as well.
+		case tea.MouseMsg:
+			// The modal owns the interaction surface; underlying workspace
+			// scrolling/selection must not receive mouse events.
+			return m, nil
 		}
 	}
 
@@ -3607,7 +3661,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case config.ConfigChangeMsg:
 		newCfg, err := config.Load()
 		if err == nil {
-			m.cfg = newCfg
+			m.applyLoadedConfig(newCfg)
 		}
 		// A config file change may have altered the active provider or the
 		// intent-tier models; re-pin the pipeline router so mode commands

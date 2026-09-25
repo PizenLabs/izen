@@ -465,6 +465,14 @@ func (m Model) FocusList() Model {
 // SearchFocused reports the current focus.
 func (m Model) SearchFocused() bool { return m.focus == FocusSearch }
 
+// searchInputActive reports whether printable input belongs in the search
+// buffer. The legacy mirror and the shim's focused bit are both checked so
+// older callers that set only one of the focus indicators retain the same
+// collision-free behavior.
+func (m Model) searchInputActive() bool {
+	return m.focus == FocusSearch || m.searchFocused || m.searchInput.Focused()
+}
+
 // PaneFocus returns the active pane focus (PaneProviders or PaneModels).
 func (m Model) PaneFocus() PaneFocus { return m.paneFocus }
 

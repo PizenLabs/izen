@@ -150,7 +150,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case "tab":
 		m.cyclePane()
 		return m, nil
-	case "up", "ctrl+p", "k":
+	case "up":
 		switch m.paneFocus {
 		case PaneProviders:
 			m.moveProviderCursor(-1)
@@ -160,7 +160,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.moveCursor(-1)
 		}
 		return m, nil
-	case "down", "ctrl+n", "j":
+	case "down":
 		switch m.paneFocus {
 		case PaneProviders:
 			m.moveProviderCursor(1)
@@ -170,7 +170,52 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.moveCursor(1)
 		}
 		return m, nil
+	case "ctrl+n":
+		// Keep non-arrow navigation available in list focus, but never let a
+		// search-focused picker consume it as a filter mutation or row move.
+		if m.searchInputActive() {
+			return m, nil
+		}
+		switch m.paneFocus {
+		case PaneProviders:
+			m.moveProviderCursor(1)
+		case PaneRoles:
+			m.moveRoleCursor(1)
+		default:
+			m.moveCursor(1)
+		}
+		return m, nil
+	case "j", "k":
+		if m.searchInputActive() {
+			if m.paneFocus == PaneProviders {
+				m.paneFocus = PaneModels
+			}
+			return m.handleSearchInput(msg)
+		}
+		if k == "j" {
+			switch m.paneFocus {
+			case PaneProviders:
+				m.moveProviderCursor(1)
+			case PaneRoles:
+				m.moveRoleCursor(1)
+			default:
+				m.moveCursor(1)
+			}
+		} else {
+			switch m.paneFocus {
+			case PaneProviders:
+				m.moveProviderCursor(-1)
+			case PaneRoles:
+				m.moveRoleCursor(-1)
+			default:
+				m.moveCursor(-1)
+			}
+		}
+		return m, nil
 	case "pgup":
+		if m.searchInputActive() {
+			return m, nil
+		}
 		budget := m.listRowBudget
 		if budget <= 0 {
 			budget = max(5, m.innerHeight-6)
@@ -188,6 +233,9 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 	case "pgdown":
+		if m.searchInputActive() {
+			return m, nil
+		}
 		budget := m.listRowBudget
 		if budget <= 0 {
 			budget = max(5, m.innerHeight-6)
@@ -230,8 +278,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			if sel := m.SelectedModel(); sel != nil {
 				m.pinDetail()
 				m.state = StateDetail
-				m.focus = FocusList
-				m.searchInput.Blur()
+				m = m.FocusList()
 				return m, nil
 			}
 		}
@@ -243,8 +290,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if sel := m.SelectedModel(); sel != nil {
 			m.pinDetail()
 			m.state = StateDetail
-			m.focus = FocusList
-			m.searchInput.Blur()
+			m = m.FocusList()
 		}
 		return m, nil
 	case "esc":
@@ -269,8 +315,10 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, func() tea.Msg { return modelapp.SyncRequestedMsg{} }
 	}
 
-	// Typing: auto-switch to models pane and filter.
-	if m.paneFocus == PaneProviders {
+	// Typing: auto-switch to models pane and filter. Non-printable control
+	// keys (including the globally-owned control shortcut) must not mutate
+	// pane focus.
+	if m.paneFocus == PaneProviders && isSearchEditKey(msg) {
 		m.paneFocus = PaneModels
 	}
 	return m.handleSearchInput(msg)
@@ -463,6 +511,18 @@ func isPrintableString(s string) bool {
 		}
 	}
 	return true
+}
+
+// isSearchEditKey reports whether a browsing key is an input mutation that
+// should move focus from the provider pane to the model search field. Control
+// keys (including the workspace-owned Ctrl+P) are deliberately excluded.
+func isSearchEditKey(msg tea.KeyMsg) bool {
+	switch msg.Type {
+	case tea.KeyRunes, tea.KeySpace, tea.KeyBackspace:
+		return true
+	default:
+		return false
+	}
 }
 
 // isListHotkey reports whether s is an explicit FocusList keybinding that
