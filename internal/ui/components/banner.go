@@ -1,13 +1,14 @@
 package components
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
-// ── Strict Layout Bounding & Word Wrapping (status / error / policy banners) ──
+// ── Strict Layout Bounding & Word Wrapping (framed surfaces) ──────────────────
 //
 // Lipgloss only PADS to a declared Width; it never guarantees the rendered box
 // fits the terminal. A bordered card sized with `Width(w)` renders at
@@ -16,8 +17,9 @@ import (
 // notice, a multi-kilobyte Go build error — silently pushes the right border
 // past the viewport edge, wraps the terminal, and corrupts the frame.
 //
-// Every status surface in the TUI therefore goes through this module, which
-// owns three guarantees:
+// The framed surfaces that remain in the TUI (approval gates, permission and
+// decomposition dialogs, thought/system log boxes, the Ask card, code fences and
+// tables) therefore go through this module, which owns three guarantees:
 //
 //  1. BOUNDED: the outer width (border + padding included) never exceeds the
 //     reported viewport width minus a safety margin.
@@ -27,6 +29,11 @@ import (
 //     a hard wrapper, so a single 4000-cell token (URL, JSON blob, stack frame)
 //     is split at the cell boundary instead of blowing past the frame.
 //
+// SYSTEM NOTICES, ERRORS AND STATUS BANNERS NO LONGER USE THIS FRAME MODEL.
+// They are frameless (see RenderMinimalNotice below): with no right border there
+// is no border to clip, and WrapBody still carries the unbreakable-safe pass. The
+// bounding arithmetic here is retained for the boxes that remain.
+//
 // WRAP AND LIPGLOSS VERSIONS: lipgloss v1 wraps unconditionally whenever
 // Width > 0 and exposes no Wrap(bool) setter, so the wrap intent is carried by
 // the Bounded wrapper below and enforced structurally by Width being set. The
@@ -35,10 +42,22 @@ import (
 // style.Width(...).Wrap(true) is the real API); no call site changes.
 
 const (
-	// ViewportMargin is the safety gutter reserved on each side of the
-	// viewport: the scrollbar column, the document gutter, and the rounding
-	// slack between the declared terminal width and the drawable area.
-	ViewportMargin = 4
+	// ViewportMargin is the safety gutter reserved on each side of the pane — one
+	// cell per side, so a bounded frame is drawn at paneWidth-2 and can never
+	// consume the pane's last drawable column (where a vertical scrollbar, a
+	// tmux pane divider, or a hairline of rounding slack lives).
+	//
+	// It is 2 rather than a larger number because of an arithmetic constraint
+	// the frame model imposes. The document's own wrap width is paneWidth-4, so
+	// a frame drawn wider than that is re-wrapped by the document builder and
+	// loses its right border there — the exact corruption this package exists to
+	// prevent, one layer up. A style's horizontal padding is over-reserved out of
+	// the budget (see usableWidth), so the drawn width of a standard padded card
+	// is paneWidth-ViewportMargin-padding. Requiring that to stay within
+	// paneWidth-4 gives ViewportMargin+padding >= 4, and every card in the tree
+	// carries Padding(0,1) — a padding of 2 — which makes 2 the exact bound. Any
+	// larger margin buys dead gutter; any smaller one tears the frame.
+	ViewportMargin = 2
 
 	// BorderCells is the horizontal space a left+right border consumes.
 	BorderCells = 2
@@ -83,20 +102,34 @@ func ContentWidth(viewportWidth int) int {
 // The arithmetic is the whole point of this module, so it is derived rather than
 // hardcoded. Lipgloss lays a frame out as:
 //
-//	outer = Width + GetHorizontalBorderSize()
+//	outer = Width + GetHorizontalBorderSize() + GetHorizontalMargins()
 //
-// with padding and margins living INSIDE the declared Width. So to land the
-// outer edge on ContentWidth, Width must be the target minus the style's own
-// border size — read off the style, not assumed to be 2. A style with a margin,
-// with a single side of the border switched off, or with a doubled border all
-// carry a different horizontal border size, and a hardcoded 2 would push the
-// right border off-screen for exactly those frames.
+// with padding living INSIDE the declared Width. So the budget has to be reduced
+// by every cell the frame adds on the OUTSIDE of that Width:
+//
+//	usableWidth = paneWidth - style.GetHorizontalFrameSize() - 2
+//
+// where the trailing 2 is the ViewportMargin gutter either side of the pane and
+// GetHorizontalFrameSize() is the sum of margins, padding, and border.
+//
+// GetHorizontalFrameSize() over-reserves by exactly the horizontal padding. That
+// is deliberate and safe: the alternative is a per-component list of which parts
+// of the frame are "outside", and any style that grows a margin — which is the
+// change most likely to be made later, and the one least likely to be re-audited
+// against this function — silently pushes the right border off-screen.
+// Over-reserving the padding costs two cells of gutter; under-reserving the
+// margin costs the frame.
+//
+// A style that differs only in frame size must therefore get a DIFFERENT usable
+// width. Returning one constant for every style is the bug this function exists
+// to prevent: with a Margin(0,1) card the rendered box came out ViewportMargin-2
+// cells too wide, which is the one-cell right-border clip on [PARTIAL] cards.
 func usableWidth(style lipgloss.Style, viewportWidth int) int {
-	border := style.GetHorizontalBorderSize()
-	if border < 0 {
-		border = 0
+	frame := style.GetHorizontalFrameSize()
+	if frame < 0 {
+		frame = 0
 	}
-	return ContentWidth(viewportWidth) - border
+	return ContentWidth(viewportWidth) - frame
 }
 
 // Bound constrains style to the safe content width of a viewport of
@@ -189,14 +222,161 @@ func MaxLineWidth(s string) int {
 	return widest
 }
 
-// ── Banner Constructors ────────────────────────────────────────────────────────
+// ── Frameless Muted Notice System ─────────────────────────────────────────────
 //
-// All four share one shape: an icon+label header line, then the detail body
-// word-wrapped inside a bounded, wrapping box. They differ only in border
-// colour and label colour, so a status/error/policy/info surface can never drift
-// into a different bounding discipline.
+// System notices, errors, and status banners are FRAMELESS. They carry no
+// full enclosure, no corners, and no right or bottom border. A notice is a
+// compact prefix badge, an optional soft left-accent line, and word-wrapped
+// muted body text.
+//
+// Removing the frame is not cosmetic: with no right border there is no border
+// to push off-screen, so frame clipping becomes physically impossible. A long
+// provider error can only WRAP, never tear a box around itself. The bounding
+// arithmetic above still governs the boxes that remain (approval gates, code
+// fences, tables); notices simply stopped being boxes.
 
-// BannerKind selects the semantic accent of a status banner.
+// NoticeLevel selects the semantic accent of a frameless notice.
+type NoticeLevel int
+
+const (
+	// NoticeInfo is an advisory/clarification surface.
+	NoticeInfo NoticeLevel = iota
+	// NoticeStatus is a neutral progress/state surface.
+	NoticeStatus
+	// NoticeSuccess is a completed/positive surface.
+	NoticeSuccess
+	// NoticeWarning is a recoverable warning or partial-result surface.
+	NoticeWarning
+	// NoticeError is a failure surface (provider error, build failure).
+	NoticeError
+)
+
+var (
+	// noticeAccent is the badge + accent-line colour per level. Every hue is a
+	// muted Catppuccin Mocha tone rather than a saturated signal colour, so a
+	// notice reads as recessed system chrome and never competes with the answer.
+	noticeAccent = map[NoticeLevel]lipgloss.Color{
+		NoticeInfo:    "#89b4fa",
+		NoticeStatus:  "#89b4fa",
+		NoticeSuccess: "#a6e3a1",
+		NoticeWarning: "#f9e2af",
+		NoticeError:   "#f38ba8",
+	}
+
+	// noticeIcon is the leading glyph the badge is prefixed with.
+	noticeIcon = map[NoticeLevel]string{
+		NoticeInfo:    "ℹ",
+		NoticeStatus:  "●",
+		NoticeSuccess: "✔",
+		NoticeWarning: "▲",
+		NoticeError:   "✖",
+	}
+
+	// noticeCaption is the fallback badge caption when a caller supplies neither
+	// a prefix nor a message that already begins with a `[TAG]` marker.
+	noticeCaption = map[NoticeLevel]string{
+		NoticeInfo:    "[INFO]",
+		NoticeStatus:  "[STATUS]",
+		NoticeSuccess: "[OK]",
+		NoticeWarning: "[WARNING]",
+		NoticeError:   "[ERROR]",
+	}
+
+	// noticeBodyStyle is the dimmed, faint body text of every notice. It is
+	// intentionally low-contrast: the badge carries the signal, the body is
+	// reference material the developer reads only on demand.
+	noticeBodyStyle = lipgloss.NewStyle().
+			Faint(true).
+			Foreground(lipgloss.Color("#6c7086"))
+)
+
+// leadingNoticeTag matches a leading `[TAG]` marker (`[PARTIAL]`, `[ERROR]`)
+// so it can be promoted into the badge rather than repeated in the body. The
+// tag must start with a letter, so decorator markers like `[!]` are left
+// verbatim in the body instead of becoming a cryptic badge.
+var leadingNoticeTag = regexp.MustCompile(`^\[([A-Za-z][A-Za-z0-9 _-]*)\]\s*`)
+
+// noticeBadge resolves the badge and body for a notice.
+//
+// Precedence: an explicit prefix wins; otherwise a leading `[TAG]` in the
+// message is promoted to the badge and stripped from the body; otherwise the
+// level's default caption is used. The level icon is prepended exactly once, so
+// a caller may pass either `"[PARTIAL]"` or `"▲ [PARTIAL]"` without doubling it.
+func noticeBadge(prefix, message string, level NoticeLevel) (badge, body string) {
+	badge = strings.TrimSpace(prefix)
+	body = strings.TrimSpace(message)
+	if badge == "" {
+		if m := leadingNoticeTag.FindStringSubmatch(body); m != nil {
+			badge = "[" + strings.ToUpper(m[1]) + "]"
+			body = strings.TrimSpace(body[len(m[0]):])
+		}
+	}
+	if badge == "" {
+		badge = noticeCaption[level]
+	}
+	if icon := noticeIcon[level]; icon != "" && !strings.HasPrefix(badge, icon) {
+		badge = icon + " " + badge
+	}
+	return badge, body
+}
+
+// RenderMinimalNotice renders the canonical frameless notice: a compact
+// coloured prefix badge, then an optional soft left-accent line (`│ `) carrying
+// the muted, faint, word-wrapped body.
+//
+// Wrapping is delegated to WrapBody — the same ANSI-aware word pass followed by
+// a hard pass the bounded boxes use — against `paneWidth - 4`. The two cells
+// the accent line occupies are then added back on top, so the widest physical
+// row is `paneWidth - 2` and the notice can never reach, let alone exceed, the
+// pane's last drawable column. Because there is no right border, even a
+// pathological payload (a 4-KiB unbreakable token) can only wrap.
+//
+// An empty body renders a badge-only notice. An empty prefix derives the badge
+// from a leading `[TAG]` in the message, or the level caption.
+func RenderMinimalNotice(prefix, message string, level NoticeLevel, paneWidth int) string {
+	if _, ok := noticeAccent[level]; !ok {
+		level = NoticeInfo
+	}
+	accent := noticeAccent[level]
+	badge, body := noticeBadge(prefix, message, level)
+
+	badgeStyle := lipgloss.NewStyle().Bold(true).Foreground(accent)
+	bar := lipgloss.NewStyle().Foreground(accent).Render("│")
+
+	limit := paneWidth
+	if limit < MinBoundWidth {
+		limit = MinBoundWidth
+	}
+	bodyWidth := limit - 4
+	if bodyWidth < 1 {
+		bodyWidth = 1
+	}
+
+	var b strings.Builder
+	b.WriteString(badgeStyle.Render(badge))
+	if body == "" {
+		return b.String()
+	}
+	for _, line := range strings.Split(WrapBody(body, bodyWidth), "\n") {
+		b.WriteString("\n")
+		if line == "" {
+			b.WriteString(bar)
+			continue
+		}
+		b.WriteString(bar + " " + noticeBodyStyle.Render(line))
+	}
+	return b.String()
+}
+
+// ── Banner Constructors (frameless) ──────────────────────────────────────────
+//
+// All four share one shape: a prefix badge, then the detail body as a soft
+// left-accent block. They differ only in accent colour and default caption, so
+// a status/error/policy/info surface can never drift into a different bounding
+// discipline. None of them draws a border.
+
+// BannerKind selects the semantic accent of a status banner. It is retained as
+// the public compatibility surface for call sites that predate NoticeLevel.
 type BannerKind int
 
 const (
@@ -210,84 +390,54 @@ const (
 	BannerInfo
 )
 
-var (
-	// bannerBody is the dimmed detail text inside every banner.
-	bannerBody = lipgloss.NewStyle().Foreground(lipgloss.Color("#cdd6f4"))
-
-	// bannerAccent is the label + border colour per kind.
-	bannerAccent = map[BannerKind]lipgloss.Color{
-		BannerError:  "#f38ba8",
-		BannerStatus: "#89b4fa",
-		BannerPolicy: "#fab387",
-		BannerInfo:   "#a6e3a1",
+// bannerLevel maps the legacy BannerKind onto the notice level scale.
+func bannerLevel(kind BannerKind) NoticeLevel {
+	switch kind {
+	case BannerError:
+		return NoticeError
+	case BannerPolicy:
+		return NoticeWarning
+	case BannerInfo:
+		return NoticeInfo
+	default:
+		return NoticeStatus
 	}
+}
 
-	// bannerIcon is the leading glyph per kind.
-	bannerIcon = map[BannerKind]string{
-		BannerError:  "✗",
-		BannerStatus: "●",
-		BannerPolicy: "◈",
-		BannerInfo:   "ℹ",
-	}
-)
-
-// Banner renders one bounded status card. The detail body is preserved
-// verbatim (raw provider text is never replaced with a generic message) but is
-// guaranteed to break inside the viewport.
+// Banner renders one frameless notice. The detail body is preserved verbatim
+// (raw provider text is never replaced with a generic message) but is
+// guaranteed to word-wrap inside the pane.
 //
-// An empty detail renders a label-only card; an empty label falls back to the
-// kind's default caption so the frame is never blank.
+// An empty detail renders a badge-only notice; an empty label falls back to the
+// kind's default caption so the badge is never blank.
 func Banner(kind BannerKind, label, detail string, viewportWidth int) string {
-	accent, ok := bannerAccent[kind]
-	if !ok {
-		kind, accent = BannerStatus, bannerAccent[BannerStatus]
+	level := bannerLevel(kind)
+	caption := strings.TrimSpace(label)
+	if caption == "" {
+		caption = defaultBannerCaption(kind)
 	}
-	labelStyle := lipgloss.NewStyle().Bold(true).Foreground(accent)
-
-	header := strings.TrimSpace(label)
-	if header == "" {
-		header = defaultBannerCaption(kind)
-	}
-	header = strings.TrimSpace(bannerIcon[kind] + " " + header)
-
-	// Chrome consumed by the frame itself: its border and horizontal padding.
-	// The body wraps to whatever is left, so a long message breaks exactly at
-	// the inner edge and the right border stays intact. The width is read off
-	// the same style Bound will render with, so the two can never disagree.
-	frame := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(accent).
-		Padding(0, 1)
-	inner := InnerWidth(viewportWidth, frame)
-
-	var b strings.Builder
-	b.WriteString(labelStyle.Render(header))
-	if detail = strings.TrimSpace(detail); detail != "" {
-		b.WriteString("\n")
-		b.WriteString(WrapBody(bannerBody.Render(detail), inner))
-	}
-
-	return Bound(frame, viewportWidth).Render(b.String())
+	return RenderMinimalNotice(caption, detail, level, viewportWidth)
 }
 
-// ErrorBanner renders a bounded error card from a raw error string. The message
-// is preserved verbatim — an OpenRouter 403 body or a `[PARTIAL]` truncation
-// notice is shown exactly as the provider reported it, only re-flowed.
+// ErrorBanner renders a frameless error notice from a raw error string. The
+// message is preserved verbatim — an OpenRouter 403 body or a `[PARTIAL]`
+// truncation notice is shown exactly as the provider reported it, only
+// re-flowed.
 func ErrorBanner(message string, viewportWidth int) string {
-	return Banner(BannerError, "Error", message, viewportWidth)
+	return RenderMinimalNotice("[ERROR]", message, NoticeError, viewportWidth)
 }
 
-// StatusBanner renders a bounded status/state card.
+// StatusBanner renders a frameless status/state notice.
 func StatusBanner(label, detail string, viewportWidth int) string {
 	return Banner(BannerStatus, label, detail, viewportWidth)
 }
 
-// PolicyBanner renders a bounded policy/permission-gate card.
+// PolicyBanner renders a frameless policy/permission-gate notice.
 func PolicyBanner(label, detail string, viewportWidth int) string {
 	return Banner(BannerPolicy, label, detail, viewportWidth)
 }
 
-// InfoBanner renders a bounded advisory/clarification card.
+// InfoBanner renders a frameless advisory/clarification notice.
 func InfoBanner(label, detail string, viewportWidth int) string {
 	return Banner(BannerInfo, label, detail, viewportWidth)
 }

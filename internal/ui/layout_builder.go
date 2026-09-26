@@ -8,12 +8,230 @@ import (
 
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/lexers"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/ui/markdown"
 )
+
+// ── Bottom-Anchored Composite Layout ─────────────────────────────────────────
+//
+// # THE PROBLEM THIS SOLVES
+//
+// The screen is not a document that happens to be tall; it is a FIXED-SIZE
+// surface with one flexible region in it. Three things are fixed — the header,
+// the proposal dock, and the bottom stack (the prompt bar plus the lifecycle
+// footer) — and exactly one thing flexes: the conversation viewport. The frame
+// therefore has an exact solution, and the only correct answer is the one where
+//
+//	header + viewport + dock + prompt + footer == pane height
+//
+// Anything else is a visible defect, and both directions are visible. A frame
+// that comes up SHORT draws its prompt bar and footer above the pane's bottom
+// edge and leaves stale terminal content visible underneath them — the
+// "floating `ask )` prompt" report. A frame that comes up LONG is not
+// truncated, it SCROLLS: the rows it pushed past the bottom edge land in
+// scrollback, which is never redrawn, so the prompt bar is orphaned there for
+// the rest of the session. Those are the same bug seen from two sides, and both
+// trace back to one cause — the frame was never required to be exactly tall.
+//
+// # THE CONTRACT
+//
+// composeBottomAnchoredFrame is where exactness is enforced, and it enforces
+// three things a raw string join does not:
+//
+//  1. EXACT HEIGHT. The elastic region is padded (or trimmed) to precisely the
+//     number of rows the budget assigned it, so the composite's height is a
+//     function of the budget rather than of how much content happened to arrive.
+//     Bubble Tea's viewport already pads to its Height; making the compositor
+//     re-assert it means a region that returns one row short cannot silently
+//     push the footer up the screen.
+//
+//  2. BOTTOM PINNING. lipgloss.JoinVertical is used for the whole stack, not
+//     string concatenation. It pads every region to the width of the widest, so
+//     a region one cell short of its neighbours is padded rather than allowed
+//     to run into them — and, because it stacks in argument order with no gaps,
+//     the last regions ARE the last rows of the frame. The prompt bar and the
+//     footer cannot drift upward because there is nothing above them that
+//     changed height.
+//
+//  3. A PREDICTABLE SACRIFICE ORDER. When the fixed chrome genuinely does not
+//     fit (a 12-row autocomplete dropdown in a 5-row pane — no height makes
+//     that frame fit), the overflow is taken from the TOP: the elastic viewport
+//     shrinks first, then whole top regions are dropped, and the bottom-anchored
+//     stack is the last thing standing. A bottom-trim would be the wrong
+//     direction precisely because the surfaces at the bottom are the ones the
+//     user is typing into.
+
+// compositeRegion is one horizontal band of the composed frame.
+type compositeRegion struct {
+	text string
+	// rows is the number of terminal rows the region is pinned to. A pinned
+	// region is padded to exactly this many rows, which is what makes the
+	// composite's total height a function of the budget.
+	rows int
+	// elastic marks the scrollable viewport: the ONLY region allowed to give up
+	// rows when the frame has to lose some. Everything else is either pinned
+	// (the bottom stack) or dropped wholesale from the top (the header).
+	elastic bool
+}
+
+// composeBottomAnchoredFrame stacks the frame's regions into a pane-height
+// string, pinning the bottom-anchored surfaces to the last rows.
+//
+// See the section comment above for the three invariants this establishes. The
+// one that is easy to get wrong is the elastic region's row count: it is
+// re-asserted here rather than trusted, because a region that renders one row
+// short does not announce it — it just quietly leaves the footer one row higher
+// on the screen than the budget says it should be.
+func composeBottomAnchoredFrame(regions []compositeRegion, bounds ScreenBounds) string {
+	// Work on a copy: the caller's slice is derived from the Workspace and is
+	// reused by the scroll fast path, so mutating it would corrupt a cached
+	// compose.
+	stack := make([]compositeRegion, 0, len(regions))
+	for _, r := range regions {
+		r.text = normalizeRegion(r.text)
+		if r.text == "" {
+			// An empty region contributes zero rows and is dropped entirely —
+			// joining it would insert a blank line nobody reserves.
+			continue
+		}
+		if r.rows < 1 {
+			r.rows = regionHeight(r.text)
+		}
+		stack = append(stack, r)
+	}
+
+	// TRIM FROM THE TOP. The bottom stack is pinned and must survive; the
+	// elastic region absorbs as much as it can, and whatever is still over is
+	// taken by dropping whole top regions. Dropping a region (rather than
+	// clipping it) is deliberate: a half-drawn header is a corrupt header, and a
+	// header that is entirely absent is merely missing.
+	//
+	// "Top" is defined relative to the elastic region, not to the slice: every
+	// region from the elastic one downwards is anchored to the pane's bottom
+	// edge, so the droppable set is exactly the regions ABOVE it. A frame with no
+	// elastic region has no droppable region at all — every band in it is bottom
+	// stack, and there is nothing to give.
+	droppable := elasticIndex(stack)
+	//
+	// The loop is written so that every iteration either REDUCES the total or
+	// exits. A trim that reports success without taking a single row is the
+	// classic way this kind of loop spins forever, and the only regions it can
+	// happen to are the ones already at zero — which is exactly the state the
+	// second step is entered from.
+	for {
+		over := stackRows(stack) - bounds.Height
+		if over <= 0 {
+			break
+		}
+		if !shrinkElastic(stack, over) {
+			if droppable > 0 {
+				stack = append(stack[:0], stack[1:]...)
+				droppable--
+				continue
+			}
+			// Nothing left to give: the bottom stack alone exceeds the pane.
+			// ClipFrame is the remaining backstop, and it must be: a frame with
+			// nothing left to remove still has to reach the terminal.
+			break
+		}
+	}
+
+	var parts []string
+	for _, r := range stack {
+		if r.rows <= 0 {
+			// A region the trim reduced to nothing is GONE, not blank: joining an
+			// empty string would spend a row nobody budgeted and move the whole
+			// bottom stack up by one.
+			continue
+		}
+		parts = append(parts, fitRegionRows(r.text, r.rows))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// stackRows is the total number of terminal rows a region stack occupies.
+func stackRows(stack []compositeRegion) int {
+	n := 0
+	for _, r := range stack {
+		n += r.rows
+	}
+	return n
+}
+
+// shrinkElastic takes up to `over` rows from the elastic region. It reports false
+// when there is no elastic region with rows left, which is the signal for the
+// caller to start dropping top regions instead.
+//
+// It always reports true when it reports true: every path that returns true has
+// reduced the stack's total by at least one row, so the caller's loop cannot
+// spin on a no-op.
+func shrinkElastic(stack []compositeRegion, over int) bool {
+	for i := range stack {
+		if !stack[i].elastic || stack[i].rows <= 0 {
+			continue
+		}
+		stack[i].rows -= min(over, stack[i].rows)
+		return true
+	}
+	return false
+}
+
+// elasticIndex returns the position of the elastic region in a stack, which is
+// the boundary between the frame's TOP (droppable) and its BOTTOM (anchored).
+// Every region from this index downwards is pinned to the pane's bottom edge.
+//
+// It returns 0 when there is no elastic region, and that is a refusal rather than
+// an oversight: without the marker there is nothing to distinguish the top of the
+// frame from the bottom, so dropping "the top" would be a guess. A frame with no
+// elastic region gives up nothing, and ClipFrame — which does not consult any part
+// of the frame — remains the backstop.
+func elasticIndex(stack []compositeRegion) int {
+	for i := range stack {
+		if stack[i].elastic {
+			return i
+		}
+	}
+	return 0
+}
+
+// fitRegionRows renders a region at exactly `rows` terminal rows: padded with
+// trailing newlines when short, truncated when long.
+//
+// Both directions matter. Padding is the fix for the floating prompt — a region
+// that draws fewer rows than it was allotted silently moves everything below it
+// up. Truncation is the guarantee the reverse: an elastic region that somehow
+// rendered MORE than the budget gave it must not push the pinned stack off the
+// bottom edge, which would turn a layout bug into a scroll.
+//
+// The padding is counted in lipgloss.Height, not regionHeight, because the
+// composite DRAWS with JoinVertical — which counts the empty row after a trailing
+// newline as a real one. Measuring the shortfall the other way round would pad a
+// region by one row less than it is short, and reproduce the very off-by-one this
+// function exists to eliminate.
+func fitRegionRows(region string, rows int) string {
+	switch {
+	case rows <= 0:
+		return ""
+	case region == "":
+		return strings.Repeat("\n", rows-1)
+	}
+	h := lipgloss.Height(region)
+	switch {
+	case h < rows:
+		return region + strings.Repeat("\n", rows-h)
+	case h > rows:
+		return normalizeRegion(lipgloss.NewStyle().MaxHeight(rows).Render(region))
+	default:
+		return region
+	}
+}
 
 // ── Quiet / Accordion Mode for Engine Logs ────────────────────────────────
 

@@ -87,7 +87,7 @@ func (m *model) renderResumeBriefing() string {
 	}
 	b := m.resumeBriefing
 
-	termWidth := m.width
+	termWidth := m.PaneWidth()
 	if termWidth <= 0 {
 		termWidth = 80
 	}

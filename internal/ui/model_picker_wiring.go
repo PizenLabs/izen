@@ -140,10 +140,13 @@ func newModelPickerFromCache(m *model) model_picker.Model {
 	// the picker opens with true cross-session context (zero I/O in-widget).
 	mp = mp.SetRecentBindings(loadRecentBindings())
 	mp = mp.SetRoleOverrides(policyOverridesFromConfig(m.cfg))
+	// A raw-field guard, not a PaneWidth() one: the question here is "has the
+	// model been sized yet", and PaneWidth() always answers, so a check against it
+	// would be vacuous.
 	if m.width > 0 || m.height > 0 {
 		var cmd tea.Cmd
 		_ = cmd
-		updated, _ := mp.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+		updated, _ := mp.Update(tea.WindowSizeMsg{Width: m.PaneWidth(), Height: m.PaneHeight()})
 		if um, ok := updated.(model_picker.Model); ok {
 			mp = um
 		}

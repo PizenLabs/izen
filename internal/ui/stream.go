@@ -330,7 +330,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
 	m.resetStreamBlocks()
-	m.streamParser = NewIncrementalStreamParser(m.width - 2)
+	m.streamParser = NewIncrementalStreamParser(m.PaneWidth() - 2)
 	m.streamParser.Reset()
 	if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.HumanConfirmed {
 		m.sess.ObjectiveState.CurrentStatus = domain.ObjectiveExecuting

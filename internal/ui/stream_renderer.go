@@ -8,10 +8,10 @@ import (
 	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/mattn/go-runewidth"
 
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/plan"
+	"github.com/PizenLabs/izen/internal/ui/markdown"
 )
 
 // tokenTypeColor maps a Chroma token type to its ANSI true-color sequence
@@ -98,16 +98,27 @@ func RenderDeterministicPipeline(rawInput string, width int, isStreaming bool) s
 	inCodeBlock := false
 	var currentBlockLines []string
 	var language string
+	// fenceLevel is the list depth of the fence currently open, resolved from
+	// the OPENING marker's indent. It is the single input to every list-embedded
+	// behaviour downstream (header suppression, margin, wrap width), so the
+	// three can never disagree about how deep the fence is.
+	var fenceLevel int
 
 	for _, line := range lines {
-		if strings.HasPrefix(line, "```") {
+		// A fence marker may be INDENTED — a fence inside a list item always is.
+		// markdown.SplitFence accepts that indent and reports it, where a bare
+		// HasPrefix("```") test silently failed to recognise nested fences and
+		// leaked the markers into the document as literal backticks.
+		if indent, fenceLang, isFence := markdown.SplitFence(line); isFence {
 			if inCodeBlock {
-				result.WriteString(renderCodeBlock(language, currentBlockLines, width) + "\n")
+				result.WriteString(renderCodeBlockAt(fenceLevel, language, currentBlockLines, width) + "\n")
 				inCodeBlock = false
 				currentBlockLines = nil
+				fenceLevel = 0
 			} else {
 				inCodeBlock = true
-				language = strings.TrimPrefix(line, "```")
+				language = fenceLang
+				fenceLevel = markdown.IndentLevel(indent)
 			}
 			continue
 		}
@@ -154,7 +165,7 @@ func RenderDeterministicPipeline(rawInput string, width int, isStreaming bool) s
 
 	// FAIL-SAFE EXTRACTION: If stream cuts off inside an open block, render partial content
 	if inCodeBlock && len(currentBlockLines) > 0 {
-		result.WriteString(renderCodeBlock(language, currentBlockLines, width))
+		result.WriteString(renderCodeBlockAt(fenceLevel, language, currentBlockLines, width))
 	}
 
 	return strings.TrimSuffix(result.String(), "\n")
@@ -230,58 +241,100 @@ func renderDeterministicInlineMarkdown(line string, width int) string {
 	return applyInlineStyles(line)
 }
 
-// renderCodeBlock renders a fenced code block with Chroma syntax highlighting
-// and ANSI-safe inline wrapping. The pipeline is: tokenize → newline fragment →
-// rune-level wrap using visual character widths. Partial/incomplete code
-// streams (e.g. mid-keyword truncation) are handled gracefully without errors.
-func renderCodeBlock(language string, lines []string, width int) string {
+// codeGutterCells is the width of the "│ " left anchor every code row carries.
+// It is subtracted from the width BEFORE the fence's own left margin, so
+// margin + gutter + content is exactly the width the caller budgeted.
+const codeGutterCells = 2
+
+// minCodeContentWidth is the narrowest column a fence body may wrap to in the
+// streaming renderer. It is deliberately HIGHER than the markdown package's
+// generic floor: this renderer anchors every row with a "│ " gutter, so a
+// narrower column here buys nothing and costs legibility. A caller may raise the
+// floor, never lower it.
+const minCodeContentWidth = 10
+
+// renderCodeBlockAt renders a fenced code block with Chroma syntax highlighting
+// and ANSI-safe inline wrapping, at the given list nesting level.
+//
+// The pipeline is: dedent → tokenize → newline fragment → rune-level wrap using
+// visual character widths. Partial/incomplete code streams (e.g. mid-keyword
+// truncation) are handled gracefully without errors.
+//
+// Every list-embedded behaviour is derived from `level` alone, through the
+// markdown.CodeBlock it builds — the header badge, the left margin, and the
+// wrap width are three views of one number, so a fence cannot end up indented
+// without its badge suppressed, or vice versa.
+func renderCodeBlockAt(level int, language string, lines []string, width int) string {
 	if len(lines) == 0 {
 		return ""
 	}
 
+	// The body of a nested fence is indented in the source to line up with its
+	// marker. That indent is structural, so it is removed BEFORE the fence's own
+	// margin is applied — otherwise the block sits visibly right of its item.
+	lines = markdown.Dedent(lines)
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+
+	block := markdown.NewCodeBlock(language, lines, level)
+	indent := strings.Repeat(" ", block.LeftMargin())
+
+	// The wrap budget is the fence's content column: the width the caller gave
+	// us, less the 2-cell "│ " gutter every code row is anchored with, less the
+	// fence's own left margin. All three are subtracted in ONE expression
+	// because that expression is the invariant: margin + gutter + content == the
+	// width the caller budgeted. Deriving them at separate call sites is how a
+	// row ends up one cell past the right border.
+	contentWidth := block.ContentWidth(width - codeGutterCells)
+	if contentWidth < minCodeContentWidth {
+		contentWidth = minCodeContentWidth
+	}
+
 	var builder strings.Builder
 
-	codeWidth := width - 6
-	if codeWidth < 10 {
-		codeWidth = 10
+	// Language header — top-level fences only. A nested fence's language is
+	// already stated by the list item that introduces it, so repeating it here
+	// is the duplicated-title bug.
+	if header := block.HeaderLine(); header != "" {
+		langLabel := header
+		if langLabel == "" {
+			langLabel = "code"
+		}
+		builder.WriteString(dimmedStyle.Render("│ ") + dimmedStyle.Render(langLabel))
+		builder.WriteString("\n")
 	}
 
-	// Language header line with monochrome icon
-	langLabel := language
-	if langLabel == "" {
-		langLabel = "code"
+	// Emit a physical row: the left margin, then the gutter anchor, then the
+	// content. All three are applied in that order and nowhere else.
+	emit := func(content string) {
+		builder.WriteString(indent)
+		builder.WriteString(dimmedStyle.Render("│ "))
+		builder.WriteString(content)
 	}
-	headerPad := width - lipgloss.Width("  "+langLabel) - 2
-	if headerPad < 0 {
-		headerPad = 0
-	}
-	builder.WriteString(dimmedStyle.Render("│ ") + dimmedStyle.Render(langLabel))
-	builder.WriteString("\n")
 
-	rawCode := strings.Join(lines, "\n")
-
-	// Resolve Chroma lexer — fallback to Fallback if language is unknown/unset
 	lexer := lexers.Get(language)
 	if lexer == nil {
 		lexer = lexers.Fallback
 	}
 	lexer = chroma.Coalesce(lexer)
 
-	iterator, err := lexer.Tokenise(nil, rawCode)
+	iterator, err := lexer.Tokenise(nil, strings.Join(lines, "\n"))
 	if err != nil {
-		// Fallback: plain rendering with left-anchor gutter
+		// Fallback: plain rendering with the same left-anchor gutter.
 		for i, line := range lines {
 			if i > 0 {
 				builder.WriteString("\n")
 			}
-			builder.WriteString(dimmedStyle.Render("│ "))
-			wrapped := ansi.Hardwrap(line, codeWidth, true)
-			parts := strings.Split(wrapped, "\n")
+			parts := strings.Split(ansi.Hardwrap(line, contentWidth, true), "\n")
 			for j, part := range parts {
 				if j > 0 {
-					builder.WriteString("\n" + dimmedStyle.Render("│ "))
+					builder.WriteString("\n")
 				}
-				builder.WriteString(mdCodeContStyle.Render(part))
+				emit(mdCodeContStyle.Render(part))
 			}
 		}
 		return builder.String()
@@ -290,60 +343,68 @@ func renderCodeBlock(language string, lines []string, width int) string {
 	tokens := iterator.Tokens()
 
 	// Single-pass token-to-line-engine with left-anchor gutter on every line
-	currentLineLen := 0
-	firstOnLine := true
+	rowCells := 0
+	rowStyled := false
+	var row strings.Builder
+
+	// flush emits the completed row. The row TERMINATOR is written by the
+	// caller, AFTER flush — a separator written before the row it follows would
+	// leave the previous line unterminated and fuse two rows into one, which is
+	// exactly how a code block grows one `│` gutter in the middle of its text.
+	flush := func() {
+		if rowStyled {
+			row.WriteString(ansiReset)
+		}
+		emit(row.String())
+		row.Reset()
+		rowCells = 0
+		rowStyled = false
+	}
+	newline := func() {
+		if row.Len() == 0 {
+			// Already at a row boundary: this newline was a BLANK line in the
+			// source. It is a row, not an absence — dropping it renumbers every
+			// line after it, so a reader copying code out gets the wrong thing.
+			emit("")
+			builder.WriteString("\n")
+			return
+		}
+		flush()
+		builder.WriteString("\n")
+	}
 
 	for _, token := range tokens {
+		if token.Value == "" {
+			continue
+		}
 		ansiStart := tokenTypeColor(token.Type)
-		text := token.Value
-
-		// Chunk token values on literal newlines
-		fragments := strings.Split(text, "\n")
-		for fi, frag := range fragments {
+		for fi, frag := range strings.Split(token.Value, "\n") {
 			if fi > 0 {
-				builder.WriteByte('\n')
-				currentLineLen = 0
-				firstOnLine = true
+				newline()
 			}
 			if frag == "" {
 				continue
 			}
-
-			// Emit gutter anchor at the start of each new line
-			if firstOnLine {
-				builder.WriteString(dimmedStyle.Render("│ "))
-				firstOnLine = false
-			}
-
-			var chunk []rune
-			chunkLen := 0
-
-			for _, rn := range frag {
-				rw := runewidth.RuneWidth(rn)
-				if currentLineLen+rw > codeWidth && chunkLen > 0 {
-					builder.WriteString(ansiStart)
-					builder.WriteString(string(chunk))
-					builder.WriteString(ansiReset)
-					builder.WriteByte('\n')
-					builder.WriteString(dimmedStyle.Render("│ "))
-					currentLineLen = 0
-					chunk = nil
-					chunkLen = 0
+			// A row is broken only when the next token genuinely does not fit
+			// the remaining room; a lexer emits `func`, ` `, `main` as separate
+			// tokens and all three belong on the same row.
+			for _, chunk := range strings.Split(ansi.Hardwrap(frag, contentWidth, true), "\n") {
+				chunkCells := ansi.StringWidth(chunk)
+				if rowCells > 0 && rowCells+chunkCells > contentWidth {
+					flush()
+					builder.WriteString("\n")
 				}
-				chunk = append(chunk, rn)
-				chunkLen += rw
-				currentLineLen += rw
-			}
-
-			if chunkLen > 0 {
-				builder.WriteString(ansiStart)
-				builder.WriteString(string(chunk))
-				builder.WriteString(ansiReset)
+				row.WriteString(ansiStart)
+				row.WriteString(chunk)
+				rowStyled = true
+				rowCells += chunkCells
 			}
 		}
 	}
+	if row.Len() > 0 {
+		flush()
+	}
 
-	_ = headerPad
 	return builder.String()
 }
 

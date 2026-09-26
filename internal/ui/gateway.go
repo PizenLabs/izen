@@ -479,7 +479,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.resolveApprovalState()
 		m.finalizeOperation(OpOutcomeAmbiguous, nil)
 		m.push(roleSystem, boundedWarning(Icon.Warning+
-			" No-op claim held for review — candidate edits below the safety threshold. No files were modified.", m.width))
+			" No-op claim held for review — candidate edits below the safety threshold. No files were modified.", m.PaneWidth()))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		if mdl, queueCmd, handled := m.projectBuildQueueFromProof(res, nil); handled {

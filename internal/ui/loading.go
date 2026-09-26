@@ -86,7 +86,7 @@ func (m *model) advanceAnimationFrame() {
 // It is called from the resize handler and from startShimmer, never from the
 // render path, so View() stays a pure projection.
 func (m *model) syncShimmerWidth() {
-	m.shimmerAnim.Width = max(0, m.width-4)
+	m.shimmerAnim.Width = max(0, m.PaneWidth()-4)
 }
 
 // startShimmer activates the loading shimmer with the given status text and a

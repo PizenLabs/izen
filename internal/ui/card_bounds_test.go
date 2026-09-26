@@ -95,6 +95,23 @@ func assertBoundedFrame(t *testing.T, name, rendered string, viewportWidth int, 
 		return
 	}
 	if !framed {
+		// A frameless surface must not draw any part of a full enclosure: no
+		// corner/tee glyph, and no row wrapped on both edges by a vertical
+		// border. A soft left accent (`│`) is allowed.
+		for _, glyph := range []string{"╭", "╮", "╰", "╯", "┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼"} {
+			if strings.Contains(ansi.Strip(rendered), glyph) {
+				t.Errorf("%s at viewport %d: frameless surface drew box glyph %q\n%s",
+					name, viewportWidth, glyph, rendered)
+			}
+		}
+		for i, l := range strings.Split(ansi.Strip(rendered), "\n") {
+			lt := strings.TrimRight(l, " ")
+			r := []rune(lt)
+			if len(r) >= 2 && isBoxRune(r[0]) && isBoxRune(r[len(r)-1]) {
+				t.Errorf("%s at viewport %d: frameless row %d is enclosed: %q",
+					name, viewportWidth, i, l)
+			}
+		}
 		return
 	}
 
@@ -152,7 +169,7 @@ func assertBoundedFrame(t *testing.T, name, rendered string, viewportWidth int, 
 // the surface that visibly tears.
 func TestPartialNoticeCardFitsTheTerminal(t *testing.T) {
 	for _, vw := range boundedWidths {
-		assertBoundedFrame(t, "[PARTIAL] notice", boundedWarning(partialNotice, vw), vw, true)
+		assertBoundedFrame(t, "[PARTIAL] notice", boundedWarning(partialNotice, vw), vw, false)
 	}
 }
 
@@ -174,12 +191,12 @@ func TestFramedSurfacesFitTheTerminal(t *testing.T) {
 	for _, vw := range boundedWidths {
 		// name, rendered, framed
 		surfaces := [][3]any{
-			{"[PARTIAL] notice", boundedWarning(partialNotice, vw), true},
-			{"error banner", components.ErrorBanner(rawProviderBody, vw), true},
-			{"status banner", components.StatusBanner("Streaming", rawProviderBody, vw), true},
-			{"policy banner", components.PolicyBanner("Tool rejected", rawProviderBody, vw), true},
-			{"info banner", components.InfoBanner("Clarify", rawProviderBody, vw), true},
-			{"unbreakable payload", components.ErrorBanner(unbreakablePayload(), vw), true},
+			{"[PARTIAL] notice", boundedWarning(partialNotice, vw), false},
+			{"error banner", components.ErrorBanner(rawProviderBody, vw), false},
+			{"status banner", components.StatusBanner("Streaming", rawProviderBody, vw), false},
+			{"policy banner", components.PolicyBanner("Tool rejected", rawProviderBody, vw), false},
+			{"info banner", components.InfoBanner("Clarify", rawProviderBody, vw), false},
+			{"unbreakable payload", components.ErrorBanner(unbreakablePayload(), vw), false},
 			{"approval box", boundBox(ApprovalBox, vw).Render("y approve · n reject · esc cancel"), true},
 			{"permission box", boundBox(permissionBoxStyle, vw).Render("allow this shell command?"), true},
 			{"decomposition box", boundBox(decompositionBoxStyle, vw).Render("apply this decomposition?"), true},
@@ -188,7 +205,7 @@ func TestFramedSurfacesFitTheTerminal(t *testing.T) {
 			// buildSummaryBoxStyle disables all four border sides: it is a bare
 			// padded block by design, so only its width is bounded.
 			{"build summary box", boundBox(buildSummaryBoxStyle, vw).Render(rawProviderBody), false},
-			{"oversized-repo notice", boundedWarning(Icon.Warning+" oversized repository — 12,400 files", vw), true},
+			{"oversized-repo notice", boundedWarning(Icon.Warning+" oversized repository — 12,400 files", vw), false},
 		}
 		for _, s := range surfaces {
 			assertBoundedFrame(t, s[0].(string), s[1].(string), vw, s[2].(bool))

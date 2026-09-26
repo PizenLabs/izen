@@ -793,8 +793,19 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case tea.WindowSizeMsg:
+		// GLOBAL terminal rectangle. Retained for the surfaces that genuinely
+		// describe the terminal (the diff viewer, the status widget's own modal
+		// size) rather than the pane the program is drawing in.
 		m.width = msg.Width
 		m.height = msg.Height
+		// ACTIVE PANE rectangle, recorded EXPLICITLY rather than left to alias
+		// m.width. The two are the same number in a full-screen terminal and
+		// different numbers in a side-by-side split, and every frame bound in
+		// this renderer has to answer to the pane. Storing it under its own
+		// name is what makes the distinction visible at the call sites that
+		// must choose between them; PaneWidth is the accessor they should use.
+		m.paneWidth = msg.Width
+		m.paneHeight = msg.Height
 		m.resizeStatusView(msg.Width, msg.Height)
 		if m.showSessionPicker && m.sessionPicker != nil {
 			// Keep the widget's responsive layout in lockstep with the parent
@@ -802,12 +813,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.sessionPicker.SetViewportSize(msg.Width, msg.Height)
 		}
 		padding := 4
-		w := msg.Width - padding
+		w := m.PaneWidth() - padding
 		if w < 20 {
 			w = 20
 		}
 		m.wrapWidth = w
-		m.ti.Width = msg.Width - 8
+		m.ti.Width = m.PaneWidth() - 8
 
 		// NOTE: the widget picker tracks resizes via the WindowSizeMsg
 		// forwarded in the picker routing block above (dynamic viewport).
@@ -815,15 +826,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		vpHeight := m.computeVpHeight()
 
 		if !m.Ready {
-			m.Viewport = viewport.New(msg.Width, vpHeight)
+			m.Viewport = viewport.New(m.PaneWidth(), vpHeight)
 			m.Ready = true
 		} else {
-			m.Viewport.Width = msg.Width
+			m.Viewport.Width = m.PaneWidth()
 			m.Viewport.Height = vpHeight
 		}
 
 		if m.streamParser != nil {
-			m.streamParser.SetWidth(msg.Width - 2)
+			m.streamParser.SetWidth(m.PaneWidth() - 2)
 		}
 
 		m.syncShimmerWidth()
@@ -842,13 +853,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.frozenViewportStr = ""
 		m.frozenRecords = nil
 		m.refreshViewportContent()
-		// Keep the diff viewer width-safe: re-truncate to the new width.
+		// Keep the diff viewer width-safe: re-truncate to the new width. It
+		// draws inside the pane like every other framed surface.
 		if m.diffView != nil {
-			vh := msg.Height - 4
+			vh := m.PaneHeight() - 4
 			if vh < 8 {
 				vh = 8
 			}
-			m.diffView.SetSize(msg.Width-2, vh)
+			m.diffView.SetSize(m.PaneWidth()-2, vh)
 		}
 		return m, nil
 
@@ -3053,7 +3065,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.truncated {
 			log.Printf("[TRUNCATION] response hit max_tokens ceiling (finish_reason: length) — %d output tokens", msg.tokenOutput)
 			m.push(roleSystem, boundedWarning(
-				"[PARTIAL] The response hit the provider's max_tokens limit and was cut off mid-generation (finish_reason: \"length\", EvidenceState.PARTIAL). Increase max_tokens in the provider config to allow longer responses.", m.width))
+				"[PARTIAL] The response hit the provider's max_tokens limit and was cut off mid-generation (finish_reason: \"length\", EvidenceState.PARTIAL). Increase max_tokens in the provider config to allow longer responses.", m.PaneWidth()))
 		}
 
 		// ── IMPLICIT PIPELINE INTERCEPT: pipe stream output to next step ──

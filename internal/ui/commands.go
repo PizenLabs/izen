@@ -3050,7 +3050,7 @@ func (m *model) runTestCmd(target string) tea.Cmd {
 					"    target path (e.g. ./pkg/foo, ./internal/bar/...).",
 				goFileCount, goFileCount*8,
 			)
-			m.push(roleSystem, boundedWarning(warning, m.width))
+			m.push(roleSystem, boundedWarning(warning, m.PaneWidth()))
 			m.refreshViewportContent()
 			m.gotoBottomIfAllowed()
 			m.pendingTestConfirm = true
@@ -3082,7 +3082,7 @@ func (m *model) runRunCmd(target string) tea.Cmd {
 					"    target path (e.g. ./pkg/foo, ./internal/bar/...).",
 				goFileCount, goFileCount*8,
 			)
-			m.push(roleSystem, boundedWarning(warning, m.width))
+			m.push(roleSystem, boundedWarning(warning, m.PaneWidth()))
 			m.refreshViewportContent()
 			m.gotoBottomIfAllowed()
 			m.pendingTestConfirm = true
@@ -3418,7 +3418,7 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 
 		// ── Fixed box geometry ────────────────────────────────────────────
 		// Total visual width of the box, derived from main viewport width.
-		boxWidth := m.width - 4
+		boxWidth := m.PaneWidth() - 4
 		if boxWidth < 40 {
 			boxWidth = 40
 		}

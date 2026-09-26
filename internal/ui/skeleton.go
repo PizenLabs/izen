@@ -189,7 +189,7 @@ func (m *model) skeletonWidth() int {
 	if m.wrapWidth > 0 {
 		return m.wrapWidth
 	}
-	return m.width
+	return m.PaneWidth()
 }
 
 // skeletonSyncWidth re-aligns a mounted indicator with the current terminal
