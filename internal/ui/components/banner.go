@@ -77,15 +77,38 @@ func ContentWidth(viewportWidth int) int {
 	return w
 }
 
+// usableWidth is the CONTENT-BOX width a framed style of this shape may be given
+// so that its rendered OUTER width stays within ContentWidth(viewportWidth).
+//
+// The arithmetic is the whole point of this module, so it is derived rather than
+// hardcoded. Lipgloss lays a frame out as:
+//
+//	outer = Width + GetHorizontalBorderSize()
+//
+// with padding and margins living INSIDE the declared Width. So to land the
+// outer edge on ContentWidth, Width must be the target minus the style's own
+// border size — read off the style, not assumed to be 2. A style with a margin,
+// with a single side of the border switched off, or with a doubled border all
+// carry a different horizontal border size, and a hardcoded 2 would push the
+// right border off-screen for exactly those frames.
+func usableWidth(style lipgloss.Style, viewportWidth int) int {
+	border := style.GetHorizontalBorderSize()
+	if border < 0 {
+		border = 0
+	}
+	return ContentWidth(viewportWidth) - border
+}
+
 // Bound constrains style to the safe content width of a viewport of
 // viewportWidth cells and declares the word-wrap contract.
 //
 // The returned style's rendered OUTER width (border included) equals
 // ContentWidth(viewportWidth): lipgloss treats Width as the content box and
-// adds the border on top, so BorderCells are subtracted before applying it.
+// adds the border on top, so the style's own horizontal border size is
+// subtracted before applying it. See usableWidth.
 func Bound(style lipgloss.Style, viewportWidth int) Bounded {
 	return Bounded{Style: style}.
-		Width(max(ContentWidth(viewportWidth)-BorderCells, MinBoundWidth-BorderCells)).
+		Width(max(usableWidth(style, viewportWidth), MinBoundWidth-BorderCells)).
 		Wrap(true)
 }
 
@@ -96,9 +119,29 @@ func BoundBox(style lipgloss.Style, viewportWidth int) Bounded {
 }
 
 // OuterWidth returns the total number of terminal cells a Bound-rendered string
-// occupies, border included.
+// occupies, border included. It is the target Bound aims the outer edge at, and
+// the budget every other bounded surface (inner rules, wrapped bodies) is
+// measured against.
 func OuterWidth(viewportWidth int) int {
 	return ContentWidth(viewportWidth)
+}
+
+// InnerWidth is the content width available INSIDE a frame drawn with Bound:
+// the outer width, minus the frame's own border and horizontal padding. Any
+// wrapped body or horizontal rule placed inside such a card must be measured
+// against this, or it outgrows the frame and tears the right border off.
+//
+// It reads the border size off the style rather than assuming a full border, so
+// a half-bordered or borderless box is measured correctly instead of being given
+// two cells of budget it cannot spend.
+func InnerWidth(viewportWidth int, style lipgloss.Style) int {
+	inner := OuterWidth(viewportWidth) -
+		style.GetHorizontalBorderSize() -
+		style.GetHorizontalPadding()
+	if inner < MinBoundWidth {
+		return MinBoundWidth
+	}
+	return inner
 }
 
 // BodyBreakpoints are the characters a banner body may break AFTER, in addition
@@ -110,7 +153,11 @@ func OuterWidth(viewportWidth int) int {
 // hard pass has to guillotine the JSON mid-token, which mangles the one thing
 // the user is reading it for. With them, the break lands on a separator and the
 // payload stays copy-pasteable.
-const BodyBreakpoints = " \t/:;,._=&?+@"
+//
+// The set covers the separators the payloads actually use — `/ : ; , . _ = & ?`
+// — plus `+ @ #` so an email address, a URL query string, and a `file:line:col`
+// coordinate all break cleanly rather than being cut mid-token.
+const BodyBreakpoints = " \t/:;,._=&?+@#"
 
 // WrapBody pre-wraps a banner body to width cells. It word-wraps first (so
 // prose breaks at spaces and the body never gains or loses a line) and then
@@ -203,10 +250,15 @@ func Banner(kind BannerKind, label, detail string, viewportWidth int) string {
 	}
 	header = strings.TrimSpace(bannerIcon[kind] + " " + header)
 
-	// Chrome consumed by the frame itself: 2 border cells + 1 padding cell on
-	// each side. The body wraps to whatever is left, so a long message breaks
-	// exactly at the inner edge and the right border stays intact.
-	inner := max(ContentWidth(viewportWidth)-BorderCells-bannerBody.GetHorizontalPadding(), MinBoundWidth)
+	// Chrome consumed by the frame itself: its border and horizontal padding.
+	// The body wraps to whatever is left, so a long message breaks exactly at
+	// the inner edge and the right border stays intact. The width is read off
+	// the same style Bound will render with, so the two can never disagree.
+	frame := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(accent).
+		Padding(0, 1)
+	inner := InnerWidth(viewportWidth, frame)
 
 	var b strings.Builder
 	b.WriteString(labelStyle.Render(header))
@@ -215,11 +267,7 @@ func Banner(kind BannerKind, label, detail string, viewportWidth int) string {
 		b.WriteString(WrapBody(bannerBody.Render(detail), inner))
 	}
 
-	frame := Bound(lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(accent).
-		Padding(0, 1), viewportWidth)
-	return frame.Render(b.String())
+	return Bound(frame, viewportWidth).Render(b.String())
 }
 
 // ErrorBanner renders a bounded error card from a raw error string. The message

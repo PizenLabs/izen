@@ -140,9 +140,23 @@ func (tp *ThinkingPanel) Render(width int, spinnerText string) string {
 	var b strings.Builder
 	title := "Reasoning"
 	elapsedStr := fmt.Sprintf("%.0fs", elapsed.Seconds())
-	titleLine := fmt.Sprintf("%s %s", title, strings.Repeat("·", max(1, width-lipgloss.Width(title)-lipgloss.Width(elapsedStr)-8)))
+	// The dot leader absorbs whatever the title and the elapsed badge do not, so
+	// the header's own width is derived rather than guessed.
+	leader := max(1, width-lipgloss.Width(title)-lipgloss.Width(elapsedStr)-8)
+	titleLine := fmt.Sprintf("%s %s", title, strings.Repeat("·", leader))
 
-	topFiller := width - lipgloss.Width(titleLine) - 6
+	// ONE-RULE GEOMETRY. Every row of this frame is exactly `width` cells:
+	//
+	//	header   "┌─ " (3) + titleLine + " " + elapsed + " " + filler + "┐" (1)
+	//	body     "│ " (2) + (width-4) + " │" (2)
+	//	footer   "└" (1) + (width-4) + "┘" (1)
+	//
+	// The header's constant chrome is 3 + 2 + 1 = 6, so the filler is the width
+	// minus the title line AND the elapsed badge. Leaving the badge out is the
+	// off-by-N that pushed the "┐" corner past the right edge on every expanded
+	// reasoning panel — a single stray cell wraps the terminal and corrupts every
+	// row beneath it, not just this frame.
+	topFiller := width - lipgloss.Width(titleLine) - lipgloss.Width(elapsedStr) - 6
 	if topFiller < 0 {
 		topFiller = 0
 	}

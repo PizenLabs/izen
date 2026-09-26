@@ -29,16 +29,57 @@ type shimmerFrameMsg = shimmer.FrameMsg
 // animation in sync with the shimmer sweep.
 //
 // UNIFIED TICK RATE: the frame is produced directly (not via shimmer.Tick) so
-// every animation loop in the UI — shimmer, braille spinner, snowflake — runs
-// on the same ~100ms cadence regardless of provider or mode.
+// every animation loop in the UI — shimmer, braille spinner, snowflake, the
+// pre-execution skeleton — runs on the same ~100ms cadence regardless of
+// provider or mode.
+//
+// A mounted pre-execution skeleton keeps the loop alive on its own: it is a
+// transient indicator that can be mounted with no loading dock at all (a code
+// block being formatted on a quiet stream), and a frozen indicator reads as a
+// stall. Returns nil only when neither surface is animating, so the loop still
+// self-terminates with no leaked timer.
 func (m *model) shimmerTickCmd() tea.Cmd {
-	if !m.shimmerActive {
+	if !m.shimmerActive && !m.skeletonActive() {
 		return nil
 	}
 	m.spinnerFrame++
 	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
 		return shimmer.FrameMsg{}
 	})
+}
+
+// advanceAnimationFrame is the ONE animation step of the master ~30 FPS frame
+// tick, and it is called from the very top of the FrameTickMsg handler — before
+// any of that handler's returns — so the frame counter is strictly monotonic
+// across the whole holdback window.
+//
+// Both animated surfaces in the conversation thread read their frame from here:
+//
+//   - the mounted pre-execution skeleton: the emerald sine wave across its one
+//     row, and the braille glyph that leads it (components.SpinnerGlyph /
+//     animation.Render, both pure functions of the frame);
+//   - the dock's own shimmer sweep, which is re-seated onto this same cadence so
+//     the two can never show a glyph moving over a frozen gradient.
+//
+// The counter is a uint64 that only ever increments, so a surface that joins
+// late (a mount) and a surface that leaves (a release) cannot rewind anything
+// else: that is what makes "the wave never stops" a property of the loop rather
+// than of any particular mount's lifetime.
+func (m *model) advanceAnimationFrame() {
+	m.frame++
+	// The skeleton rides the master counter, so its wave and glyph advance in
+	// lockstep with everything else on the tick. Seeding from m.frame (rather
+	// than a private counter) is what keeps the two from drifting apart.
+	m.skeletonFrame = m.frame
+	if m.skeleton != nil {
+		m.skeleton.SetFrame(m.skeletonFrame)
+	}
+	// Re-seat the dock sweep on the master cadence. Guarded on Active so an
+	// inactive shimmer is not silently resurrected: stopShimmer clears the
+	// flag, and renderLoadingDock renders nothing when it is clear.
+	if m.shimmerAnim.Active {
+		m.shimmerAnim.Frame = int(m.frame)
+	}
 }
 
 // syncShimmerWidth keeps the sweep span aligned with the current pane width.

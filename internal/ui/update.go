@@ -827,6 +827,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 
 		m.syncShimmerWidth()
+		// The pre-execution skeleton is clamped to the same wrap width, so a
+		// narrow terminal elides the subject instead of wrapping the row onto a
+		// second line.
+		m.skeletonSyncWidth()
 
 		// Full layout re-hydration on resize: clear and rebuild document layout
 		// using the updated wrapWidth, then re-anchor scroll offset.
@@ -2481,6 +2485,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case FrameTickMsg:
+		// ── ANIMATION FRAME ADVANCE (unconditional, FIRST) ────────────────
+		// The frame counter is bumped here, before ANY of the returns below,
+		// so it is strictly monotonic over the whole holdback window: every
+		// path out of this handler still advances the wave by exactly one
+		// step. Nothing downstream — a repaint, a flush, a holdback latch, a
+		// terminal-path return — can skip it, which is precisely the
+		// invariant the emerald shimmer wave and the braille glyph need in
+		// order to keep sweeping instead of freezing.
+		m.advanceAnimationFrame()
 		// ── FRAME-LOCKED PACED DRAIN (engine→UI decoupling) ─────────────
 		// The master frame tick is the single point where overflow tokens
 		// parked in the lock-free ring by the non-blocking producer re-join
@@ -2497,6 +2510,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// interrupt teardown rather than duplicated here.
 		if m.flushStreamContentToView() {
 			if repaint := m.scheduleRepaint(); repaint != nil {
+				// Batched with the tick so the wave keeps advancing while the
+				// repaint is in flight, not only once it lands.
 				return m, tea.Batch(m.frameTickCmd(), repaint)
 			}
 		}
@@ -2515,11 +2530,23 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				return m, tea.Batch(m.frameTickCmd(), repaint)
 			}
 		}
-		// Keep the loop alive while a stream is live, the first byte is
-		// still awaited, or the loading shimmer owns the dock (async
-		// context-prep window before streamCmd sets streaming). Every
-		// terminal path clears these flags, so the loop always stops.
-		if m.streaming || waitingForFirstByte || m.shimmerActive {
+		// Keep the loop alive while a stream is live, the first byte is still
+		// awaited, the loading shimmer owns the dock (the async context-prep
+		// window before streamCmd sets streaming), or a pre-execution
+		// SKELETON is mounted.
+		//
+		// The skeleton arm is what stops an indicator from freezing. A
+		// skeleton is a transient one-row claim mounted inside the viewport
+		// (see skeleton.go) and it animates on this tick alone; a table
+		// holdback can outlast the conditions above — the stream can end, the
+		// first byte can have long since landed, the dock can already be gone
+		// — and gating the loop on those flags would leave a live "[struct]
+		// Constructing table view..." on screen with a wave that stopped
+		// moving. A frozen animated indicator is indistinguishable from a
+		// hang, so the mounted row owns the loop for as long as it is
+		// mounted. Every terminal path releases the skeleton, so the loop
+		// still self-terminates with no leaked timer.
+		if m.streaming || waitingForFirstByte || m.shimmerActive || m.skeletonActive() {
 			m.frameTickActive = true
 			return m, m.frameTickCmd()
 		}
@@ -2683,7 +2710,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// every frame while streaming is true, the spinner can never die
 		// mid-answer. The inline braille spinner takes over from the snowflake
 		// once the first content token hands off the dock.
-		if !m.shimmerActive && !m.streaming {
+		//
+		// A MOUNTED PRE-EXECUTION SKELETON is a third reason to stay alive: it
+		// is a one-row indicator that can be mounted with no loading dock and no
+		// live stream, and a frozen skeleton is indistinguishable from a stall.
+		if !m.shimmerActive && !m.streaming && !m.skeletonActive() {
 			return m, nil
 		}
 		// SAFETY NET: if every background producer has released its flags but
@@ -2697,11 +2728,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Without this guard the shimmer self-terminates on the first frame
 		// after startShimmer("", "autonomy") is called, freezing the spinner
 		// for the entire provider invocation.
-		if !m.streaming && !m.agentRunning && !m.reviewRunning && !m.pipelineRunning && !m.planPending && !m.shellRunning && !m.autonomousActive {
+		if !m.streaming && !m.agentRunning && !m.reviewRunning && !m.pipelineRunning && !m.planPending && !m.shellRunning && !m.autonomousActive && !m.skeletonActive() {
 			m.stopShimmer()
 			return m, nil
 		}
 		m.shimmerAnim, _ = m.shimmerAnim.Update(msg)
+		// The pre-execution skeleton shares this tick so its glyph and colour
+		// wave advance in lockstep with every other animation in the UI.
+		m.advanceSkeletonFrame()
 		if m.Ready {
 			m.refreshViewportContent()
 		}

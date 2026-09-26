@@ -87,14 +87,12 @@ func boundBox(style lipgloss.Style, viewportWidth int) components.Bounded {
 // with boundBox: the outer width minus the box's own border and padding. Any
 // horizontal rule or wrapped body placed inside the card must use it, otherwise
 // the rule outgrows the frame and the right border is pushed off-screen.
+//
+// It delegates to components.InnerWidth so the budget is derived from the
+// style's own border size — a half-bordered or borderless box is measured
+// correctly instead of being charged a full two cells it cannot spend.
 func boundInner(viewportWidth int, style lipgloss.Style) int {
-	inner := components.OuterWidth(viewportWidth) -
-		components.BorderCells -
-		style.GetHorizontalPadding()
-	if inner < components.MinBoundWidth {
-		return components.MinBoundWidth
-	}
-	return inner
+	return components.InnerWidth(viewportWidth, style)
 }
 
 // boundRule draws a horizontal separator sized to the card's inner width. The

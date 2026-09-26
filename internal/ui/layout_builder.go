@@ -704,8 +704,52 @@ type aiBlockRenderer struct {
 	inCode    bool
 	lang      string
 	codeLines []string
-	inTable   bool
-	tableRows []string
+	// inTable is the TABLE LATCH: true means a table block is open and every
+	// byte of it is being held back in `hold`. It is deliberately hysteretic —
+	// see markdown.TableHoldback for why an intermediate pipe-free chunk must
+	// never clear it.
+	inTable bool
+	// hold is the FULL HOLDBACK BUFFER. It is nil until a table block is
+	// recognised, so the overwhelmingly common table-free path allocates
+	// nothing. It is the single source of truth for the block's contents:
+	// nothing mirrors its rows, so a row can never be counted twice or read
+	// stale.
+	hold *markdown.TableHoldback
+}
+
+// ensureHold lazily allocates the holdback so a table-free renderer stays
+// allocation-free and a bare struct literal is immediately usable.
+func (r *aiBlockRenderer) ensureHold() *markdown.TableHoldback {
+	if r.hold == nil {
+		r.hold = markdown.NewTableHoldback()
+	}
+	return r.hold
+}
+
+// tableHolding reports whether a table block is currently latched. It is the
+// authority behind both the viewport indicator and the pre-execution skeleton:
+// a mount is therefore never fabricated, because a hold can only exist where
+// real table bytes were actually diverted.
+//
+// inTable IS the latch — it is set by engageTable and cleared by emitHeldTable,
+// the same two transitions that engage and drain the holdback — so it is the
+// value the partial-line clone inherits. That inheritance is what makes the
+// clone divert a non-table fragment arriving inside an open block: without it
+// the clone would fall through to the prose path and leak `Here is the summary`
+// onto the viewport underneath the mounted indicator.
+func (r *aiBlockRenderer) tableHolding() bool {
+	return r != nil && r.inTable
+}
+
+// engageTable latches the holdback ON with no content yet. It is the "opening
+// pipes arrived" edge: the block is real, so the indicator mounts immediately,
+// but nothing is renderable until its rows commit.
+func (r *aiBlockRenderer) engageTable() {
+	if r == nil {
+		return
+	}
+	r.inTable = true
+	r.ensureHold().Engage()
 }
 
 // renderLine consumes one LOGICAL line (no embedded "\n") and appends its
@@ -717,6 +761,22 @@ func (r *aiBlockRenderer) renderLine(rl string, wrapWidth int) {
 		wrapWidth = 20
 	}
 	trimmed := strings.TrimSpace(rl)
+
+	// ── FULL HOLDBACK: table block already latched ─────────────────────
+	// Every complete line of an open table is diverted into the holdback and
+	// NOTHING is appended to out. The only line that is not absorbed is a
+	// TERMINATOR, and it belongs to the block that follows — so it is emitted
+	// through the normal pipeline below, in the same pass, after the whole
+	// held-back table has been rendered in one shot. That ordering is what
+	// makes the swap atomic: either the viewport shows the indicator alone, or
+	// it shows the complete grid; never a half-populated one.
+	if r.tableHolding() {
+		if term := r.hold.Feed(rl); !term.Closed() {
+			return
+		}
+		r.emitHeldTable(wrapWidth)
+	}
+
 	if strings.HasPrefix(trimmed, "```") {
 		if r.inCode {
 			r.flushCode(wrapWidth)
@@ -731,20 +791,19 @@ func (r *aiBlockRenderer) renderLine(rl string, wrapWidth int) {
 		r.codeLines = append(r.codeLines, rl)
 		return
 	}
-	// Pipe-delimited table detection: a trimmed line that starts with '|'
-	// and contains another '|' is a table row (header, separator, or body).
-	// Rows are buffered so the full grid (column widths) can be computed on
-	// flush, exactly like fenced code blocks.
-	if isTableRowLine(trimmed) {
-		if !r.inTable {
-			r.inTable = true
-		}
-		r.tableRows = append(r.tableRows, rl)
+
+	// ── Pipe-delimited table: engage the holdback ──────────────────────
+	// A table row can NEVER be rendered on its own — the grid's column widths
+	// are max(cell width) across the header and every data row, and the frame
+	// grows by a physical line per row. So the first row latches the holdback
+	// and returns: no partial row, no re-laid-out grid, and no scroll jump as
+	// the remaining rows stream in.
+	if markdown.TableRow(trimmed) {
+		r.engageTable()
+		r.hold.Feed(rl)
 		return
 	}
-	if r.inTable {
-		r.flushTable(wrapWidth)
-	}
+
 	if trimmed == "" {
 		r.out = append(r.out, gutterDocumentLine(wrapWidth))
 		return
@@ -779,26 +838,41 @@ func (r *aiBlockRenderer) flushCode(wrapWidth int) {
 
 // finish flushes any unclosed code block left at the end of the input so a
 // stream that ends mid-fence still renders its buffered lines exactly as the
-// completed-history path does.
+// completed-history path does. It is also the STREAM COMPLETION termination
+// signal for a held-back table: a table block latched when the stream ended is
+// released and rendered here, so the "PARTIAL token limit / Ctrl+C" case shows
+// the whole table rather than nothing at all.
 func (r *aiBlockRenderer) finish(wrapWidth int) {
 	if r.inCode {
 		r.flushCode(wrapWidth)
 	}
 	if r.inTable {
-		r.flushTable(wrapWidth)
+		r.emitHeldTable(wrapWidth)
 	}
 }
 
-// flushTable emits the buffered table rows as a Unicode box grid at the closing
-// blank line or EOF. Rows are parsed, column widths computed, and the structured
-// border container (┌─┬─┐ / ├─┼─┤ / └─┴─┘) rendered with native transparent
-// background preserved.
-func (r *aiBlockRenderer) flushTable(wrapWidth int) {
-	if len(r.tableRows) > 0 {
-		r.out = append(r.out, renderMarkdownTableToLines(r.tableRows, wrapWidth)...)
+// emitHeldTable performs the ONE-SHOT ATOMIC RENDER: it drains the entire
+// held-back block and renders it as a Unicode box grid in a SINGLE pass, then
+// releases the latch.
+//
+// The whole grid — every row, the final column widths, the frame — is decided
+// once, from the complete row set, and appended to out once. There is therefore
+// no intermediate frame in which a partially-built grid is visible, and the
+// rows are never re-laid-out afterwards. An empty drain is normal (a holdback
+// that latched on a lone "|" holds nothing worth drawing) and emits nothing.
+func (r *aiBlockRenderer) emitHeldTable(wrapWidth int) {
+	if r == nil {
+		return
 	}
-	r.tableRows = nil
 	r.inTable = false
+	if r.hold == nil {
+		return
+	}
+	rows, ok := r.hold.Drain()
+	if !ok {
+		return
+	}
+	r.out = append(r.out, renderMarkdownTableToLines(rows, wrapWidth)...)
 }
 
 // renderPartialLine renders the STILL-GROWING trailing line of a live stream.
@@ -810,18 +884,60 @@ func (r *aiBlockRenderer) flushTable(wrapWidth int) {
 // the remaining bytes stream in (the "table columns jump / markup flickers while
 // streaming" report).
 //
-// So the partial line is routed through the UncommittedBuffer first: when the
-// line is NOT structurally final it is rendered as PLAIN DIMMED TEXT with no
-// block or inline interpretation. Plain text has exactly one possible layout,
-// so nothing can reflow; the line is promoted to the full pipeline exactly once,
-// when it commits. When the line IS already final (it happens to sit on a
-// syntactic boundary — a closed table row, a balanced `**bold**`) it goes
-// straight down the normal path, so the hold-back costs no extra frame.
+// So two hold-backs apply, and they are deliberately different in strength:
+//
+//  1. TABLE BLOCK (full holdback). A leading pipe commits the line to table
+//     grammar, so the moment one appears the block latches the full holdback and
+//     the line is diverted into it, rendering NOTHING at all. A table grid is
+//     not merely un-styled while incomplete — it has no stable layout at all,
+//     because every column width is the max over rows that have not arrived yet,
+//     and each arriving row adds a physical line. Showing a plain-text prefix
+//     would still reflow and still grow the document, so nothing is shown. The
+//     single-line skeleton is the whole truth until the block terminates.
+//
+//  2. ANY OTHER LINE (line holdback). The partial line is routed through the
+//     UncommittedBuffer: when the line is NOT structurally final it is rendered
+//     as PLAIN DIMMED TEXT with no block or inline interpretation. Plain text
+//     has exactly one possible layout, so nothing can reflow; the line is
+//     promoted to the full pipeline exactly once, when it commits. When the line
+//     IS already final (it happens to sit on a syntactic boundary — a balanced
+//     `**bold**`) it goes straight down the normal path, so the hold-back costs
+//     no extra frame.
 func (r *aiBlockRenderer) renderPartialLine(rl string, wrapWidth int) {
 	if wrapWidth < 20 {
 		wrapWidth = 20
 	}
-	if kind, incomplete := markdown.Incomplete(rl, r.inCode, r.inTable); incomplete {
+	// ── FULL HOLDBACK: table block already latched ─────────────────────
+	// The still-growing trailing line is DIVERTED VERBATIM and renders
+	// NOTHING. This is the anti-leak clause and it has two halves:
+	//
+	//   - A prefix of a row (`| Na`, `| Name | Ag`) is a prefix of a grid whose
+	//     column widths are still changing, so it must not be laid out at all.
+	//   - A complete non-table line arriving inside an open block (the prose
+	//     that follows the last row, before its terminating blank line) must
+	//     not slip through either — that is the leak that put a half-built
+	//     grid and a raw fragment on screen at the same time.
+	//
+	// The line is re-supplied in full on every tick, so it REPLACES the
+	// held-back tail rather than accumulating: the buffer holds the line's
+	// current prefix, never a concatenation of prefixes.
+	if r.tableHolding() {
+		r.ensureHold().Hold(rl)
+		return
+	}
+	kind, incomplete := markdown.Incomplete(rl, r.inCode, r.inTable)
+	if incomplete {
+		// A LEADING PIPE commits the line to table grammar, so from this instant
+		// it is 100% table content and joins the full holdback — a plain-text
+		// holdback would still re-flow the prefix and still grow the document,
+		// which is the flicker this mechanism exists to remove. The latch turns
+		// ON here, before a single row has committed, so the indicator mounts on
+		// the very first opening pipe.
+		if kind == markdown.BlockTable {
+			r.engageTable()
+			r.ensureHold().Hold(rl)
+			return
+		}
 		r.out = append(r.out, renderUncommittedLine(rl, wrapWidth, kind)...)
 		return
 	}
@@ -1305,15 +1421,6 @@ func shellColorCommand(piece string) string {
 		return cmdYellow + piece + reset
 	}
 	return cmdYellow + piece[:idx] + reset + cmdGreen + piece[idx:] + reset
-}
-
-// isTableRowLine reports whether a trimmed line is a pipe-delimited markdown
-// table row: it must start with '|' and contain at least one further '|'.
-func isTableRowLine(trimmed string) bool {
-	if !strings.HasPrefix(trimmed, "|") {
-		return false
-	}
-	return strings.Contains(strings.TrimPrefix(trimmed, "|"), "|")
 }
 
 // splitTableRowCells splits one pipe-delimited row into its cells, dropping the

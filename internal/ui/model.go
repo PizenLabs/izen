@@ -62,9 +62,11 @@ import (
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
 	"github.com/PizenLabs/izen/internal/tui/tips"
+	"github.com/PizenLabs/izen/internal/ui/components"
 	"github.com/PizenLabs/izen/internal/ui/diff"
 	"github.com/PizenLabs/izen/internal/ui/markdown"
 	uiplan "github.com/PizenLabs/izen/internal/ui/plan"
+	"github.com/PizenLabs/izen/internal/ui/states"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	uitool "github.com/PizenLabs/izen/internal/ui/tool"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
@@ -913,7 +915,16 @@ type model struct {
 	// the visible answer instead of staying buffered until the closing
 	// marker arrives. See extractSentinelReasoning.
 	pendingReasoningFragment string
-	spinnerFrame             int
+	// frame is the MASTER animation frame, advanced by exactly one step on
+	// every FrameTickMsg (~30ms / ~33 FPS) at the top of that handler, before
+	// any of its returns. It is the clock the emerald shimmer wave and the
+	// braille spinner glyph ride, so the indicator sweeping inside the viewport
+	// can never freeze while a construct is held back: every path out of the
+	// handler — flush, repaint, latch reconciliation, terminal return — still
+	// advances it, which is exactly the invariant a transient one-row claim
+	// needs (a frozen animated indicator is indistinguishable from a hang).
+	frame        uint64
+	spinnerFrame int
 	// dotFrame advances each viewport refresh to drive the animated
 	// truncation-dots counter in execution log entries (1 → 2 → 3 → 1…).
 	dotFrame int
@@ -1730,6 +1741,26 @@ type model struct {
 	loadingTip    string
 	tipProvider   *tips.Provider
 
+	// ── Transient pre-execution skeleton ─────────────────────────────
+	// lifecycle is the pre-execution indicator state machine: which single
+	// surface is being produced but cannot yet be shown (a table under
+	// construction, a code block being formatted, an edit being staged, a tool
+	// being prepared, a workspace being mapped). skeleton is the mounted
+	// one-row widget for it, and skeletonFrame is the shared animation frame
+	// the row's glyph and colour wave both advance on. All three are lazily
+	// allocated (see ensureSkeleton) so a model built as a struct literal
+	// behaves exactly like one built by the program bootstrap. See
+	// skeleton.go for the mount/release contract.
+	lifecycle *states.Machine
+	skeleton  *components.Skeleton
+	// skeletonFrame is the frame the mounted row is currently drawing. It is
+	// not a clock of its own: advanceAnimationFrame assigns it from the master
+	// m.frame counter every tick, so a mount picks up wherever the master
+	// timeline is (no visible snap back to frame zero) and the two can never
+	// drift. Kept as a field so a mount can read the current frame without
+	// reaching into the counter mid-step.
+	skeletonFrame uint64
+
 	// Event bus — the headless engines publish domain events here and the UI
 	// subscribes as a pure projection. Never nil after bootstrap.
 	bus *events.Bus
@@ -1863,6 +1894,25 @@ type model struct {
 	// received table row, fence, heading, or `**bold**` span cannot re-flow the
 	// viewport dozens of times per second. See internal/ui/markdown.
 	aiStreamUncommitted *markdown.Buffer
+	// tableLatch is the StateTablePending HYSTERESIS. It turns ON the moment the
+	// streaming block renderer recognises a table block (the opening pipes
+	// arrive) and stays ON through every subsequent chunk — including bare cell
+	// fragments that contain no pipe at all. Only an explicit termination
+	// signal releases it: a complete line that is not part of the table, a blank
+	// line, or stream completion.
+	//
+	// The latch exists because the indicator must not be re-derived from what the
+	// most recent chunk looks like. A table's rows arrive interleaved with
+	// fragments that are not table syntax, and a per-chunk derivation flips the
+	// one-row indicator on and off once per cell boundary — the oscillation that
+	// reads as screen flicker. Its value is reconciled from the authoritative
+	// holdback (aiStreamRenderer) once per streaming tick; see syncTableLatch.
+	//
+	// It is held by POINTER for the same reason m.lifecycle is: Latch carries a
+	// lock, and a lock inside model would make the model a non-copyable value
+	// (the value receiver that value-semantics callers rely on would be a
+	// vet-level copylocks violation). A nil latch is released and inert.
+	tableLatch *states.Latch
 	// docScrollOffset is the app-owned single scroll position into the
 	// scrollable document. The bubbles viewport is a pure render surface
 	// (content is pre-sliced to exactly the visible window and
@@ -2616,7 +2666,30 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		m.logRuntimeDetail("[runtime] target resolved: %s (exists=%t, %s)", p.Target, p.Exists, p.Source)
 	case events.ContextPreparedPayload:
 		m.setStage("context", "", stageRunning)
+		// ATOMIC REPLACEMENT: the workspace mapping finished, so any indexing
+		// indicator's row is released and the compiled context — which the
+		// context/mutation surfaces below render — takes its place.
+		m.finalizeSkeleton(states.StateAstIndexing, "")
 		m.logRuntimeDetail("[runtime] context prepared: %d channel(s), ~%d tokens", len(p.Channels), p.Tokens)
+	case events.ContextCompilationPayload:
+		// PRE-EXECUTION INDICATOR: the context compiler is running. Nothing has
+		// been read or sent yet, and a context scan on a large workspace is a
+		// real, non-instant pause with nothing else to show for it. The payload is
+		// content-free by construction, so the indicator names no file.
+		m.mountSkeleton(states.StateAstIndexing, "")
+	case events.ToolBatchStartedPayload:
+		// PRE-EXECUTION INDICATOR: the tool set is committed and about to be
+		// dispatched. Nothing has been handed to a subprocess yet, so the
+		// viewport has no result to show. The first tool id is the most useful
+		// subject available; a batch of ten is not a one-line claim.
+		if len(p.ToolIDs) > 0 {
+			m.mountSkeleton(states.StateToolExecution, p.ToolIDs[0])
+		}
+	case events.ToolBatchCompletedPayload:
+		// ATOMIC REPLACEMENT: the tools ran, so the row is released. The
+		// finalized content is the tool card the tool dock renders, so nothing
+		// is pushed here.
+		m.finalizeSkeleton(states.StateToolExecution, "")
 	case events.ModelInvokedPayload:
 		m.setStage("model", p.Model, stageWaiting)
 		m.logRuntimeDetail("[runtime] model invoked: %s", p.Model)
@@ -2659,6 +2732,13 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		m.logRuntimeDetail("[runtime] provider response: %s (%d tok in / %d tok out)", p.Model, p.TokenInput, p.TokenOutput)
 	case events.ArtifactProducedPayload:
 		m.setStage("patch", p.Target, stageRunning)
+		// PRE-EXECUTION INDICATOR: an artifact now exists and its target is
+		// known, but the mutation has NOT started — the edit is being staged, so
+		// the viewport has nothing truthful to show yet. The indicator names the
+		// file, which is the one thing a user can usefully watch. Released by
+		// MutationStarted below, or by finalizeOperation if the mutation never
+		// begins.
+		m.mountSkeleton(states.StateWorkspacePatch, p.Target)
 		m.logRuntimeDetail("[runtime] artifact produced: %s (%s)", p.Kind, p.Target)
 	case events.MutationStartedPayload:
 		target := ""
@@ -2666,6 +2746,12 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			target = p.Targets[0]
 		}
 		m.setStage("apply", target, stageRunning)
+		// ATOMIC REPLACEMENT: staging is over, so the indicator's row is
+		// released. The finalized content is the mutation card / activity entry
+		// the runtime renders for this event, so the substitution is empty —
+		// pushing anything here would duplicate content that is already on its
+		// way into the document.
+		m.finalizeSkeleton(states.StateWorkspacePatch, "")
 		m.logRuntimeDetail("[runtime] mutation started: %d target(s)", len(p.Targets))
 	case events.MutationCompletedPayload:
 		m.setStage("apply", p.Target, stageDone)
@@ -2975,6 +3061,13 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	// the user cancelled after stays on screen.
 	m.drainStreamRingAll()
 	m.flushStreamContentToView()
+	// CANCELLATION CONTRACT: the raw stream buffer is flushed above, so the
+	// partial answer the user cancelled after stays on screen. The pre-execution
+	// skeleton is released here, AFTER the flush, so the row it occupied is
+	// replaced by the flushed content in the same repaint — an indicator that
+	// outlived a Ctrl+C would claim work that is no longer happening, and one
+	// released before the flush would leave a blank row between the two.
+	m.unmountSkeleton()
 	// 0. Cancel the authoritative operation context FIRST so provider calls
 	// and subprocesses spawned under the active operation observe the
 	// cancellation immediately (Section 6: context propagation).
@@ -4523,6 +4616,14 @@ func (m *model) refreshViewportContent() {
 		prevLayoutWidth = m.docLayout.Width()
 	}
 	m.updateConversationLayout(wrapWidth, username)
+	// ── Pre-execution skeleton reconciliation ─────────────────────────
+	// Runs HERE, inside the projection pass, and before the tail is rendered:
+	// the block renderer has just reported what it is holding back, so the
+	// mounted indicator is reconciled in the very frame that will draw it. A
+	// released indicator is therefore never visible in the same frame as its
+	// finalized content — the replacement is atomic by construction rather than
+	// by a follow-up repaint. See skeleton.go.
+	m.syncStreamingSkeleton()
 	// ── Framebuffer invalidation (Performance Safeguards §4) ──────────
 	// Re-rasterize ONLY on document buffer updates or WindowSizeMsg, NEVER
 	// on mouse movement. While dragging we keep the frozen framebuffer to
@@ -4955,6 +5056,12 @@ func (m *model) syncStreamingSegment() {
 		return
 	}
 	if !m.streaming {
+		// STREAM COMPLETION termination signal (StreamEnd, a PARTIAL token-limit
+		// truncation, or Ctrl+C). A table block that was still latched is
+		// released and its accumulated rows are rendered in ONE pass, so the
+		// holdback can never outlive the stream it belongs to and the indicator
+		// is released on exactly the same turn.
+		m.closeTableHoldback()
 		// Stream ended (or was cancelled): strip the stale streaming tail so a
 		// residual cursor block can never linger in the rendered document.
 		if m.streamingDocStart >= 0 && m.streamingDocStart <= len(m.docLayout.Lines) {
@@ -5097,22 +5204,90 @@ func (m *model) renderStreamingTail(content string, wrapWidth int) []DocumentLin
 	// renderer state so the persistent state is never advanced past the
 	// still-growing line (it is re-rendered fresh every tick until it
 	// completes, then committed exactly once).
+	//
+	// The clone deliberately gets a NIL holdback: the still-growing line must
+	// never be able to mutate the authoritative holdback, or a row would be
+	// counted twice — once by the clone's probe and again when its newline
+	// commits it to the persistent renderer. What the clone DOES establish is
+	// that the line is a table block, and that fact is promoted immediately
+	// below so the latch turns ON on the very first opening pipe.
 	partial := &aiBlockRenderer{
 		inCode:    m.aiStreamRenderer.inCode,
 		lang:      m.aiStreamRenderer.lang,
 		codeLines: append([]string(nil), m.aiStreamRenderer.codeLines...),
 		inTable:   m.aiStreamRenderer.inTable,
-		tableRows: append([]string(nil), m.aiStreamRenderer.tableRows...),
 	}
 	partial.renderPartialLine(partialLine, wrapWidth)
+	if partial.inTable && !m.aiStreamRenderer.inTable {
+		// LATCH ON at the opening pipes. The trailing line has been recognised
+		// as a table block BEFORE a single row committed, so the one-line
+		// indicator mounts now — and the line itself is diverted into the
+		// authoritative holdback, because from this instant it is 100% table
+		// content and must not reach the viewport as plain text.
+		m.aiStreamRenderer.engageTable()
+		m.aiStreamRenderer.hold.Hold(partialLine)
+	}
 	tail := append(append([]DocumentLine(nil), m.aiStreamRenderer.out...), partial.out...)
 	m.aiStreamTailContent = content
 	m.aiStreamTailCache = append([]DocumentLine(nil), tail...)
+	m.syncTableLatch()
 	// New tokens were spliced into the streaming tail: advance the repaint
 	// sequence so the single-flight gate can detect a stale frame and re-arm
 	// one final repaint (no token left unrendered in memory).
 	m.repaintSeq++
 	return tail
+}
+
+// syncTableLatch reconciles the StateTablePending hysteresis with the
+// authoritative holdback and is the ONLY writer of the latch.
+//
+// The holdback is the single source of truth: the latch mirrors whether a table
+// block is currently being held back, so it turns ON with the hold and OFF with
+// it — at the blank line, at a complete line that is not part of the table, or
+// at stream completion. It never invents a hold, and it is never re-derived from
+// what the most recent chunk happened to look like, so an intermediate
+// pipe-free fragment cannot release it.
+func (m *model) syncTableLatch() {
+	if m == nil {
+		return
+	}
+	m.ensureTableLatch().Set(m.aiStreamRenderer.tableHolding())
+}
+
+// ensureTableLatch lazily allocates the hysteresis register. It exists for the
+// same reason ensureSkeleton does: every headless harness in this package builds
+// the model as a struct literal, and a latch that must be constructed before it
+// can be read is a latch that silently stops latching.
+func (m *model) ensureTableLatch() *states.Latch {
+	if m.tableLatch == nil {
+		m.tableLatch = &states.Latch{}
+	}
+	return m.tableLatch
+}
+
+// closeTableHoldback applies the STREAM COMPLETION termination signal to a
+// latched table block: the still-growing trailing line is promoted (nothing
+// will extend it), the accumulated rows are rendered in ONE atomic pass, and the
+// latch is released.
+//
+// It is idempotent — a holdback that is not latched does nothing — so it is safe
+// to call from every stream teardown path (StreamEnd, PARTIAL truncation, Ctrl+C)
+// without each one having to know whether a table happened to be in flight.
+func (m *model) closeTableHoldback() {
+	if m == nil || m.aiStreamRenderer == nil {
+		return
+	}
+	r := m.aiStreamRenderer
+	if !r.tableHolding() {
+		return
+	}
+	r.hold.Close()
+	wrapWidth := m.wrapWidth
+	if m.docLayout != nil && m.docLayout.Width() > 0 {
+		wrapWidth = m.docLayout.Width()
+	}
+	r.emitHeldTable(wrapWidth)
+	m.syncTableLatch()
 }
 
 // resetStreamingRenderer drops the persistent streaming-tail renderer state.
@@ -5127,6 +5302,9 @@ func (m *model) resetStreamingRenderer() {
 	if m.aiStreamUncommitted != nil {
 		m.aiStreamUncommitted.Reset()
 	}
+	// LATCH OFF (stream-completion termination): a holdback that outlives its
+	// stream would keep the indicator mounted over the next turn's first token.
+	m.tableLatch.Release()
 }
 
 // renderTailPanelLines renders the fixed tail panels that follow the
@@ -5136,6 +5314,17 @@ func (m *model) resetStreamingRenderer() {
 // the scrollable document so live status stays reachable.
 func (m *model) renderTailPanelLines() []string {
 	var b strings.Builder
+
+	// ── Transient pre-execution skeleton (exactly one row) ────────────
+	// Mounted by the lifecycle state machine while a surface is being
+	// produced but cannot yet be shown. It is the FIRST row of the tail so it
+	// sits directly beneath the content it precedes, and it is a single line by
+	// construction — the widget's Height() is a constant, and the row is
+	// released the instant the finalized content lands.
+	if row := m.skeletonRenderLine(); row != "" {
+		b.WriteString(row)
+		b.WriteString("\n")
+	}
 
 	// ── Agent Execution Plan card (docked top of viewport tail) ──
 	// Rendered first so it sits immediately below the conversation content
