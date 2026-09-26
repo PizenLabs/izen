@@ -13,6 +13,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/ui/markdown"
 	"github.com/PizenLabs/izen/internal/ui/status"
 )
 
@@ -59,50 +60,78 @@ func (m *model) renderContextHeader() string {
 // current Workspace from the workflow layer and renders it. The renderer knows
 // nothing about modes, banners, prompts, footers, or action logic — only how
 // to project a Workspace onto the terminal.
+//
+// ZERO-LEAK: every return path passes through ClipFrame. A frame taller than the
+// terminal is not truncated by the terminal, it SCROLLS it, and the rows it
+// pushes into scrollback are never redrawn — that is where the stacked `ask )`
+// prompt bars come from. Clipping here, on the way out, is what makes the leak
+// structurally impossible rather than merely unlikely.
 func (m *model) View() string {
-	base := renderWorkspace(m.BuildWorkspace())
+	bounds := m.Screen()
+	base := renderBoundedWorkspace(m.BuildWorkspace(), bounds)
 	// The security interceptor is the topmost modal: a pending permission
 	// decision can never be bypassed by the quit dialog or any other overlay.
 	if m.pendingPermission != nil {
-		return m.renderPermissionOverlay(base)
+		return ClipFrame(m.renderPermissionOverlay(base), bounds)
 	}
 	if m.pendingQuitConfirm {
-		return m.renderQuitConfirmOverlay(base)
+		return ClipFrame(m.renderQuitConfirmOverlay(base), bounds)
 	}
 	if m.diffActive() {
-		return m.renderDiffOverlay()
+		return ClipFrame(m.renderDiffOverlay(), bounds)
 	}
 	return base
 }
 
-// renderWorkspace is the ONLY rendering primitive. It projects a Workspace
-// onto the terminal with no awareness of mode, workflow, or UI logic.
-// The screen is partitioned into three vertical regions:
-//   - Fixed top region: Header (WorkflowState + toast overlay)
-//   - Scrollable middle region: Viewport + ProposalDock + Input
-//   - Fixed bottom region: Footer (single-line lifecycle bar)
-func renderWorkspace(ws Workspace) string {
+// renderBoundedWorkspace projects a Workspace onto the terminal within bounds.
+//
+// It delegates the composition to composeBottomAnchoredFrame, which is where the
+// layout contract lives: the regions are stacked so the prompt bar and the
+// lifecycle footer are the LAST rows of the frame, and the scrollable viewport is
+// re-asserted at exactly the row count the budget assigned it. Raw string
+// concatenation cannot promise either — it neither pins the bottom nor re-asserts
+// a region's height, so a viewport that rendered one row short would quietly
+// float the prompt bar up the screen.
+func renderBoundedWorkspace(ws Workspace, bounds ScreenBounds) string {
 	if ws.Overlay != "" {
-		return ws.Overlay
+		return ClipFrame(ws.Overlay, bounds)
 	}
+	return ClipFrame(composeBottomAnchoredFrame([]compositeRegion{
+		{text: ws.Header, rows: regionHeight(ws.Header)},
+		{text: ws.Viewport, rows: ws.ViewportRows, elastic: true},
+		{text: ws.ProposalDock, rows: regionHeight(ws.ProposalDock)},
+		{text: ws.Input, rows: regionHeight(ws.Input)},
+		{text: ws.Footer, rows: regionHeight(ws.Footer)},
+	}, bounds), bounds)
+}
 
-	// Build the scrollable content body (viewport + proposal + input).
-	var bodyParts []string
-	if ws.Viewport != "" {
-		bodyParts = append(bodyParts, ws.Viewport)
+// renderInputRegion builds the prompt region: the autocomplete dropdown (when
+// open), a rule, the prompt line, and a closing rule.
+//
+// It is extracted from assembleScreen because the layout budget needs to MEASURE
+// this region, and a region that is measured in one place and assembled in
+// another is a region whose two descriptions can drift. Rendering it twice from
+// one function is cheaper than the alternative, which is discovering the
+// discrepancy as a scrolling terminal.
+func (m *model) renderInputRegion(width int, borderStyle lipgloss.Style) string {
+	var inputView strings.Builder
+	if m.autocompleteActive && len(m.autocompleteItems) > 0 {
+		inputView.WriteString(m.renderAutocompleteDropdown(width))
 	}
-	if ws.ProposalDock != "" {
-		bodyParts = append(bodyParts, ws.ProposalDock)
-	}
-	if ws.Input != "" {
-		bodyParts = append(bodyParts, ws.Input)
-	}
-	body := lipgloss.JoinVertical(lipgloss.Left, bodyParts...)
+	inputView.WriteString(rule(width, borderStyle) + "\n")
 
-	// Partition into fixed header / scrollable body / fixed footer.
-	// If either fixed region is empty, the layout falls back to a simple
-	// vertical join so the caller sees no structural change.
-	return Partition(body, ws.Header, ws.Footer)
+	switch {
+	case m.inViMode && m.viCmdMode:
+		inputView.WriteString(viCmdStyle.Render(m.viCmdBuf) + "\n")
+	case m.inViMode:
+		inputView.WriteString(viStatusStyle.Render("-- "+m.viModeLabel()+" --") + "\n")
+	default:
+		mode := m.resolver.Current()
+		promptLabel := m.modeStyle(mode).Render(mode.String() + " " + Icon.Command)
+		inputView.WriteString(promptLabel + " " + m.renderPromptForFrame() + "\n")
+	}
+	inputView.WriteString(rule(width, borderStyle))
+	return inputView.String()
 }
 
 // assembleScreen builds the Workspace's screen regions from the supplied
@@ -114,10 +143,7 @@ func renderWorkspace(ws Workspace) string {
 // Fixed Header and Fixed Footer are derived from RuntimeContext and
 // WorkflowStateMachine — the model never caches these values independently.
 func (m *model) assembleScreen(actions []Action) Workspace {
-	width := m.width
-	if width < 40 {
-		width = 40
-	}
+	width := max(m.PaneWidth(), minViewportWidth)
 
 	mode := m.resolver.Current()
 	modeColor := m.modeStyle(mode)
@@ -150,29 +176,20 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		len(m.scrollDocLines) == m.lastScrollTotal && m.scrollDocLines != nil &&
 		m.scrollSpaceWidth == width {
 		m.chromeCacheHits++
-		var inputView strings.Builder
-		if m.autocompleteActive && len(m.autocompleteItems) > 0 {
-			inputView.WriteString(m.renderAutocompleteDropdown(width))
-		}
-		inputView.WriteString(rule(width, borderColor) + "\n")
-		switch {
-		case m.inViMode && m.viCmdMode:
-			promptLabel := viCmdStyle.Render(m.viCmdBuf)
-			inputView.WriteString(promptLabel + "\n")
-		case m.inViMode:
-			inputView.WriteString(viStatusStyle.Render("-- "+m.viModeLabel()+" --") + "\n")
-		default:
-			promptLabel := modeColor.Render(mode.String() + " " + Icon.Command)
-			inputView.WriteString(promptLabel + " " + m.renderPromptForFrame() + "\n")
-		}
-		inputView.WriteString(rule(width, borderColor))
+		inputView := normalizeRegion(m.renderInputRegion(width, borderColor))
 
 		var proposalDockView string
 		if m.state == StateAwaitingApproval || m.state == StateProcessing {
-			proposalDockView = m.renderProposalBlock()
+			proposalDockView = normalizeRegion(m.renderProposalBlock())
 		}
+		// Bound the dock BEFORE measuring, so the geometry describes the rows
+		// that are actually drawn rather than the rows the dock wanted.
+		proposalDockView = capProposalDock(proposalDockView, m.Screen().Height,
+			regionHeight(m.cachedHeaderView), regionHeight(inputView), regionHeight(m.cachedFooterView))
 
-		geo := m.viewportGeometry()
+		// Size the viewport from the MEASURED chrome, so the cached chrome and
+		// the reserved space are guaranteed to describe the same rows.
+		geo := m.measureViewportGeometry(m.cachedHeaderView, proposalDockView, inputView, m.cachedFooterView)
 		m.Viewport.Height = geo.Height
 		top := m.docScrollOffset
 		if maxOff := len(m.scrollDocLines) - geo.Height; top > maxOff && maxOff > 0 {
@@ -185,16 +202,20 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		return Workspace{
 			Header:       m.cachedHeaderView,
 			Viewport:     m.composeViewportWindow(top, width, geo.Height),
+			ViewportRows: geo.Height,
 			ProposalDock: proposalDockView,
-			Input:        inputView.String(),
+			Input:        inputView,
 			Footer:       m.cachedFooterView,
 			Actions:      actions,
 		}
 	}
 
 	// ── Fixed Header / Footer (authoritative geometry source) ──
-	headerView := m.renderTopBar(width)
-	footerView := m.renderFixedFooter(width, actions)
+	// Every region is normalized before it is measured, so regionHeight and
+	// lipgloss.Height agree and the geometry describes the rows that will be
+	// DRAWN rather than the rows the renderer happened to end its string with.
+	headerView := normalizeRegion(m.renderTopBar(width))
+	footerView := normalizeRegion(m.renderFixedFooter(width, actions))
 	// Memoize the fixed chrome for the scroll fast path. Scroll frames
 	// reuse these verbatim; any non-scroll message dirties the cache.
 	m.cachedHeaderView = headerView
@@ -203,23 +224,7 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 	m.chromeCacheValid = true
 
 	// ── Input region: autocomplete + separators + prompt ──
-	var inputView strings.Builder
-	if m.autocompleteActive && len(m.autocompleteItems) > 0 {
-		inputView.WriteString(m.renderAutocompleteDropdown(width))
-	}
-	inputView.WriteString(rule(width, borderColor) + "\n")
-
-	switch {
-	case m.inViMode && m.viCmdMode:
-		promptLabel := viCmdStyle.Render(m.viCmdBuf)
-		inputView.WriteString(promptLabel + "\n")
-	case m.inViMode:
-		inputView.WriteString(viStatusStyle.Render("-- "+m.viModeLabel()+" --") + "\n")
-	default:
-		promptLabel := modeColor.Render(mode.String() + " " + Icon.Command)
-		inputView.WriteString(promptLabel + " " + m.renderPromptForFrame() + "\n")
-	}
-	inputView.WriteString(rule(width, borderColor))
+	inputView := normalizeRegion(m.renderInputRegion(width, borderColor))
 
 	// ── Proposal dock (conditional) — floats above Input ──
 	// NOTE: shimmerActive no longer triggers the proposalDock — the loading
@@ -227,11 +232,20 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 	// so it scrolls with the text content.
 	var proposalDockView string
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
-		proposalDockView = m.renderProposalBlock()
+		proposalDockView = normalizeRegion(m.renderProposalBlock())
 	}
+	// Bound the dock BEFORE measuring, so the geometry describes the rows that
+	// are actually drawn rather than the rows the dock asked for. An uncapped
+	// expanded diff is the one region that can be arbitrarily tall, and it would
+	// push the prompt bar and the lifecycle footer off the bottom of the screen.
+	proposalDockView = capProposalDock(proposalDockView, m.Screen().Height,
+		regionHeight(headerView), regionHeight(inputView), regionHeight(footerView))
 
 	// ── Size the viewport via single authoritative geometry ──
-	geo := m.viewportGeometry()
+	// Every term is a MEASURED height of a region that was just rendered, not
+	// an estimate of one. See ViewportHeight for why an estimate here scrolls
+	// the terminal.
+	geo := m.measureViewportGeometry(headerView, proposalDockView, inputView, footerView)
 	m.Viewport.Height = geo.Height
 
 	// ── Full-path body source ──
@@ -260,10 +274,66 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 	return Workspace{
 		Header:       headerView,
 		Viewport:     viewportView,
+		ViewportRows: geo.Height,
 		ProposalDock: proposalDockView,
-		Input:        inputView.String(),
+		Input:        inputView,
 		Footer:       footerView,
 		Actions:      actions,
+	}
+}
+
+// capProposalDock bounds the proposal dock to the rows left over once the
+// header, the prompt bar, the footer, and a minimal viewport have been reserved.
+//
+// The dock is the one region that can be arbitrarily tall — an expanded diff is
+// however many lines the author wrote — and it is also the one region the user
+// can scroll within, so capping it costs nothing and is strictly better than the
+// alternative. Without the cap a large diff pushes the prompt bar and the
+// lifecycle footer off the bottom of the screen, where the terminal's scroll
+// turns them into permanent orphans. The dock already owns its own scroll offset
+// (proposalDiffOffset), so the rows that do not fit are rows the user was never
+// going to see anyway.
+func capProposalDock(dock string, screenH, headerH, promptH, footerH int) string {
+	if dock == "" {
+		return dock
+	}
+	budget := screenH - headerH - promptH - footerH - minViewportRows
+	if budget < 1 {
+		budget = 1
+	}
+	// Re-normalize on the way out: MaxHeight renders exactly `budget` rows, and
+	// a cap that returned a trailing newline would then be one row taller than
+	// the budget it just enforced.
+	dock = normalizeRegion(dock)
+	if regionHeight(dock) <= budget {
+		return dock
+	}
+	return normalizeRegion(lipgloss.NewStyle().MaxHeight(budget).Render(dock))
+}
+
+// measureViewportGeometry converts four RENDERED regions into the authoritative
+// viewport rectangle. The regions are passed in rather than re-rendered here so
+// the geometry is derived from the exact strings that are about to be composed:
+// a re-render is a second opinion, and a second opinion is how the reserved
+// height and the drawn height come to disagree.
+func (m *model) measureViewportGeometry(headerView, proposalView, inputView, footerView string) ViewportGeometry {
+	bounds := m.Screen()
+	height := ViewportHeight(
+		bounds.Height,
+		regionHeight(headerView),
+		regionHeight(proposalView),
+		regionHeight(inputView),
+		regionHeight(footerView),
+	)
+	top := regionHeight(headerView) + m.viewportPaneTop
+	if top < 0 {
+		top = 0
+	}
+	return ViewportGeometry{
+		Top:    top,
+		Left:   m.viewportPaneLeft,
+		Width:  m.Viewport.Width,
+		Height: height,
 	}
 }
 
@@ -310,10 +380,7 @@ func wrapString(text string, width int) []string {
 // renderProposalBlock renders the interactive proposal/processing dock
 // between the viewport and the input line, framed for clear isolation.
 func (m *model) renderProposalBlock() string {
-	width := m.width
-	if width < 40 {
-		width = 40
-	}
+	width := max(m.PaneWidth(), minViewportWidth)
 
 	var b strings.Builder
 
@@ -1292,7 +1359,7 @@ func (m *model) styleActivityLine(line string) string {
 	// so that raw asterisks, bullet dashes, and other Markdown
 	// syntax are converted to styled TUI output instead of leaking
 	// as plain text.
-	rendered := RenderDeterministicPipeline(line, m.width, false)
+	rendered := RenderDeterministicPipeline(line, m.PaneWidth(), false)
 	if rendered != "" && rendered != line {
 		return rendered
 	}
@@ -1306,10 +1373,10 @@ func (m *model) printRecord(rec record) string {
 	content := sanitizeText(rec.text)
 
 	if rec.role == roleAI {
-		return m.renderAIResponseBlocks(content, m.width)
+		return m.renderAIResponseBlocks(content, m.PaneWidth())
 	}
 
-	wrapWidth := m.width - 4
+	wrapWidth := m.PaneWidth() - 4
 	if wrapWidth < 20 {
 		wrapWidth = 20
 	}
@@ -1563,10 +1630,22 @@ func parseAIContent(content string) []contentBlock {
 	return blocks
 }
 
+// renderTable draws a GFM table as a bordered grid bounded to width.
+//
+// Column widths are allocated by markdown.BudgetTable — the same prorated
+// budgeter the AST renderer uses — so the two paths cannot disagree about
+// whether a table fits, and in-cell word wrapping is applied with the same
+// Width().Wrap(true) rule in both. The two behaviours that used to be mutually
+// exclusive are now simultaneous: a cell too long for its column WRAPS inside
+// the grid instead of tearing it, so the bordered form survives all the way
+// down to a 40-cell split-pane instead of degrading to a bullet list at 60.
 func renderTable(rawTable string, width int) string {
+	// Pre-AST normalisation of the raw fragment: `<br>` in any spelling and
+	// CRLF become real newlines before the pipe splitter runs, so a cell break
+	// is never mistaken for literal markup or fused into one token.
+	rawTable = markdown.SanitizeRawMarkdown(rawTable)
 	lines := strings.Split(rawTable, "\n")
 	var grid [][]string
-	var colWidths []int
 
 	for _, l := range lines {
 		trimmed := strings.TrimSpace(l)
@@ -1584,7 +1663,12 @@ func renderTable(rawTable string, width int) string {
 		parts := strings.Split(trimmed, "|")
 		var row []string
 		for _, p := range parts {
-			row = append(row, strings.TrimSpace(p))
+			// SanitizeCellBreaks here, at the point the cell becomes a string,
+			// so EVERY consumer downstream sees normalised text: the width scan
+			// below, the grid, and the stacked fallback. A `<br>` left in place
+			// prints as literal markup and is charged four characters of column
+			// budget for a break it never draws.
+			row = append(row, strings.TrimSpace(markdown.SanitizeCellBreaks(p)))
 		}
 		if len(row) > 0 && row[0] == "" {
 			row = row[1:]
@@ -1594,15 +1678,6 @@ func renderTable(rawTable string, width int) string {
 		}
 		if len(row) > 0 {
 			grid = append(grid, row)
-			for len(colWidths) < len(row) {
-				colWidths = append(colWidths, 0)
-			}
-			for idx, val := range row {
-				valLen := lipgloss.Width(val)
-				if valLen > colWidths[idx] {
-					colWidths[idx] = valLen
-				}
-			}
 		}
 	}
 
@@ -1610,84 +1685,149 @@ func renderTable(rawTable string, width int) string {
 		return rawTable
 	}
 
-	// Calculate sum of column widths including padding and grid lines
-	totalTableW := 0
-	for _, w := range colWidths {
-		totalTableW += w + 3
-	}
-	totalTableW += 1
-
-	// Fallback to compact key-value listing if split terminal screen is too small
-	if totalTableW > width || width < 60 {
-		var b strings.Builder
-		headers := grid[0]
-		for rowIdx := 1; rowIdx < len(grid); rowIdx++ {
-			row := grid[rowIdx]
-			if rowIdx > 1 {
-				b.WriteString("\n" + strings.Repeat("─", width) + "\n")
+	numCols := max(len(grid[0]), 1)
+	// Intrinsic demand per column, measured in terminal cells and PER LINE — the
+	// same measurement the AST renderer makes, so the two budgets agree and a
+	// `<br>`-broken cell demands its widest line rather than the sum of all of
+	// them. Measuring the joined cell would over-demand by every extra line and
+	// starve the columns beside it in a squeezed pane.
+	raw := make([]int, numCols)
+	for _, row := range grid {
+		for idx, val := range row {
+			if idx >= numCols {
+				continue
 			}
-			for colIdx, val := range row {
-				header := fmt.Sprintf("Col %d", colIdx+1)
-				if colIdx < len(headers) {
-					header = headers[colIdx]
-				}
-				line := fmt.Sprintf("• %s: %s", header, val)
-				wrapped := wrapStreamText(line, width)
-				b.WriteString(strings.Join(wrapped, "\n") + "\n")
+			if w := markdown.CellIntrinsicWidth(val); w > raw[idx] {
+				raw[idx] = w
 			}
 		}
-		return strings.TrimSuffix(b.String(), "\n")
+	}
+
+	budget := markdown.BudgetTable(raw, width)
+	if !budget.Fits(width) {
+		// More columns than this pane can frame at a readable width. Degrade to
+		// a stacked key/value listing: the column relationship survives, the
+		// alignment cue does not, and the frame is never torn.
+		return renderTableStacked(grid, numCols, width)
+	}
+	colWidths := budget.Widths
+
+	var b strings.Builder
+	b.WriteString(tableRule(colWidths, "┌", "┬", "┐", true))
+	b.WriteString("\n")
+
+	for rowIdx, row := range grid {
+		if rowIdx == 1 {
+			b.WriteString(tableRule(colWidths, "├", "┼", "┤", true))
+			b.WriteString("\n")
+		}
+		b.WriteString(tableRowLines(row, colWidths, rowIdx == 0))
+		if rowIdx < len(grid)-1 {
+			b.WriteString("\n")
+		}
+	}
+	// A newline before the closing rule, ALWAYS — including for a single-row
+	// table, where the row loop's own separator never fires. Without it the
+	// bottom rule is concatenated onto the last data row, so the frame closes on
+	// the same line as its content and the table reads as corrupted.
+	b.WriteString("\n")
+	b.WriteString(tableRule(colWidths, "└", "┴", "┘", true))
+
+	return b.String()
+}
+
+// tableRowLines draws one bordered row of any height. Every cell is wrapped to
+// its column width, and the row is as tall as its tallest cell, so a wrapped
+// cell grows its own row instead of pushing the rest of the grid out of
+// alignment. The `│` boundary is re-emitted on every physical line — that
+// re-emission is what keeps a wrapped cell from tearing the border off the
+// rows beneath it.
+func tableRowLines(row []string, colWidths []int, header bool) string {
+	numCols := len(colWidths)
+	wrapped := make([][]string, numCols)
+	height := 1
+
+	cellStyle := mdCellStyle
+	if header {
+		cellStyle = mdHeaderBoldCell
+	}
+
+	for c := 0; c < numCols; c++ {
+		text := ""
+		if c < len(row) {
+			text = row[c]
+		}
+		lines := strings.Split(markdown.Cell{Style: cellStyle}.Width(colWidths[c]).Wrap(true).Render(text), "\n")
+		wrapped[c] = lines
+		if len(lines) > height {
+			height = len(lines)
+		}
 	}
 
 	var b strings.Builder
-	b.WriteString("┌")
-	for idx, w := range colWidths {
-		if idx > 0 {
-			b.WriteString("┬")
-		}
-		b.WriteString(strings.Repeat("─", w+2))
-	}
-	b.WriteString("┐\n")
-
-	for rowIdx, row := range grid {
-		if rowIdx > 0 && rowIdx == 1 {
-			b.WriteString("├")
-			for idx, w := range colWidths {
-				if idx > 0 {
-					b.WriteString("┼")
-				}
-				b.WriteString(strings.Repeat("─", w+2))
-			}
-			b.WriteString("┤\n")
-		}
-
+	for r := 0; r < height; r++ {
 		b.WriteString("│")
-		for idx, w := range colWidths {
-			val := ""
-			if idx < len(row) {
-				val = row[idx]
+		for c := 0; c < numCols; c++ {
+			cell := ""
+			if r < len(wrapped[c]) {
+				cell = wrapped[c][r]
 			}
-			padded := " " + val + " "
-			extra := w + 2 - lipgloss.Width(padded)
-			if extra > 0 {
-				padded += strings.Repeat(" ", extra)
-			}
-			b.WriteString(padded)
+			b.WriteString(" " + padMRight(cell, colWidths[c]) + " ")
 			b.WriteString("│")
 		}
-		b.WriteString("\n")
-	}
-
-	b.WriteString("└")
-	for idx, w := range colWidths {
-		if idx > 0 {
-			b.WriteString("┴")
+		if r < height-1 {
+			b.WriteString("\n")
 		}
-		b.WriteString(strings.Repeat("─", w+2))
 	}
-	b.WriteString("┘")
-
 	return b.String()
+}
+
+// tableRule draws a horizontal rule aligned to the grid's columns.
+func tableRule(colWidths []int, left, mid, right string, styled bool) string {
+	var b strings.Builder
+	b.WriteString(left)
+	for i, w := range colWidths {
+		if i > 0 {
+			b.WriteString(mid)
+		}
+		rule := strings.Repeat("─", w+2)
+		if styled {
+			rule = mdSepStyle.Render(rule)
+		}
+		b.WriteString(rule)
+	}
+	b.WriteString(right)
+	return b.String()
+}
+
+// renderTableStacked re-emits a grid as a labelled listing for panes too narrow
+// to frame it. Every value keeps its header, so the column RELATIONSHIP — the
+// reason the author chose a table — is not lost.
+func renderTableStacked(grid [][]string, numCols, width int) string {
+	var b strings.Builder
+	headers := make([]string, numCols)
+	for c := 0; c < numCols; c++ {
+		headers[c] = fmt.Sprintf("Col %d", c+1)
+	}
+	for c, v := range grid[0] {
+		if c < numCols {
+			headers[c] = v
+		}
+	}
+	for rowIdx := 1; rowIdx < len(grid); rowIdx++ {
+		if rowIdx > 1 {
+			b.WriteString(mdSepStyle.Render(strings.Repeat("─", max(width, 1))) + "\n")
+		}
+		for c := 0; c < numCols; c++ {
+			val := ""
+			if c < len(grid[rowIdx]) {
+				val = grid[rowIdx][c]
+			}
+			line := fmt.Sprintf("• %s: %s", headers[c], val)
+			b.WriteString(strings.Join(wrapStreamText(line, width), "\n") + "\n")
+		}
+	}
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 func parseDiffMetadata(diffBody string) (file, symbol, linesRange, cleanDiff string) {

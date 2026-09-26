@@ -178,6 +178,15 @@ func TestPadRightOverlayWidthInvariant(t *testing.T) {
 // idle-telemetry status row and the toast row are eliminated, so the viewport
 // reclaims the exact 1-line footer + 1 dropped status row (2 lines total) vs
 // the old layout. The prompt bar anchors directly above that single line.
+//
+// The height is now derived from the MEASURED heights of the rendered regions
+// (see measureViewportGeometry), so the assertion is stated as the composition
+// it must satisfy rather than as a bare number: every fixed region is measured,
+// and the remaining rows are the viewport. There is no rounding reserve: the
+// budget is exact, and the compositor re-asserts the region's height so a frame
+// can neither float its prompt bar nor scroll the pane. A hand-written constant
+// here would pass while the real chrome drifted, which is precisely the failure
+// this arithmetic exists to prevent.
 func TestViewportGeometrySingleLineFooter(t *testing.T) {
 	m := headerTestModel()
 	m.height = 40
@@ -185,16 +194,29 @@ func TestViewportGeometrySingleLineFooter(t *testing.T) {
 
 	geo := m.viewportGeometry()
 
+	header := m.renderTopBar(m.width)
+	footer := m.renderFixedFooter(m.width, nil)
+	input := m.renderInputRegion(m.width, m.modeStyle(m.resolver.Current()))
+
 	// The old layout reserved: header (2) + status (1) + input (3) + footer
 	// chrome+content (2) = 8 fixed rows. The new layout drops the status row
 	// and the footer chrome, leaving header (2) + input (3) + footer (1) = 6.
-	// Viewport height = height - fixed = 40 - 6 - proposal(0) = 34.
-	if geo.Height != 34 {
-		t.Errorf("viewport height = %d, want 34 (1-line footer, no status row)", geo.Height)
+	// The viewport is the remainder, exactly.
+	want := 40 - regionHeight(header) - regionHeight(input) - regionHeight(footer)
+	if geo.Height != want {
+		t.Errorf("viewport height = %d, want %d (header=%d input=%d footer=%d)",
+			geo.Height, want, regionHeight(header), regionHeight(input), regionHeight(footer))
+	}
+	// The composition must leave the whole screen accounted for, with nothing
+	// left over. This is the zero-leak budget stated as an invariant: the frame
+	// is never taller than the terminal, so the terminal never scrolls and never
+	// leaves an orphan prompt bar in scrollback.
+	if geo.Top+geo.Height+regionHeight(input)+regionHeight(footer) > m.height {
+		t.Errorf("composed frame exceeds terminal height %d: top=%d viewport=%d input=%d footer=%d",
+			m.height, geo.Top, geo.Height, regionHeight(input), regionHeight(footer))
 	}
 	// The footer is a single line and sits immediately above the terminal
 	// bottom; its content never wraps to a second row.
-	footer := m.renderFixedFooter(m.width, nil)
 	if countLines(footer) != 1 {
 		t.Errorf("footer rendered %d lines (want 1):\n%q", countLines(footer), footer)
 	}

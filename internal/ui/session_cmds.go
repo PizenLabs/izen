@@ -449,6 +449,9 @@ func (m *model) openSessionPicker() tea.Cmd {
 	}
 	infos := m.decorateSessionInfos(m.sessionManager.List(context.Background()))
 	sp := NewSessionPickerModal(infos)
+	// A raw-field guard, not a PaneWidth() one: the question here is "has the
+	// model been sized yet", and PaneWidth() always answers, so a check against it
+	// would be vacuous.
 	if m.width > 0 && m.height > 0 {
 		w, h := m.sessionPickerDialogSize()
 		sp.SetSize(w, h)

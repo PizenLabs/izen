@@ -141,11 +141,11 @@ func (m *model) renderPermissionOverlay(base string) string {
 	if m.pendingPermission == nil {
 		return base
 	}
-	width := m.width
+	width := m.PaneWidth()
 	if width < 40 {
 		width = 40
 	}
-	height := m.height
+	height := m.PaneHeight()
 	if height <= 0 {
 		height = 24
 	}

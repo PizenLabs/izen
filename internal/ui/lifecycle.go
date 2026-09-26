@@ -84,6 +84,17 @@ func (m *model) clearPresentation() {
 	if m.liveCodePreview != nil {
 		m.liveCodePreview.Reset()
 	}
+	// The pre-execution skeleton is PRESENTATION: /clear clears what I see, and
+	// an indicator for work the user just dismissed is a claim about a
+	// conversation that no longer exists. It is released here (not in
+	// clearExecutionActivity) because it is a rendered surface, not an
+	// execution-activity record.
+	m.unmountSkeleton()
+	// Same reasoning for the table holdback: a held-back table describes a
+	// response the user just discarded, so the latch is released and its
+	// buffered bytes dropped rather than surfacing in the next turn.
+	m.closeTableHoldback()
+	m.resetStreamingRenderer()
 	m.stopShimmer()
 }
 

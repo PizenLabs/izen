@@ -62,9 +62,11 @@ import (
 	"github.com/PizenLabs/izen/internal/state"
 	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
 	"github.com/PizenLabs/izen/internal/tui/tips"
+	"github.com/PizenLabs/izen/internal/ui/components"
 	"github.com/PizenLabs/izen/internal/ui/diff"
 	"github.com/PizenLabs/izen/internal/ui/markdown"
 	uiplan "github.com/PizenLabs/izen/internal/ui/plan"
+	"github.com/PizenLabs/izen/internal/ui/states"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	uitool "github.com/PizenLabs/izen/internal/ui/tool"
 	proposaltui "github.com/PizenLabs/izen/internal/ui/tui"
@@ -72,6 +74,264 @@ import (
 	model_picker "github.com/PizenLabs/izen/internal/ui/widgets/model_picker"
 	settings_widget "github.com/PizenLabs/izen/internal/ui/widgets/settings"
 )
+
+// ── Zero-Leak Screen Composite ────────────────────────────────────────────────
+//
+// # THE PROBLEM: A TALLER FRAME DOES NOT CLIP, IT SCROLLS
+//
+// Bubble Tea hands View()'s return value to the terminal verbatim. When that
+// value is TALLER than the terminal, the terminal does not truncate it — it
+// scrolls. Scrolling pushes the previous frame's last rows off the top of the
+// live area and into SCROLLBACK, and scrollback is not part of the redraw: the
+// orphan stays there, frozen, for the rest of the session. The symptom is a
+// stack of `ask )` prompt bars and telemetry rows that accumulate above the
+// conversation and never move again, and it gets worse the longer the output
+// streams, because every overflowing frame leaves one more orphan.
+//
+// No amount of redrawing fixes this. The debris is already outside the live
+// area. The only fix is to never hand the terminal a frame that does not fit.
+//
+// # THE TWO HALVES, BOTH REQUIRED
+//
+//  1. BUDGET. The viewport is sized from the MEASURED heights of the regions
+//     that surround it, not from a hand-maintained count of what those regions
+//     "usually" take. A constant is wrong the instant an autocomplete dropdown
+//     opens, a proposal dock gains a line, or a footer adds a badge — and
+//     nothing notices, because the arithmetic still adds up. The regions are
+//     measured with regionHeight (see below) as they are rendered, so a region
+//     that grows shrinks the viewport instead of the screen.
+//
+//  2. CLIP. The composed frame is then wrapped in an unconditional
+//     MaxHeight/MaxWidth bound. This half needs no cooperation from any part:
+//     whatever the budget arithmetic got wrong — a mis-measured dock, a header
+//     that grew, an overlay that ignored its budget — the frame that reaches
+//     the terminal is at most m.height rows by m.width cells. A TUI
+//     that clips is merely shorter; a TUI that scrolls leaves permanent marks
+//     in the user's terminal history.
+//
+// The budget half exists so the clip is almost never the thing that has to act.
+// A frame that only ever gets clipped from the bottom loses its prompt bar and
+// its footer — the two surfaces the user is typing into. Sizing the viewport to
+// absorb the shortfall keeps those alive and makes the clip a backstop.
+
+// ScreenBounds is the terminal rectangle a frame is allowed to occupy. It is
+// the single source of the clip bound so the budget arithmetic and the final
+// clip cannot disagree about what "fits".
+type ScreenBounds struct {
+	Width  int
+	Height int
+}
+
+// Screen returns the model's current terminal bounds, floored at 1x1.
+//
+// A zero or negative bound would make every subsequent computation degenerate
+// (a zero MaxHeight truncates to the empty string; a negative width makes
+// lipgloss wrap every rune). Terminals report 0 before the first WindowSizeMsg,
+// so this is a real state, not a hypothetical.
+//
+// It reports the ACTIVE PANE, not the global terminal: see PaneWidth for why the
+// two are different quantities and why every bound has to be the pane's.
+func (m *model) Screen() ScreenBounds {
+	w, h := 80, 24
+	if m != nil {
+		w, h = m.PaneWidth(), m.PaneHeight()
+	}
+	return ScreenBounds{Width: max(w, 1), Height: max(h, 1)}
+}
+
+// PaneWidth is the width of the ACTIVE PANE — the number every frame the
+// renderer draws must be bounded by.
+//
+// It is deliberately NOT m.width. The global terminal width is the wrong answer
+// in exactly the situation that produced the worst framing bug this renderer
+// had: a side-by-side terminal split. There, `m.width` is the width of the whole
+// terminal, the program is drawing inside a pane a fraction of that wide, and
+// the terminal hard-wraps whatever crosses the pane boundary. A [PARTIAL]
+// truncation notice bounded to the terminal width is therefore bounded to
+// something the user can never see: its right border lands past the pane edge,
+// the terminal wraps it onto the next row, and the frame reads as a torn box
+// with a stray `|` in it.
+//
+// Falling back to the global width when no pane width has been recorded is what
+// makes this safe to adopt call-site by call-site: tests and pre-bootstrap
+// frames that set m.width directly still get a real bound instead of a
+// degenerate one, and a zero or negative pane width is never returned.
+func (m *model) PaneWidth() int {
+	if m == nil {
+		return 80
+	}
+	if m.paneWidth > 0 {
+		return m.paneWidth
+	}
+	if m.width > 0 {
+		return m.width
+	}
+	return 80
+}
+
+// PaneHeight is the row count of the ACTIVE PANE — the same split from
+// PaneWidth applied to the vertical axis, and the height the bottom-anchored
+// composite is sized against.
+func (m *model) PaneHeight() int {
+	if m == nil {
+		return 24
+	}
+	if m.paneHeight > 0 {
+		return m.paneHeight
+	}
+	if m.height > 0 {
+		return m.height
+	}
+	return 24
+}
+
+// minViewportRows is the fewest rows the conversation viewport is worth keeping
+// at all, and the slack capProposalDock leaves for it. The viewport is the
+// content the user came to read, so the dock gives way to it before the prompt
+// bar and the lifecycle footer do — which is why the arithmetic below treats
+// those two as pinned rather than as candidates for savings.
+const minViewportRows = 3
+
+// minViewportWidth is the narrowest width the layout budget will reason about.
+// Rendering clamps to it, so measuring against anything smaller would reserve
+// space for a layout that is never drawn.
+const minViewportWidth = 40
+
+// ViewportHeight returns the number of rows the conversation viewport occupies in
+// a frame of screenH rows, given the MEASURED heights of every fixed region
+// above and below it.
+//
+// The contract is EXACT, and it is the whole point of the function:
+//
+//	headerH + viewportH + proposalH + promptH + footerH == screenH
+//
+// A budget that comes up short is not a conservative budget, it is a broken one.
+// Bubble Tea writes a frame from the top of the pane and does not pad it, so two
+// unaccounted rows at the bottom draw the `ask )` prompt bar and the lifecycle
+// footer two rows ABOVE the pane's bottom edge — the "floating prompt", with
+// whatever the terminal last painted still visible underneath. That is why
+// there is no rounding reserve here: a reserve cannot make a frame fit, it can
+// only make it float by a different amount. Exactness is achieved instead by
+// making the MEASURED heights and the DRAWN heights the same number — see
+// normalizeRegion and composeBottomAnchoredFrame — which removes the
+// disagreement a reserve would otherwise have to absorb.
+//
+// The prompt bar and the footer are pinned: they are the surfaces the user is
+// interacting with, so they are never what gets sacrificed to make room. The
+// viewport is never asked to be zero rows — a viewport with no rows is not a
+// scrollable region, it is a hole — and never taller than the space the bottom
+// stack leaves, since a viewport that overruns its slot is the one input that
+// makes the composite overflow no matter what the clip does.
+//
+// When the fixed chrome alone exceeds screenH — a 12-row autocomplete dropdown
+// in a 5-row pane — no height makes the frame fit and the compositor takes over.
+// The header is what it gives up: composeBottomAnchoredFrame drops whole regions
+// from the TOP of the frame, so the bottom-anchored stack is never the part that
+// gets lost.
+func ViewportHeight(screenH, headerH, proposalH, promptH, footerH int) int {
+	// The prompt bar and the lifecycle footer: measured, never estimated, and
+	// never sacrificed.
+	bottomStack := promptH + footerH
+
+	// The viewport absorbs the remainder, exactly. No reserve, and no
+	// header-sacrifice branch: a branch that quietly reclaims the header's rows
+	// for the viewport would make the drawn frame taller than the budget says,
+	// and that disagreement is precisely what scrolls the pane.
+	budget := screenH - bottomStack - headerH - proposalH
+	// Floor: never zero rows.
+	if budget < 1 {
+		budget = 1
+	}
+	// Ceiling: never taller than the space the bottom stack leaves. This is the
+	// clamp that matters when the chrome alone is taller than the screen — a
+	// 12-row autocomplete dropdown in a 5-row pane — where no viewport height
+	// can make the frame fit and the compositor's top-down trim takes over.
+	if ceiling := screenH - bottomStack; budget > ceiling {
+		budget = max(1, ceiling)
+	}
+	return budget
+}
+
+// normalizeRegion is the single seam that makes a rendered region's MEASURED
+// height and its DRAWN height the same number.
+//
+// A region ending in "\n" is the disagreement this exists to remove.
+// lipgloss.JoinVertical splits a block on "\n", so "a\nb\n" becomes three lines
+// and the empty one is joined into the frame — while the budget, which is derived
+// from the number of CONTENT rows the region carries, accounts for two. The frame
+// would then be one row taller than everything measured, and it would overflow the
+// pane by exactly the amount the composition can least afford to be wrong by.
+//
+// Trimming trailing newlines makes the two agree by construction, at every
+// layer: the budget, the compositor, and the mouse mapper that resolves a click
+// through the same rectangle. ALL of them, not just the last one: regionHeight
+// corrects for exactly one, so a region ending "\n\n" would keep disagreeing by
+// one row. A region that normalizes to empty is dropped from the composite
+// entirely, contributing zero rows rather than a joined blank line.
+func normalizeRegion(region string) string {
+	if region == "" {
+		return ""
+	}
+	return strings.TrimRight(region, "\n")
+}
+
+// regionHeight is the number of terminal ROWS a rendered region contributes to
+// the composed frame.
+//
+// It is lipgloss.Height with its two degenerate inputs corrected, because both
+// of them are real states in this renderer and both over-report by a row:
+//
+//   - The EMPTY string. lipgloss.Height("") is 1, but an empty region is joined
+//     away entirely and contributes nothing. Counting it as a row silently
+//     reserves a row that no one draws, which is a one-row gap between the
+//     header and the viewport and a one-row error in every mouse mapping.
+//   - A region ending in "\n". lipgloss.Height counts the empty string after the
+//     final newline as a row, so a dock that ends with a separator line reports
+//     one row more than it draws.
+//
+// Over-counting is the dangerous direction: the budget reserves space that is
+// never used, so the frame is shorter than it needs to be, and the difference
+// shows up as a hole rather than as a scroll.
+//
+// After normalizeRegion both corrections are no-ops, because a normalized region
+// neither is empty nor ends in a newline — which is the point. Every region the
+// compositor measures has passed through that seam, so regionHeight and
+// lipgloss.Height agree on all of them, and the frame's height is a function of
+// the budget rather than of how each renderer happened to end its string.
+func regionHeight(region string) int {
+	if region == "" {
+		return 0
+	}
+	h := lipgloss.Height(region)
+	if strings.HasSuffix(region, "\n") && h > 1 {
+		h--
+	}
+	return h
+}
+
+// ClipFrame hard-bounds a composed frame to the given screen rectangle.
+//
+// This is the zero-leak guarantee, stated as a function so every return path out
+// of View() can be held to it. lipgloss's MaxWidth/MaxHeight truncate
+// line-by-line and are ANSI-aware, so a clipped frame loses whole ROWS rather
+// than half an escape sequence — a truncated SGR run would leak colour into
+// whatever the user runs next.
+//
+// A frame that already fits is returned unchanged (byte-identical), so the clip
+// is a no-op on the overwhelmingly common path and costs nothing but a width and
+// a height measurement.
+func ClipFrame(frame string, bounds ScreenBounds) string {
+	if frame == "" {
+		return frame
+	}
+	if lipgloss.Height(frame) <= bounds.Height && lipgloss.Width(frame) <= bounds.Width {
+		return frame
+	}
+	return lipgloss.NewStyle().
+		MaxWidth(bounds.Width).
+		MaxHeight(bounds.Height).
+		Render(frame)
+}
 
 // ── Init stage types ──────────────────────────────────────────────────────────
 
@@ -852,10 +1112,28 @@ type model struct {
 	// that starts a new conversation.
 	resumeBriefing *resumeBriefingData
 
-	// Window dimensions
+	// Window dimensions.
+	//
+	// width/height are the GLOBAL terminal rectangle. paneWidth/paneHeight are
+	// the ACTIVE PANE's rectangle inside it. They are not synonyms: a tmux or
+	// Ghostty split runs one Bubble Tea program in a pane of a much wider
+	// terminal, and every bound the renderer draws to — banner frames, card
+	// frames, table column budgets, the prompt bar, the footer — must answer to
+	// the pane, because the pane is what the terminal will actually clip at.
+	// Measuring a [PARTIAL] banner against the global width is what pushes its
+	// right border past the pane edge and wraps the frame.
+	//
+	// They are kept as separate fields rather than collapsed into one so the
+	// distinction is visible at every call site that has to choose; PaneWidth
+	// and PaneHeight are the accessors, and they are the correct answer for
+	// every frame-bounding question. See PaneWidth.
 	width     int
 	height    int
-	wrapWidth int
+	paneWidth int
+	// paneHeight is the active pane's row count, the same split from
+	// paneWidth applied to the vertical axis.
+	paneHeight int
+	wrapWidth  int
 
 	// Viewport for scrollable chat history
 	Viewport           viewport.Model
@@ -913,7 +1191,16 @@ type model struct {
 	// the visible answer instead of staying buffered until the closing
 	// marker arrives. See extractSentinelReasoning.
 	pendingReasoningFragment string
-	spinnerFrame             int
+	// frame is the MASTER animation frame, advanced by exactly one step on
+	// every FrameTickMsg (~30ms / ~33 FPS) at the top of that handler, before
+	// any of its returns. It is the clock the emerald shimmer wave and the
+	// braille spinner glyph ride, so the indicator sweeping inside the viewport
+	// can never freeze while a construct is held back: every path out of the
+	// handler — flush, repaint, latch reconciliation, terminal return — still
+	// advances it, which is exactly the invariant a transient one-row claim
+	// needs (a frozen animated indicator is indistinguishable from a hang).
+	frame        uint64
+	spinnerFrame int
 	// dotFrame advances each viewport refresh to drive the animated
 	// truncation-dots counter in execution log entries (1 → 2 → 3 → 1…).
 	dotFrame int
@@ -1730,6 +2017,26 @@ type model struct {
 	loadingTip    string
 	tipProvider   *tips.Provider
 
+	// ── Transient pre-execution skeleton ─────────────────────────────
+	// lifecycle is the pre-execution indicator state machine: which single
+	// surface is being produced but cannot yet be shown (a table under
+	// construction, a code block being formatted, an edit being staged, a tool
+	// being prepared, a workspace being mapped). skeleton is the mounted
+	// one-row widget for it, and skeletonFrame is the shared animation frame
+	// the row's glyph and colour wave both advance on. All three are lazily
+	// allocated (see ensureSkeleton) so a model built as a struct literal
+	// behaves exactly like one built by the program bootstrap. See
+	// skeleton.go for the mount/release contract.
+	lifecycle *states.Machine
+	skeleton  *components.Skeleton
+	// skeletonFrame is the frame the mounted row is currently drawing. It is
+	// not a clock of its own: advanceAnimationFrame assigns it from the master
+	// m.frame counter every tick, so a mount picks up wherever the master
+	// timeline is (no visible snap back to frame zero) and the two can never
+	// drift. Kept as a field so a mount can read the current frame without
+	// reaching into the counter mid-step.
+	skeletonFrame uint64
+
 	// Event bus — the headless engines publish domain events here and the UI
 	// subscribes as a pure projection. Never nil after bootstrap.
 	bus *events.Bus
@@ -1863,6 +2170,25 @@ type model struct {
 	// received table row, fence, heading, or `**bold**` span cannot re-flow the
 	// viewport dozens of times per second. See internal/ui/markdown.
 	aiStreamUncommitted *markdown.Buffer
+	// tableLatch is the StateTablePending HYSTERESIS. It turns ON the moment the
+	// streaming block renderer recognises a table block (the opening pipes
+	// arrive) and stays ON through every subsequent chunk — including bare cell
+	// fragments that contain no pipe at all. Only an explicit termination
+	// signal releases it: a complete line that is not part of the table, a blank
+	// line, or stream completion.
+	//
+	// The latch exists because the indicator must not be re-derived from what the
+	// most recent chunk looks like. A table's rows arrive interleaved with
+	// fragments that are not table syntax, and a per-chunk derivation flips the
+	// one-row indicator on and off once per cell boundary — the oscillation that
+	// reads as screen flicker. Its value is reconciled from the authoritative
+	// holdback (aiStreamRenderer) once per streaming tick; see syncTableLatch.
+	//
+	// It is held by POINTER for the same reason m.lifecycle is: Latch carries a
+	// lock, and a lock inside model would make the model a non-copyable value
+	// (the value receiver that value-semantics callers rely on would be a
+	// vet-level copylocks violation). A nil latch is released and inert.
+	tableLatch *states.Latch
 	// docScrollOffset is the app-owned single scroll position into the
 	// scrollable document. The bubbles viewport is a pure render surface
 	// (content is pre-sliced to exactly the visible window and
@@ -2616,7 +2942,30 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		m.logRuntimeDetail("[runtime] target resolved: %s (exists=%t, %s)", p.Target, p.Exists, p.Source)
 	case events.ContextPreparedPayload:
 		m.setStage("context", "", stageRunning)
+		// ATOMIC REPLACEMENT: the workspace mapping finished, so any indexing
+		// indicator's row is released and the compiled context — which the
+		// context/mutation surfaces below render — takes its place.
+		m.finalizeSkeleton(states.StateAstIndexing, "")
 		m.logRuntimeDetail("[runtime] context prepared: %d channel(s), ~%d tokens", len(p.Channels), p.Tokens)
+	case events.ContextCompilationPayload:
+		// PRE-EXECUTION INDICATOR: the context compiler is running. Nothing has
+		// been read or sent yet, and a context scan on a large workspace is a
+		// real, non-instant pause with nothing else to show for it. The payload is
+		// content-free by construction, so the indicator names no file.
+		m.mountSkeleton(states.StateAstIndexing, "")
+	case events.ToolBatchStartedPayload:
+		// PRE-EXECUTION INDICATOR: the tool set is committed and about to be
+		// dispatched. Nothing has been handed to a subprocess yet, so the
+		// viewport has no result to show. The first tool id is the most useful
+		// subject available; a batch of ten is not a one-line claim.
+		if len(p.ToolIDs) > 0 {
+			m.mountSkeleton(states.StateToolExecution, p.ToolIDs[0])
+		}
+	case events.ToolBatchCompletedPayload:
+		// ATOMIC REPLACEMENT: the tools ran, so the row is released. The
+		// finalized content is the tool card the tool dock renders, so nothing
+		// is pushed here.
+		m.finalizeSkeleton(states.StateToolExecution, "")
 	case events.ModelInvokedPayload:
 		m.setStage("model", p.Model, stageWaiting)
 		m.logRuntimeDetail("[runtime] model invoked: %s", p.Model)
@@ -2659,6 +3008,13 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		m.logRuntimeDetail("[runtime] provider response: %s (%d tok in / %d tok out)", p.Model, p.TokenInput, p.TokenOutput)
 	case events.ArtifactProducedPayload:
 		m.setStage("patch", p.Target, stageRunning)
+		// PRE-EXECUTION INDICATOR: an artifact now exists and its target is
+		// known, but the mutation has NOT started — the edit is being staged, so
+		// the viewport has nothing truthful to show yet. The indicator names the
+		// file, which is the one thing a user can usefully watch. Released by
+		// MutationStarted below, or by finalizeOperation if the mutation never
+		// begins.
+		m.mountSkeleton(states.StateWorkspacePatch, p.Target)
 		m.logRuntimeDetail("[runtime] artifact produced: %s (%s)", p.Kind, p.Target)
 	case events.MutationStartedPayload:
 		target := ""
@@ -2666,6 +3022,12 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			target = p.Targets[0]
 		}
 		m.setStage("apply", target, stageRunning)
+		// ATOMIC REPLACEMENT: staging is over, so the indicator's row is
+		// released. The finalized content is the mutation card / activity entry
+		// the runtime renders for this event, so the substitution is empty —
+		// pushing anything here would duplicate content that is already on its
+		// way into the document.
+		m.finalizeSkeleton(states.StateWorkspacePatch, "")
 		m.logRuntimeDetail("[runtime] mutation started: %d target(s)", len(p.Targets))
 	case events.MutationCompletedPayload:
 		m.setStage("apply", p.Target, stageDone)
@@ -2975,6 +3337,13 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	// the user cancelled after stays on screen.
 	m.drainStreamRingAll()
 	m.flushStreamContentToView()
+	// CANCELLATION CONTRACT: the raw stream buffer is flushed above, so the
+	// partial answer the user cancelled after stays on screen. The pre-execution
+	// skeleton is released here, AFTER the flush, so the row it occupied is
+	// replaced by the flushed content in the same repaint — an indicator that
+	// outlived a Ctrl+C would claim work that is no longer happening, and one
+	// released before the flush would leave a blank row between the two.
+	m.unmountSkeleton()
 	// 0. Cancel the authoritative operation context FIRST so provider calls
 	// and subprocesses spawned under the active operation observe the
 	// cancellation immediately (Section 6: context propagation).
@@ -3730,7 +4099,7 @@ func (m *model) cacheRecordToHistory(rec record) {
 // multi-line content like the TODO CHECKLIST must preserve its line structure
 // (each checklist item on its own line) rather than being reflowed as one blob.
 func (m *model) renderRecordForViewport(rec record) string {
-	viewportWidth := m.width
+	viewportWidth := m.PaneWidth()
 	if m.Ready && m.Viewport.Width > 0 {
 		viewportWidth = m.Viewport.Width
 	}
@@ -4475,7 +4844,7 @@ func (m *model) refreshViewportContent() {
 	// live mode/banner state) and prepended to the scrollable document.
 	var chrome strings.Builder
 	if m.showBanner && len(m.records) == 0 {
-		if b := m.renderStartupBanner(m.width); b != "" {
+		if b := m.renderStartupBanner(m.PaneWidth()); b != "" {
 			chrome.WriteString(b)
 			chrome.WriteString("\n")
 		}
@@ -4502,7 +4871,7 @@ func (m *model) refreshViewportContent() {
 	// Developer inside builder.
 	wrapWidth := m.wrapWidth
 	if wrapWidth == 0 {
-		wrapWidth = m.width
+		wrapWidth = m.PaneWidth()
 	}
 	if wrapWidth < 20 {
 		wrapWidth = 20
@@ -4523,6 +4892,14 @@ func (m *model) refreshViewportContent() {
 		prevLayoutWidth = m.docLayout.Width()
 	}
 	m.updateConversationLayout(wrapWidth, username)
+	// ── Pre-execution skeleton reconciliation ─────────────────────────
+	// Runs HERE, inside the projection pass, and before the tail is rendered:
+	// the block renderer has just reported what it is holding back, so the
+	// mounted indicator is reconciled in the very frame that will draw it. A
+	// released indicator is therefore never visible in the same frame as its
+	// finalized content — the replacement is atomic by construction rather than
+	// by a follow-up repaint. See skeleton.go.
+	m.syncStreamingSkeleton()
 	// ── Framebuffer invalidation (Performance Safeguards §4) ──────────
 	// Re-rasterize ONLY on document buffer updates or WindowSizeMsg, NEVER
 	// on mouse movement. While dragging we keep the frozen framebuffer to
@@ -4582,8 +4959,8 @@ func (m *model) refreshViewportContent() {
 	}
 	pool = append(pool, tailLines...)
 	m.scrollDocLines = pool
-	m.scrollSpaceLine = strings.Repeat(" ", m.width)
-	m.scrollSpaceWidth = m.width
+	m.scrollSpaceLine = strings.Repeat(" ", m.PaneWidth())
+	m.scrollSpaceWidth = m.PaneWidth()
 
 	var visible []string
 	switch {
@@ -4955,6 +5332,12 @@ func (m *model) syncStreamingSegment() {
 		return
 	}
 	if !m.streaming {
+		// STREAM COMPLETION termination signal (StreamEnd, a PARTIAL token-limit
+		// truncation, or Ctrl+C). A table block that was still latched is
+		// released and its accumulated rows are rendered in ONE pass, so the
+		// holdback can never outlive the stream it belongs to and the indicator
+		// is released on exactly the same turn.
+		m.closeTableHoldback()
 		// Stream ended (or was cancelled): strip the stale streaming tail so a
 		// residual cursor block can never linger in the rendered document.
 		if m.streamingDocStart >= 0 && m.streamingDocStart <= len(m.docLayout.Lines) {
@@ -5097,22 +5480,90 @@ func (m *model) renderStreamingTail(content string, wrapWidth int) []DocumentLin
 	// renderer state so the persistent state is never advanced past the
 	// still-growing line (it is re-rendered fresh every tick until it
 	// completes, then committed exactly once).
+	//
+	// The clone deliberately gets a NIL holdback: the still-growing line must
+	// never be able to mutate the authoritative holdback, or a row would be
+	// counted twice — once by the clone's probe and again when its newline
+	// commits it to the persistent renderer. What the clone DOES establish is
+	// that the line is a table block, and that fact is promoted immediately
+	// below so the latch turns ON on the very first opening pipe.
 	partial := &aiBlockRenderer{
 		inCode:    m.aiStreamRenderer.inCode,
 		lang:      m.aiStreamRenderer.lang,
 		codeLines: append([]string(nil), m.aiStreamRenderer.codeLines...),
 		inTable:   m.aiStreamRenderer.inTable,
-		tableRows: append([]string(nil), m.aiStreamRenderer.tableRows...),
 	}
 	partial.renderPartialLine(partialLine, wrapWidth)
+	if partial.inTable && !m.aiStreamRenderer.inTable {
+		// LATCH ON at the opening pipes. The trailing line has been recognised
+		// as a table block BEFORE a single row committed, so the one-line
+		// indicator mounts now — and the line itself is diverted into the
+		// authoritative holdback, because from this instant it is 100% table
+		// content and must not reach the viewport as plain text.
+		m.aiStreamRenderer.engageTable()
+		m.aiStreamRenderer.hold.Hold(partialLine)
+	}
 	tail := append(append([]DocumentLine(nil), m.aiStreamRenderer.out...), partial.out...)
 	m.aiStreamTailContent = content
 	m.aiStreamTailCache = append([]DocumentLine(nil), tail...)
+	m.syncTableLatch()
 	// New tokens were spliced into the streaming tail: advance the repaint
 	// sequence so the single-flight gate can detect a stale frame and re-arm
 	// one final repaint (no token left unrendered in memory).
 	m.repaintSeq++
 	return tail
+}
+
+// syncTableLatch reconciles the StateTablePending hysteresis with the
+// authoritative holdback and is the ONLY writer of the latch.
+//
+// The holdback is the single source of truth: the latch mirrors whether a table
+// block is currently being held back, so it turns ON with the hold and OFF with
+// it — at the blank line, at a complete line that is not part of the table, or
+// at stream completion. It never invents a hold, and it is never re-derived from
+// what the most recent chunk happened to look like, so an intermediate
+// pipe-free fragment cannot release it.
+func (m *model) syncTableLatch() {
+	if m == nil {
+		return
+	}
+	m.ensureTableLatch().Set(m.aiStreamRenderer.tableHolding())
+}
+
+// ensureTableLatch lazily allocates the hysteresis register. It exists for the
+// same reason ensureSkeleton does: every headless harness in this package builds
+// the model as a struct literal, and a latch that must be constructed before it
+// can be read is a latch that silently stops latching.
+func (m *model) ensureTableLatch() *states.Latch {
+	if m.tableLatch == nil {
+		m.tableLatch = &states.Latch{}
+	}
+	return m.tableLatch
+}
+
+// closeTableHoldback applies the STREAM COMPLETION termination signal to a
+// latched table block: the still-growing trailing line is promoted (nothing
+// will extend it), the accumulated rows are rendered in ONE atomic pass, and the
+// latch is released.
+//
+// It is idempotent — a holdback that is not latched does nothing — so it is safe
+// to call from every stream teardown path (StreamEnd, PARTIAL truncation, Ctrl+C)
+// without each one having to know whether a table happened to be in flight.
+func (m *model) closeTableHoldback() {
+	if m == nil || m.aiStreamRenderer == nil {
+		return
+	}
+	r := m.aiStreamRenderer
+	if !r.tableHolding() {
+		return
+	}
+	r.hold.Close()
+	wrapWidth := m.wrapWidth
+	if m.docLayout != nil && m.docLayout.Width() > 0 {
+		wrapWidth = m.docLayout.Width()
+	}
+	r.emitHeldTable(wrapWidth)
+	m.syncTableLatch()
 }
 
 // resetStreamingRenderer drops the persistent streaming-tail renderer state.
@@ -5127,6 +5578,9 @@ func (m *model) resetStreamingRenderer() {
 	if m.aiStreamUncommitted != nil {
 		m.aiStreamUncommitted.Reset()
 	}
+	// LATCH OFF (stream-completion termination): a holdback that outlives its
+	// stream would keep the indicator mounted over the next turn's first token.
+	m.tableLatch.Release()
 }
 
 // renderTailPanelLines renders the fixed tail panels that follow the
@@ -5137,16 +5591,27 @@ func (m *model) resetStreamingRenderer() {
 func (m *model) renderTailPanelLines() []string {
 	var b strings.Builder
 
+	// ── Transient pre-execution skeleton (exactly one row) ────────────
+	// Mounted by the lifecycle state machine while a surface is being
+	// produced but cannot yet be shown. It is the FIRST row of the tail so it
+	// sits directly beneath the content it precedes, and it is a single line by
+	// construction — the widget's Height() is a constant, and the row is
+	// released the instant the finalized content lands.
+	if row := m.skeletonRenderLine(); row != "" {
+		b.WriteString(row)
+		b.WriteString("\n")
+	}
+
 	// ── Agent Execution Plan card (docked top of viewport tail) ──
 	// Rendered first so it sits immediately below the conversation content
 	// during multi-step execution and stays pinned via tail auto-scroll.
-	if dock := m.renderPlanDock(m.width); dock != "" {
+	if dock := m.renderPlanDock(m.PaneWidth()); dock != "" {
 		b.WriteString(dock)
 		b.WriteString("\n")
 	}
 
 	// ── Live Tool Output cards (inline in the chat stream thread) ──
-	if dock := m.renderToolDock(m.width); dock != "" {
+	if dock := m.renderToolDock(m.PaneWidth()); dock != "" {
 		b.WriteString(dock)
 		b.WriteString("\n")
 	}
@@ -5161,7 +5626,7 @@ func (m *model) renderTailPanelLines() []string {
 				if m.hideThinkingBlocks {
 					entry.Thinking = ""
 				}
-				b.WriteString(RenderEntry(entry, m.width, m.dotFrame))
+				b.WriteString(RenderEntry(entry, m.PaneWidth(), m.dotFrame))
 				b.WriteString("\n")
 			}
 		}
@@ -5189,20 +5654,20 @@ func (m *model) renderTailPanelLines() []string {
 		inlineThinking := m.streamBlocks != nil && m.streamBlocks.HasThinking()
 		dockActive := m.shimmerActive
 		if inlineThinking {
-			if r := m.renderStreamThinkingOnly(m.width); r != "" {
+			if r := m.renderStreamThinkingOnly(m.PaneWidth()); r != "" {
 				b.WriteString(r)
 				b.WriteString("\n")
 			}
 		}
 		if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
 			if !inlineThinking && (m.thinkingBuffer.Expanded() || !dockActive) {
-				if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
+				if thoughts := m.renderLiveThinking(m.PaneWidth()); thoughts != "" {
 					b.WriteString(thoughts)
 					b.WriteString("\n")
 				}
 			}
 		} else if !dockActive {
-			if reasoningBlock := m.renderReasoningBlock(m.width); reasoningBlock != "" {
+			if reasoningBlock := m.renderReasoningBlock(m.PaneWidth()); reasoningBlock != "" {
 				b.WriteString(reasoningBlock)
 				b.WriteString("\n")
 			}
@@ -5211,7 +5676,7 @@ func (m *model) renderTailPanelLines() []string {
 
 	// ── Persisted collapsible thought block (after streaming) ──────
 	if !m.streaming && !m.hideThinkingBlocks && m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
-		if thoughts := m.renderLiveThinking(m.width); thoughts != "" {
+		if thoughts := m.renderLiveThinking(m.PaneWidth()); thoughts != "" {
 			b.WriteString(thoughts)
 			b.WriteString("\n")
 		}
@@ -5219,7 +5684,7 @@ func (m *model) renderTailPanelLines() []string {
 
 	// ── Unified output trace viewport (Ctrl+O) ─────────────────────
 	if m.traceExpanded && m.traceBuffer.Len() > 0 {
-		if trace := m.renderOutputTrace(m.width); trace != "" {
+		if trace := m.renderOutputTrace(m.PaneWidth()); trace != "" {
 			b.WriteString(trace)
 			b.WriteString("\n")
 		}
@@ -5236,7 +5701,7 @@ func (m *model) renderTailPanelLines() []string {
 	// ── Activity Tree: structured tool call view ───────────────────
 	if m.activityTree != nil {
 		treeActive := m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.shellRunning || m.state == StateProcessing
-		if treeView := m.activityTree.RenderActive(m.width, treeActive, m.spinnerFrame); treeView != "" {
+		if treeView := m.activityTree.RenderActive(m.PaneWidth(), treeActive, m.spinnerFrame); treeView != "" {
 			b.WriteString(treeView)
 			b.WriteString("\n")
 		}
@@ -5690,67 +6155,15 @@ func (m *model) lineRuneLen(lineIdx int) int {
 	return len([]rune(ansi.Strip(m.records[lineIdx].text)))
 }
 
-// countRenderedDiffLines returns how many lines DiffRenderer would output
-// for the given raw diff string, excluding pure metadata (---/+++).
-func countRenderedDiffLines(diff string) int {
-	if diff == "" {
-		return 0
-	}
-	lines := strings.Split(diff, "\n")
-	n := 0
-	for _, line := range lines {
-		line = strings.TrimRight(line, "\r")
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "---") {
-			continue
-		}
-		if strings.HasPrefix(line, "+++") {
-			continue
-		}
-		n++
-	}
-	return n
-}
-
-// getProposalDockCurrentHeight returns the exact line count of the rendered
-// proposal dock block (renderProposalBlock), computed dynamically from the
-// actual diff content so the viewport can reclaim every spare line.
+// getAutocompleteHeight returns the number of terminal lines the autocomplete
+// dropdown occupies when rendered.
 //
-//	StateProcessing:        3 lines (top divider + spinner + bottom divider)
-//	StateAwaitingApproval:
-//	  Collapsed:            9 lines (top divider + 7 card lines + bottom divider)
-//	  Expanded:             1 + card(4 + cappedDiff + blank + scrollHint + action + blank + border) + 1
-func (m *model) getProposalDockCurrentHeight() int {
-	switch m.state {
-	case StateProcessing:
-		return 1
-	case StateAwaitingApproval:
-		if len(m.pendingProposals) == 0 {
-			return 0
-		}
-		p := m.pendingProposals[0]
-		if !p.Expanded || p.Diff == "" {
-			return 6
-		}
-		n := countRenderedDiffLines(p.Diff)
-		capped := n
-		if capped > maxProposalDiffHeight {
-			capped = maxProposalDiffHeight
-		}
-		scrollHint := 0
-		if n > maxProposalDiffHeight || m.proposalDiffOffset > 0 {
-			scrollHint = 1
-		}
-		return 7 + capped + scrollHint
-	}
-	return 0
-}
-
-// getAutocompleteHeight returns the exact number of terminal lines the
-// autocomplete dropdown occupies when rendered. This must be subtracted from
-// the viewport height to prevent the input line from being pushed upward.
+// It exists for callers that need the dropdown's height on its own — a test
+// asserting the dropdown drew what it claims to. The layout budget does NOT use
+// it: renderInputRegion already contains the dropdown, and the budget measures
+// that whole region with regionHeight. Estimating the dropdown separately and
+// adding it to the prompt region is precisely the double-count that used to make
+// the frame overflow whenever a dropdown opened.
 func (m *model) getAutocompleteHeight() int {
 	if !m.autocompleteActive || len(m.autocompleteItems) == 0 {
 		return 0

@@ -8,12 +8,230 @@ import (
 
 	"github.com/alecthomas/chroma/v2"
 	"github.com/alecthomas/chroma/v2/lexers"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/ui/markdown"
 )
+
+// ── Bottom-Anchored Composite Layout ─────────────────────────────────────────
+//
+// # THE PROBLEM THIS SOLVES
+//
+// The screen is not a document that happens to be tall; it is a FIXED-SIZE
+// surface with one flexible region in it. Three things are fixed — the header,
+// the proposal dock, and the bottom stack (the prompt bar plus the lifecycle
+// footer) — and exactly one thing flexes: the conversation viewport. The frame
+// therefore has an exact solution, and the only correct answer is the one where
+//
+//	header + viewport + dock + prompt + footer == pane height
+//
+// Anything else is a visible defect, and both directions are visible. A frame
+// that comes up SHORT draws its prompt bar and footer above the pane's bottom
+// edge and leaves stale terminal content visible underneath them — the
+// "floating `ask )` prompt" report. A frame that comes up LONG is not
+// truncated, it SCROLLS: the rows it pushed past the bottom edge land in
+// scrollback, which is never redrawn, so the prompt bar is orphaned there for
+// the rest of the session. Those are the same bug seen from two sides, and both
+// trace back to one cause — the frame was never required to be exactly tall.
+//
+// # THE CONTRACT
+//
+// composeBottomAnchoredFrame is where exactness is enforced, and it enforces
+// three things a raw string join does not:
+//
+//  1. EXACT HEIGHT. The elastic region is padded (or trimmed) to precisely the
+//     number of rows the budget assigned it, so the composite's height is a
+//     function of the budget rather than of how much content happened to arrive.
+//     Bubble Tea's viewport already pads to its Height; making the compositor
+//     re-assert it means a region that returns one row short cannot silently
+//     push the footer up the screen.
+//
+//  2. BOTTOM PINNING. lipgloss.JoinVertical is used for the whole stack, not
+//     string concatenation. It pads every region to the width of the widest, so
+//     a region one cell short of its neighbours is padded rather than allowed
+//     to run into them — and, because it stacks in argument order with no gaps,
+//     the last regions ARE the last rows of the frame. The prompt bar and the
+//     footer cannot drift upward because there is nothing above them that
+//     changed height.
+//
+//  3. A PREDICTABLE SACRIFICE ORDER. When the fixed chrome genuinely does not
+//     fit (a 12-row autocomplete dropdown in a 5-row pane — no height makes
+//     that frame fit), the overflow is taken from the TOP: the elastic viewport
+//     shrinks first, then whole top regions are dropped, and the bottom-anchored
+//     stack is the last thing standing. A bottom-trim would be the wrong
+//     direction precisely because the surfaces at the bottom are the ones the
+//     user is typing into.
+
+// compositeRegion is one horizontal band of the composed frame.
+type compositeRegion struct {
+	text string
+	// rows is the number of terminal rows the region is pinned to. A pinned
+	// region is padded to exactly this many rows, which is what makes the
+	// composite's total height a function of the budget.
+	rows int
+	// elastic marks the scrollable viewport: the ONLY region allowed to give up
+	// rows when the frame has to lose some. Everything else is either pinned
+	// (the bottom stack) or dropped wholesale from the top (the header).
+	elastic bool
+}
+
+// composeBottomAnchoredFrame stacks the frame's regions into a pane-height
+// string, pinning the bottom-anchored surfaces to the last rows.
+//
+// See the section comment above for the three invariants this establishes. The
+// one that is easy to get wrong is the elastic region's row count: it is
+// re-asserted here rather than trusted, because a region that renders one row
+// short does not announce it — it just quietly leaves the footer one row higher
+// on the screen than the budget says it should be.
+func composeBottomAnchoredFrame(regions []compositeRegion, bounds ScreenBounds) string {
+	// Work on a copy: the caller's slice is derived from the Workspace and is
+	// reused by the scroll fast path, so mutating it would corrupt a cached
+	// compose.
+	stack := make([]compositeRegion, 0, len(regions))
+	for _, r := range regions {
+		r.text = normalizeRegion(r.text)
+		if r.text == "" {
+			// An empty region contributes zero rows and is dropped entirely —
+			// joining it would insert a blank line nobody reserves.
+			continue
+		}
+		if r.rows < 1 {
+			r.rows = regionHeight(r.text)
+		}
+		stack = append(stack, r)
+	}
+
+	// TRIM FROM THE TOP. The bottom stack is pinned and must survive; the
+	// elastic region absorbs as much as it can, and whatever is still over is
+	// taken by dropping whole top regions. Dropping a region (rather than
+	// clipping it) is deliberate: a half-drawn header is a corrupt header, and a
+	// header that is entirely absent is merely missing.
+	//
+	// "Top" is defined relative to the elastic region, not to the slice: every
+	// region from the elastic one downwards is anchored to the pane's bottom
+	// edge, so the droppable set is exactly the regions ABOVE it. A frame with no
+	// elastic region has no droppable region at all — every band in it is bottom
+	// stack, and there is nothing to give.
+	droppable := elasticIndex(stack)
+	//
+	// The loop is written so that every iteration either REDUCES the total or
+	// exits. A trim that reports success without taking a single row is the
+	// classic way this kind of loop spins forever, and the only regions it can
+	// happen to are the ones already at zero — which is exactly the state the
+	// second step is entered from.
+	for {
+		over := stackRows(stack) - bounds.Height
+		if over <= 0 {
+			break
+		}
+		if !shrinkElastic(stack, over) {
+			if droppable > 0 {
+				stack = append(stack[:0], stack[1:]...)
+				droppable--
+				continue
+			}
+			// Nothing left to give: the bottom stack alone exceeds the pane.
+			// ClipFrame is the remaining backstop, and it must be: a frame with
+			// nothing left to remove still has to reach the terminal.
+			break
+		}
+	}
+
+	var parts []string
+	for _, r := range stack {
+		if r.rows <= 0 {
+			// A region the trim reduced to nothing is GONE, not blank: joining an
+			// empty string would spend a row nobody budgeted and move the whole
+			// bottom stack up by one.
+			continue
+		}
+		parts = append(parts, fitRegionRows(r.text, r.rows))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// stackRows is the total number of terminal rows a region stack occupies.
+func stackRows(stack []compositeRegion) int {
+	n := 0
+	for _, r := range stack {
+		n += r.rows
+	}
+	return n
+}
+
+// shrinkElastic takes up to `over` rows from the elastic region. It reports false
+// when there is no elastic region with rows left, which is the signal for the
+// caller to start dropping top regions instead.
+//
+// It always reports true when it reports true: every path that returns true has
+// reduced the stack's total by at least one row, so the caller's loop cannot
+// spin on a no-op.
+func shrinkElastic(stack []compositeRegion, over int) bool {
+	for i := range stack {
+		if !stack[i].elastic || stack[i].rows <= 0 {
+			continue
+		}
+		stack[i].rows -= min(over, stack[i].rows)
+		return true
+	}
+	return false
+}
+
+// elasticIndex returns the position of the elastic region in a stack, which is
+// the boundary between the frame's TOP (droppable) and its BOTTOM (anchored).
+// Every region from this index downwards is pinned to the pane's bottom edge.
+//
+// It returns 0 when there is no elastic region, and that is a refusal rather than
+// an oversight: without the marker there is nothing to distinguish the top of the
+// frame from the bottom, so dropping "the top" would be a guess. A frame with no
+// elastic region gives up nothing, and ClipFrame — which does not consult any part
+// of the frame — remains the backstop.
+func elasticIndex(stack []compositeRegion) int {
+	for i := range stack {
+		if stack[i].elastic {
+			return i
+		}
+	}
+	return 0
+}
+
+// fitRegionRows renders a region at exactly `rows` terminal rows: padded with
+// trailing newlines when short, truncated when long.
+//
+// Both directions matter. Padding is the fix for the floating prompt — a region
+// that draws fewer rows than it was allotted silently moves everything below it
+// up. Truncation is the guarantee the reverse: an elastic region that somehow
+// rendered MORE than the budget gave it must not push the pinned stack off the
+// bottom edge, which would turn a layout bug into a scroll.
+//
+// The padding is counted in lipgloss.Height, not regionHeight, because the
+// composite DRAWS with JoinVertical — which counts the empty row after a trailing
+// newline as a real one. Measuring the shortfall the other way round would pad a
+// region by one row less than it is short, and reproduce the very off-by-one this
+// function exists to eliminate.
+func fitRegionRows(region string, rows int) string {
+	switch {
+	case rows <= 0:
+		return ""
+	case region == "":
+		return strings.Repeat("\n", rows-1)
+	}
+	h := lipgloss.Height(region)
+	switch {
+	case h < rows:
+		return region + strings.Repeat("\n", rows-h)
+	case h > rows:
+		return normalizeRegion(lipgloss.NewStyle().MaxHeight(rows).Render(region))
+	default:
+		return region
+	}
+}
 
 // ── Quiet / Accordion Mode for Engine Logs ────────────────────────────────
 
@@ -704,8 +922,52 @@ type aiBlockRenderer struct {
 	inCode    bool
 	lang      string
 	codeLines []string
-	inTable   bool
-	tableRows []string
+	// inTable is the TABLE LATCH: true means a table block is open and every
+	// byte of it is being held back in `hold`. It is deliberately hysteretic —
+	// see markdown.TableHoldback for why an intermediate pipe-free chunk must
+	// never clear it.
+	inTable bool
+	// hold is the FULL HOLDBACK BUFFER. It is nil until a table block is
+	// recognised, so the overwhelmingly common table-free path allocates
+	// nothing. It is the single source of truth for the block's contents:
+	// nothing mirrors its rows, so a row can never be counted twice or read
+	// stale.
+	hold *markdown.TableHoldback
+}
+
+// ensureHold lazily allocates the holdback so a table-free renderer stays
+// allocation-free and a bare struct literal is immediately usable.
+func (r *aiBlockRenderer) ensureHold() *markdown.TableHoldback {
+	if r.hold == nil {
+		r.hold = markdown.NewTableHoldback()
+	}
+	return r.hold
+}
+
+// tableHolding reports whether a table block is currently latched. It is the
+// authority behind both the viewport indicator and the pre-execution skeleton:
+// a mount is therefore never fabricated, because a hold can only exist where
+// real table bytes were actually diverted.
+//
+// inTable IS the latch — it is set by engageTable and cleared by emitHeldTable,
+// the same two transitions that engage and drain the holdback — so it is the
+// value the partial-line clone inherits. That inheritance is what makes the
+// clone divert a non-table fragment arriving inside an open block: without it
+// the clone would fall through to the prose path and leak `Here is the summary`
+// onto the viewport underneath the mounted indicator.
+func (r *aiBlockRenderer) tableHolding() bool {
+	return r != nil && r.inTable
+}
+
+// engageTable latches the holdback ON with no content yet. It is the "opening
+// pipes arrived" edge: the block is real, so the indicator mounts immediately,
+// but nothing is renderable until its rows commit.
+func (r *aiBlockRenderer) engageTable() {
+	if r == nil {
+		return
+	}
+	r.inTable = true
+	r.ensureHold().Engage()
 }
 
 // renderLine consumes one LOGICAL line (no embedded "\n") and appends its
@@ -717,6 +979,22 @@ func (r *aiBlockRenderer) renderLine(rl string, wrapWidth int) {
 		wrapWidth = 20
 	}
 	trimmed := strings.TrimSpace(rl)
+
+	// ── FULL HOLDBACK: table block already latched ─────────────────────
+	// Every complete line of an open table is diverted into the holdback and
+	// NOTHING is appended to out. The only line that is not absorbed is a
+	// TERMINATOR, and it belongs to the block that follows — so it is emitted
+	// through the normal pipeline below, in the same pass, after the whole
+	// held-back table has been rendered in one shot. That ordering is what
+	// makes the swap atomic: either the viewport shows the indicator alone, or
+	// it shows the complete grid; never a half-populated one.
+	if r.tableHolding() {
+		if term := r.hold.Feed(rl); !term.Closed() {
+			return
+		}
+		r.emitHeldTable(wrapWidth)
+	}
+
 	if strings.HasPrefix(trimmed, "```") {
 		if r.inCode {
 			r.flushCode(wrapWidth)
@@ -731,20 +1009,19 @@ func (r *aiBlockRenderer) renderLine(rl string, wrapWidth int) {
 		r.codeLines = append(r.codeLines, rl)
 		return
 	}
-	// Pipe-delimited table detection: a trimmed line that starts with '|'
-	// and contains another '|' is a table row (header, separator, or body).
-	// Rows are buffered so the full grid (column widths) can be computed on
-	// flush, exactly like fenced code blocks.
-	if isTableRowLine(trimmed) {
-		if !r.inTable {
-			r.inTable = true
-		}
-		r.tableRows = append(r.tableRows, rl)
+
+	// ── Pipe-delimited table: engage the holdback ──────────────────────
+	// A table row can NEVER be rendered on its own — the grid's column widths
+	// are max(cell width) across the header and every data row, and the frame
+	// grows by a physical line per row. So the first row latches the holdback
+	// and returns: no partial row, no re-laid-out grid, and no scroll jump as
+	// the remaining rows stream in.
+	if markdown.TableRow(trimmed) {
+		r.engageTable()
+		r.hold.Feed(rl)
 		return
 	}
-	if r.inTable {
-		r.flushTable(wrapWidth)
-	}
+
 	if trimmed == "" {
 		r.out = append(r.out, gutterDocumentLine(wrapWidth))
 		return
@@ -779,26 +1056,41 @@ func (r *aiBlockRenderer) flushCode(wrapWidth int) {
 
 // finish flushes any unclosed code block left at the end of the input so a
 // stream that ends mid-fence still renders its buffered lines exactly as the
-// completed-history path does.
+// completed-history path does. It is also the STREAM COMPLETION termination
+// signal for a held-back table: a table block latched when the stream ended is
+// released and rendered here, so the "PARTIAL token limit / Ctrl+C" case shows
+// the whole table rather than nothing at all.
 func (r *aiBlockRenderer) finish(wrapWidth int) {
 	if r.inCode {
 		r.flushCode(wrapWidth)
 	}
 	if r.inTable {
-		r.flushTable(wrapWidth)
+		r.emitHeldTable(wrapWidth)
 	}
 }
 
-// flushTable emits the buffered table rows as a Unicode box grid at the closing
-// blank line or EOF. Rows are parsed, column widths computed, and the structured
-// border container (┌─┬─┐ / ├─┼─┤ / └─┴─┘) rendered with native transparent
-// background preserved.
-func (r *aiBlockRenderer) flushTable(wrapWidth int) {
-	if len(r.tableRows) > 0 {
-		r.out = append(r.out, renderMarkdownTableToLines(r.tableRows, wrapWidth)...)
+// emitHeldTable performs the ONE-SHOT ATOMIC RENDER: it drains the entire
+// held-back block and renders it as a Unicode box grid in a SINGLE pass, then
+// releases the latch.
+//
+// The whole grid — every row, the final column widths, the frame — is decided
+// once, from the complete row set, and appended to out once. There is therefore
+// no intermediate frame in which a partially-built grid is visible, and the
+// rows are never re-laid-out afterwards. An empty drain is normal (a holdback
+// that latched on a lone "|" holds nothing worth drawing) and emits nothing.
+func (r *aiBlockRenderer) emitHeldTable(wrapWidth int) {
+	if r == nil {
+		return
 	}
-	r.tableRows = nil
 	r.inTable = false
+	if r.hold == nil {
+		return
+	}
+	rows, ok := r.hold.Drain()
+	if !ok {
+		return
+	}
+	r.out = append(r.out, renderMarkdownTableToLines(rows, wrapWidth)...)
 }
 
 // renderPartialLine renders the STILL-GROWING trailing line of a live stream.
@@ -810,18 +1102,60 @@ func (r *aiBlockRenderer) flushTable(wrapWidth int) {
 // the remaining bytes stream in (the "table columns jump / markup flickers while
 // streaming" report).
 //
-// So the partial line is routed through the UncommittedBuffer first: when the
-// line is NOT structurally final it is rendered as PLAIN DIMMED TEXT with no
-// block or inline interpretation. Plain text has exactly one possible layout,
-// so nothing can reflow; the line is promoted to the full pipeline exactly once,
-// when it commits. When the line IS already final (it happens to sit on a
-// syntactic boundary — a closed table row, a balanced `**bold**`) it goes
-// straight down the normal path, so the hold-back costs no extra frame.
+// So two hold-backs apply, and they are deliberately different in strength:
+//
+//  1. TABLE BLOCK (full holdback). A leading pipe commits the line to table
+//     grammar, so the moment one appears the block latches the full holdback and
+//     the line is diverted into it, rendering NOTHING at all. A table grid is
+//     not merely un-styled while incomplete — it has no stable layout at all,
+//     because every column width is the max over rows that have not arrived yet,
+//     and each arriving row adds a physical line. Showing a plain-text prefix
+//     would still reflow and still grow the document, so nothing is shown. The
+//     single-line skeleton is the whole truth until the block terminates.
+//
+//  2. ANY OTHER LINE (line holdback). The partial line is routed through the
+//     UncommittedBuffer: when the line is NOT structurally final it is rendered
+//     as PLAIN DIMMED TEXT with no block or inline interpretation. Plain text
+//     has exactly one possible layout, so nothing can reflow; the line is
+//     promoted to the full pipeline exactly once, when it commits. When the line
+//     IS already final (it happens to sit on a syntactic boundary — a balanced
+//     `**bold**`) it goes straight down the normal path, so the hold-back costs
+//     no extra frame.
 func (r *aiBlockRenderer) renderPartialLine(rl string, wrapWidth int) {
 	if wrapWidth < 20 {
 		wrapWidth = 20
 	}
-	if kind, incomplete := markdown.Incomplete(rl, r.inCode, r.inTable); incomplete {
+	// ── FULL HOLDBACK: table block already latched ─────────────────────
+	// The still-growing trailing line is DIVERTED VERBATIM and renders
+	// NOTHING. This is the anti-leak clause and it has two halves:
+	//
+	//   - A prefix of a row (`| Na`, `| Name | Ag`) is a prefix of a grid whose
+	//     column widths are still changing, so it must not be laid out at all.
+	//   - A complete non-table line arriving inside an open block (the prose
+	//     that follows the last row, before its terminating blank line) must
+	//     not slip through either — that is the leak that put a half-built
+	//     grid and a raw fragment on screen at the same time.
+	//
+	// The line is re-supplied in full on every tick, so it REPLACES the
+	// held-back tail rather than accumulating: the buffer holds the line's
+	// current prefix, never a concatenation of prefixes.
+	if r.tableHolding() {
+		r.ensureHold().Hold(rl)
+		return
+	}
+	kind, incomplete := markdown.Incomplete(rl, r.inCode, r.inTable)
+	if incomplete {
+		// A LEADING PIPE commits the line to table grammar, so from this instant
+		// it is 100% table content and joins the full holdback — a plain-text
+		// holdback would still re-flow the prefix and still grow the document,
+		// which is the flicker this mechanism exists to remove. The latch turns
+		// ON here, before a single row has committed, so the indicator mounts on
+		// the very first opening pipe.
+		if kind == markdown.BlockTable {
+			r.engageTable()
+			r.ensureHold().Hold(rl)
+			return
+		}
 		r.out = append(r.out, renderUncommittedLine(rl, wrapWidth, kind)...)
 		return
 	}
@@ -1305,15 +1639,6 @@ func shellColorCommand(piece string) string {
 		return cmdYellow + piece + reset
 	}
 	return cmdYellow + piece[:idx] + reset + cmdGreen + piece[idx:] + reset
-}
-
-// isTableRowLine reports whether a trimmed line is a pipe-delimited markdown
-// table row: it must start with '|' and contain at least one further '|'.
-func isTableRowLine(trimmed string) bool {
-	if !strings.HasPrefix(trimmed, "|") {
-		return false
-	}
-	return strings.Contains(strings.TrimPrefix(trimmed, "|"), "|")
 }
 
 // splitTableRowCells splits one pipe-delimited row into its cells, dropping the

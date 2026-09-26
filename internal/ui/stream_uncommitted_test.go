@@ -30,13 +30,19 @@ func tailWidths(lines []DocumentLine) []int {
 	return out
 }
 
-// TestPartialTableRowIsHeldBackAsPlainText is the anti-flicker contract for
-// tables. A row whose closing pipe has not arrived must render as plain dimmed
-// text — never as a wrapped paragraph that will re-flow into a box grid — so
-// the viewport does not jump every time a cell boundary streams in.
-func TestPartialTableRowIsHeldBackAsPlainText(t *testing.T) {
+// TestPartialTableRowIsDivertedNotRendered is the anti-flicker contract for
+// tables, in its strongest form. A row whose closing pipe has not arrived must
+// not reach the viewport AT ALL — not as a wrapped paragraph that re-flows into
+// a box grid, and not even as plain dimmed text, because a plain-text prefix
+// still reflows as the remaining cells arrive and still grows the document by a
+// line per row. A leading pipe commits the line to table grammar, so it is
+// diverted into the full holdback and the one-line skeleton is the only thing on
+// screen.
+func TestPartialTableRowIsDivertedNotRendered(t *testing.T) {
 	const w = 80
-	// Every prefix of this row up to (but not including) the closing pipe.
+	// Every prefix of this row UP TO the closing pipe is structurally
+	// incomplete; the closing pipe itself makes the line final but does NOT
+	// make it renderable — a grid needs the whole block.
 	heldPrefixes := []string{"|", "| Name", "| Name | Age"}
 
 	r := &aiBlockRenderer{}
@@ -45,20 +51,28 @@ func TestPartialTableRowIsHeldBackAsPlainText(t *testing.T) {
 			t.Fatalf("prefix %q classified as (%v, %v), want (table, true)", p, kind, ok)
 		}
 		lines := r.renderPartialTail(p, w)
-		if len(lines) == 0 {
-			t.Fatalf("prefix %q produced no lines", p)
+		if len(lines) != 0 {
+			t.Errorf("prefix %q reached the viewport:\n%s", p, tailText(lines))
 		}
-		raw := ansi.Strip(lines[len(lines)-1].RenderedStr)
-		// A held-back row keeps its literal pipes: it is shown as typed, not
-		// re-laid-out into a table cell grid.
-		if !strings.Contains(raw, "|") {
-			t.Errorf("prefix %q lost its pipe: %q", p, raw)
+		if !r.tableHolding() {
+			t.Fatalf("prefix %q did not latch the holdback", p)
 		}
-		// It must not have been interpreted as a table: a committed table row
-		// renders a box frame, a partial one must not.
-		if strings.Contains(raw, "┌") || strings.Contains(raw, "├") || strings.Contains(raw, "└") {
-			t.Errorf("prefix %q rendered a table frame before the row was closed: %q", p, raw)
-		}
+	}
+	// Nothing was ever rendered, so nothing can reflow.
+	if len(r.out) != 0 {
+		t.Fatalf("the holdback leaked %d lines into the viewport:\n%s", len(r.out), tailText(r.out))
+	}
+	// Even a structurally COMPLETE row is not renderable on its own: it is
+	// diverted too, and the accumulated prefix is retained verbatim for the
+	// one-shot render.
+	if lines := r.renderPartialTail("| Name | Age |", w); len(lines) != 0 {
+		t.Fatalf("a complete but unterminated row reached the viewport:\n%s", tailText(lines))
+	}
+	if !r.tableHolding() {
+		t.Fatal("a complete unterminated row released the holdback")
+	}
+	if got := r.hold.Pending(); got != "| Name | Age |" {
+		t.Errorf("the holdback holds %q, want the full row", got)
 	}
 }
 
@@ -204,21 +218,35 @@ func TestCodeFenceIsNotInterpretedMidStream(t *testing.T) {
 	}
 }
 
-// TestTableCommitsIntoTheBoxGridOnce is the promotion path: after the closing
-// pipe arrives the line commits through the normal table renderer, so the
-// held-back frame is replaced by the real grid exactly once.
+// TestTableCommitsIntoTheBoxGridOnce is the promotion path, and the DoD clause
+// for the FULL HOLDBACK: every row of the block is diverted (so the tail stays
+// EMPTY — no partial grid is ever visible), and the terminating blank line
+// releases the latch and renders the whole table in a single pass.
 func TestTableCommitsIntoTheBoxGridOnce(t *testing.T) {
 	const w = 80
 	r := &aiBlockRenderer{}
 	rows := []string{"| Name | Age |", "|---|---|", "| Ana | 31 |"}
 	for _, row := range rows {
-		r.renderPartialTail(row, w)
+		r.renderLine(row, w)
+		// The persistent state must have buffered the row as a table, and
+		// NOTHING may have reached the viewport.
+		if !r.inTable {
+			t.Fatalf("row %q did not latch the holdback", row)
+		}
+		if len(r.out) != 0 {
+			t.Fatalf("row %q leaked %d lines into the viewport before the block completed:\n%s",
+				row, len(r.out), tailText(r.out))
+		}
 	}
-	// The persistent state must have buffered the rows as a table.
-	if !r.inTable || len(r.tableRows) != len(rows) {
-		t.Fatalf("table state = inTable:%v rows:%d, want true/%d", r.inTable, len(r.tableRows), len(rows))
+	if got := r.hold.RowCount(); got != len(rows) {
+		t.Fatalf("holdback rows = %d, want %d", got, len(rows))
 	}
-	r.finish(w)
+
+	// The blank line is the explicit termination signal.
+	r.renderLine("", w)
+	if r.inTable {
+		t.Fatal("the blank line did not release the holdback")
+	}
 	joined := tailText(r.out)
 	for _, want := range []string{"┌", "├", "└", "Ana", "31"} {
 		if !strings.Contains(joined, want) {
@@ -284,11 +312,27 @@ func TestUncommittedBufferResetsAtStreamBoundaries(t *testing.T) {
 // block state, mirroring exactly what renderStreamingTail does per tick: a
 // structurally incomplete line is held back, a final one goes through the full
 // pipeline and advances the persistent state.
+//
+// The FULL HOLDBACK branch comes first and renders nothing at all, matching
+// production: a table block that is latched diverts even a structurally
+// complete trailing line, because a grid's layout is not knowable until the
+// whole block has arrived. A trailing line that merely LOOKS like a table row
+// latches the holdback too — a leading pipe commits the line to table grammar.
 func (r *aiBlockRenderer) renderPartialTail(rl string, wrapWidth int) []DocumentLine {
 	if wrapWidth < 20 {
 		wrapWidth = 20
 	}
-	if kind, incomplete := markdown.Incomplete(rl, r.inCode, r.inTable); incomplete {
+	if r.tableHolding() {
+		r.ensureHold().Hold(rl)
+		return nil
+	}
+	kind, incomplete := markdown.Incomplete(rl, r.inCode, r.inTable)
+	if incomplete {
+		if kind == markdown.BlockTable {
+			r.engageTable()
+			r.ensureHold().Hold(rl)
+			return nil
+		}
 		return renderUncommittedLine(rl, wrapWidth, kind)
 	}
 	probe := r.clone()
@@ -297,15 +341,17 @@ func (r *aiBlockRenderer) renderPartialTail(rl string, wrapWidth int) []Document
 	return probe.out
 }
 
-// clone deep-copies the renderer's block state so a partial render can never
-// advance the persistent state.
+// clone copies the renderer's block state so a partial render can never advance
+// the persistent state. The holdback pointer is SHARED (not deep-copied) because
+// the latch is one resource: a probe that opened a hold and a parent that never
+// learned about it would strand the holdback and its rows.
 func (r *aiBlockRenderer) clone() *aiBlockRenderer {
 	return &aiBlockRenderer{
 		inCode:    r.inCode,
 		lang:      r.lang,
 		codeLines: append([]string(nil), r.codeLines...),
 		inTable:   r.inTable,
-		tableRows: append([]string(nil), r.tableRows...),
+		hold:      r.hold,
 	}
 }
 
@@ -313,5 +359,5 @@ func (r *aiBlockRenderer) clone() *aiBlockRenderer {
 // state is adopted — never `out`, which is the per-tick render output.
 func (r *aiBlockRenderer) adopt(p *aiBlockRenderer) {
 	r.inCode, r.lang, r.codeLines = p.inCode, p.lang, p.codeLines
-	r.inTable, r.tableRows = p.inTable, p.tableRows
+	r.inTable, r.hold = p.inTable, p.hold
 }

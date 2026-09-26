@@ -793,8 +793,19 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case tea.WindowSizeMsg:
+		// GLOBAL terminal rectangle. Retained for the surfaces that genuinely
+		// describe the terminal (the diff viewer, the status widget's own modal
+		// size) rather than the pane the program is drawing in.
 		m.width = msg.Width
 		m.height = msg.Height
+		// ACTIVE PANE rectangle, recorded EXPLICITLY rather than left to alias
+		// m.width. The two are the same number in a full-screen terminal and
+		// different numbers in a side-by-side split, and every frame bound in
+		// this renderer has to answer to the pane. Storing it under its own
+		// name is what makes the distinction visible at the call sites that
+		// must choose between them; PaneWidth is the accessor they should use.
+		m.paneWidth = msg.Width
+		m.paneHeight = msg.Height
 		m.resizeStatusView(msg.Width, msg.Height)
 		if m.showSessionPicker && m.sessionPicker != nil {
 			// Keep the widget's responsive layout in lockstep with the parent
@@ -802,12 +813,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.sessionPicker.SetViewportSize(msg.Width, msg.Height)
 		}
 		padding := 4
-		w := msg.Width - padding
+		w := m.PaneWidth() - padding
 		if w < 20 {
 			w = 20
 		}
 		m.wrapWidth = w
-		m.ti.Width = msg.Width - 8
+		m.ti.Width = m.PaneWidth() - 8
 
 		// NOTE: the widget picker tracks resizes via the WindowSizeMsg
 		// forwarded in the picker routing block above (dynamic viewport).
@@ -815,18 +826,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		vpHeight := m.computeVpHeight()
 
 		if !m.Ready {
-			m.Viewport = viewport.New(msg.Width, vpHeight)
+			m.Viewport = viewport.New(m.PaneWidth(), vpHeight)
 			m.Ready = true
 		} else {
-			m.Viewport.Width = msg.Width
+			m.Viewport.Width = m.PaneWidth()
 			m.Viewport.Height = vpHeight
 		}
 
 		if m.streamParser != nil {
-			m.streamParser.SetWidth(msg.Width - 2)
+			m.streamParser.SetWidth(m.PaneWidth() - 2)
 		}
 
 		m.syncShimmerWidth()
+		// The pre-execution skeleton is clamped to the same wrap width, so a
+		// narrow terminal elides the subject instead of wrapping the row onto a
+		// second line.
+		m.skeletonSyncWidth()
 
 		// Full layout re-hydration on resize: clear and rebuild document layout
 		// using the updated wrapWidth, then re-anchor scroll offset.
@@ -838,13 +853,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.frozenViewportStr = ""
 		m.frozenRecords = nil
 		m.refreshViewportContent()
-		// Keep the diff viewer width-safe: re-truncate to the new width.
+		// Keep the diff viewer width-safe: re-truncate to the new width. It
+		// draws inside the pane like every other framed surface.
 		if m.diffView != nil {
-			vh := msg.Height - 4
+			vh := m.PaneHeight() - 4
 			if vh < 8 {
 				vh = 8
 			}
-			m.diffView.SetSize(msg.Width-2, vh)
+			m.diffView.SetSize(m.PaneWidth()-2, vh)
 		}
 		return m, nil
 
@@ -2481,6 +2497,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case FrameTickMsg:
+		// ── ANIMATION FRAME ADVANCE (unconditional, FIRST) ────────────────
+		// The frame counter is bumped here, before ANY of the returns below,
+		// so it is strictly monotonic over the whole holdback window: every
+		// path out of this handler still advances the wave by exactly one
+		// step. Nothing downstream — a repaint, a flush, a holdback latch, a
+		// terminal-path return — can skip it, which is precisely the
+		// invariant the emerald shimmer wave and the braille glyph need in
+		// order to keep sweeping instead of freezing.
+		m.advanceAnimationFrame()
 		// ── FRAME-LOCKED PACED DRAIN (engine→UI decoupling) ─────────────
 		// The master frame tick is the single point where overflow tokens
 		// parked in the lock-free ring by the non-blocking producer re-join
@@ -2497,6 +2522,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// interrupt teardown rather than duplicated here.
 		if m.flushStreamContentToView() {
 			if repaint := m.scheduleRepaint(); repaint != nil {
+				// Batched with the tick so the wave keeps advancing while the
+				// repaint is in flight, not only once it lands.
 				return m, tea.Batch(m.frameTickCmd(), repaint)
 			}
 		}
@@ -2515,11 +2542,23 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				return m, tea.Batch(m.frameTickCmd(), repaint)
 			}
 		}
-		// Keep the loop alive while a stream is live, the first byte is
-		// still awaited, or the loading shimmer owns the dock (async
-		// context-prep window before streamCmd sets streaming). Every
-		// terminal path clears these flags, so the loop always stops.
-		if m.streaming || waitingForFirstByte || m.shimmerActive {
+		// Keep the loop alive while a stream is live, the first byte is still
+		// awaited, the loading shimmer owns the dock (the async context-prep
+		// window before streamCmd sets streaming), or a pre-execution
+		// SKELETON is mounted.
+		//
+		// The skeleton arm is what stops an indicator from freezing. A
+		// skeleton is a transient one-row claim mounted inside the viewport
+		// (see skeleton.go) and it animates on this tick alone; a table
+		// holdback can outlast the conditions above — the stream can end, the
+		// first byte can have long since landed, the dock can already be gone
+		// — and gating the loop on those flags would leave a live "[struct]
+		// Constructing table view..." on screen with a wave that stopped
+		// moving. A frozen animated indicator is indistinguishable from a
+		// hang, so the mounted row owns the loop for as long as it is
+		// mounted. Every terminal path releases the skeleton, so the loop
+		// still self-terminates with no leaked timer.
+		if m.streaming || waitingForFirstByte || m.shimmerActive || m.skeletonActive() {
 			m.frameTickActive = true
 			return m, m.frameTickCmd()
 		}
@@ -2683,7 +2722,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// every frame while streaming is true, the spinner can never die
 		// mid-answer. The inline braille spinner takes over from the snowflake
 		// once the first content token hands off the dock.
-		if !m.shimmerActive && !m.streaming {
+		//
+		// A MOUNTED PRE-EXECUTION SKELETON is a third reason to stay alive: it
+		// is a one-row indicator that can be mounted with no loading dock and no
+		// live stream, and a frozen skeleton is indistinguishable from a stall.
+		if !m.shimmerActive && !m.streaming && !m.skeletonActive() {
 			return m, nil
 		}
 		// SAFETY NET: if every background producer has released its flags but
@@ -2697,11 +2740,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// Without this guard the shimmer self-terminates on the first frame
 		// after startShimmer("", "autonomy") is called, freezing the spinner
 		// for the entire provider invocation.
-		if !m.streaming && !m.agentRunning && !m.reviewRunning && !m.pipelineRunning && !m.planPending && !m.shellRunning && !m.autonomousActive {
+		if !m.streaming && !m.agentRunning && !m.reviewRunning && !m.pipelineRunning && !m.planPending && !m.shellRunning && !m.autonomousActive && !m.skeletonActive() {
 			m.stopShimmer()
 			return m, nil
 		}
 		m.shimmerAnim, _ = m.shimmerAnim.Update(msg)
+		// The pre-execution skeleton shares this tick so its glyph and colour
+		// wave advance in lockstep with every other animation in the UI.
+		m.advanceSkeletonFrame()
 		if m.Ready {
 			m.refreshViewportContent()
 		}
@@ -3019,7 +3065,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if msg.truncated {
 			log.Printf("[TRUNCATION] response hit max_tokens ceiling (finish_reason: length) — %d output tokens", msg.tokenOutput)
 			m.push(roleSystem, boundedWarning(
-				"[PARTIAL] The response hit the provider's max_tokens limit and was cut off mid-generation (finish_reason: \"length\", EvidenceState.PARTIAL). Increase max_tokens in the provider config to allow longer responses.", m.width))
+				"[PARTIAL] The response hit the provider's max_tokens limit and was cut off mid-generation (finish_reason: \"length\", EvidenceState.PARTIAL). Increase max_tokens in the provider config to allow longer responses.", m.PaneWidth()))
 		}
 
 		// ── IMPLICIT PIPELINE INTERCEPT: pipe stream output to next step ──

@@ -87,14 +87,12 @@ func boundBox(style lipgloss.Style, viewportWidth int) components.Bounded {
 // with boundBox: the outer width minus the box's own border and padding. Any
 // horizontal rule or wrapped body placed inside the card must use it, otherwise
 // the rule outgrows the frame and the right border is pushed off-screen.
+//
+// It delegates to components.InnerWidth so the budget is derived from the
+// style's own border size — a half-bordered or borderless box is measured
+// correctly instead of being charged a full two cells it cannot spend.
 func boundInner(viewportWidth int, style lipgloss.Style) int {
-	inner := components.OuterWidth(viewportWidth) -
-		components.BorderCells -
-		style.GetHorizontalPadding()
-	if inner < components.MinBoundWidth {
-		return components.MinBoundWidth
-	}
-	return inner
+	return components.InnerWidth(viewportWidth, style)
 }
 
 // boundRule draws a horizontal separator sized to the card's inner width. The
@@ -108,17 +106,18 @@ func boundRule(viewportWidth int, style lipgloss.Style, indent int) string {
 	return strings.Repeat("─", n)
 }
 
-// boundedWarning renders the amber warning/gate banner (policy notice,
-// [PARTIAL] truncation notice, oversized-repo warning) inside a frame whose
-// width is derived from the live viewport.
+// boundedWarning renders a system warning/gate notice — the [PARTIAL]
+// truncation notice, an oversized-repo warning, a no-op-claim review gate — as
+// a FRAMELESS muted notice.
 //
-// These notices are the longest free-form strings the UI ever renders — a
-// [PARTIAL] notice alone is ~190 cells — so without an explicit bound the box
-// sizes itself to the payload and shoves the right border far off-screen,
-// wrapping the terminal and corrupting every frame around it.
+// It used to be a rounded amber box, and these notices are the longest
+// free-form strings the UI ever renders (a [PARTIAL] notice alone is ~190
+// cells), so the box was the surface that tore whenever its width arithmetic
+// was even one cell off. Delegating to components.RenderMinimalNotice removes
+// the frame entirely: there is no right border to clip, and the body wraps at
+// paneWidth-4 with the accent line re-added, so the widest row is paneWidth-2.
 func boundedWarning(text string, viewportWidth int) string {
-	return boundBox(warningStyle, viewportWidth).
-		Render(components.WrapBody(strings.TrimSpace(text), boundInner(viewportWidth, warningStyle)))
+	return components.RenderMinimalNotice("", strings.TrimSpace(text), components.NoticeWarning, viewportWidth)
 }
 
 // ── Color Interpolation For Mode-Line Fade ────────────────────────────────────
@@ -297,13 +296,6 @@ var (
 	successBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorGreen))
 	failureBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
 	warningBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorYellow))
-
-	// Warning box style for safety gate
-	warningStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(colorOrange)).
-			Foreground(lipgloss.Color(colorYellow)).
-			Padding(0, 1)
 
 	// ── Build Mutation Summary Box ──────────────────────────────
 	// Clean styled box with border highlights for BUILD MUTATION SUMMARY

@@ -359,6 +359,13 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventStrategySelected,
 		events.EventTargetResolved,
 		events.EventContextPrepared,
+		// Pre-execution lifecycle boundaries: the context compiler starting and
+		// a tool batch starting/finishing are the real moments a surface is
+		// being produced but cannot be shown yet, so the UI mounts its one-row
+		// skeleton indicator on them (see skeleton.go).
+		events.EventContextCompilation,
+		events.EventToolBatchStarted,
+		events.EventToolBatchCompleted,
 		events.EventModelInvoked,
 		events.EventProviderWaiting,
 		events.EventProviderFirstToken,

@@ -208,17 +208,25 @@ func TestSmoothStreamTickKeepsStreamingAlive(t *testing.T) {
 func TestComputeVpHeightWithProposalBlock(t *testing.T) {
 	m := newTestModel()
 
-	// computeVpHeight uses the new zero-gap formula:
-	// height=40 - inputHeight(2) - statusLineHeight(1) - dockHeight(10) - bottomSep(1) = 26
-	vpHeight := m.computeVpHeight()
-	expectVp := 26
-	if vpHeight != expectVp {
-		t.Errorf("computeVpHeight = %d, want %d", vpHeight, expectVp)
-	}
-
-	// Render the proposal block and count lines
+	// The viewport budget is derived from the MEASURED heights of the four
+	// rendered regions, not from a hand-maintained line count per region. That
+	// is the whole point: the old estimate reserved 10 rows for a dock that
+	// actually draws 14, so the frame was four rows taller than the terminal
+	// and the terminal scrolled — which is how `ask )` prompt bars ended up
+	// stacked in scrollback.
+	header := m.renderTopBar(m.width)
+	footer := m.renderFixedFooter(m.width, nil)
+	input := m.renderInputRegion(m.width, m.modeStyle(m.resolver.Current()))
 	proposalBlock := m.renderProposalBlock()
-	proposalLines := len(strings.Split(strings.TrimRight(proposalBlock, "\n"), "\n"))
+	proposalLines := regionHeight(proposalBlock)
+
+	vpHeight := m.computeVpHeight()
+	want := m.height - regionHeight(header) - regionHeight(input) - regionHeight(footer) - proposalLines
+	if vpHeight != want {
+		t.Errorf("computeVpHeight = %d, want %d (header=%d input=%d footer=%d dock=%d)",
+			vpHeight, want, regionHeight(header), regionHeight(input),
+			regionHeight(footer), proposalLines)
+	}
 	t.Logf("Proposal block rendered %d lines (vpHeight=%d)", proposalLines, vpHeight)
 
 	// The View() output total should not exceed m.height

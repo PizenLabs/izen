@@ -49,6 +49,14 @@ type Workspace struct {
 	Footer       string
 	Actions      []Action
 	Sections     []Section
+	// ViewportRows is the row count the layout budget assigned to Viewport.
+	//
+	// The compositor needs it as a NUMBER, not as something it re-derives from
+	// Viewport: the bottom-anchored contract is that the scrollable region is
+	// pinned to the height the budget gave it, and a region that measures itself
+	// is pinned to whatever it happened to render instead. The two can differ —
+	// and when they do, only the budget's number is the truth.
+	ViewportRows int
 }
 
 // ViewportManager is the workspace-owned runtime authority for stream
@@ -177,7 +185,7 @@ func (r *Registry) For(mode modes.Mode) (ViewMode, bool) {
 // never sees mode, banner, prompt, footer, or action logic.
 // sessionPickerDialogSize clamps the session picker dialog to the terminal.
 func (m *model) sessionPickerDialogSize() (int, int) {
-	return sessionPickerDialogSizeFor(m.width, m.height)
+	return sessionPickerDialogSizeFor(m.PaneWidth(), m.PaneHeight())
 }
 
 func (m *model) renderSessionPickerModal() string {
@@ -209,8 +217,8 @@ func (m *model) renderSessionPickerModal() string {
 	// clip at Tmux-pane edges during a resize.
 	modalBox := m.sessionPicker.View()
 
-	centered := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modalBox)
-	return overlayOn(normalContent, centered, m.width, m.height)
+	centered := lipgloss.Place(m.PaneWidth(), m.PaneHeight(), lipgloss.Center, lipgloss.Center, modalBox)
+	return overlayOn(normalContent, centered, m.PaneWidth(), m.PaneHeight())
 }
 
 // ModelPickerModalSize computes the adaptive centred-dialog constraints
@@ -271,7 +279,7 @@ func (m *model) renderModelPickerModal() string {
 	}
 	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
-	modalW, modalH := ModelPickerModalSize(m.width, m.height)
+	modalW, modalH := ModelPickerModalSize(m.PaneWidth(), m.PaneHeight())
 	// Pass total outer dimensions to picker; picker derives inner bounds
 	// strictly as modal-4 / modal-2 (spec rectification).
 	m.modelPicker = m.modelPicker.SetSize(modalW, modalH)
@@ -297,13 +305,13 @@ func (m *model) renderModelPickerModal() string {
 		Render(innerContent)
 
 	centered := lipgloss.Place(
-		m.width, m.height,
+		m.PaneWidth(), m.PaneHeight(),
 		lipgloss.Center, lipgloss.Center,
 		modalBox,
 		// Fill surrounding workspace overlay with neutral dimmed whitespace.
 		lipgloss.WithWhitespaceChars(" "),
 	)
-	return overlayOn(normalContent, centered, m.width, m.height)
+	return overlayOn(normalContent, centered, m.PaneWidth(), m.PaneHeight())
 }
 
 // StatusModalSize computes the responsive outer bounds for the standalone
@@ -317,7 +325,7 @@ func StatusModalSize(w, h int) (int, int) {
 // renderStatusModal overlays the fixed status card on the normal workspace
 // without adding any status text to the conversation document.
 func (m *model) renderStatusModal() string {
-	w, h := m.width, m.height
+	w, h := m.PaneWidth(), m.PaneHeight()
 	if w <= 0 {
 		w = 80
 	}
@@ -370,7 +378,7 @@ func SettingsModalSize(w, h int) (int, int) {
 // kept underneath so closing the dialog returns focus without rebuilding or
 // resetting the primary view.
 func (m *model) renderSettingsModal() string {
-	w, h := m.width, m.height
+	w, h := m.PaneWidth(), m.PaneHeight()
 	if w <= 0 {
 		w = 80
 	}
@@ -448,9 +456,9 @@ func (m *model) renderTraceOverlayModal() string {
 	if m.telemetryDemuxer == nil {
 		return normalContent
 	}
-	overlayContent := m.telemetryDemuxer.RenderOverlay(m.width, m.height)
-	centered := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlayContent)
-	return overlayOn(normalContent, centered, m.width, m.height)
+	overlayContent := m.telemetryDemuxer.RenderOverlay(m.PaneWidth(), m.PaneHeight())
+	centered := lipgloss.Place(m.PaneWidth(), m.PaneHeight(), lipgloss.Center, lipgloss.Center, overlayContent)
+	return overlayOn(normalContent, centered, m.PaneWidth(), m.PaneHeight())
 }
 
 // overlayOn renders bg as a full-screen string with fg centered on top.
