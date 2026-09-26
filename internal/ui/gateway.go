@@ -207,7 +207,11 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 	// reader goroutine + callback. The executor invokes the callback for each
 	// content delta, first token, and completion. The UI reads from the channel
 	// and renders incrementally via the existing tokenMsg/streamDoneMsg handlers.
-	m.execStreamCh = make(chan tea.Msg, 1024)
+	//
+	// The channel is built through newEventChannel so its depth is floored at
+	// objengine.MinEventBuffer: an executor tool that streams faster than the
+	// renderer paints can never apply backpressure to the worker goroutine.
+	m.execStreamCh = newEventChannel(EventChannelBuffer)
 	m.execStreaming = true
 	m.spinnerFrame = 0
 	m.startShimmer("Waiting for model...", "execution")
@@ -474,8 +478,8 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		m.pendingProposals = nil
 		m.resolveApprovalState()
 		m.finalizeOperation(OpOutcomeAmbiguous, nil)
-		m.push(roleSystem, warningStyle.Render("  "+Icon.Warning+
-			" No-op claim held for review — candidate edits below the safety threshold. No files were modified."))
+		m.push(roleSystem, boundedWarning(Icon.Warning+
+			" No-op claim held for review — candidate edits below the safety threshold. No files were modified.", m.width))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
 		if mdl, queueCmd, handled := m.projectBuildQueueFromProof(res, nil); handled {

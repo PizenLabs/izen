@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PizenLabs/izen/internal/modes"
+	"github.com/PizenLabs/izen/internal/ui/components"
 )
 
 // ── Catppuccin Mocha Palette (Optimized Visual Hierarchy) ─────────────────────
@@ -65,6 +67,58 @@ const (
 // lipglossColor is a convenience helper (init-time only, NOT for render path).
 func lipglossColor(hex string) lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(lipgloss.Color(hex))
+}
+
+// boundBox is THE bounding entry point for every framed (bordered) TUI surface.
+//
+// Lipgloss applies a border AFTER the content box, so `style.Width(w)` renders
+// at w+2 cells. Handing w = viewport width therefore pushes the right border two
+// cells past the viewport, which wraps the terminal and corrupts the frame
+// whenever the payload is long (an OpenRouter 403 JSON body, a [PARTIAL]
+// truncation notice, a multi-kilobyte build error). boundBox subtracts the
+// safety margin and the border, and states the word-wrap contract explicitly,
+// so a long string always breaks inside the frame instead of breaking the
+// frame. See internal/ui/components/banner.go for the full contract.
+func boundBox(style lipgloss.Style, viewportWidth int) components.Bounded {
+	return components.Bound(style, viewportWidth)
+}
+
+// boundInner returns the content width available INSIDE a framed surface drawn
+// with boundBox: the outer width minus the box's own border and padding. Any
+// horizontal rule or wrapped body placed inside the card must use it, otherwise
+// the rule outgrows the frame and the right border is pushed off-screen.
+func boundInner(viewportWidth int, style lipgloss.Style) int {
+	inner := components.OuterWidth(viewportWidth) -
+		components.BorderCells -
+		style.GetHorizontalPadding()
+	if inner < components.MinBoundWidth {
+		return components.MinBoundWidth
+	}
+	return inner
+}
+
+// boundRule draws a horizontal separator sized to the card's inner width. The
+// width is clamped to a minimum so a very narrow terminal degrades to a short
+// rule instead of a negative Repeat count.
+func boundRule(viewportWidth int, style lipgloss.Style, indent int) string {
+	n := boundInner(viewportWidth, style) - indent
+	if n < 8 {
+		n = 8
+	}
+	return strings.Repeat("─", n)
+}
+
+// boundedWarning renders the amber warning/gate banner (policy notice,
+// [PARTIAL] truncation notice, oversized-repo warning) inside a frame whose
+// width is derived from the live viewport.
+//
+// These notices are the longest free-form strings the UI ever renders — a
+// [PARTIAL] notice alone is ~190 cells — so without an explicit bound the box
+// sizes itself to the payload and shoves the right border far off-screen,
+// wrapping the terminal and corrupting every frame around it.
+func boundedWarning(text string, viewportWidth int) string {
+	return boundBox(warningStyle, viewportWidth).
+		Render(components.WrapBody(strings.TrimSpace(text), boundInner(viewportWidth, warningStyle)))
 }
 
 // ── Color Interpolation For Mode-Line Fade ────────────────────────────────────
@@ -200,11 +254,13 @@ var (
 	// permissionBoxStyle wraps the entire permission-required dialog in a
 	// distinctive red/orange bordered box so the user instantly recognises
 	// an interactive security checkpoint.
+	//
+	// NO hardcoded Width: the width is always derived from the live viewport
+	// through boundBox, so the frame can never outgrow the terminal.
 	permissionBoxStyle = lipgloss.NewStyle().
 				Border(lipgloss.DoubleBorder()).
 				BorderForeground(lipgloss.Color(colorOrange)).
-				Padding(0, 1).
-				Width(60)
+				Padding(0, 1)
 	permissionTitleStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(lipgloss.Color(colorYellow))
@@ -221,11 +277,11 @@ var (
 	// The staged ExecutionDAG proposal renders as a yellow-framed interactive
 	// decision box so it is instantly distinguishable from the orange
 	// permission/approval gates while still reading as "human decision here".
+	// Width is supplied per-frame by boundBox (never hardcoded).
 	decompositionBoxStyle = lipgloss.NewStyle().
 				Border(lipgloss.DoubleBorder()).
 				BorderForeground(lipgloss.Color(colorYellow)).
-				Padding(0, 1).
-				Width(60)
+				Padding(0, 1)
 	decompositionTitleStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(lipgloss.Color(colorYellow))
@@ -441,6 +497,16 @@ var (
 	// the AI gutter (#89b4fa) so the insertion point reads as part of the
 	// answer surface, never as a separate cursor widget.
 	streamCursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
+
+	// streamUncommittedStyle is applied to a structurally-INCOMPLETE streaming
+	// line — one whose Markdown block is still arriving (a table row with no
+	// closing pipe, a half-received fence, an unterminated `**bold**` span). It
+	// is deliberately flat: one colour, no bold, no inline interpretation. A
+	// flat line has exactly one possible layout, which is what makes the hold
+	// back flicker-free; the line is promoted to the full styled pipeline once,
+	// at commit. Muted (not faint) so the dim still reads on terminals that
+	// ignore the Faint SGR attribute.
+	streamUncommittedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDimmed))
 )
 
 // Pre-compiled Markdown renderer styles (render-path — zero NewStyle).
@@ -502,8 +568,33 @@ var (
 )
 
 // ── Interrupt Boundary Spinner ────────────────────────────────────────────
-var ProposalSpinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-var SpinnerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMauve))
+//
+// ProposalSpinnerFrames is the canonical smooth braille dot cycle, sourced from
+// components.DotsFrames (bubbles' spinner.MiniDot) so the glyph set can never
+// drift from the framework's definition. The animation advances at 100ms (10Hz)
+// on the independent spinner tick while the 30/60 FPS UI frame loop re-renders
+// the same glyph, which is what makes the rotation read as smooth motion rather
+// than a stuttering flicker.
+//
+// READ-ONLY: this aliases the shared frame slice so a framework upgrade
+// propagates here. Callers index it modulo its length and must never mutate it.
+var ProposalSpinnerFrames = components.DotsFrames
+
+// spinnerGlyph renders animation frame n in the shared emerald ramp: a
+// single-hue green→emerald cycle that restores perceived motion at 10Hz without
+// ever reading as a state change (no amber/red leaking into a healthy
+// "working" indicator).
+func spinnerGlyph(frame int) string {
+	if frame < 0 {
+		frame = 0
+	}
+	// #nosec G115 -- frame is a non-negative animation index, bounded by callers.
+	return components.SpinnerGlyph(uint64(frame))
+}
+
+// SpinnerStyle is the base (unramped) spinner style, kept for call sites that
+// render a single static frame with no animation context.
+var SpinnerStyle = components.SpinnerStyleFor(0)
 
 // ── Gutter / Label Helpers ────────────────────────────────────────────────────
 

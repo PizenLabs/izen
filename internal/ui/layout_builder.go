@@ -12,6 +12,7 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"github.com/PizenLabs/izen/internal/config"
+	"github.com/PizenLabs/izen/internal/ui/markdown"
 )
 
 // ── Quiet / Accordion Mode for Engine Logs ────────────────────────────────
@@ -798,6 +799,89 @@ func (r *aiBlockRenderer) flushTable(wrapWidth int) {
 	}
 	r.tableRows = nil
 	r.inTable = false
+}
+
+// renderPartialLine renders the STILL-GROWING trailing line of a live stream.
+//
+// A partial line is not a line: it is a prefix of one. Running it through
+// renderLine would interpret syntax that may not mean what it looks like yet —
+// `| Name | Age` is not a table row until its closing pipe arrives, `**bol` is
+// not bold until its closer does — and the viewport would re-flow the whole time
+// the remaining bytes stream in (the "table columns jump / markup flickers while
+// streaming" report).
+//
+// So the partial line is routed through the UncommittedBuffer first: when the
+// line is NOT structurally final it is rendered as PLAIN DIMMED TEXT with no
+// block or inline interpretation. Plain text has exactly one possible layout,
+// so nothing can reflow; the line is promoted to the full pipeline exactly once,
+// when it commits. When the line IS already final (it happens to sit on a
+// syntactic boundary — a closed table row, a balanced `**bold**`) it goes
+// straight down the normal path, so the hold-back costs no extra frame.
+func (r *aiBlockRenderer) renderPartialLine(rl string, wrapWidth int) {
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
+	if kind, incomplete := markdown.Incomplete(rl, r.inCode, r.inTable); incomplete {
+		r.out = append(r.out, renderUncommittedLine(rl, wrapWidth, kind)...)
+		return
+	}
+	r.renderLine(rl, wrapWidth)
+}
+
+// renderUncommittedLine renders a structurally-incomplete streaming line as
+// plain dimmed text. No Markdown interpretation runs, so the rendered width is
+// a pure function of the raw bytes: a closing table pipe, a backtick run, or a
+// heading marker completing can never change the layout of what is already on
+// screen.
+//
+// The gutter is preserved so the line stays aligned with the committed
+// assistant record, and the text is word-wrapped with the same width budget the
+// committed path uses, so the promotion at commit changes styling only — never
+// the line count.
+func renderUncommittedLine(rl string, wrapWidth int, kind markdown.BlockKind) []DocumentLine {
+	raw := strings.TrimRight(rl, "\r")
+	if strings.TrimSpace(raw) == "" {
+		return []DocumentLine{gutterDocumentLine(wrapWidth)}
+	}
+	innerW := wrapWidth - 2
+	if innerW < 10 {
+		innerW = 10
+	}
+	wrapW := innerW - markdownLinePrefixWidth(raw) - 2
+	if wrapW < 10 {
+		wrapW = 10
+	}
+	// A table row is held back until its closing pipe arrives; giving it the
+	// full inner width keeps the commit-time promotion from reflowing the cells
+	// onto different lines.
+	if kind == markdown.BlockTable {
+		wrapW = innerW
+	}
+	parts := strings.Split(ansi.Wordwrap(raw, wrapW, " \t"), "\n")
+	out := make([]DocumentLine, 0, len(parts))
+	for _, sub := range parts {
+		out = append(out, renderedTextToDocumentLines("│ ", renderUncommittedText(sub), wrapWidth)...)
+	}
+	if len(out) == 0 {
+		return []DocumentLine{gutterDocumentLine(wrapWidth)}
+	}
+	return out
+}
+
+// renderUncommittedText applies the flat hold-back style to one raw line.
+//
+// lipgloss renders a style to PLAIN TEXT when the active terminal colour
+// profile is Ascii — a pipe, a test harness, TERM=dumb. Emitting unstyled text
+// there would make the hold-back indistinguishable from ordinary content (and
+// make the "still arriving" signal vanish from every capture), so an explicit
+// dimmed SGR is emitted instead. The fallback fires only when lipgloss actually
+// dropped the colour, so a real terminal keeps its profile-resolved output.
+func renderUncommittedText(s string) string {
+	rendered := streamUncommittedStyle.Render(s)
+	if rendered != s {
+		return rendered
+	}
+	return "\x1b[38;2;88;91;112m" + s + "\x1b[0m"
 }
 
 // renderAIBlockLines renders an AI record's text to physical DocumentLines.

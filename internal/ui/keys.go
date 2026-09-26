@@ -1480,7 +1480,7 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 		// background producer owns the flags, so idle submits leak nothing.
 		if !m.frameTickActive {
 			m.frameTickActive = true
-			cmd = tea.Batch(cmd, FrameTickCmd())
+			cmd = tea.Batch(cmd, m.frameTickCmd())
 		}
 		cmd = tea.Batch(cmd, m.shimmerTickCmd(), m.smoothStreamTickCmd())
 		m.lockTailToNewPrompt()

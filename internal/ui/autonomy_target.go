@@ -199,10 +199,6 @@ func (m *model) renderAutonomyTargetSelectorBlock(width int) string {
 	if len(m.pendingAutonomyTargets) == 0 {
 		return ""
 	}
-	boxWidth := width - 4
-	if boxWidth < 40 {
-		boxWidth = 40
-	}
 
 	var b strings.Builder
 	b.WriteString(permissionTitleStyle.Render(Icon.Warning + " AUTONOMY TARGET SELECTION"))
@@ -218,9 +214,8 @@ func (m *model) renderAutonomyTargetSelectorBlock(width int) string {
 		b.WriteString("\n")
 	}
 
-	sep := strings.Repeat("─", boxWidth-4)
-	b.WriteString(" " + sep + "\n")
+	b.WriteString(" " + boundRule(width, permissionBoxStyle, 2) + "\n")
 	b.WriteString(" " + mutedStyle.Render("↑/↓ navigate · Enter select · Esc cancel") + "\n")
 
-	return permissionBoxStyle.Width(boxWidth).Render(b.String())
+	return boundBox(permissionBoxStyle, width).Render(b.String())
 }

@@ -138,8 +138,10 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 	m.agentLabel = ""
 	m.startShimmer("", "autonomy")
 
-	// Set up executor streaming (same mechanism as $prompt/$hot gateway path)
-	m.execStreamCh = make(chan tea.Msg, 1024)
+	// Set up executor streaming (same mechanism as $prompt/$hot gateway path).
+	// newEventChannel floors the depth at objengine.MinEventBuffer so the
+	// autonomy worker never blocks on a slow render frame.
+	m.execStreamCh = newEventChannel(EventChannelBuffer)
 	m.execStreaming = true
 	m.spinnerFrame = 0
 	m.startShimmer("Waiting for model...", "autonomy")
@@ -780,12 +782,12 @@ func (m *model) renderAutonomousDecompositionBoundary(b *autonomy.HumanBoundary)
 // renderDecompositionProposalBlock renders the staged ExecutionDAG as a
 // framed interactive proposal box: the splitting strategy kind, every sub-task
 // with its line-range window, and the navigation keys.
+//
+// Every interior element (rules, key hints, target paths) is sized from the
+// live viewport through boundWidth/boundInner, and the frame itself is drawn
+// with boundBox, so a long target path or a long sub-task description re-flows
+// inside the card instead of shoving the right border off-screen.
 func renderDecompositionProposalBlock(dag *planner.ExecutionDAG, width int) string {
-	boxWidth := width - 4
-	if boxWidth < 40 {
-		boxWidth = 40
-	}
-
 	var sb strings.Builder
 	sb.WriteString(decompositionTitleStyle.Render(Icon.Blueprint + " DECOMPOSITION PROPOSAL"))
 	sb.WriteString("\n\n")
@@ -802,19 +804,17 @@ func renderDecompositionProposalBlock(dag *planner.ExecutionDAG, width int) stri
 			decompositionKeyStyle.Render(st.ID),
 			Icon.Chevron,
 			boldTextStyle.Render(st.Region.String()),
-			mutedStyle.Render(truncateDisplay(st.Description, 48)),
+			mutedStyle.Render(truncateDisplay(st.Description, boundInner(width, decompositionBoxStyle)-24)),
 			st.EstimatedTokens)
 	}
 	total := dag.TotalEstimatedTokens()
 	fmt.Fprintf(&sb, "%s ~%d tok total · budget ≤%d tok/sub-task\n",
 		permissionDescStyle.Render("Budget:"), total, dag.Budget())
-
-	sep := strings.Repeat("─", boxWidth-4)
-	sb.WriteString(" " + sep + "\n")
+	sb.WriteString(" " + boundRule(width, decompositionBoxStyle, 2) + "\n")
 	sb.WriteString(" " + fmt.Sprintf("%s Authorize & Run DAG   %s Cancel",
 		decompositionKeyStyle.Render("[Enter]"), decompositionKeyStyle.Render("[Esc]")) + "\n")
 
-	return decompositionBoxStyle.Width(boxWidth).Render(sb.String())
+	return boundBox(decompositionBoxStyle, width).Render(sb.String())
 }
 
 // renderAutonomousBoundaryBlock renders the parked driver boundary as an
@@ -823,10 +823,6 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 	b := m.autonomousBoundary
 	if b == nil {
 		return ""
-	}
-	boxWidth := width - 4
-	if boxWidth < 40 {
-		boxWidth = 40
 	}
 
 	var sb strings.Builder
@@ -865,7 +861,7 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 		sb.WriteString(" " + infoStyle.Render(b.Reason))
 		sb.WriteString("\n")
 		sb.WriteString(" " + mutedStyle.Render("No further automatic execution. Start a fresh run (Ctrl+C to dismiss).") + "\n")
-		return permissionBoxStyle.Width(boxWidth).Render(sb.String())
+		return boundBox(permissionBoxStyle, width).Render(sb.String())
 	case autonomy.HumanBoundaryDecomposition:
 		// The staged DECOMPOSITION_PROPOSAL (PLAN_STAGED) decision card.
 		if b.Proposal != nil {
@@ -876,11 +872,10 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 		sb.WriteString(permissionDescStyle.Render("Reason:"))
 		sb.WriteString(" " + infoStyle.Render(b.Reason))
 		sb.WriteString("\n")
-		sep := strings.Repeat("─", boxWidth-4)
-		sb.WriteString(" " + sep + "\n")
+		sb.WriteString(" " + boundRule(width, permissionBoxStyle, 2) + "\n")
 		sb.WriteString(" " + fmt.Sprintf("%s Authorize & Run DAG   %s Cancel",
 			decompositionKeyStyle.Render("[Enter]"), decompositionKeyStyle.Render("[Esc]")) + "\n")
-		return permissionBoxStyle.Width(boxWidth).Render(sb.String())
+		return boundBox(permissionBoxStyle, width).Render(sb.String())
 	case autonomy.HumanBoundaryProposal:
 		// The ZERO-TOKEN DecisionSurface recovery menu. It is a LIVE human
 		// decision surface — the interactive selection model owns rendering so
@@ -893,16 +888,14 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 		sb.WriteString(permissionDescStyle.Render("Reason:"))
 		sb.WriteString(" " + infoStyle.Render(b.Reason))
 		sb.WriteString("\n")
-		sep := strings.Repeat("─", boxWidth-4)
-		sb.WriteString(" " + sep + "\n")
+		sb.WriteString(" " + boundRule(width, permissionBoxStyle, 2) + "\n")
 		sb.WriteString(" " + mutedStyle.Render("↑/↓ navigate · Enter select · Esc cancel") + "\n")
-		return permissionBoxStyle.Width(boxWidth).Render(sb.String())
+		return boundBox(permissionBoxStyle, width).Render(sb.String())
 	default:
 		return ""
 	}
 
-	sep := strings.Repeat("─", boxWidth-4)
-	sb.WriteString(" " + sep + "\n")
+	sb.WriteString(" " + boundRule(width, permissionBoxStyle, 2) + "\n")
 
 	if b.Action == autonomy.HumanBoundaryApproval {
 		sb.WriteString(" " + mutedStyle.Render("Alt+A / Enter approve · Alt+R / Esc reject · Ctrl+C abort") + "\n")
@@ -910,5 +903,5 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 		sb.WriteString(" " + mutedStyle.Render("↑/↓ navigate · Enter select · Esc cancel · Ctrl+C abort") + "\n")
 	}
 
-	return permissionBoxStyle.Width(boxWidth).Render(sb.String())
+	return boundBox(permissionBoxStyle, width).Render(sb.String())
 }

@@ -91,30 +91,35 @@ func (m *model) ingestStreamUsage(input, output, reasoning int) {
 }
 
 // ── Overflow Ring Drain (frame-flush pass) ────────────────────────────────
-// drainStreamRing pops every currently-buffered message from the lock-free
-// overflow ring and ingests it through the shared paths above. It is called
-// from the FrameTickMsg flush pass (the UI event loop's 30FPS frame loop) and
-// from the terminal stream handlers (streamDoneMsg / streamErrMsg / interrupt
-// teardown) so no overflow token can ever be left unrendered when a stream
-// ends. Content ingested here lands in the same utf8StreamBuf/throttle buffers
-// the immediate flush of the frame drains, so the emission stays single-pass
-// and the repaint gate stays single-flight.
+// drainStreamRing releases ONE FRAME'S WORTH of tokens parked in the lock-free
+// overflow ring and ingests them through the shared paths above.
+//
+// It is called from the FrameTickMsg flush pass (the UI event loop's 30FPS frame
+// loop) and — in its DrainAll form, drainStreamRingAll — from the terminal
+// stream handlers (streamDoneMsg / streamErrMsg / interrupt teardown) so no
+// overflow token can ever be left unrendered when a stream ends. Content
+// ingested here lands in the same utf8StreamBuf/throttle buffers the immediate
+// flush of the frame drains, so the emission stays single-pass and the repaint
+// gate stays single-flight.
+//
+// BATCHING (see model_stream.go): a steady state releases TokensPerFrame tokens
+// per tick; a backlogged queue releases proportionally more so it converges to
+// empty instead of displaying a persistent delay. The batch is a VISUAL LATENCY
+// bound only — the terminal drain is exhaustive, so a paced batch can never
+// drop a token.
 func (m *model) drainStreamRing() {
-	if m.streamRing == nil {
+	if m.streamRing == nil && m.tokenPacer == nil {
 		return
 	}
-	for {
-		msg, ok := m.streamRing.Pop()
-		if !ok {
-			return
-		}
-		switch t := msg.(type) {
-		case tokenMsg:
-			m.ingestContentToken(SanitizeForIngest(string(t)))
-		case thinkingTokenMsg:
-			m.ingestThinkingToken(SanitizeForIngest(string(t)))
-		case streamUsageMsg:
-			m.ingestStreamUsage(t.input, t.output, t.reasoning)
-		}
+	m.ingestPacedTokens(false)
+}
+
+// drainStreamRingAll is the terminal drain: it releases every queued token
+// before the stream is sealed, so no received byte is left behind in the ring
+// when the stream ends, errors, or is interrupted.
+func (m *model) drainStreamRingAll() {
+	if m.streamRing == nil && m.tokenPacer == nil {
+		return
 	}
+	m.ingestPacedTokens(true)
 }

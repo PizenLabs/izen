@@ -159,6 +159,21 @@ func TestAskTruncatedFollowedByContinuation_Succeeds(t *testing.T) {
 		t.Fatalf("outcome = %q, want completed", res.Proof.Outcome)
 	}
 	waitCount(t, c, events.EventStepCompleted, 1, 2*time.Second)
+	// Every remaining event is published asynchronously on its own
+	// per-subscription goroutine, so none of them is ordered against
+	// EventStepCompleted. Each must therefore be AWAITED, not merely asserted:
+	// reading the collector straight after the last one lands races the bus and
+	// made this acceptance test fail intermittently under -race on a loaded
+	// machine.
+	for _, typ := range []string{
+		events.EventStepStarted,
+		events.EventStepExhausted,
+		events.EventContinuationScheduled,
+		events.EventContinuationStarted,
+		events.EventStateCommitted,
+	} {
+		waitCount(t, c, typ, 1, 2*time.Second)
+	}
 	// The executor output gate discards the truncated buffer (empty salvage,
 	// mirroring plan StepIncomplete rescheduling): the exhausted step commits
 	// nothing and the continuation rebuilds from the bare base prompt. The

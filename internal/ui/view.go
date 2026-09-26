@@ -362,16 +362,11 @@ func (m *model) renderProposalBlock() string {
 		// ── Build Approval Permission Box (SHELL_EXEC gate) ─────────────
 		if m.pendingBuildApproval && m.pendingBuildTask != nil {
 			task := m.pendingBuildTask
-			boxWidth := width - 4
-			if boxWidth < 40 {
-				boxWidth = 40
-			}
 			var content strings.Builder
 			title := permissionTitleStyle.Render("▲ PERMISSION REQUIRED")
 			action := permissionDescStyle.Render("Action:") + " " + boldTextStyle.Render("SHELL_EXEC")
 			target := permissionTargetStyle.Render(task.Target)
 			desc := permissionDescStyle.Render(fmt.Sprintf("Reason: %s", task.Description))
-			sep := strings.Repeat("─", boxWidth-4)
 			keys := fmt.Sprintf("%s  %s  %s",
 				permissionKeyStyle.Render("Alt+A / Enter  Allow Once"),
 				permissionKeyStyle.Render("Alt+L  Allow Always"),
@@ -381,9 +376,12 @@ func (m *model) renderProposalBlock() string {
 			content.WriteString(action + "\n\n")
 			content.WriteString(target + "\n")
 			content.WriteString(desc + "\n")
-			content.WriteString(" " + sep + "\n")
+			content.WriteString(" " + boundRule(width, permissionBoxStyle, 2) + "\n")
 			content.WriteString(keys + "\n")
-			b.WriteString(permissionBoxStyle.Render(content.String()))
+			// bounded: the frame width is derived from the live viewport so a long
+			// target path or reason re-flows inside the card instead of pushing
+			// the right border off-screen.
+			b.WriteString(boundBox(permissionBoxStyle, width).Render(content.String()))
 			break
 		}
 
@@ -414,8 +412,7 @@ func (m *model) renderProposalBlock() string {
 		// the runtime is ACTUALLY doing (apply/patch/model), never the generic
 		// "Processing file mutations..." claim. When no authoritative stage
 		// exists, nothing is rendered — empty is better than fake.
-		frame := ProposalSpinnerFrames[m.spinnerFrame%len(ProposalSpinnerFrames)]
-		sp := SpinnerStyle.Render(frame)
+		sp := spinnerGlyph(m.spinnerFrame)
 		stageLine := m.renderStageLine()
 		if stageLine == "" {
 			return b.String()

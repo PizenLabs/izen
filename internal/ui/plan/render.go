@@ -26,6 +26,11 @@ var (
 	planSuccessStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6e3a1"))
 	planFailedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#f38ba8"))
 	planMetaStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#585b70"))
+
+	// planBoxBorderCells is the horizontal space planBoxStyle's left+right
+	// rounded border consumes. Lipgloss adds it AFTER the declared content
+	// width, so it must be subtracted whenever a width is bound to a viewport.
+	planBoxBorderCells = 2
 )
 
 // SpinnerFrame returns the spinner glyph for a frame tick.
@@ -67,7 +72,10 @@ func (p *ExecutionPlan) Render(frame, width int) string {
 	b.WriteString("\n" + planMetaStyle.Render(summary))
 	box := planBoxStyle.Render(b.String())
 	if width > 0 && lipgloss.Width(box) > width {
-		box = planBoxStyle.Width(width).Render(b.String())
+		// Lipgloss applies the border AFTER the content box, so Width(n) renders
+		// at n+2 cells. Subtract the border so the re-flowed plan card still fits
+		// the viewport instead of pushing its right edge off-screen.
+		box = planBoxStyle.Width(max(width-planBoxBorderCells, 1)).Render(b.String())
 	}
 	return box
 }

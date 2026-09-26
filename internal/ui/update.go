@@ -2481,49 +2481,23 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, nil
 
 	case FrameTickMsg:
-		// ── FRAME-LOCKED RING DRAIN (engine→UI decoupling) ─────────
-		// The master 30FPS frame tick is the single point where overflow
-		// tokens parked in the lock-free ring by the non-blocking producer
-		// re-join the rendering pipeline. Each drained chunk appends to the
-		// SAME utf8StreamBuf/throttle buffers the flush below drains, so the
-		// pass stays single-FIFO and the repaint stays single-flight.
+		// ── FRAME-LOCKED PACED DRAIN (engine→UI decoupling) ─────────────
+		// The master frame tick is the single point where overflow tokens
+		// parked in the lock-free ring by the non-blocking producer re-join
+		// the rendering pipeline. Exactly ONE frame's worth is released per
+		// tick, so the visual cadence stays constant whether the provider
+		// emitted 5 or 500 tokens in the interval. Each drained chunk appends
+		// to the SAME utf8StreamBuf/throttle buffers the flush below drains,
+		// so the pass stays single-FIFO and the repaint stays single-flight.
 		m.drainStreamRing()
 		// ── DEBOUNCED FRAME TICKER (30ms / ~33 FPS) ─────────────────────
 		// STREAM BUFFER CONTRACT: Option A — Cumulative Overwrite.
-		// StreamBuffer.ReadValidString() returns the FULL accumulated string
-		// from the start of the stream (never a drained delta). This handler
-		// MUST NOT do `m.currentStreamContent += fullText` (that duplicates).
-		// It overwrites the view from the full text by emitting ONLY the
-		// unread suffix beyond currentStreamContent. FrameTick is the SOLE
-		// content emitter while utf8StreamBuf is active; the smooth-tick loop
-		// never emits throttle/legacy content on that path (see
-		// smoothStreamTickMsg) so no byte is ever rendered twice.
-		if m.utf8StreamBuf != nil {
-			if content, updated := m.utf8StreamBuf.ReadValidString(); updated && content != "" {
-				// Only animate spinner while streaming; content emission is handled via smooth tick path
-				// For FrameTick path, we emit via the UTF-8 buffer's valid string delta.
-				// Cumulative overwrite: emit only the new suffix beyond
-				// currentStreamContent. HasPrefix guards against slicing
-				// mismatched bytes after a mid-stream reset (content shorter
-				// or diverged) — in that case there is no safe delta, so
-				// emit nothing rather than duplicating.
-				if strings.HasPrefix(content, m.currentStreamContent) {
-					if delta := content[len(m.currentStreamContent):]; delta != "" {
-						m.emitVisibleContent(delta)
-					}
-				} else if m.currentStreamContent == "" {
-					m.emitVisibleContent(content)
-				}
-				if repaint := m.scheduleRepaint(); repaint != nil {
-					return m, tea.Batch(FrameTickCmd(), repaint)
-				}
-			}
-		} else if m.streamThrottle != nil {
-			if content, ok := m.streamThrottle.Flush(); ok && content != "" {
-				m.emitVisibleContent(content)
-				if repaint := m.scheduleRepaint(); repaint != nil {
-					return m, tea.Batch(FrameTickCmd(), repaint)
-				}
+		// See flushStreamContentToView: the emission is a pure function of the
+		// byte buffer and the current visible content, so it is shared with the
+		// interrupt teardown rather than duplicated here.
+		if m.flushStreamContentToView() {
+			if repaint := m.scheduleRepaint(); repaint != nil {
+				return m, tea.Batch(m.frameTickCmd(), repaint)
 			}
 		}
 		// ── LIVE TTFT COUNTDOWN ──────────────────────────────────────
@@ -2538,7 +2512,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		if waitingForFirstByte {
 			if repaint := m.scheduleRepaint(); repaint != nil {
 				m.frameTickActive = true
-				return m, tea.Batch(FrameTickCmd(), repaint)
+				return m, tea.Batch(m.frameTickCmd(), repaint)
 			}
 		}
 		// Keep the loop alive while a stream is live, the first byte is
@@ -2547,7 +2521,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// terminal path clears these flags, so the loop always stops.
 		if m.streaming || waitingForFirstByte || m.shimmerActive {
 			m.frameTickActive = true
-			return m, FrameTickCmd()
+			return m, m.frameTickCmd()
 		}
 		m.frameTickActive = false
 		return m, nil
@@ -2842,7 +2816,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		if !m.frameTickActive {
 			m.frameTickActive = true
-			cmds = append(cmds, FrameTickCmd())
+			cmds = append(cmds, m.frameTickCmd())
 		}
 		// PROMPT RENDER ISOLATION: stream tokens MUST NOT touch the prompt
 		// input component. The prompt view is memoized (cachedPromptView)
@@ -2868,10 +2842,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 	case streamDoneMsg:
 		// ── AUTHORITATIVE STAGE: provider stream completed ─────────
-		// NO-TOKEN-LEFT-BEHIND: flush any ring-overflow tokens before the
+		// NO-TOKEN-LEFT-BEHIND: flush every ring-overflow token before the
 		// terminal teardown so a burst parked under full-channel backpressure
-		// is fully rendered before the stage resolves.
-		m.drainStreamRing()
+		// is fully rendered before the stage resolves. The terminal drain is
+		// EXHAUSTIVE (never a paced batch): this is the last chance a token can
+		// reach the viewport.
+		m.drainStreamRingAll()
 		// A terminal stream is done; the stage can never linger as "streaming".
 		m.setStage("model", m.getActiveModelName(), stageDone)
 		// Freeze Thought duration timer upon stream completion.
@@ -2898,6 +2874,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 
 		m.streamCh = nil
 		m.streamRing = nil
+		m.resetTokenPacer()
 		m.streaming = false
 		m.streamCancel = nil
 		// Clean up the inter-token timeout timer and deadline.
@@ -3041,8 +3018,8 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// streamed token content above is preserved verbatim.
 		if msg.truncated {
 			log.Printf("[TRUNCATION] response hit max_tokens ceiling (finish_reason: length) — %d output tokens", msg.tokenOutput)
-			m.push(roleSystem, warningStyle.Render(
-				"[PARTIAL] The response hit the provider's max_tokens limit and was cut off mid-generation (finish_reason: \"length\", EvidenceState.PARTIAL). Increase max_tokens in the provider config to allow longer responses."))
+			m.push(roleSystem, boundedWarning(
+				"[PARTIAL] The response hit the provider's max_tokens limit and was cut off mid-generation (finish_reason: \"length\", EvidenceState.PARTIAL). Increase max_tokens in the provider config to allow longer responses.", m.width))
 		}
 
 		// ── IMPLICIT PIPELINE INTERCEPT: pipe stream output to next step ──
@@ -3440,14 +3417,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// build-patch operation (defensive; streams normally run without one).
 		m.finalizeBuildOperation(msg.err)
 		// NO-TOKEN-LEFT-BEHIND: flush ring-overflow tokens so a mid-stream
-		// failure preserves every rendered byte up to the error.
-		m.drainStreamRing()
+		// failure preserves every rendered byte up to the error. The terminal
+		// drain is exhaustive, so a burst is never truncated by the error.
+		m.drainStreamRingAll()
 		// ── AUTHORITATIVE STAGE: provider stream failed ─────────────
 		// A terminal stream failure marks the stage failed so no "waiting" /
 		// "streaming" indicator can survive the error.
 		m.setStage("model", m.getActiveModelName(), stageFailed)
 		m.streamCh = nil
 		m.streamRing = nil
+		m.resetTokenPacer()
 		m.streaming = false
 		m.streamParser = nil
 		m.streamCancel = nil

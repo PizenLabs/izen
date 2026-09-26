@@ -14,12 +14,24 @@ import (
 // only when updated==true.
 type FrameTickMsg time.Time
 
-// FrameTickInterval is the debounced frame interval: 30ms (~33 FPS).
-const FrameTickInterval = 30 * time.Millisecond
+// FrameTickInterval is the default debounced frame interval: 30ms (~33 FPS).
+const FrameTickInterval = FrameInterval
 
 // FrameTickCmd returns a tea.Cmd that sends a FrameTickMsg after FrameTickInterval.
 func FrameTickCmd() tea.Cmd {
-	return tea.Tick(FrameTickInterval, func(t time.Time) tea.Msg {
+	return frameTickCmdEvery(FrameTickInterval)
+}
+
+// frameTickCmdEvery returns a tea.Cmd that sends a FrameTickMsg after d. It is
+// the per-model cadence seam: a model armed for the 60 FPS low-latency profile
+// re-arms through the same FrameTickMsg handler at HighFrameInterval, so the
+// message type — and therefore every consumer — stays single-shaped while the
+// visual cadence is a live setting. A non-positive d falls back to the default.
+func frameTickCmdEvery(d time.Duration) tea.Cmd {
+	if d <= 0 {
+		d = FrameTickInterval
+	}
+	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return FrameTickMsg(t)
 	})
 }

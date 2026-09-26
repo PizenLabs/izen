@@ -556,8 +556,13 @@ func footerDropToFit(width int, segments []string) string {
 func statusArrowIn(n string) string  { return "↑" + n }
 func statusArrowOut(n string) string { return "↓" + n }
 
-// executingSpinner renders the braille spinner frame with a cyan→amber
-// pulsation, signalling live background activity during EXECUTING.
+// executingSpinner renders the braille spinner frame during EXECUTING.
+//
+// The hue is a cyan→amber pulsation, not the emerald ramp the idle dock uses:
+// amber is the TUI's established "work is in flight" accent here, and the
+// pulsation (smoothstepped so the sine never shows a velocity discontinuity)
+// restores perceived motion at 10Hz. Executing keeps its distinct identity while
+// the shared braille glyph cycle keeps both indicators visually related.
 func (m *model) executingSpinner() string {
 	n := len(ProposalSpinnerFrames)
 	frameStr := ProposalSpinnerFrames[m.spinnerFrame%n]
