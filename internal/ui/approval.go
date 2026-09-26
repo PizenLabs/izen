@@ -31,11 +31,6 @@ type approvalPromptData struct {
 //
 //nolint:unused // Ready for approval flow wiring; not yet in call path.
 func renderApprovalPrompt(data approvalPromptData, width int) string {
-	if width < 50 {
-		width = 50
-	}
-	innerW := width - 4
-
 	var b strings.Builder
 	b.WriteString(ApprovalTitle.Render(Icon.Warning + " APPROVAL REQUIRED"))
 	b.WriteString("\n\n")
@@ -100,24 +95,19 @@ func renderApprovalPrompt(data approvalPromptData, width int) string {
 	}
 
 	// Key bindings
-	sep := strings.Repeat("─", innerW-6)
-	b.WriteString(" " + sep + "\n")
+	b.WriteString(" " + boundRule(width, ApprovalBox, 2) + "\n")
 	fmt.Fprintf(&b, "%s  %s",
 		ApprovalKey.Render("Alt+A / Enter  Accept"),
 		ApprovalKey.Render("Alt+R / Esc    Reject"),
 	)
 
-	return ApprovalBox.Width(width).Render(b.String())
+	return boundBox(ApprovalBox, width).Render(b.String())
 }
 
 // renderBuildApprovalPrompt renders a SHELL_EXEC approval prompt with task details.
 //
 //nolint:unused
 func renderBuildApprovalPrompt(taskTarget, taskDesc string, width int) string {
-	if width < 50 {
-		width = 50
-	}
-
 	var b strings.Builder
 	b.WriteString(ApprovalTitle.Render(Icon.Warning + " PERMISSION REQUIRED"))
 	b.WriteString("\n\n")
@@ -129,14 +119,12 @@ func renderBuildApprovalPrompt(taskTarget, taskDesc string, width int) string {
 		b.WriteString(ApprovalInfo.Render("Reason: " + taskDesc))
 		b.WriteString("\n\n")
 	}
-	innerW := width - 4
-	sep := strings.Repeat("─", innerW-6)
-	b.WriteString(" " + sep + "\n")
+	b.WriteString(" " + boundRule(width, ApprovalBox, 2) + "\n")
 	fmt.Fprintf(&b, "%s  %s  %s",
 		ApprovalKey.Render("Alt+A / Enter  Allow Once"),
 		ApprovalKey.Render("Alt+L  Allow Always"),
 		ApprovalKey.Render("Alt+R / Esc  Reject"),
 	)
 
-	return ApprovalBox.Width(width).Render(b.String())
+	return boundBox(ApprovalBox, width).Render(b.String())
 }

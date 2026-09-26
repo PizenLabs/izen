@@ -3050,7 +3050,7 @@ func (m *model) runTestCmd(target string) tea.Cmd {
 					"    target path (e.g. ./pkg/foo, ./internal/bar/...).",
 				goFileCount, goFileCount*8,
 			)
-			m.push(roleSystem, warningStyle.Render(warning))
+			m.push(roleSystem, boundedWarning(warning, m.width))
 			m.refreshViewportContent()
 			m.gotoBottomIfAllowed()
 			m.pendingTestConfirm = true
@@ -3082,7 +3082,7 @@ func (m *model) runRunCmd(target string) tea.Cmd {
 					"    target path (e.g. ./pkg/foo, ./internal/bar/...).",
 				goFileCount, goFileCount*8,
 			)
-			m.push(roleSystem, warningStyle.Render(warning))
+			m.push(roleSystem, boundedWarning(warning, m.width))
 			m.refreshViewportContent()
 			m.gotoBottomIfAllowed()
 			m.pendingTestConfirm = true

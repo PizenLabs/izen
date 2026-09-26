@@ -60,12 +60,16 @@ func NewAskComponent(question string, multiSelect bool, options []AskOption) Ask
 var (
 	askCardStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#74c7ec"))
+			BorderForeground(lipgloss.Color("#74c7ec")).
+			Padding(0, 1)
 	askTitleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cdd6f4"))
 	askCursorStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#a6e3a1"))
 	askDescStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	askRecStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f9e2af"))
 	askHintStyle   = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("#585b70"))
+	// askBody is the neutral foreground the description rows are measured
+	// against when the body wrap width is computed.
+	askBody = lipgloss.NewStyle().Foreground(lipgloss.Color("#cdd6f4"))
 )
 
 // HandleKey routes one logical key ("j", "k", "up", "down", "space",
@@ -178,20 +182,28 @@ func (a AskComponent) Update(msg tea.Msg) (AskComponent, tea.Cmd) {
 }
 
 // Render renders the modal card at the given width. Empty options render a
-// safe placeholder; width < 20 degrades gracefully (never panics).
+// safe placeholder; narrow widths degrade gracefully (never panics).
+//
+// Every line — the question, each option title, each description, the hint row
+// — is word-wrapped to the bounded frame width before the box is drawn, so a
+// long clarification question or option description can never push the right
+// border past the viewport.
 func (a AskComponent) Render(width int) string {
-	if width < 20 {
-		width = 20
+	if width < MinBoundWidth+BorderCells {
+		width = MinBoundWidth + BorderCells
 	}
 	if width > 80 {
 		width = 80
 	}
+	// Padding is one cell on each side of the frame; the border adds two more.
+	inner := max(ContentWidth(width)-BorderCells-askBody.GetHorizontalPadding(), MinBoundWidth)
+
 	var b strings.Builder
 	q := a.Question
 	if q == "" {
 		q = "Clarification needed"
 	}
-	b.WriteString(askTitleStyle.Render("? "+q) + "\n")
+	b.WriteString(askTitleStyle.Render("? "+WrapBody(q, inner)) + "\n")
 	for i, opt := range a.Options {
 		cursor := "  "
 		if i == a.Cursor {
@@ -208,9 +220,9 @@ func (a AskComponent) Render(width int) string {
 		if opt.Recommended {
 			title += " " + askRecStyle.Render("(Recommended)")
 		}
-		fmt.Fprintf(&b, "%s%s\n", cursor, title)
+		fmt.Fprintf(&b, "%s%s\n", cursor, WrapBody(title, inner-2))
 		if opt.Description != "" {
-			b.WriteString("    " + askDescStyle.Render(opt.Description) + "\n")
+			b.WriteString("    " + askDescStyle.Render(WrapBody(opt.Description, inner-4)) + "\n")
 		}
 	}
 	if len(a.Options) == 0 {
@@ -221,5 +233,5 @@ func (a AskComponent) Render(width int) string {
 	} else {
 		b.WriteString(askHintStyle.Render("j/k navigate · enter submit · esc cancel") + "\n")
 	}
-	return askCardStyle.Width(width).Render(strings.TrimSuffix(b.String(), "\n"))
+	return Bound(askCardStyle, width).Render(strings.TrimSuffix(b.String(), "\n"))
 }

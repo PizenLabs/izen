@@ -63,6 +63,7 @@ import (
 	"github.com/PizenLabs/izen/internal/tui/components/shimmer"
 	"github.com/PizenLabs/izen/internal/tui/tips"
 	"github.com/PizenLabs/izen/internal/ui/diff"
+	"github.com/PizenLabs/izen/internal/ui/markdown"
 	uiplan "github.com/PizenLabs/izen/internal/ui/plan"
 	"github.com/PizenLabs/izen/internal/ui/status"
 	uitool "github.com/PizenLabs/izen/internal/ui/tool"
@@ -872,7 +873,12 @@ type model struct {
 	// and in every terminal stream handler, so no byte is ever lost. It is
 	// only ever accessed via atomic ops from the producer's captured
 	// reference and from the main Update goroutine.
-	streamRing      *streamRing
+	streamRing *streamRing
+	// tokenPacer is the frame-paced consumer of streamRing: it releases a
+	// bounded batch of tokens per frame tick so the render cadence is a
+	// constant 30/60 FPS instead of a mirror of the provider's token rate.
+	// See model_stream.go for the batch policy and the adaptive cadence.
+	tokenPacer      *TokenPacer
 	responseBuffer  strings.Builder
 	reasoningBuffer strings.Builder
 	streaming       bool
@@ -1850,6 +1856,13 @@ type model struct {
 	// aiStreamTailCache. It is the no-change fast-path key and the prefix
 	// anchor for the incremental extension check.
 	aiStreamTailContent string
+	// aiStreamUncommitted is the UncommittedBuffer for the live streaming
+	// record. It holds the still-growing trailing line and decides whether that
+	// line is structurally final. While it is not, the line is rendered as
+	// PLAIN DIMMED TEXT with no block/inline interpretation, so a partially
+	// received table row, fence, heading, or `**bold**` span cannot re-flow the
+	// viewport dozens of times per second. See internal/ui/markdown.
+	aiStreamUncommitted *markdown.Buffer
 	// docScrollOffset is the app-owned single scroll position into the
 	// scrollable document. The bubbles viewport is a pure render surface
 	// (content is pre-sliced to exactly the visible window and
@@ -2951,6 +2964,17 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	// Any emergency interrupt settles the Esc double-tap window: a fired or
 	// superseded cancel must never leave a stale "Press Esc again!" hint.
 	m.disarmInterrupt()
+	// NO-TOKEN-LEFT-BEHIND: flush the frame-paced token queue BEFORE the
+	// teardown below releases it. reconcileSpinner drops m.streamRing, and the
+	// producer's terminal streamErrMsg is dispatched to a channel this path has
+	// already abandoned — so anything still parked in the ring at the instant the
+	// user hits Ctrl+C would be discarded even though the provider had already
+	// delivered those bytes. The drain is exhaustive, exactly like the
+	// streamDoneMsg/streamErrMsg terminal drains, and the promotion runs through
+	// the same flushStreamContentToView the frame tick uses, so the partial answer
+	// the user cancelled after stays on screen.
+	m.drainStreamRingAll()
+	m.flushStreamContentToView()
 	// 0. Cancel the authoritative operation context FIRST so provider calls
 	// and subprocesses spawned under the active operation observe the
 	// cancellation immediately (Section 6: context propagation).
@@ -4070,6 +4094,7 @@ func (m *model) resetStreamingState() {
 	m.streaming = false
 	m.streamCh = nil
 	m.streamRing = nil
+	m.resetTokenPacer()
 	m.streamCancel = nil
 	m.streamTickActive = false
 	m.refreshScheduled = false
@@ -4146,6 +4171,7 @@ func (m *model) reconcileSpinner() {
 	m.clearBusyFlags()
 	m.streamCh = nil
 	m.streamRing = nil
+	m.resetTokenPacer()
 	m.streamCancel = nil
 	m.shellCh = nil
 	if m.shellCancel != nil {
@@ -5033,6 +5059,17 @@ func (m *model) renderStreamingTail(content string, wrapWidth int) []DocumentLin
 		completePart = content[:lastNL]
 	}
 	partialLine := content[lastNL+1:]
+	// UncommittedBuffer: the still-growing trailing line is fed here so the
+	// block state is explicit and testable. Push is a pure append; the commit
+	// split above already carved the line out of `content`, so the buffer only
+	// ever holds the uncommitted population.
+	if m.aiStreamUncommitted == nil {
+		m.aiStreamUncommitted = markdown.NewBuffer(wrapWidth)
+	}
+	m.aiStreamUncommitted.SetWidth(wrapWidth)
+	m.aiStreamUncommitted.Reset()
+	m.aiStreamUncommitted.Push(partialLine)
+	m.aiStreamUncommitted.SetBlockState(m.aiStreamRenderer.inCode, m.aiStreamRenderer.inTable)
 	// Commit new complete logical lines to the persistent renderer. consumed
 	// always points at a logical-line boundary, so any feed starts exactly at a
 	// separator newline whose leading Split element is spurious — drop it.
@@ -5064,8 +5101,10 @@ func (m *model) renderStreamingTail(content string, wrapWidth int) []DocumentLin
 		inCode:    m.aiStreamRenderer.inCode,
 		lang:      m.aiStreamRenderer.lang,
 		codeLines: append([]string(nil), m.aiStreamRenderer.codeLines...),
+		inTable:   m.aiStreamRenderer.inTable,
+		tableRows: append([]string(nil), m.aiStreamRenderer.tableRows...),
 	}
-	partial.renderLine(partialLine, wrapWidth)
+	partial.renderPartialLine(partialLine, wrapWidth)
 	tail := append(append([]DocumentLine(nil), m.aiStreamRenderer.out...), partial.out...)
 	m.aiStreamTailContent = content
 	m.aiStreamTailCache = append([]DocumentLine(nil), tail...)
@@ -5085,6 +5124,9 @@ func (m *model) resetStreamingRenderer() {
 	m.aiStreamConsumed = 0
 	m.aiStreamTailCache = nil
 	m.aiStreamTailContent = ""
+	if m.aiStreamUncommitted != nil {
+		m.aiStreamUncommitted.Reset()
+	}
 }
 
 // renderTailPanelLines renders the fixed tail panels that follow the
@@ -5793,10 +5835,13 @@ func (m *model) renderFlowingSpinner() string {
 // Used exclusively in the BOTTOM LOADING DOCK (above the prompt input bar)
 // and the status bar to maintain layout symmetry — snowflake glyphs (✻/❆)
 // are reserved for the inline status line in the viewport body.
+//
+// The glyph is drawn through spinnerGlyph, so the emerald ramp advances with the
+// animation frame: a 10Hz glyph change with a synchronised hue cycle reads as
+// one continuous rotation instead of a glyph that jumps between two static
+// colours.
 func (m *model) renderRectSpinner() string {
-	n := len(ProposalSpinnerFrames)
-	idx := m.spinnerFrame % n
-	return SpinnerStyle.Render(ProposalSpinnerFrames[idx])
+	return spinnerGlyph(m.spinnerFrame)
 }
 
 func (m *model) renderWorkspaceHeader() string {

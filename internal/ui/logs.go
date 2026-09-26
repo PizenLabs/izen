@@ -306,14 +306,21 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 		contentWidth = 10
 	}
 
+	// Each expanded panel is a framed box whose width is derived from the live
+	// viewport: a long log line re-flows inside the frame instead of sizing the
+	// box to its payload and pushing the right border off-screen.
+	thoughtBox := boundBox(thoughtLogBoxStyle, width)
+	systemBox := boundBox(systemLogBoxStyle, width)
+	summaryBox := boundBox(buildSummaryBoxStyle, width)
+
 	// Render thinking content (LLM reasoning) when expanded
 	if thinking != "" {
-		b.WriteString(thoughtLogBoxStyle.Render(thoughtLogTitleStyle.Render("  Reasoning")))
+		b.WriteString(thoughtBox.Render(thoughtLogTitleStyle.Render("  Reasoning")))
 		b.WriteString("\n")
 		for _, line := range strings.Split(thinking, "\n") {
 			wrapped := wrapLine(line, contentWidth)
 			for _, wl := range wrapped {
-				b.WriteString(thoughtLogBoxStyle.Render("  " + mutedStyle.Render(wl)))
+				b.WriteString(thoughtBox.Render("  " + mutedStyle.Render(wl)))
 				b.WriteString("\n")
 			}
 		}
@@ -321,24 +328,24 @@ func RenderEntry(entry LogEntry, width int, dotFrame int) string {
 
 	// Render system execution log when expanded
 	if systemLog != "" {
-		b.WriteString(systemLogBoxStyle.Render(systemLogTitleStyle.Render("  System Log")))
+		b.WriteString(systemBox.Render(systemLogTitleStyle.Render("  System Log")))
 		b.WriteString("\n")
 		for _, line := range strings.Split(systemLog, "\n") {
 			wrapped := wrapLine(line, contentWidth)
 			for _, wl := range wrapped {
-				b.WriteString(systemLogBoxStyle.Render("  " + mutedStyle.Render(wl)))
+				b.WriteString(systemBox.Render("  " + mutedStyle.Render(wl)))
 				b.WriteString("\n")
 			}
 		}
 	}
 
 	if content != "" {
-		b.WriteString(buildSummaryBoxStyle.Render(buildSummaryTitleStyle.Render("  Details")))
+		b.WriteString(summaryBox.Render(buildSummaryTitleStyle.Render("  Details")))
 		b.WriteString("\n")
 		for _, line := range strings.Split(content, "\n") {
 			wrapped := wrapLine(line, contentWidth)
 			for _, wl := range wrapped {
-				b.WriteString(buildSummaryBoxStyle.Render("  " + mutedStyle.Render(wl)))
+				b.WriteString(summaryBox.Render("  " + mutedStyle.Render(wl)))
 				b.WriteString("\n")
 			}
 		}

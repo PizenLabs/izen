@@ -372,6 +372,9 @@ func stageLabel(kind EventKind) string {
 func stageBadge(status ActivityStatus, spinnerFrame int) string {
 	switch status {
 	case ActivityStatusRunning:
+		// Raw glyph (unstyled) so the badge column keeps its exact width: the
+		// emerald ramp is applied by the caller's own style, and a styled glyph
+		// would be double-wrapped by padRightVisual's escape-aware padding.
 		frame := ProposalSpinnerFrames[spinnerFrame%len(ProposalSpinnerFrames)]
 		return orangeStyle.Render(padRightVisual(frame, statusBadgeWidth))
 	case ActivityStatusFailed:

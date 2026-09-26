@@ -20,7 +20,7 @@ import (
 func (m *model) runExplainDecisionCmd() tea.Cmd {
 	root := m.workspaceRoot
 	if root == "" {
-		m.push(roleSystem, warningStyle.Render("no workspace root — cannot inspect decisions"))
+		m.push(roleSystem, boundedWarning("no workspace root — cannot inspect decisions", m.width))
 		m.refreshViewportContent()
 		return nil
 	}
@@ -57,8 +57,8 @@ func (m *model) runExplainDecisionCmd() tea.Cmd {
 				"      alt        %-16s confidence %.2f", alt.Label, alt.Confidence())))
 		}
 		if verdict.RunnerUp != nil && verdict.Decision == inference.DecisionEscalateToHuman {
-			m.push(roleSystem, warningStyle.Render(fmt.Sprintf(
-				"      ⚠ %s", verdict.Reason)))
+			m.push(roleSystem, boundedWarning(fmt.Sprintf(
+				"      ⚠ %s", verdict.Reason), m.width))
 		}
 		m.push(roleSystem, "")
 	}

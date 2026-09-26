@@ -266,8 +266,15 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamLiveTokens = 0
 	m.streamBaseInputTokens = estimatePromptTokens(content)
 	m.streamInputPricePerM, m.streamOutputPricePerM = m.lookupStreamPricing(m.getActiveModelName())
-	m.streamCh = make(chan tea.Msg, 1024)
+	// The engine→UI transport: a deep non-blocking channel (>= MinEventBuffer)
+	// fronted by a lock-free overflow ring. Depth decouples engine workers from
+	// render latency; the ring absorbs a burst when the event loop is mid-frame;
+	// the frame-paced TokenPacer re-releases the overflow at a constant frame
+	// cadence so the visual rate never mirrors the provider's token rate.
+	m.streamCh = newEventChannel(EventChannelBuffer)
 	m.streamRing = newStreamRing(streamRingCapacity)
+	m.resetTokenPacer()
+	m.tokenPacer = NewTokenPacer(m.streamRing, 0, 0, m.frameInterval())
 	m.streaming = true
 	m.spinnerFrame = 0
 	// A fresh stream starts a new assistant record: the streaming tail is
