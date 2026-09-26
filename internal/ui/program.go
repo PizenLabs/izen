@@ -217,6 +217,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		currentEffort:       EffortAuto,
 		plannerMu:           &sync.Mutex{},
 		traceVerbose:        IsTraceVerbose(),
+		reasoningViewport:   newReasoningViewport(),
 	}
 	// Keep the presentation bootstrap aligned with the persisted style even
 	// when the program is constructed outside cmd/izen (tests/embedded hosts).

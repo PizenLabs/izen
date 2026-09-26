@@ -66,8 +66,19 @@ func (m *model) renderContextHeader() string {
 // pushes into scrollback are never redrawn — that is where the stacked `ask )`
 // prompt bars come from. Clipping here, on the way out, is what makes the leak
 // structurally impossible rather than merely unlikely.
+//
+// PROMPT INPUT PATH ISOLATION: when the only thing that changed is the prompt
+// bar, the frame is re-composed from the cached document bands and a freshly
+// rendered prompt region (promptComposeFrame). That is the difference between a
+// keystroke costing O(prompt) and costing O(document), and it is what makes
+// typing stay inside its latency budget while an answer streams behind it.
+// Everything else — a stream frame, a scroll, a resize, any overlay — composes
+// the whole workspace exactly as it always did.
 func (m *model) View() string {
 	bounds := m.Screen()
+	if base, ok := m.promptComposeFrame(bounds); ok {
+		return base
+	}
 	base := renderBoundedWorkspace(m.BuildWorkspace(), bounds)
 	// The security interceptor is the topmost modal: a pending permission
 	// decision can never be bypassed by the quit dialog or any other overlay.
@@ -99,6 +110,7 @@ func renderBoundedWorkspace(ws Workspace, bounds ScreenBounds) string {
 	return ClipFrame(composeBottomAnchoredFrame([]compositeRegion{
 		{text: ws.Header, rows: regionHeight(ws.Header)},
 		{text: ws.Viewport, rows: ws.ViewportRows, elastic: true},
+		{text: ws.ReasoningPanel, rows: ws.ReasoningRows},
 		{text: ws.ProposalDock, rows: regionHeight(ws.ProposalDock)},
 		{text: ws.Input, rows: regionHeight(ws.Input)},
 		{text: ws.Footer, rows: regionHeight(ws.Footer)},
@@ -199,15 +211,20 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 			top = 0
 		}
 
-		return Workspace{
-			Header:       m.cachedHeaderView,
-			Viewport:     m.composeViewportWindow(top, width, geo.Height),
-			ViewportRows: geo.Height,
-			ProposalDock: proposalDockView,
-			Input:        inputView,
-			Footer:       m.cachedFooterView,
-			Actions:      actions,
+		reasoningView := m.renderReasoningPanel()
+		ws := Workspace{
+			Header:         m.cachedHeaderView,
+			Viewport:       m.composeViewportWindow(top, width, geo.Height),
+			ViewportRows:   geo.Height,
+			ReasoningPanel: reasoningView,
+			ReasoningRows:  m.reasoningPanelRows,
+			ProposalDock:   proposalDockView,
+			Input:          inputView,
+			Footer:         m.cachedFooterView,
+			Actions:        actions,
 		}
+		m.capturePromptRegions(ws, width, m.Screen(), borderColor)
+		return ws
 	}
 
 	// ── Fixed Header / Footer (authoritative geometry source) ──
@@ -271,15 +288,24 @@ func (m *model) assembleScreen(actions []Action) Workspace {
 		viewportView = m.Viewport.View()
 	}
 
-	return Workspace{
-		Header:       headerView,
-		Viewport:     viewportView,
-		ViewportRows: geo.Height,
-		ProposalDock: proposalDockView,
-		Input:        inputView,
-		Footer:       footerView,
-		Actions:      actions,
+	ws := Workspace{
+		Header:         headerView,
+		Viewport:       viewportView,
+		ViewportRows:   geo.Height,
+		ReasoningPanel: m.renderReasoningPanel(),
+		ReasoningRows:  m.reasoningPanelRows,
+		ProposalDock:   proposalDockView,
+		Input:          inputView,
+		Footer:         footerView,
+		Actions:        actions,
 	}
+	// PROMPT INPUT PATH ISOLATION: this is the one place every band has just
+	// been rendered and measured against a known budget, so it is the one place
+	// the document side of the frame can be captured for the prompt-only
+	// recomposition. A full compose is what makes the cache valid; a keypress
+	// never writes to it.
+	m.capturePromptRegions(ws, width, m.Screen(), borderColor)
+	return ws
 }
 
 // capProposalDock bounds the proposal dock to the rows left over once the
@@ -318,16 +344,33 @@ func capProposalDock(dock string, screenH, headerH, promptH, footerH int) string
 // height and the drawn height come to disagree.
 func (m *model) measureViewportGeometry(headerView, proposalView, inputView, footerView string) ViewportGeometry {
 	bounds := m.Screen()
-	height := ViewportHeight(
+	// The rows the scrollable area may use at all, before the reasoning panel
+	// takes its share. This is the ONLY place the split is decided: the frame,
+	// the document window composer and the mouse mapper all read the geometry
+	// this returns, so a second opinion about the split could only ever be a
+	// disagreement with what was drawn.
+	available := ViewportHeight(
 		bounds.Height,
 		regionHeight(headerView),
 		regionHeight(proposalView),
 		regionHeight(inputView),
 		regionHeight(footerView),
 	)
+	height := m.applyReasoningSplit(available)
+	// The panel wraps to the same pane width the conversation does, so both
+	// bands are measured against one number and neither can exceed the pane.
+	m.reasoningViewport.Width = max(m.PaneWidth(), minViewportWidth)
 	top := regionHeight(headerView) + m.viewportPaneTop
 	if top < 0 {
 		top = 0
+	}
+	// The panel is the band DIRECTLY BELOW the conversation viewport, so its
+	// first row is the row after the viewport ends. Publishing the rectangle
+	// here is what lets the mouse dispatcher answer a bounds question with two
+	// integer reads instead of re-measuring the chrome.
+	m.reasoningPanelTop = top + height
+	if m.reasoningPanelRows <= 0 {
+		m.reasoningPanelTop = 0
 	}
 	return ViewportGeometry{
 		Top:    top,

@@ -1156,7 +1156,20 @@ type model struct {
 	// bounded batch of tokens per frame tick so the render cadence is a
 	// constant 30/60 FPS instead of a mirror of the provider's token rate.
 	// See model_stream.go for the batch policy and the adaptive cadence.
-	tokenPacer      *TokenPacer
+	tokenPacer *TokenPacer
+	// streamAccum is the thread-safe delta accumulator that stands between the
+	// provider goroutine and the event loop (stream_accumulator.go). The
+	// producer appends content and reasoning deltas straight into it and
+	// returns; the Update loop receives NO per-token message and drains the
+	// whole batch on the next FrameTickMsg. It is the reason a 100+ tok/s
+	// stream cannot starve the queue a wheel event is waiting in.
+	//
+	// streamRing remains the overflow lane for messages that arrive on the
+	// channel path (the executor/gated streams and any producer that has not
+	// been converted); the two are drained by the same frame pass, in that
+	// order, so a converted producer's deltas always precede any message that
+	// was still in flight behind them.
+	streamAccum     *streamAccumulator
 	responseBuffer  strings.Builder
 	reasoningBuffer strings.Builder
 	streaming       bool
@@ -1918,6 +1931,48 @@ type model struct {
 	// the response pipeline.
 	thinkingBuffer *ThinkingBuffer
 
+	// ── DUAL-VIEWPORT REASONING FOCUS (Ctrl+O) ──────────────────────────
+	//
+	// The reasoning block is a SECOND, dedicated scrollable viewport rather than
+	// a box painted inside the conversation. Two states are tracked because they
+	// are genuinely different questions:
+	//
+	//   - reasoningExpanded: is the panel mounted and taking rows from the main
+	//     conversation viewport?
+	//   - reasoningFocused: does the reasoning panel own mouse-scroll input?
+	//
+	// Keeping them apart is what makes the hand-off lossless: the panel can stay
+	// mounted (holding its scroll position) at any moment scroll control returns
+	// to the main viewport, and it can be re-focused without the pane re-budgeting
+	// its rows on the same keypress.
+	reasoningExpanded bool
+	reasoningFocused  bool
+	// reasoningViewport is the dedicated sub-viewport that owns the reasoning
+	// text while the panel is expanded. It is a real bubbles viewport, so its
+	// mouse-wheel scrolling, YOffset clamping and tail-follow semantics are the
+	// library's rather than a hand-rolled reimplementation of them.
+	reasoningViewport viewport.Model
+	// reasoningSyncedBytes / reasoningSyncedKind / reasoningSyncedWidth are the
+	// (buffer length, source identity, wrap width) triple the panel content was
+	// last built from. They make the per-frame content sync O(1) in the common
+	// case: an unchanged buffer is not re-wrapped, which matters because a live
+	// stream grows it on every frame.
+	reasoningSyncedBytes int
+	reasoningSyncedKind  int
+	reasoningSyncedWidth int
+	// reasoningSynced reports whether the panel content has ever been pushed into
+	// reasoningViewport. The first sync anchors the window at the tail (there is
+	// no previous position to preserve); every later sync either follows the tail
+	// during a live stream or preserves the reader's position once idle.
+	reasoningSynced bool
+	// reasoningPanelTop is the absolute terminal row of the panel's first line
+	// and reasoningPanelRows is its height, both published by the layout pass so
+	// the mouse dispatcher can answer "is this row inside the panel?" with two
+	// integer reads. The wheel path must stay O(1) — it may not re-measure the
+	// chrome (see the strict mouse-scroll short-circuit contract).
+	reasoningPanelTop  int
+	reasoningPanelRows int
+
 	// Number of reasoningBuffer bytes already flushed into thinkingBuffer from
 	// the sentinel path. Tracks the delta so the unified thinking box never
 	// double-appends the same reasoning on successive ticks.
@@ -2219,6 +2274,37 @@ type model struct {
 	// ingestion consults it (via calculateEffectiveYOffset) and never
 	// mutates yOffset while it is true.
 	userScrollLocked bool
+	// userDetached is THE auto-scroll detach latch for the conversation, and
+	// the only field the render path reads to decide whether the stream tail
+	// owns the viewport (AUTO-SCROLL DETACH LATCH).
+	//
+	// It replaces reading the trio above as a conjunction. Three names for one
+	// bit is three chances to disagree, and they did: the tail-pin test read
+	// only two of the three (userScrolledAway || userScrollLocked) while
+	// keys.go and several render gates read only userIsScrollingUp, so the
+	// question "is the user off the tail?" had three different answers
+	// depending on which file asked. One field, written from exactly one
+	// place (setScrollLocked), has one answer.
+	//
+	// Semantics are the mandate's, unchanged: an upward scroll always engages
+	// it; a downward scroll releases it only at the absolute bottom. While it
+	// is true, incoming stream tokens update the backing document WITHOUT
+	// moving the viewport — which is what lets a reader scroll up mid-answer
+	// and stay where they put the wheel.
+	userDetached bool
+	// reasoningDetached is the reasoning panel's own auto-scroll detach latch,
+	// and it is deliberately NOT the same field as userDetached.
+	//
+	// The panel holds an EXCLUSIVE scroll lock (reasoningScrollLocked), so at
+	// any instant exactly one surface can be detached. Sharing one flag
+	// across the two would make them steal each other's state: a reader who
+	// scrolled up inside the reasoning panel, then collapsed it to read the
+	// answer, would come back to a conversation that had silently stopped
+	// following the stream — scrolled by a wheel that, by contract, belonged
+	// to the panel (see routeReasoningScroll). Two latches, one per surface,
+	// keeps each surface's follow state a function of input that actually
+	// reached it.
+	reasoningDetached bool
 	// lastScrollTime is the timestamp watermark of the most recent
 	// wheel/scroll-key event (TTY render decoupling §3). isScrollActive()
 	// derives the scroll-burst window from time.Since(lastScrollTime) — a
@@ -2248,6 +2334,35 @@ type model struct {
 	cachedFooterView string
 	// chromeCacheHits counts fast-path reuses (test observability).
 	chromeCacheHits int
+	// ── PROMPT INPUT PATH ISOLATION ────────────────────────────────────
+	// The document and the prompt bar are two independent surfaces that happen
+	// to share a frame. Typing changes exactly one of them, and that split is
+	// what keeps a keystroke off the Markdown AST pipeline: a keypress sets
+	// promptDirty and leaves the document generation alone, so the next View()
+	// re-composites the bottom prompt region against the document rows the
+	// previous frame already rendered.
+	//
+	// documentDirty is DERIVED from documentGen, which the document pipeline
+	// bumps itself, so a mutation site that forgets to invalidate cannot serve a
+	// stale document. A keypress, by contrast, bumps nothing — and that is the
+	// whole point, so the cheap flag is the one that has to be set by hand.
+	promptDirty    bool
+	documentGen    uint64
+	promptRegions  promptRegionCache
+	promptComposes int
+	// streamPacer is the single frame-bound render gate for every background
+	// stream — the answer, the reasoning trace, the /exec output, and the tool
+	// log. A producer only records that it appended; the FrameTickMsg handler
+	// does the rendering, once, for all of them. See stream_pacer.go.
+	streamPacer *streamPacer
+	// typewriter is the character-level reveal pacer for the answer stream
+	// (typewriter_pacer.go). It is constructed at the production stream start
+	// and released at a turn boundary. A nil typewriter means "reveal
+	// immediately", which is what every headless harness builds — so the
+	// smoothing is additive and never changes the tested immediate-reveal
+	// contract, while the live TUI interpolates a bursty answer into a fluid
+	// typewriter animation.
+	typewriter *typewriterPacer
 	// lastScrollTotal caches the full scrollable document height (chrome +
 	// records/streaming + tail panels) from the most recent refresh so
 	// scroll-bounds helpers (selection auto-scroll, wheel) stay consistent
@@ -2274,6 +2389,46 @@ type model struct {
 	// It is the O(1) source for selection and copy. Re-rasterized only on
 	// WindowSizeMsg or document buffer updates, never on mouse movement.
 	framebuffer *Framebuffer
+	// ── PER-FRAME COST: the O(document) caches ────────────────────────
+	// A streaming frame changes exactly one thing about the document: rows are
+	// APPENDED at the end. Everything below the streaming tail is byte-stable
+	// for the whole turn. The three structures a frame would otherwise
+	// re-derive from the whole document — the row pool, the hit map and the
+	// selection framebuffer — are therefore cacheable across streaming frames,
+	// which is what makes a frame tick cost O(new rows + visible window)
+	// instead of O(document). See incremental_frame_cache.go.
+	//
+	// Each cache carries its own validity KEY rather than a dirty flag,
+	// because a dirty flag has to be set at every write site and one forgotten
+	// site is a silent staleness bug. A key is read from the very state the
+	// cache is derived from, so a cache cannot outlive its input.
+
+	// docRowCache holds the rendered rows of docLayout.Lines[0:docRowCached].
+	// docRowCached is always a STABLE boundary: the streaming partial line —
+	// the single row re-rendered from scratch every tick as it grows — is
+	// deliberately excluded, so the cache is never asked to hold a row that
+	// can still change.
+	docRowCache  []string
+	docRowCached int
+	// docRowRebuilds and hitMapRebuilds count full re-derivations, so a test can
+	// assert that a frame was SERVED rather than RECOMPUTED. They are the
+	// observable form of the property the caches exist to provide.
+	docRowRebuilds int
+	hitMapRebuilds int
+	// docRowRecords/docRowWidth identify what the cache was built from: the
+	// records the immutable prefix was flattened from, and the wrap width it
+	// was wrapped at. A change to either invalidates every row below the tail.
+	docRowRecords int
+	docRowWidth   int
+	// hitMapCache is the memoized record-derived hit map (hitmap.go). It is a
+	// pure function of (records, prefix height, pane width), and none of
+	// those move during a stream — the answer is committed as a record only
+	// at completion, which is not a streaming frame.
+	hitMapCache        []RowLayout
+	hitMapCacheRecords int
+	hitMapCachePrefix  int
+	hitMapCacheWidth   int
+	hitMapCacheLive    bool
 }
 
 // isProjectInitialized checks whether .izen/ exists AND contains a valid
@@ -4464,6 +4619,7 @@ func (m *model) resetStreamingState() {
 	m.streamCh = nil
 	m.streamRing = nil
 	m.resetTokenPacer()
+	m.streamAccum = nil
 	m.streamCancel = nil
 	m.streamTickActive = false
 	m.refreshScheduled = false
@@ -4541,6 +4697,7 @@ func (m *model) reconcileSpinner() {
 	m.streamCh = nil
 	m.streamRing = nil
 	m.resetTokenPacer()
+	m.streamAccum = nil
 	m.streamCancel = nil
 	m.shellCh = nil
 	if m.shellCancel != nil {
@@ -4608,7 +4765,15 @@ func (m *model) emitVisibleContent(raw string) {
 		// Append the new token to docLayout's streaming segment immediately
 		// (O(streaming record), never the whole document) so the throttled
 		// 30FPS repaint always renders the current frame.
-		if m.docLayout != nil && m.streaming {
+		//
+		// With the typewriter pacer active, the bytes are QUEUED here and the
+		// render is driven by advanceTypewriter on the frame tick instead: the
+		// whole point of the pacer is that newly arrived bytes are placed a
+		// slice at a time. The deferred sync is safe because advanceTypewriter
+		// runs on the same frame that drained this emission.
+		if m.typewriter != nil {
+			m.typewriter.Push(visible)
+		} else if m.docLayout != nil && m.streaming {
 			m.syncStreamingSegment()
 		}
 	}
@@ -4834,6 +4999,13 @@ func (m *model) latestCheckpointID() string {
 // WindowSizeMsg or structural record mutation; streaming ticks update only the
 // trailing record.
 func (m *model) refreshViewportContent() {
+	// PROMPT INPUT PATH ISOLATION: every document mutation converges here, so
+	// this is the one place the document region can be declared changed. Bumping
+	// a generation here rather than setting a flag at each write site is what
+	// makes the prompt-only path safe: a site that forgot to invalidate cannot
+	// serve a stale document, because the counter moves whether or not anyone
+	// remembers to say so.
+	m.markDocumentChanged()
 	if !m.Ready {
 		return
 	}
@@ -4905,7 +5077,7 @@ func (m *model) refreshViewportContent() {
 	// on mouse movement. While dragging we keep the frozen framebuffer to
 	// avoid layout shifts; a new raster is built after drag ends.
 	layoutChanged := m.docLayout == nil || m.docLayout.Len() != prevLayoutLen || m.docLayout.Width() != prevLayoutWidth
-	if !m.mouseSel.Dragging && (layoutChanged || m.framebuffer == nil) {
+	if !m.mouseSel.Dragging && (layoutChanged || m.framebuffer == nil) && m.framebufferNeeded() {
 		m.framebuffer = Rasterize(m.docLayout, m.wrapWidth)
 		// Cap memory: if height exceeds viewport+buffer, slice to windowed version.
 		if m.framebuffer != nil && m.framebuffer.Height > m.Viewport.Height+2*FramebufferBufferLines {
@@ -4954,9 +5126,12 @@ func (m *model) refreshViewportContent() {
 		pool = append(pool, chromeLines[i])
 	}
 	docLen := m.docLayout.Len()
-	for i := 0; i < docLen; i++ {
-		pool = append(pool, m.docLayout.Lines[i].RenderedStr)
-	}
+	// The document rows come from the incremental cache: during a stream the
+	// rows below the tail never change, so re-reading them out of the
+	// 88-byte-strided docLayout struct array on every frame is a memory walk
+	// proportional to the whole conversation for no new information. The cache
+	// always re-reads the volatile trailing row. See incremental_frame_cache.go.
+	pool = append(pool, m.docRowPool(docLen)...)
 	pool = append(pool, tailLines...)
 	m.scrollDocLines = pool
 	m.scrollSpaceLine = strings.Repeat(" ", m.PaneWidth())
@@ -5001,11 +5176,19 @@ func (m *model) refreshViewportContent() {
 		}
 		m.fullHitRows = fullRows
 	} else {
-		fullRows = buildFullHitMap(m)
+		fullRows = m.hitMapFor()
 		if total > len(fullRows) {
+			// The padding is placeholder geometry (a row that belongs to no
+			// record), not derived data, so it is never part of the cache. It
+			// is materialised into a fresh slice so the cached backing array is
+			// never written past its length by a caller that believes it owns
+			// the rows.
+			padded := make([]RowLayout, total)
+			copy(padded, fullRows)
 			for i := len(fullRows); i < total; i++ {
-				fullRows = append(fullRows, RowLayout{RecordIdx: -1, LogicalLine: -1, PrefixCells: 0})
+				padded[i] = RowLayout{RecordIdx: -1, LogicalLine: -1, PrefixCells: 0}
 			}
+			fullRows = padded
 		}
 		m.fullHitRows = fullRows
 		if m.mouseSel.Dragging && m.frozenFullHitRows == nil {
@@ -5347,7 +5530,18 @@ func (m *model) syncStreamingSegment() {
 		m.resetStreamingRenderer()
 		return
 	}
-	content := ensurePreflightDelimiter(sanitizeText(m.currentStreamContent))
+	// ── TYPEWRITER REVEAL WINDOW ────────────────────────────────────────
+	// The still-streaming tail renders the REVEALED prefix, not the whole
+	// authoritative buffer: the typewriter pacer releases a small adaptive
+	// slice per frame so a packet-sized burst is painted as flowing text
+	// instead of a single jump. m.currentStreamContent stays complete and
+	// authoritative — the committed record and every terminal path read it —
+	// so a paused reveal can delay the pixels but never the answer.
+	visible := m.currentStreamContent
+	if m.typewriter != nil {
+		visible = m.typewriter.Revealed()
+	}
+	content := ensurePreflightDelimiter(sanitizeText(visible))
 	if content == "" {
 		return
 	}
@@ -5493,7 +5687,16 @@ func (m *model) renderStreamingTail(content string, wrapWidth int) []DocumentLin
 		codeLines: append([]string(nil), m.aiStreamRenderer.codeLines...),
 		inTable:   m.aiStreamRenderer.inTable,
 	}
-	partial.renderPartialLine(partialLine, wrapWidth)
+	// TRANSIENT AST BALANCE (frame sync loop, incremental_frame_cache.go). The
+	// raw partial line stays authoritative everywhere else — the UncommittedBuffer
+	// above, the table holdback below, the memo key at the bottom, and the record
+	// that is eventually committed. Only THIS frame's markdown parse sees the
+	// balanced copy, so an unclosed `**`, `*`, `~~` or backtick is styled on the
+	// first tick instead of flashing its raw marker and restyling a frame later.
+	// The copy is derived per tick and discarded with the frame; nothing is stored
+	// and the underlying message buffer is never modified.
+	partial.renderPartialFramed(partialLine,
+		frameTailLine(partialLine, partial.inCode, partial.inTable), wrapWidth)
 	if partial.inTable && !m.aiStreamRenderer.inTable {
 		// LATCH ON at the opening pipes. The trailing line has been recognised
 		// as a table block BEFORE a single row committed, so the one-line
@@ -5578,9 +5781,23 @@ func (m *model) resetStreamingRenderer() {
 	if m.aiStreamUncommitted != nil {
 		m.aiStreamUncommitted.Reset()
 	}
+	// TURN BOUNDARY: a new turn's document is not an extension of the last
+	// one's, so the append-only assumption the per-frame caches rest on stops
+	// holding here. Dropping them is free (the next frame rebuilds at the cost
+	// the pre-cache code always paid) and removes a whole class of "the rows
+	// are from the previous answer" bug.
+	m.invalidateFrameCaches()
 	// LATCH OFF (stream-completion termination): a holdback that outlives its
 	// stream would keep the indicator mounted over the next turn's first token.
 	m.tableLatch.Release()
+	// TURN BOUNDARY for the typewriter reveal: outside a live stream the tail
+	// renderer has already been trimmed away, so a retained revealed prefix
+	// (and its backlog) is dead memory describing an answer that is no longer
+	// streaming. It is dropped only when the stream is NOT live, so a resize
+	// that rebuilds the layout mid-answer keeps the reveal in progress.
+	if !m.streaming {
+		m.resetTypewriter()
+	}
 }
 
 // renderTailPanelLines renders the fixed tail panels that follow the
@@ -5733,15 +5950,14 @@ func (m *model) renderStreamThinkingOnly(width int) string {
 
 // calculateEffectiveYOffset returns the effective viewport offset over the
 // full scrollable document. When the user has NOT scrolled away from the tail
-// (!m.userScrolledAway && !m.userScrollLocked), it is continuously pinned to
-// the tail:
+// (!m.userDetached), it is continuously pinned to the tail:
 //
 //	yOffset = max(0, total - Viewport.Height)
 //
-// STREAMING-SCROLL DECOUPLING: while userScrollLocked is true, incoming
-// stream tokens update the backing document layout WITHOUT mutating yOffset —
-// the offset is preserved (clamped) so the layout never bounces between the
-// tail and the manual position frame-by-frame. Otherwise it is the app-owned
+// STREAMING-SCROLL DECOUPLING: while userDetached is true, incoming stream
+// tokens update the backing document layout WITHOUT mutating yOffset — the
+// offset is preserved (clamped) so the layout never bounces between the tail
+// and the manual position frame-by-frame. Otherwise it is the app-owned
 // scroll offset clamped to the document. An active mouse drag owns the
 // viewport: the offset is preserved exactly so the selection controller
 // (handleSelectionAutoScroll) can move it without the tail-lock fighting it.
@@ -5761,7 +5977,7 @@ func (m *model) calculateEffectiveYOffset(total int) int {
 		return off
 	}
 	if m.viewportManager.ShouldFollowTail(
-		m.userScrolledAway || m.userScrollLocked,
+		m.userDetached,
 		m.mouseSel.Active && m.mouseSel.Dragging,
 	) {
 		return maxOff
@@ -5791,12 +6007,17 @@ func (m *model) maxAppScroll() int {
 	return maxOff
 }
 
-// setScrollLocked flips the single tail-lock flag. userScrolledAway is the
-// authoritative "user left the tail" state; userIsScrollingUp is kept in sync
-// for the legacy callers that still read it; userScrollLocked is the explicit
-// manual-scroll engagement lock consumed by the streaming-scroll decoupling
-// guard (calculateEffectiveYOffset). All three always move together.
+// setScrollLocked flips the conversation's auto-scroll detach latch.
+//
+// It is the ONLY writer of the latch family. userDetached is the authoritative
+// bit that the tail-pin decision and the frame-throttled content sync read;
+// userScrolledAway and userIsScrollingUp are the legacy mirrors kept for the
+// render gates and history navigation that still name them, and
+// userScrollLocked is the name the streaming-scroll decoupling mandate was
+// specified under. All four move together here, so a reader that names any of
+// them gets the same answer.
 func (m *model) setScrollLocked(locked bool) {
+	m.userDetached = locked
 	m.userScrolledAway = locked
 	m.userIsScrollingUp = locked
 	m.userScrollLocked = locked
@@ -5811,6 +6032,29 @@ func (m *model) followTail() {
 	}
 	m.setScrollLocked(false)
 	m.refreshViewportContent()
+}
+
+// resetAutoScrollLatch re-arms auto-follow at a turn boundary — stream
+// completion, or /clear — and reports whether anything had to be released.
+//
+// It exists because "the user is off the tail" is only meaningful *while there
+// is a tail to follow*. At the end of a turn the streaming tail is replaced by a
+// committed record and a status line is appended, so the document is re-laid
+// out: a preserved numeric offset no longer addresses the same content it did a
+// frame ago, and a latch left engaged would pin the NEXT thing that arrives
+// (a status line, a plan card) to a stale row instead of the tail.
+//
+// The reasoning panel is deliberately NOT reset here. Its latch protects a
+// position inside a trace that has stopped growing, so there is nothing left to
+// yank it away from, and clearing it would discard the step the reader chose.
+// It is re-armed by scrolling to the bottom or pressing Space, like any other
+// panel position.
+func (m *model) resetAutoScrollLatch() bool {
+	if !m.userDetached {
+		return false
+	}
+	m.setScrollLocked(false)
+	return true
 }
 
 // scrollBy moves the app-owned scroll offset by delta rows with deterministic
@@ -5837,6 +6081,10 @@ func (m *model) scrollBy(delta int) {
 	}
 	m.setScrollLocked(true)
 	m.markScrollBurst()
+	// The scroll offset selects WHICH document rows are on screen, so a scroll is
+	// a document-region change even though no row moved. The prompt-only path
+	// reuses the composed viewport band verbatim, so it has to know.
+	m.markDocumentChanged()
 	m.docScrollOffset += delta
 	if maxOff := m.maxAppScroll(); m.docScrollOffset > maxOff {
 		m.docScrollOffset = maxOff
@@ -5850,13 +6098,13 @@ func (m *model) scrollBy(delta int) {
 		m.refreshViewportContent()
 	}
 	// DETERMINISTIC RE-ENGAGEMENT: only a downward scroll that lands on the
-	// absolute bottom releases the manual lock so the live stream tail
-	// resumes. An upward scroll always holds the lock (even when the
-	// document has no scrollable range), and anything short of the bottom
-	// keeps it so tokens accumulate without yanking the view. The scroll
-	// burst watermark is NOT cleared here — tail re-engagement is about
-	// scroll-lock, while the prompt burst persists until any KeyMsg or the
-	// watermark expiry, matching the legacy release-timer semantics.
+	// absolute bottom releases the latch so the live stream tail resumes. An
+	// upward scroll always holds it (even when the document has no scrollable
+	// range), and anything short of the bottom keeps it so tokens accumulate
+	// without yanking the view. The scroll burst watermark is NOT cleared here
+	// — tail re-engagement is about the detach latch, while the prompt burst
+	// persists until any KeyMsg or the watermark expiry, matching the legacy
+	// release-timer semantics.
 	if delta > 0 && m.docScrollOffset >= m.maxAppScroll() {
 		m.setScrollLocked(false)
 	}

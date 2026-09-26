@@ -228,10 +228,15 @@ func TestCtrlOTogglesThoughtBlock(t *testing.T) {
 
 // TestCtrlOAsyncToggleDuringStreaming guards the async reasoning toggle: while
 // reasoning tokens are still streaming in (m.streaming == true), a Ctrl+O
-// keypress must expand the inline faint reasoning box in the Viewport body
-// IMMEDIATELY (no waiting for stream completion, no freeze). Collapsed state
-// must never leak the full reasoning text into the body; expanded state must
-// show it.
+// keypress must make the full reasoning text inspectable IMMEDIATELY (no waiting
+// for stream completion, no freeze).
+//
+// The surface it is inspectable on is the DEDICATED reasoning viewport, not the
+// conversation body: Ctrl+O mounts a second scrollable band and hands it the
+// wheel. So the body keeps only the one-line handle, and the prose is asserted
+// against the panel — the two are separate surfaces precisely so the body cannot
+// become a second, unscrollable copy of the same text. Collapsed state must never
+// leak the reasoning into either surface.
 func TestCtrlOAsyncToggleDuringStreaming(t *testing.T) {
 	m := newTestModel()
 	m.state = StateChat
@@ -252,19 +257,32 @@ func TestCtrlOAsyncToggleDuringStreaming(t *testing.T) {
 
 	// Async expand on keypress while still streaming.
 	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
-	if !m.thinkingBuffer.Expanded() {
-		t.Fatal("Ctrl+O did not expand the thought block during active streaming")
+	if !m.reasoningExpanded || !m.reasoningFocused {
+		t.Fatal("Ctrl+O did not expand + focus the reasoning panel during active streaming")
 	}
-	expanded := m.Viewport.View()
-	if !strings.Contains(expanded, "live reasoning tokens") {
-		t.Fatalf("Ctrl+O during streaming did not show the inline reasoning box: %q", expanded)
+	if strings.Contains(m.Viewport.View(), "live reasoning tokens") {
+		t.Fatal("the conversation body duplicated the reasoning the panel owns")
+	}
+	// The panel's row budget is only allocated by the layout pass, so compose a
+	// frame before reading the band. assembleScreen is the same entry the view
+	// registry uses, so this is the band the terminal would actually receive.
+	ws := m.assembleScreen(nil)
+	if ws.ReasoningRows <= 0 {
+		t.Fatal("the layout budget gave the reasoning panel no rows")
+	}
+	if got := ws.ReasoningPanel; !strings.Contains(got, "live reasoning tokens") {
+		t.Fatalf("Ctrl+O during streaming did not show the reasoning panel: %q", got)
 	}
 
 	// Async collapse on a second keypress while still streaming.
 	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
-	if m.thinkingBuffer.Expanded() {
-		t.Fatal("Ctrl+O did not collapse the thought block during active streaming")
+	if m.reasoningExpanded || m.reasoningFocused {
+		t.Fatal("Ctrl+O did not collapse the reasoning panel during active streaming")
 	}
+	if got := m.renderReasoningPanel(); got != "" {
+		t.Fatalf("collapsed panel still renders rows: %q", got)
+	}
+	m.refreshViewportContent()
 	collapsedAgain := m.Viewport.View()
 	if strings.Contains(collapsedAgain, "live reasoning tokens") {
 		t.Fatalf("collapsed body leaked reasoning after second Ctrl+O: %q", collapsedAgain)

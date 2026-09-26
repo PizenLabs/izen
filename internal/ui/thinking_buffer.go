@@ -355,15 +355,63 @@ func (tb *ThinkingBuffer) Render(width int, streaming bool, spinner string) stri
 	// While the reasoning block is still streaming show a compact spinner
 	// plus a faint expand hint; once it finishes (terminal event or stream
 	// over) collapse into a single-line summary.
+	return tb.renderCollapsed(elapsedStr, reasoningTokens, complete, streaming, spinner, "[Ctrl+O to expand]", "")
+}
+
+// PanelOpenHint is the affordance carried by the collapsed handle while the
+// dedicated reasoning viewport is mounted. The reasoning text is no longer in
+// this block, so without it the keypress that opened the panel would look like
+// it deleted the line it was pressed on.
+const PanelOpenHint = " · Ctrl+O to close"
+
+// RenderHandle renders the collapsed one-line handle for a reasoning block whose
+// text has been handed to the dedicated reasoning viewport.
+//
+// It is deliberately NOT Render with the expansion flag forced off: the handle
+// is a different sentence, not the same one. While the block is still streaming
+// it says the panel is open instead of offering to open it, and once complete it
+// keeps the authoritative token count — which is the only part of the summary a
+// reader of the body still needs, because the prose is one band below.
+func (tb *ThinkingBuffer) RenderHandle(width int, streaming bool, spinner string) string {
+	tb.mu.Lock()
+	empty := tb.builder.Len() == 0
+	complete := tb.complete
+	reasoningTokens := tb.reasoningTokens
+	var elapsed time.Duration
+	if complete && !tb.ended.IsZero() {
+		elapsed = tb.ended.Sub(tb.started)
+	} else {
+		elapsed = time.Since(tb.started)
+	}
+	tb.mu.Unlock()
+	if empty {
+		return ""
+	}
+	return tb.renderCollapsed(formatElapsed(elapsed), reasoningTokens, complete, streaming, spinner,
+		"[reasoning panel open]", PanelOpenHint)
+}
+
+// renderCollapsed is the shared collapsed rendering: a live spinner line while
+// the block streams, a one-line summary once it is done, plus the affordance
+// that fits the surface it is being rendered into.
+//
+// complete is passed in rather than read here because every caller has already
+// sampled it under the lock; re-reading it would be an unsynchronized read of a
+// field the stream goroutine's sibling writes.
+func (tb *ThinkingBuffer) renderCollapsed(elapsedStr string, reasoningTokens int, complete bool, streaming bool, spinner, hint, suffix string) string {
 	if streaming && !complete {
 		sp := spinner
 		if sp == "" {
 			sp = SpinnerSnowflake()
 		}
 		return thinkingStyle.Render(fmt.Sprintf("%s Thinking.. (%s)  %s",
-			sp, elapsedStr, mutedStyle.Render("[Ctrl+O to expand]")))
+			sp, elapsedStr, mutedStyle.Render(hint)))
 	}
-	return thinkingStyle.Render(renderThoughtSummary(elapsedStr, reasoningTokens))
+	line := renderThoughtSummary(elapsedStr, reasoningTokens)
+	if suffix != "" {
+		line += mutedStyle.Render(suffix)
+	}
+	return thinkingStyle.Render(line)
 }
 
 // thinkingStyle is the dimmed/italic reasoning style. Reasoning must read as a

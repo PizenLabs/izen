@@ -107,6 +107,14 @@ func isPrintableRunes(msg tea.KeyMsg) bool {
 // "active text input" keyboard precedence (priority 1): a printable character
 // typed into the focused input is ALWAYS text — it can never be hijacked by a
 // card, chip, or keybinding shortcut.
+//
+// PROMPT INPUT PATH ISOLATION: the prompt region is marked dirty here, and the
+// DOCUMENT is not. That is the whole isolation, and it lives in this one function
+// so it covers every key that reaches the input — the ones the early fast path
+// takes AND the ones that fall through the full chain (a paste, a caret move, a
+// backspace). Marking it in one place is what makes "editing the prompt never
+// re-composes the document" a property of the input rather than of one
+// optimisation.
 func (m *model) forwardToInput(msg tea.KeyMsg) tea.Cmd {
 	var tiCmd tea.Cmd
 	m.ti, tiCmd = m.ti.Update(msg)
@@ -116,6 +124,7 @@ func (m *model) forwardToInput(msg tea.KeyMsg) tea.Cmd {
 	}
 	m.syncInputFromTI()
 	m.updateSuggestions()
+	m.markPromptChanged()
 	return tiCmd
 }
 
@@ -151,6 +160,10 @@ func (m *model) cycleExecVisibility() bool {
 //     contract. Takes precedence so a running shell is always inspectable.
 //  2. The event-driven ThinkingBuffer, then the legacy ThinkingPanel.
 //
+// The reasoning branch hands the toggle to the dedicated reasoning viewport
+// (see DUAL-VIEWPORT REASONING FOCUS): the block leaves the conversation body
+// and becomes its own scrollable band, and the wheel goes with it.
+//
 // The viewport is repainted synchronously so the inline box toggles
 // immediately on the keypress — even while reasoning tokens or shell output
 // are still streaming in (async inspection). Returns false when no thought or
@@ -165,13 +178,15 @@ func (m *model) toggleThoughtBlock() bool {
 		return true
 	}
 	// The settings preference is authoritative: Alt+O/Ctrl+O must not reveal
-	// hidden CoT content through a second control path.
-	if m.hideThinkingBlocks {
+	// hidden CoT content through a second control path. The refusal says so —
+	// a silently swallowed keypress is indistinguishable from a broken one.
+	if !m.reasoningDisplayEnabled() {
+		m.setToast(reasoningDisabledToast)
 		return true
 	}
 	switch {
 	case m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0:
-		m.thinkingBuffer.Toggle()
+		m.toggleReasoningPanel()
 	case m.thinkingPanel != nil:
 		m.thinkingPanel.Toggle()
 	case m.traceBuffer.Len() > 0:
@@ -185,6 +200,13 @@ func (m *model) toggleThoughtBlock() bool {
 	default:
 		return false
 	}
+	// Re-budget BEFORE repainting. Opening the panel moves rows from the
+	// conversation viewport to the reasoning one, and the document window is
+	// composed against the viewport's height — so a refresh that ran first would
+	// slice the conversation to the old height and the frame would carry one
+	// stale row (or one blank) for a frame. The budget is a function of the
+	// chrome, so this is a measurement, not a guess.
+	m.recalcViewportHeight()
 	m.refreshViewportContent()
 	// While the output-trace viewport is expanded during an active stream,
 	// preserve the user's scroll position: new chunks must never yank the
@@ -475,6 +497,17 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// ── THOUGHT-BOX SCROLL ────────────────────────────────────────────
+	// While the dedicated reasoning viewport holds the focus lock, j/k, arrows
+	// and PgUp/PgDn scroll WITHIN IT — the same proposal-diff convention the
+	// inline box used, applied to the band that now owns the reasoning. The
+	// interception is gated on the panel actually overflowing: a panel whose text
+	// fits must not swallow the j and k of a half-typed word, and the prompt bar
+	// is the one surface that can never be traded for a convenience.
+	if m.reasoningScrollLocked() && m.reasoningScrollable() && m.state != StateAwaitingApproval {
+		if handled, cmd := m.handleReasoningScrollKey(msg); handled {
+			return m, cmd
+		}
+	}
 	// While the expanded reasoning box overflows maxLines, j/k, arrows, and
 	// PgUp/PgDn scroll WITHIN the box (the proposal-diff convention) so the
 	// user can read earlier reasoning without losing place. Space jumps back
@@ -482,7 +515,10 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// these keys fall through to the main viewport / input untouched — and the
 	// intercepted keys never reach the text input, so no raw ANSI/regex escape
 	// sequence can leak into the prompt bar.
-	if m.thinkingBuffer != nil && m.thinkingBuffer.Expanded() && m.thinkingBuffer.HasOverflow() &&
+	//
+	// The inline box is the LEGACY expansion surface: it is only reachable when
+	// the dedicated panel is not mounted, so the two can never both own j/k.
+	if !m.reasoningExpanded && m.thinkingBuffer != nil && m.thinkingBuffer.Expanded() && m.thinkingBuffer.HasOverflow() &&
 		m.state != StateAwaitingApproval {
 		switch {
 		case msg.String() == "k" || msg.Type == tea.KeyUp || msg.Type == tea.KeyCtrlU:
@@ -1500,10 +1536,15 @@ func (m *model) submitEnter() (tea.Model, tea.Cmd) {
 // triggers a SYNCHRONOUS viewport flush so the new prompt appears at the
 // bottom of the document instantly — never waiting for an external UI event
 // or a throttled repaint tick.
+//
+// The unlock goes through setScrollLocked rather than assigning the latch
+// fields directly, for two reasons. It is the single place that may clear the
+// latch family, so a field added to it later cannot be missed here. And it has
+// to happen BEFORE followTail, because followTail returns early on a
+// not-yet-ready model — writing the bits here is what guarantees a submission
+// made during startup still re-arms auto-follow.
 func (m *model) lockTailToNewPrompt() {
-	m.userScrolledAway = false
-	m.userIsScrollingUp = false
-	m.userScrollLocked = false
+	m.setScrollLocked(false)
 	m.endScrollBurst()
 	m.followTail()
 	m.refreshViewportContentImmediate()

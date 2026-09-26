@@ -138,6 +138,7 @@ func (m *model) applySettingsCommit(msg settings_widget.CommitMsg) {
 	prompt.SetActiveStyle(activeStyle)
 	m.hideThinkingBlocks = cfg.UI.HideThinking
 	m.setAutoScrollMode(cfg.ActiveAutoScrollMode())
+	m.releaseReasoningPanelIfHidden()
 	m.settingsModel = m.settingsModel.
 		SetValues(settings_widget.Values{
 			ResponseStyle: activeStyle,
@@ -157,6 +158,7 @@ func (m *model) applyLoadedConfig(cfg *config.Config) {
 	m.cfg = cfg
 	m.hideThinkingBlocks = cfg.UI.HideThinking
 	m.setAutoScrollMode(cfg.ActiveAutoScrollMode())
+	m.releaseReasoningPanelIfHidden()
 	prompt.SetActiveStyle(cfg.ActiveStylePolicy())
 	if m.showSettings {
 		m.settingsModel = m.settingsModel.SetValues(settings_widget.Values{

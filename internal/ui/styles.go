@@ -513,7 +513,12 @@ var (
 	mdH3Style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
 	mdH4Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	// Inline code: Pink text (#f5c2e7) on Surface0 background (#313244).
-	mdCodeSpanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f5c2e7")).Background(lipgloss.Color("#313244"))
+	mdCodeSpanStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#f5c2e7")).Background(lipgloss.Color("#313244"))
+	// Inline strikethrough (GFM `~~`): struck text in Overlay1 (#6c7086), so a
+	// retracted line reads as retracted rather than merely dimmer. The
+	// SGR-9 fallback in applyInlineStyles covers terminals where lipgloss drops
+	// the attribute.
+	mdStrikeStyle     = lipgloss.NewStyle().Strikethrough(true).Foreground(lipgloss.Color("#6c7086"))
 	mdLinkStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#89b4fa")).Underline(true)
 	mdMutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c7086"))
 	mdCodeContStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#f9e2af"))

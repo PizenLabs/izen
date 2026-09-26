@@ -57,6 +57,32 @@ type Workspace struct {
 	// is pinned to whatever it happened to render instead. The two can differ —
 	// and when they do, only the budget's number is the truth.
 	ViewportRows int
+	// ReasoningPanel is the dedicated reasoning band (Ctrl+O) and
+	// ReasoningRows is the row count the budget assigned it. It is a first-class
+	// band rather than part of Viewport for the same reason ViewportRows is a
+	// number: the conversation and the reasoning are two independent scroll
+	// surfaces, so each needs its own pinned row count, and the pair has to sum
+	// to the rows the scrollable area was given. Empty when the panel is closed.
+	ReasoningPanel string
+	ReasoningRows  int
+}
+
+// backdropParts returns the workspace bands that make up a modal's BACKDROP, in
+// composition order and with empty bands dropped.
+//
+// Every overlay background is built from this one list rather than from five
+// hand-written sequences, and that is what keeps a band added to the workspace —
+// the Ctrl+O reasoning panel, for one — from silently disappearing the moment a
+// modal opens. A backdrop that quietly drops a band is not a backdrop, it is a
+// different screen, and the user cannot tell which one they are still looking at.
+func backdropParts(ws Workspace) []string {
+	parts := make([]string, 0, 5)
+	for _, band := range []string{ws.Viewport, ws.ReasoningPanel, ws.ProposalDock, ws.Input, ws.Footer} {
+		if band != "" {
+			parts = append(parts, band)
+		}
+	}
+	return parts
 }
 
 // ViewportManager is the workspace-owned runtime authority for stream
@@ -183,9 +209,109 @@ func (r *Registry) For(mode modes.Mode) (ViewMode, bool) {
 // it resolves UI lifecycle overlays (init / help / loading) and otherwise
 // delegates to the registered ViewMode for the current mode. The renderer
 // never sees mode, banner, prompt, footer, or action logic.
-// sessionPickerDialogSize clamps the session picker dialog to the terminal.
-func (m *model) sessionPickerDialogSize() (int, int) {
-	return sessionPickerDialogSizeFor(m.PaneWidth(), m.PaneHeight())
+func (m *model) BuildWorkspace() Workspace {
+	// One gate, one list, one place. The prompt-only recomposition path asks the
+	// SAME predicate before it reuses any cached band, because an overlay
+	// replaces the entire frame — a cached document band drawn underneath one is
+	// not a stale document, it is a document behind a dialog.
+	if m.workspaceOverlayGate() {
+		return m.buildWorkspaceOverlay()
+	}
+	if !m.Ready {
+		return Workspace{Overlay: "Loading IZEN..."}
+	}
+	if m.viewRegistry == nil {
+		return Workspace{}
+	}
+	v, ok := m.viewRegistry.For(m.resolver.Current())
+	if !ok {
+		return Workspace{}
+	}
+	return v.BuildWorkspace(m)
+}
+
+// workspaceOverlayGate reports whether the frame is an OVERLAY rather than the
+// composed workspace. It is the exact condition under which BuildWorkspace
+// discards every band, exposed as a predicate so the prompt-only path can
+// consult it without composing anything.
+//
+// It is derived from state, not from a flag: a flag would have to be set at every
+// open and every close of every surface, and a surface that forgot to clear it
+// would paint a dialog-less frame forever. Reading the conditions is the same
+// number of comparisons and cannot drift.
+func (m *model) workspaceOverlayGate() bool {
+	switch {
+	case m.showStatus:
+		// Status is an explicitly requested, read-only overlay. It stays
+		// available even while a host is still completing initialization.
+		return true
+	case !m.isProjectInitialized():
+		// FIRST-RUN DISK GATE: the authoritative .izen/ existence check
+		// supersedes any in-memory initStage value.
+		return true
+	case m.initStage != initNone && m.initStage != initComplete:
+		return true
+	case m.showHelpOverlay:
+		return true
+	case m.showSettings:
+		return true
+	case m.showModelPicker:
+		return true
+	case m.showSessionPicker && m.sessionPicker != nil:
+		return true
+	case m.showTraceOverlay && m.telemetryDemuxer != nil:
+		return true
+	}
+	return false
+}
+
+// buildWorkspaceOverlay renders the overlay that workspaceOverlayGate selected.
+// Its order matches the gate's order and both must agree: a surface reachable
+// from one and not the other is a surface that can be opened but never closed,
+// or closed but never opened.
+func (m *model) buildWorkspaceOverlay() Workspace {
+	switch {
+	case m.showStatus:
+		return Workspace{Overlay: m.renderStatusModal()}
+	case m.initStage != initNone && m.initStage != initComplete, !m.isProjectInitialized():
+		return Workspace{Overlay: m.renderInitView()}
+	case m.showHelpOverlay:
+		return Workspace{Overlay: m.renderHelpOverlay()}
+	case m.showSettings:
+		return Workspace{Overlay: m.renderSettingsModal()}
+	case m.showModelPicker:
+		return Workspace{Overlay: m.renderModelPickerModal()}
+	case m.showSessionPicker && m.sessionPicker != nil:
+		return Workspace{Overlay: m.renderSessionPickerModal()}
+	case m.showTraceOverlay && m.telemetryDemuxer != nil:
+		return Workspace{Overlay: m.renderTraceOverlayModal()}
+	}
+	return Workspace{Overlay: "Loading IZEN..."}
+}
+
+// currentModeActions returns the capability set the current mode's view would
+// assemble, without composing the screen.
+//
+// Every mode view builds its actions through this same dispatch, so the
+// prompt-only path re-derives the set it needs instead of trusting a cached one.
+// That matters because a capability set can change WITHOUT the document changing
+// — a plan is approved, a diff is proposed — and the footer renders it.
+func (m *model) currentModeActions() []Action {
+	if m == nil {
+		return nil
+	}
+	switch m.resolver.Current() {
+	case modes.ModePlan:
+		return m.planActions()
+	case modes.ModeBuild:
+		return m.buildActions()
+	case modes.ModeInvestigate:
+		return m.investigateActions()
+	case modes.ModeReview:
+		return m.reviewActions()
+	default:
+		return m.askActions()
+	}
 }
 
 func (m *model) renderSessionPickerModal() string {
@@ -195,19 +321,7 @@ func (m *model) renderSessionPickerModal() string {
 			normalWS = v.BuildWorkspace(m)
 		}
 	}
-	var parts []string
-	if normalWS.Viewport != "" {
-		parts = append(parts, normalWS.Viewport)
-	}
-	if normalWS.ProposalDock != "" {
-		parts = append(parts, normalWS.ProposalDock)
-	}
-	if normalWS.Input != "" {
-		parts = append(parts, normalWS.Input)
-	}
-	if normalWS.Footer != "" {
-		parts = append(parts, normalWS.Footer)
-	}
+	parts := backdropParts(normalWS)
 	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
 	dialogW, dialogH := m.sessionPickerDialogSize()
@@ -264,19 +378,7 @@ func (m *model) renderModelPickerModal() string {
 			normalWS = v.BuildWorkspace(m)
 		}
 	}
-	var parts []string
-	if normalWS.Viewport != "" {
-		parts = append(parts, normalWS.Viewport)
-	}
-	if normalWS.ProposalDock != "" {
-		parts = append(parts, normalWS.ProposalDock)
-	}
-	if normalWS.Input != "" {
-		parts = append(parts, normalWS.Input)
-	}
-	if normalWS.Footer != "" {
-		parts = append(parts, normalWS.Footer)
-	}
+	parts := backdropParts(normalWS)
 	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
 	modalW, modalH := ModelPickerModalSize(m.PaneWidth(), m.PaneHeight())
@@ -339,19 +441,7 @@ func (m *model) renderStatusModal() string {
 			normalWS = view.BuildWorkspace(m)
 		}
 	}
-	var parts []string
-	if normalWS.Viewport != "" {
-		parts = append(parts, normalWS.Viewport)
-	}
-	if normalWS.ProposalDock != "" {
-		parts = append(parts, normalWS.ProposalDock)
-	}
-	if normalWS.Input != "" {
-		parts = append(parts, normalWS.Input)
-	}
-	if normalWS.Footer != "" {
-		parts = append(parts, normalWS.Footer)
-	}
+	parts := backdropParts(normalWS)
 	mainView := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
 	modalW, modalH := StatusModalSize(w, h)
@@ -391,19 +481,7 @@ func (m *model) renderSettingsModal() string {
 			normalWS = v.BuildWorkspace(m)
 		}
 	}
-	var parts []string
-	if normalWS.Viewport != "" {
-		parts = append(parts, normalWS.Viewport)
-	}
-	if normalWS.ProposalDock != "" {
-		parts = append(parts, normalWS.ProposalDock)
-	}
-	if normalWS.Input != "" {
-		parts = append(parts, normalWS.Input)
-	}
-	if normalWS.Footer != "" {
-		parts = append(parts, normalWS.Footer)
-	}
+	parts := backdropParts(normalWS)
 	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
 	modalW, modalH := SettingsModalSize(w, h)
@@ -438,19 +516,7 @@ func (m *model) renderTraceOverlayModal() string {
 			normalWS = v.BuildWorkspace(m)
 		}
 	}
-	var parts []string
-	if normalWS.Viewport != "" {
-		parts = append(parts, normalWS.Viewport)
-	}
-	if normalWS.ProposalDock != "" {
-		parts = append(parts, normalWS.ProposalDock)
-	}
-	if normalWS.Input != "" {
-		parts = append(parts, normalWS.Input)
-	}
-	if normalWS.Footer != "" {
-		parts = append(parts, normalWS.Footer)
-	}
+	parts := backdropParts(normalWS)
 	normalContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
 
 	if m.telemetryDemuxer == nil {
@@ -541,63 +607,35 @@ func splitVis(s string, visLen int) (string, string) {
 	return left.String(), right.String()
 }
 
-func (m *model) BuildWorkspace() Workspace {
-	// Status is an explicitly requested, read-only overlay. Keep it available
-	// even when a host is still completing workspace initialization; the normal
-	// onboarding/help surfaces remain underneath it.
-	if m.showStatus {
-		return Workspace{Overlay: m.renderStatusModal()}
-	}
-	// FIRST-RUN DISK GATE: authoritative .izen/ existence check supersedes
-	// any in-memory initStage value. This prevents stale/incorrect state
-	// (e.g., initNone zero value, initComplete from auto-create bypass)
-	// from rendering the workspace before the user completes onboarding.
-	if !m.isProjectInitialized() {
-		return Workspace{Overlay: m.renderInitView()}
-	}
-	if m.initStage != initNone && m.initStage != initComplete {
-		return Workspace{Overlay: m.renderInitView()}
-	}
-	if m.showHelpOverlay {
-		return Workspace{Overlay: m.renderHelpOverlay()}
-	}
-	if m.showSettings {
-		return Workspace{Overlay: m.renderSettingsModal()}
-	}
-	if m.showModelPicker {
-		return Workspace{Overlay: m.renderModelPickerModal()}
-	}
-	if m.showSessionPicker && m.sessionPicker != nil {
-		return Workspace{Overlay: m.renderSessionPickerModal()}
-	}
-	if m.showTraceOverlay && m.telemetryDemuxer != nil {
-		return Workspace{Overlay: m.renderTraceOverlayModal()}
-	}
-	if !m.Ready {
-		return Workspace{Overlay: "Loading IZEN..."}
-	}
-	if m.viewRegistry == nil {
-		return Workspace{}
-	}
-	v, ok := m.viewRegistry.For(m.resolver.Current())
-	if !ok {
-		return Workspace{}
-	}
-	return v.BuildWorkspace(m)
+// sessionPickerDialogSize clamps the session picker dialog to the terminal.
+func (m *model) sessionPickerDialogSize() (int, int) {
+	return sessionPickerDialogSizeFor(m.PaneWidth(), m.PaneHeight())
 }
 
 // ── /ask ───────────────────────────────────────────────────────────────────
 // Read-only mode: no handoff capabilities are exposed.
 type askView struct{}
 
+// askActions is the capability set /ask exposes. It is a METHOD rather than an
+// inline literal so the prompt-only recomposition path can re-derive the set it
+// needs to re-render the footer, instead of trusting a cached one that a
+// capability change may have invalidated.
+func (m *model) askActions() []Action { return m.currentResultActions() }
+
 func (askView) BuildWorkspace(m *model) Workspace {
-	return m.assembleScreen(m.currentResultActions())
+	return m.assembleScreen(m.askActions())
 }
 
 // ── /plan ──────────────────────────────────────────────────────────────────
 type planView struct{}
 
 func (planView) BuildWorkspace(m *model) Workspace {
+	return m.assembleScreen(m.planActions())
+}
+
+// planActions is the capability set /plan exposes. See askActions for why it is
+// a method.
+func (m *model) planActions() []Action {
 	var actions []Action
 	if len(m.handoffCtx.PendingTodos) > 0 {
 		if m.planApproved {
@@ -646,20 +684,28 @@ func (planView) BuildWorkspace(m *model) Workspace {
 	} else if len(m.currentResultActions()) > 0 {
 		actions = append(actions, m.currentResultActions()...)
 	}
-	return m.assembleScreen(actions)
+	return actions
 }
 
 // ── /build ─────────────────────────────────────────────────────────────────
 type buildView struct{}
 
+func (m *model) buildActions() []Action { return m.currentResultActions() }
+
 func (buildView) BuildWorkspace(m *model) Workspace {
-	return m.assembleScreen(m.currentResultActions())
+	return m.assembleScreen(m.buildActions())
 }
 
 // ── /investigate ───────────────────────────────────────────────────────────
 type investigateView struct{}
 
 func (investigateView) BuildWorkspace(m *model) Workspace {
+	return m.assembleScreen(m.investigateActions())
+}
+
+// investigateActions is the capability set /investigate exposes. See askActions
+// for why it is a method.
+func (m *model) investigateActions() []Action {
 	var actions []Action
 	if m.handoffCtx.ProposedFix != "" {
 		actions = append(actions, Action{
@@ -672,12 +718,14 @@ func (investigateView) BuildWorkspace(m *model) Workspace {
 			Priority: 100,
 		})
 	}
-	return m.assembleScreen(actions)
+	return actions
 }
 
 // ── /review ────────────────────────────────────────────────────────────────
 type reviewView struct{}
 
+func (m *model) reviewActions() []Action { return m.currentResultActions() }
+
 func (reviewView) BuildWorkspace(m *model) Workspace {
-	return m.assembleScreen(m.currentResultActions())
+	return m.assembleScreen(m.reviewActions())
 }

@@ -77,14 +77,22 @@ func TestPartialTableRowIsDivertedNotRendered(t *testing.T) {
 }
 
 // TestPartialLineReflowIsMonotonic is the observable flicker metric. Within one
-// hold-back run — a sequence of prefixes that are ALL still structurally
-// incomplete — the rendered tail may only grow: the line count must never
+// hold-back run — a sequence of prefixes that are ALL rendered by the SAME
+// mechanism — the rendered tail may only grow: the line count must never
 // decrease and the text already on screen must never be rewritten. A decrease or
 // a rewrite is a visible pop.
 //
-// The moment a prefix becomes structurally final it is PROMOTED to the full
-// pipeline, and that single transition is expected to change the rendering: a
-// line break or a block closure arriving is exactly what the contract allows.
+// A hold-back run ends at either of the two deliberate transitions:
+//
+//   - PROMOTION: the prefix becomes structurally final and goes down the full
+//     pipeline (a line break, a block closure).
+//   - INLINE BALANCE: the prefix acquires a transient AST parse copy, so the
+//     phrase starts rendering styled instead of held. This is the same kind of
+//     one-time transition — the raw marker stops being displayed because it is no
+//     longer what the line is — and it is what the balance exists to cause.
+//
+// Both are single edges, not ongoing churn. Everything AFTER an edge must be
+// monotonic, which is the property that says streaming does not flicker.
 func TestPartialLineReflowIsMonotonic(t *testing.T) {
 	const w = 80
 	sources := []string{
@@ -96,20 +104,26 @@ func TestPartialLineReflowIsMonotonic(t *testing.T) {
 		"func main() {",
 		"~~struck phrase~~ followed by plain text",
 		"see [the docs](https://example.com) for detail",
+		"a `code span` closes here",
+		"*an italic phrase* then plain",
 	}
 	for _, src := range sources {
 		r := &aiBlockRenderer{}
 		prevLines, prevText := 0, ""
 		held := false
+		balanced := false
 		for i := 1; i <= len(src); i++ {
 			prefix := src[:i]
-			_, incomplete := markdown.Incomplete(prefix, r.inCode, r.inTable)
-			if !incomplete && held {
-				// Promotion boundary: the line just became structurally final.
-				// Reset the comparison so the (expected) restyle is not read as
-				// a pop.
-				held, prevLines, prevText = false, 0, ""
-				continue
+			kind, incomplete := markdown.Incomplete(prefix, r.inCode, r.inTable)
+			nowBalanced := incomplete && kind == markdown.BlockInline &&
+				frameTailLine(prefix, r.inCode, r.inTable) != prefix
+			if nowBalanced != balanced || (!incomplete && held) {
+				// A deliberate one-time transition. Reset the comparison so the
+				// expected change of rendering is not read as a pop.
+				held, balanced, prevLines, prevText = false, nowBalanced, 0, ""
+				if !incomplete {
+					continue
+				}
 			}
 			lines := r.renderPartialTail(prefix, w)
 			if incomplete {
@@ -132,25 +146,115 @@ func TestPartialLineReflowIsMonotonic(t *testing.T) {
 	}
 }
 
-// TestUncommittedLineUsesPlainDimmedStyle pins the visual treatment: a held-back
-// line is dimmed and carries NO bold/italic SGR, so the eye reads it as "still
-// arriving" instead of watching markup flash in and out.
-func TestUncommittedLineUsesPlainDimmedStyle(t *testing.T) {
+// TestInlineDelimiterRendersStyledFromTheFirstFrame is the no-raw-marker
+// contract. `**bold` has an unterminated strong delimiter, and the frame's
+// TRANSIENT AST BALANCE closes it for this frame's parse only — so the phrase is
+// bold on the FIRST tick, with no `**` ever reaching the screen and no
+// restyle-to-bold frame later.
+//
+// This is the case the inline hold-back could never serve. The hold-back exists
+// to stop the viewport REFLOWING, and an inline delimiter cannot reflow anything:
+// it changes the style of the words after it, never the number of physical rows
+// or the width of any of them. Holding it back therefore bought no stability and
+// cost the entire point of streaming.
+func TestInlineDelimiterRendersStyledFromTheFirstFrame(t *testing.T) {
 	const w = 80
-	// `**bold` has an unterminated strong delimiter.
-	lines := (&aiBlockRenderer{}).renderPartialTail("**bold", w)
+	for _, tc := range []struct {
+		prefix string
+		want   string
+		absent string
+	}{
+		{"**bold", "bold", "**"},
+		{"*italic", "italic", "*i"},
+		{"a `code", "code", "`"},
+	} {
+		lines := (&aiBlockRenderer{}).renderPartialTail(tc.prefix, w)
+		if len(lines) == 0 {
+			t.Fatalf("%q rendered nothing", tc.prefix)
+		}
+		rendered := lines[len(lines)-1].RenderedStr
+		if got := ansi.Strip(rendered); strings.Contains(got, tc.absent) {
+			t.Errorf("%q leaked its raw marker: %q", tc.prefix, got)
+		}
+		if !strings.Contains(ansi.Strip(rendered), tc.want) {
+			t.Errorf("%q lost its content: %q", tc.prefix, ansi.Strip(rendered))
+		}
+		if !strings.Contains(rendered, "\x1b[") {
+			t.Errorf("%q rendered unstyled: %q", tc.prefix, rendered)
+		}
+	}
+}
+
+// TestInlineBalanceNeverChangesTheCommittedBytes is the buffer-safety contract.
+// The frame renders a balanced COPY, so every authoritative consumer of the line
+// — the UncommittedBuffer, the tail memo key, and ultimately the committed record
+// — must still see the exact bytes the provider sent. A committed transcript
+// containing a synthetic `**` would be a content bug, not a rendering one.
+func TestInlineBalanceNeverChangesTheCommittedBytes(t *testing.T) {
+	const raw = "**The migration is complete and verified"
+	m := readyChatModel(newTestModel())
+	m.streaming = true
+	m.streamingDocStart = -1
+	m.docLayout = &DocumentLayout{width: 80}
+	m.currentStreamContent = raw
+
+	m.syncStreamingSegment()
+	if got := m.aiStreamUncommitted.Pending(); got != raw {
+		t.Errorf("UncommittedBuffer.Pending() = %q, want the raw bytes %q", got, raw)
+	}
+	if m.aiStreamTailContent != raw {
+		t.Errorf("tail memo key = %q, want the raw bytes %q", m.aiStreamTailContent, raw)
+	}
+
+	// The frame shows styled text...
+	tail := m.docLayout.Lines[m.streamingDocStart:]
+	if len(tail) == 0 {
+		t.Fatal("the streaming tail rendered no rows")
+	}
+	shown := ansi.Strip(tail[len(tail)-1].RenderedStr)
+	if strings.Contains(shown, "**") {
+		t.Errorf("the streaming frame shows a raw marker: %q", shown)
+	}
+	if !strings.Contains(shown, "The migration is complete and verified") {
+		t.Errorf("the streaming frame lost content: %q", shown)
+	}
+
+	// ...and the line that COMMITS carries the provider's own bytes, with no
+	// synthetic closer baked into it. An unbalanced `**` is what the model
+	// actually wrote, so the committed transcript must show exactly that.
+	committed := renderAIBlockLines(raw, 80)
+	if len(committed) == 0 {
+		t.Fatal("the committed render produced no lines")
+	}
+	if got := ansi.Strip(committed[0].RenderedStr); !strings.Contains(got, raw) {
+		t.Errorf("the committed line is not the raw bytes: got %q, want %q", got, raw)
+	}
+}
+
+// TestBlockGrammarIsStillHeldBack is the counterpart: the balance applies to
+// INLINE delimiters only. A line that is block-incomplete must keep the
+// hold-back treatment, because those are grammar that changes what the line IS.
+func TestBlockGrammarIsStillHeldBack(t *testing.T) {
+	const w = 80
+	// An arriving fence: a transient closer on a fence marker would hand the
+	// rest of the line to a code block that does not exist yet.
+	for _, partial := range []string{"`", "``"} {
+		lines := (&aiBlockRenderer{}).renderPartialTail(partial, w)
+		if len(lines) == 0 {
+			t.Errorf("partial fence %q rendered nothing", partial)
+		}
+		if got := ansi.Strip(lines[len(lines)-1].RenderedStr); !strings.Contains(got, "`") {
+			t.Errorf("partial fence %q lost its marker (it must be held, not closed): %q", partial, got)
+		}
+	}
+	// An unclosed link is block-incomplete for the holdback and is NOT closed
+	// transiently: a `)` would fabricate a destination the model never wrote.
+	lines := (&aiBlockRenderer{}).renderPartialTail("see [the docs](https://exa", w)
 	if len(lines) == 0 {
-		t.Fatal("no lines rendered for an unterminated bold prefix")
+		t.Fatal("an unclosed link rendered nothing")
 	}
-	rendered := lines[len(lines)-1].RenderedStr
-	if !strings.Contains(rendered, "\x1b[") {
-		t.Error("a held-back line must still be styled (dimmed)")
-	}
-	if strings.Contains(rendered, "\x1b[1m") {
-		t.Errorf("a held-back line must not be bold yet: %q", ansi.Strip(rendered))
-	}
-	if !strings.Contains(ansi.Strip(rendered), "**bold") {
-		t.Errorf("a held-back line must show the raw text as typed, got %q", ansi.Strip(rendered))
+	if got := ansi.Strip(lines[len(lines)-1].RenderedStr); strings.Contains(got, "https://exa)") {
+		t.Errorf("an unclosed link was given a synthetic closer: %q", got)
 	}
 }
 
@@ -318,25 +422,16 @@ func TestUncommittedBufferResetsAtStreamBoundaries(t *testing.T) {
 // complete trailing line, because a grid's layout is not knowable until the
 // whole block has arrived. A trailing line that merely LOOKS like a table row
 // latches the holdback too — a leading pipe commits the line to table grammar.
+//
+// Like production it also feeds the frame's TRANSIENT PARSE COPY to the markdown
+// pass (frameTailLine), so an inline delimiter with no closer yet is styled from
+// the first frame instead of flashing its raw marker.
 func (r *aiBlockRenderer) renderPartialTail(rl string, wrapWidth int) []DocumentLine {
 	if wrapWidth < 20 {
 		wrapWidth = 20
 	}
-	if r.tableHolding() {
-		r.ensureHold().Hold(rl)
-		return nil
-	}
-	kind, incomplete := markdown.Incomplete(rl, r.inCode, r.inTable)
-	if incomplete {
-		if kind == markdown.BlockTable {
-			r.engageTable()
-			r.ensureHold().Hold(rl)
-			return nil
-		}
-		return renderUncommittedLine(rl, wrapWidth, kind)
-	}
 	probe := r.clone()
-	probe.renderLine(rl, wrapWidth)
+	probe.renderPartialFramed(rl, frameTailLine(rl, r.inCode, r.inTable), wrapWidth)
 	r.adopt(probe)
 	return probe.out
 }

@@ -255,10 +255,16 @@ const (
 	segBold
 	segItalic
 	segCode
+	// segStrike is GFM strikethrough. It exists because the transient AST
+	// balancer closes an unclosed `~~` for the frame's parse, and a closer whose
+	// segment type the renderer does not implement would PAINT the raw markers it
+	// was added to remove. A delimiter family is only safe to balance if the
+	// pipeline downstream can actually style it.
+	segStrike
 )
 
 func applyInlineStyles(line string) string {
-	if !strings.ContainsAny(line, "*`") {
+	if !strings.ContainsAny(line, "*`~") {
 		rendered := textStyle.Render(line)
 		if rendered == line {
 			// Fallback raw foreground when lipgloss disabled (test env)
@@ -293,6 +299,12 @@ func applyInlineStyles(line string) string {
 			r := mdEmphasisStyle.Render(seg.text)
 			if r == seg.text {
 				r = "\x1b[3m\x1b[38;2;203;166;247m" + seg.text + "\x1b[0m"
+			}
+			out.WriteString(r)
+		case segStrike:
+			r := mdStrikeStyle.Render(seg.text)
+			if r == seg.text {
+				r = "\x1b[9m\x1b[38;2;166;173;200m" + seg.text + "\x1b[0m"
 			}
 			out.WriteString(r)
 		case segCode:
@@ -388,6 +400,30 @@ func parseInlineSegments(line string) []inlineSegment {
 			continue
 		}
 
+		if runes[i] == '~' {
+			// GFM strikethrough: a run of two opens, a run of two closes. A single
+			// tilde is ordinary text (it is also a valid fence marker), and a run
+			// of three or more is not an inline span.
+			if i+1 < n && runes[i+1] == '~' {
+				start := i + 2
+				end := -1
+				for j := start; j+1 < n; j++ {
+					if runes[j] == '~' && runes[j+1] == '~' {
+						end = j
+						break
+					}
+				}
+				if end >= start {
+					segs = append(segs, inlineSegment{text: string(runes[start:end]), style: segStrike})
+					i = end + 2
+					continue
+				}
+			}
+			segs = append(segs, inlineSegment{text: "~", style: segPlain})
+			i++
+			continue
+		}
+
 		if runes[i] == '*' {
 			start := i + 1
 			end := -1
@@ -413,7 +449,7 @@ func parseInlineSegments(line string) []inlineSegment {
 
 		// Accumulate plain text
 		start := i
-		for i < n && runes[i] != '*' && runes[i] != '`' {
+		for i < n && runes[i] != '*' && runes[i] != '`' && runes[i] != '~' {
 			i++
 		}
 		if i > start {

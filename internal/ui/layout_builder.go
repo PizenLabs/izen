@@ -201,6 +201,134 @@ func elasticIndex(stack []compositeRegion) int {
 	return 0
 }
 
+// ── Reasoning Panel Row Budget (Ctrl+O dual viewport) ───────────────────────
+//
+// The expanded reasoning panel is a BAND of the frame, not decoration inside the
+// conversation viewport. The arithmetic therefore has exactly one solution:
+//
+//	mainViewportRows + reasoningPanelRows == availableRows
+//
+// and both terms are bounded integers, which is what makes a narrow or split
+// pane safe. A hand-tuned "40%" with no ceiling is not: in a pane with twelve
+// rows of chrome, forty percent of what is left can exceed what is left, and the
+// overage lands in the frame — which scrolls, and takes the prompt bar with it.
+//
+// The clamps below are the whole contract:
+//
+//	percent     the panel is subordinate to the conversation. It is a drawer, not
+//	            a second conversation.
+//	minimum     below five rows there is nothing to read: a three-row panel with
+//	            a one-line body is a widget that has to be scrolled to be used.
+//	reserve     the conversation always keeps its reserve. A panel that could
+//	            take every row would let one keypress hide the transcript.
+//	minAvailable below six rows there is no split in which both bands stay
+//	            legible, so the panel declines to mount at all rather than
+//	            rendering a strip.
+const (
+	reasoningPanelPercent      = 40
+	reasoningPanelMinRows      = 5
+	reasoningPanelReserveRows  = 8
+	reasoningPanelMinAvailable = reasoningPanelMinRows + 1
+)
+
+// reasoningPanelHeight returns the number of rows the expanded reasoning panel
+// may take out of `available`, or 0 when the pane cannot be split at all.
+//
+// The return of 0 for a cramped pane is a refusal, not an oversight: below
+// reasoningPanelMinAvailable rows there is no split in which both bands stay
+// legible, and the honest answer is to show the conversation alone rather than to
+// render a panel that would leave the prompt bar with no room to exist.
+func reasoningPanelHeight(available int) int {
+	if available < reasoningPanelMinAvailable {
+		return 0
+	}
+	rows := available * reasoningPanelPercent / 100
+	rows = max(rows, reasoningPanelMinRows)
+	// The ceiling is applied AFTER the floor on purpose. In a pane with room for
+	// only a handful of rows, available-reserve goes negative, and a max() applied
+	// last would hand the panel five rows out of six and leave the conversation
+	// one — the reserve is the promise, so it is the promise that survives.
+	ceiling := available - reasoningPanelReserveRows
+	if ceiling < 1 {
+		ceiling = 1
+	}
+	return max(1, min(rows, ceiling))
+}
+
+// applyReasoningSplit divides the rows available to the scrollable area between
+// the main conversation viewport and the expanded reasoning panel, publishes both
+// budgets, and returns the main viewport's height.
+//
+// It is called from the single geometry seam (measureViewportGeometry) rather
+// than from the renderer or the key handler, so every consumer of the layout —
+// the frame, the mouse mapper, the document window composer — reads the same two
+// numbers and cannot disagree about where the panel is.
+//
+// A closed panel is not an error case and costs the conversation nothing: the
+// budget returns whole, so collapse is not a special case anywhere else.
+func (m *model) applyReasoningSplit(available int) int {
+	if m == nil {
+		return available
+	}
+	// The panel's CONTENT IS NOT BUILT HERE. This is the render path, and Bubble
+	// Tea renders once per message — so a content sync driven from the layout
+	// re-wrapped the whole reasoning trace once per incoming token while a
+	// stream was live, on the UI goroutine, which is the goroutine that has to
+	// drain the mouse queue. That is what made the wheel feel broken mid-answer.
+	// The content is now pushed by flushReasoningViewport from the frame tick,
+	// at most once per ~33ms and only when the source actually changed.
+	//
+	// What still happens here is the cheap half. A panel with no source behind
+	// it must give its rows back and release the wheel in THIS frame, and
+	// answering that costs two integer reads — so it is not worth a frame of
+	// latency to defer.
+	m.reconcileReasoningMount()
+	//
+	// The row budget therefore has to be answerable WITHOUT the viewport
+	// already holding the content, so it asks the SOURCE (two integer reads)
+	// rather than the rendered viewport. Asking the viewport would make the
+	// panel's height a function of the last frame's timing — it would claim
+	// rows on one frame and not the next.
+	rows := 0
+	if m.reasoningExpanded && m.reasoningHasContent() {
+		rows = reasoningPanelHeight(available)
+	}
+	m.reasoningViewport.Height = rows
+	m.reasoningPanelRows = rows
+	// RE-CLAMP THE WINDOW. The offset was chosen against the height this call is
+	// about to replace, and the first budget is the worst case: the content is
+	// mounted while the height is still zero, so a tail anchor lands at
+	// len(lines) — and an offset past the bottom of a viewport that now has
+	// twenty rows renders an EMPTY window, not the tail. Re-asserting the offset
+	// through the viewport's own clamp pins it to the real bottom in one step,
+	// and leaves a scrolled-up position exactly where the reader put it.
+	m.reasoningViewport.SetYOffset(m.reasoningViewport.YOffset)
+
+	main := available - rows
+	if main < 1 {
+		// The conversation never loses its last row. A zero-height viewport is
+		// not a cramped conversation, it is a lipgloss target that renders an
+		// unbounded string.
+		main = 1
+	}
+	return main
+}
+
+// renderReasoningPanel renders the expanded reasoning band, pinned to exactly
+// the row count the budget assigned it.
+//
+// fitRegionRows is the same seam the compositor uses for every other band, and
+// for the same reason: a region that renders fewer rows than it was allotted
+// moves the prompt bar and the footer up off the pane's bottom edge, and one that
+// renders more pushes them into scrollback. Neither is a cosmetic drift here —
+// it is the floating-prompt bug.
+func (m *model) renderReasoningPanel() string {
+	if m == nil || m.reasoningPanelRows <= 0 {
+		return ""
+	}
+	return fitRegionRows(m.reasoningViewport.View(), m.reasoningPanelRows)
+}
+
 // fitRegionRows renders a region at exactly `rows` terminal rows: padded with
 // trailing newlines when short, truncated when long.
 //
@@ -1093,14 +1221,13 @@ func (r *aiBlockRenderer) emitHeldTable(wrapWidth int) {
 	r.out = append(r.out, renderMarkdownTableToLines(rows, wrapWidth)...)
 }
 
-// renderPartialLine renders the STILL-GROWING trailing line of a live stream.
+// renderPartialFramed renders the STILL-GROWING trailing line of a live stream.
 //
 // A partial line is not a line: it is a prefix of one. Running it through
 // renderLine would interpret syntax that may not mean what it looks like yet —
-// `| Name | Age` is not a table row until its closing pipe arrives, `**bol` is
-// not bold until its closer does — and the viewport would re-flow the whole time
-// the remaining bytes stream in (the "table columns jump / markup flickers while
-// streaming" report).
+// `| Name | Age` is not a table row until its closing pipe arrives — and the
+// viewport would re-flow the whole time the remaining bytes stream in (the
+// "table columns jump while streaming" report).
 //
 // So two hold-backs apply, and they are deliberately different in strength:
 //
@@ -1121,7 +1248,37 @@ func (r *aiBlockRenderer) emitHeldTable(wrapWidth int) {
 //     IS already final (it happens to sit on a syntactic boundary — a balanced
 //     `**bold**`) it goes straight down the normal path, so the hold-back costs
 //     no extra frame.
-func (r *aiBlockRenderer) renderPartialLine(rl string, wrapWidth int) {
+//
+// ONE EXCEPTION TO (2), AND IT IS THE INLINE ONE. The hold-back's job is to stop
+// the viewport REFLOWING, and inline delimiters cannot reflow anything: a `**`
+// that has opened changes the STYLE of the words after it, never the number of
+// physical rows or the width of any of them. So holding a half-typed `**bold`
+// back buys no stability at all and costs the whole point of streaming — the
+// reader watches the phrase render unstyled and then restyle, which is the "raw
+// markup flashes in while the answer streams" report.
+//
+// A partial line whose ONLY incompleteness is an inline delimiter is therefore
+// rendered from a TRANSIENT PARSE COPY: the same line with its open delimiters
+// closed, styled correctly on the very first frame. The raw bytes are what the
+// holdback, the UncommittedBuffer and the committed record see, so the line that
+// lands in the transcript is exactly the line that arrived.
+//
+// # WHY THE SIGNATURE TAKES TWO STRINGS
+//
+// The block state machine is asked about `raw` and the markdown pipeline parses
+// `frame`, and the two differ by at most the transient closing delimiters
+// frameTailLine appended. Keeping them as separate parameters rather than
+// recomputing the copy inside this function is what makes the split auditable:
+// every consumer of the raw bytes is a call site that passes `raw`, and the one
+// consumer of the balanced form is the single renderLine call below. Passing the
+// same string twice is the plain case and costs nothing.
+//
+//	raw    the line exactly as the stream delivered it — the authority for the
+//	       table holdback, the incompleteness classification, and (one level up)
+//	       the UncommittedBuffer, the tail memo key and the committed record.
+//	frame  the line the markdown pipeline parses; equal to raw unless the
+//	       transient AST balancer found an inline delimiter still open.
+func (r *aiBlockRenderer) renderPartialFramed(raw, frame string, wrapWidth int) {
 	if wrapWidth < 20 {
 		wrapWidth = 20
 	}
@@ -1140,10 +1297,10 @@ func (r *aiBlockRenderer) renderPartialLine(rl string, wrapWidth int) {
 	// held-back tail rather than accumulating: the buffer holds the line's
 	// current prefix, never a concatenation of prefixes.
 	if r.tableHolding() {
-		r.ensureHold().Hold(rl)
+		r.ensureHold().Hold(raw)
 		return
 	}
-	kind, incomplete := markdown.Incomplete(rl, r.inCode, r.inTable)
+	kind, incomplete := markdown.Incomplete(raw, r.inCode, r.inTable)
 	if incomplete {
 		// A LEADING PIPE commits the line to table grammar, so from this instant
 		// it is 100% table content and joins the full holdback — a plain-text
@@ -1153,13 +1310,22 @@ func (r *aiBlockRenderer) renderPartialLine(rl string, wrapWidth int) {
 		// the very first opening pipe.
 		if kind == markdown.BlockTable {
 			r.engageTable()
-			r.ensureHold().Hold(rl)
+			r.ensureHold().Hold(raw)
 			return
 		}
-		r.out = append(r.out, renderUncommittedLine(rl, wrapWidth, kind)...)
+		// INLINE DELIMITERS ARE NOT HELD BACK. A balanced parse copy exists, so
+		// the phrase is styled from this frame instead of flashing its markers
+		// and restyling a few frames later. Everything else (an arriving fence, a
+		// bare heading marker, an unclosed link) still holds: those are grammar
+		// that genuinely changes what the line IS.
+		if kind == markdown.BlockInline && frame != raw {
+			r.renderLine(frame, wrapWidth)
+			return
+		}
+		r.out = append(r.out, renderUncommittedLine(raw, wrapWidth, kind)...)
 		return
 	}
-	r.renderLine(rl, wrapWidth)
+	r.renderLine(frame, wrapWidth)
 }
 
 // renderUncommittedLine renders a structurally-incomplete streaming line as

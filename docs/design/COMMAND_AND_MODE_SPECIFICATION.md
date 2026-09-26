@@ -336,8 +336,8 @@ runs dynamic tests → injects telemetry into forensic ledger → comprehensive 
 | `Esc` | always | Emergency abort while `StateProcessing`/`planPending`; otherwise contextual: dismiss help overlay / suggestions / autocomplete / model picker; cancel active stream; clear proposed shell cmd; clear input buffer. **3 consecutive Esc in `StateChat` → enter Vi-mode** (triple-escape detection, update.go:141-160) |
 | `Ctrl+D` | chat + processing | Emergency abort in `StateProcessing`; else **clean shutdown** when input is empty and nothing is running (`cleanShutdownCmd`) |
 | `?` | chat (empty input) | Toggle help overlay |
-| `Alt+O` | global | `toggleThoughtBlock()` — expand/collapse live ThinkingBuffer or legacy ThinkingPanel (or `$`-exec entry via Ctrl+O path); priority: running command exec → ThinkingBuffer → ThinkingPanel → trace buffer |
-| `Ctrl+O` | global | Same as `Alt+O`; falls back to cycling foldable build-log entries (`logStore.ToggleCycle`) |
+| `Alt+O` | global | `toggleThoughtBlock()` — mount/unmount the dedicated reasoning viewport (or `$`-exec entry via Ctrl+O path); priority: running command exec → reasoning panel → legacy ThinkingPanel → trace buffer |
+| `Ctrl+O` | global | Same as `Alt+O`; falls back to cycling foldable build-log entries (`logStore.ToggleCycle`). Takes the **scroll focus lock** with it: while the panel is mounted the mouse wheel and the scroll keys (arrows / PgUp / PgDn / Home / End / Space) drive the panel only, and the conversation keeps its own auto-follow. If CoT visibility is off in `/settings`, the keypress is refused with a toast and changes nothing |
 | `Alt+F` | `/ask` | **Handoff to `/investigate`**: requires a valid ask Context Ledger (`ask_handoff` packet or Diagnostics or `handoffLedgerContent`); intent bypass routes frontend-UI → `/plan`, mutation → `/build`; otherwise `setMode(ModeInvestigate)` |
 
 ### 3.2 Modal Approval States (`handleKey`, keys.go)

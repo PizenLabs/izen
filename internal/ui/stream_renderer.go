@@ -426,6 +426,14 @@ func (m *model) renderLiveThinking(width int) string {
 		return ""
 	}
 	spinner := flowingSpinnerFrames[m.spinnerFrame%len(flowingSpinnerFrames)]
+	// SINGLE-SURFACE CONTRACT: while the dedicated reasoning viewport is
+	// mounted, this block is the panel's HANDLE, not a second copy of its
+	// contents. Rendering the expanded box here as well would print the same
+	// reasoning twice — once in a band the wheel cannot scroll, once in the band
+	// it can — and the reader would have no way to tell which one is live.
+	if m.reasoningExpanded {
+		return m.thinkingBuffer.RenderHandle(width, m.streaming, spinner)
+	}
 	return m.thinkingBuffer.Render(width, m.streaming, spinner)
 }
 

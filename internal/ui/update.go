@@ -96,6 +96,32 @@ func (m *model) Init() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// recoverUpdate is the panic barrier for the whole update loop.
+//
+// It is a METHOD, not a deferred closure, and that is a performance decision
+// rather than a style one. A deferred closure here captures the named result
+// `model` by reference, and in a function the size of Update the compiler
+// cannot open-code the defer — so the closure is heap-allocated on EVERY
+// message. One 16-byte object per event is invisible on its own; it is not
+// invisible when the event is a wheel notch arriving 30 times a second behind
+// a stream, because it is the difference between a scroll path that allocates
+// nothing and one that cannot be measured as such.
+//
+// The `defer m.recoverUpdate(&model)` form carries the same guarantee — the
+// panic is caught, the stack is written, and the model is preserved so the UI
+// stays responsive instead of cascading into a second crash when bubbletea
+// calls View() on the nil model — with nothing allocated to set it up.
+func (m *model) recoverUpdate(out *tea.Model) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	buf := make([]byte, 4096)
+	n := runtime.Stack(buf, false)
+	fmt.Fprintf(os.Stderr, "\nIZEN PANIC: %v\nStack:\n%s\n", r, buf[:n])
+	*out = m
+}
+
 // Update routes state machines and events.
 func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	// ── GLOBAL PANIC RECOVERY ──────────────────────────────────
@@ -103,15 +129,31 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	// is written to stderr for debugging, and the model is preserved so
 	// the UI remains responsive instead of cascading into a second crash
 	// when bubbletea calls View() on the nil model returned by the broken
-	// update dispatch.
-	defer func() {
-		if r := recover(); r != nil {
-			buf := make([]byte, 4096)
-			n := runtime.Stack(buf, false)
-			fmt.Fprintf(os.Stderr, "\nIZEN PANIC: %v\nStack:\n%s\n", r, buf[:n])
-			model = m
+	// update dispatch. See recoverUpdate for why this is a method and not a
+	// deferred closure.
+	defer m.recoverUpdate(&model)
+
+	// ── PRIORITY ZERO: MOUSE SCROLL FAST PATH (scroll_fastpath.go) ──
+	// A wheel event is answered HERE — ahead of the workspace guard, the
+	// permission interceptor, the overlay swallows, the escape hatch, the state
+	// machine and the main type switch — with an offset mutation and a nil
+	// command.
+	//
+	// It is first for a reason that is about scheduling, not about elegance:
+	// the scroll path and the token path contend for one goroutine, and a wheel
+	// event's latency is the cost of everything it was queued behind. During
+	// active streaming that queue is deep, because the provider produces tokens
+	// faster than the frame loop retires them. A wheel that answers at the front
+	// of the queue has a bounded, one-frame latency; a wheel that answers at the
+	// back of it has whatever the frame happened to be doing.
+	//
+	// Overlays still swallow the wheel (classifyWheel → wheelTargetConsumed),
+	// so no modal is made transparent by being made fast.
+	if wheelMsg, ok := msg.(tea.MouseMsg); ok {
+		if fast, fastCmd, handled := m.interceptWheel(wheelMsg); handled {
+			return fast, fastCmd
 		}
-	}()
+	}
 
 	// ── SCROLL CHROME DIRTY DEFAULT + INSTANT EDIT RECOVERY ──────────
 	// Every message dirties the scroll fast-path chrome cache; only pure
@@ -123,6 +165,29 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	m.scrollChromeDirty = true
 	if _, ok := msg.(tea.KeyMsg); ok && !m.showStatus {
 		m.endScrollBurst()
+	}
+
+	// ── PROMPT INPUT PATH ISOLATION (prompt_isolation.go) ────────────
+	// A printable keystroke aimed at the focused prompt bar is answered HERE,
+	// above every modal, picker, state machine and keybinding in the chain
+	// below. The reason is scheduling, not elegance: the key path and the
+	// stream path contend for one goroutine, so a keystroke's latency is the
+	// cost of everything it was queued behind — and the routing chain plus the
+	// document composition that follows it are O(document).
+	//
+	// The guard is a whitelist of what provably cannot claim a plain printable
+	// keystroke, so every binding, modal and interceptor below still sees
+	// exactly the keys it saw before. Only the prompt region's dirty flag is
+	// set: the document generation is not touched, so the following View()
+	// re-composites the prompt against the document rows already on screen.
+	//
+	// It is placed AFTER the wheel interceptor (a wheel event is not a
+	// keystroke and never reaches here) and BEFORE the workspace guard, so
+	// the cost of a keystroke cannot include a disk check.
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		if fastCmd, handled := m.interceptPromptKey(keyMsg); handled {
+			return m, fastCmd
+		}
 	}
 
 	// ── DEFENSIVE WORKSPACE GUARD ──────────────────────────────────────────
@@ -387,9 +452,9 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		case "alt+o":
 			// Delegate to the unified reasoning toggle so Alt+O behaves exactly
-			// like Ctrl+O: it expands/collapses the live ThinkingBuffer box in
-			// the viewport body (immediate re-render, even mid-stream) instead
-			// of flipping the vestigial showReasoning flag nothing renders from.
+			// like Ctrl+O: it mounts or unmounts the dedicated reasoning viewport
+			// (immediate re-render, even mid-stream) instead of flipping the
+			// vestigial showReasoning flag nothing renders from.
 			m.toggleThoughtBlock()
 			return m, nil
 		}
@@ -555,38 +620,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 	}
 
-	// ── STRICT MOUSE SCROLL SHORT-CIRCUIT (prompt-scroll isolation) ──
-	// Wheel events are consumed ENTIRELY by the viewport scroll handler and
-	// return immediately: they are never delegated to the prompt input
-	// component (m.ti) or any child, so scrolling can never invalidate
-	// input state, reset blink timers, or force cursor redraws. Modal
-	// states (permission/quit/picker/approval gates above, isModalForMouse
-	// below) swallow the wheel.
-	//
-	// ZERO-TIMER CONTRACT (TTY render decoupling §2): this handler returns
-	// ONLY nil commands. No tea.Tick, no time.After, no goroutines — the
-	// scroll burst is tracked by the lastScrollTime watermark (scrollBy →
-	// markScrollBurst) and the static-prompt suppression expires via
-	// time.Since on the next render pass. scrollBy is O(1) (offset mutation
-	// only); the document is never re-rendered and no state-changing message
-	// is emitted, so consecutive wheel frames coalesce onto the fast path.
-	if wheelMsg, ok := msg.(tea.MouseMsg); ok &&
-		(wheelMsg.Button == tea.MouseButtonWheelUp || wheelMsg.Button == tea.MouseButtonWheelDown) {
-		if m.isModalForMouse() {
-			return m, nil
-		}
-		if m.Ready {
-			m.scrollChromeDirty = false
-			if wheelMsg.Button == tea.MouseButtonWheelUp {
-				m.scrollBy(-3)
-			} else {
-				m.scrollBy(3)
-			}
-			return m, nil
-		}
-		return m, nil
-	}
-
+	// NOTE: wheel events never reach this point. They are answered at the very
+	// top of Update() by the priority-zero interceptor (scroll_fastpath.go), so
+	// a scroll frame is never queued behind the workspace guard, the overlay
+	// interceptors or the state machine. Everything below this line is
+	// message-shape work with no scroll in it.
 	switch msg := msg.(type) {
 
 	case statuscommand.ResultMsg:
@@ -1676,6 +1714,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// thought drawer renders the model's raw stream live — 100% of the
 		// output is retained, never discarded. Done collapses the block to its
 		// summary once the stream/hotfix completes.
+		//
+		// The APPEND is synchronous (the buffer is the source of truth) and the
+		// RENDER is frame-paced, so a reasoning channel emitting at token rate
+		// cannot turn into a document composition per token.
 		if msg.Content != "" {
 			if m.thinkingBuffer == nil {
 				m.thinkingBuffer = NewThinkingBuffer()
@@ -1687,11 +1729,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				m.thinkingBuffer.MarkComplete()
 			}
 		}
-		m.refreshViewportContent()
-		if m.Ready && !m.userIsScrollingUp {
-			m.gotoBottomIfAllowed()
-		}
-		return m, nil
+		return m, m.notePacedSource(pacedReasoning, !m.userIsScrollingUp)
 
 	case ReasoningChunkMsg:
 		// Sub-task reasoning trace: one thinking chunk from an async executor
@@ -1709,11 +1747,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.thinkingBuffer = NewThinkingBuffer()
 		}
 		m.thinkingBuffer.Append(msg.Chunk)
-		m.refreshViewportContent()
-		if m.Ready && !m.userIsScrollingUp {
-			m.gotoBottomIfAllowed()
-		}
-		return m, nil
+		return m, m.notePacedSource(pacedReasoning, !m.userIsScrollingUp)
 
 	case buildResultMsg:
 		// GUARANTEED LIFECYCLE PATTERN: universally reset every transient
@@ -2402,23 +2436,30 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		return m, flush
 
 	case shellChunkMsg:
-		// ── LIVE SHELL OUTPUT ───────────────────────────────────────
-		// Stream each stdout/stderr chunk into the running exec entry of the
-		// activity tree so the output grows in real-time (visible via Ctrl+O
-		// expansion). The heartbeat keeps the idle-gate hang detector from
-		// force-clearing the shell spinner.
+		// ── LIVE SHELL OUTPUT (FRAME-PACED) ──────────────────────────
+		// The chunk is appended to the running exec entry of the activity tree
+		// here, synchronously, because that buffer is the source of truth. The
+		// RENDER is not here: the chunk notes the unified pacer and the
+		// FrameTickMsg does one document refresh for the whole frame.
+		//
+		// That split is what makes `/exec` behave like the answer stream. A `cat`
+		// of a build log delivers hundreds of chunks per second, and rendering
+		// each one meant hundreds of full document compositions per second on the
+		// UI goroutine — the frame clock stopped being the bottleneck and the
+		// terminal painted as fast as the event loop happened to reach it. The
+		// same 30 FPS now applies, and throughput is unchanged: nothing is
+		// dropped and nothing waits longer than one frame.
+		//
+		// The heartbeat stays synchronous. It is not a render, it is the
+		// idle-gate hang detector's evidence that the process is alive, and it
+		// has to keep ticking on frames the renderer never sees.
 		msg.text = SanitizeForIngest(msg.text)
 		if !m.activitySurfaceSealed && m.activityTree != nil {
 			m.activityTree.AppendExecOutput(msg.text)
 		}
 		m.lastAgentActivity = time.Now()
-		if m.Ready {
-			m.refreshViewportContent()
-		}
-		if !m.userIsScrollingUp {
-			m.gotoBottomIfAllowed()
-		}
-		return m, m.readShellCh()
+		tick := m.notePacedSource(pacedExec, !m.userIsScrollingUp)
+		return m, batchCmds(m.readShellCh(), tick)
 
 	case shellExitMsg:
 		// ── SHELL TERMINAL EVENT: clean teardown ────────────────────
@@ -2445,6 +2486,11 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			m.push(roleSystem, dimmedStyle.Render(fmt.Sprintf(
 				"shell exited %d (%s)", msg.exitCode, formatElapsed(msg.elapsed))))
 		}
+		// TERMINAL DRAIN: nothing more will arrive from this shell, so whatever
+		// the pacer is still holding is rendered NOW rather than left for a tick
+		// that this teardown is about to stop. A pending flag behind a stopped
+		// loop is output the user never sees — the command's last line, missing.
+		m.drainPacedSourcesNow(pacedExec)
 		m.refreshViewportContent()
 		flush := m.flushPendingRecords()
 		return m, flush
@@ -2506,6 +2552,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// invariant the emerald shimmer wave and the braille glyph need in
 		// order to keep sweeping instead of freezing.
 		m.advanceAnimationFrame()
+		// ── ACCUMULATOR DRAIN (the only reader of the producer's deltas) ──
+		// The provider goroutine appended its content and reasoning deltas
+		// straight into m.streamAccum and emitted no message for them, so THIS
+		// is where those bytes become model state. It runs first in the handler
+		// because everything below it — the ring drain, the visible-content
+		// flush, the repaint gate — must see a single coherent FIFO: a delta
+		// that arrived this frame is indistinguishable, downstream, from one
+		// that arrived last frame, and the only way to keep it indistinguishable
+		// is to make the drain exhaustive before anything reads the buffers.
+		m.drainStreamAccumulator()
 		// ── FRAME-LOCKED PACED DRAIN (engine→UI decoupling) ─────────────
 		// The master frame tick is the single point where overflow tokens
 		// parked in the lock-free ring by the non-blocking producer re-join
@@ -2515,12 +2571,46 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// to the SAME utf8StreamBuf/throttle buffers the flush below drains,
 		// so the pass stays single-FIFO and the repaint stays single-flight.
 		m.drainStreamRing()
+		// ── FRAME-THROTTLED REASONING PANEL SYNC ─────────────────────
+		// The panel's content is rebuilt HERE and nowhere on the render path.
+		// This is the throttle: one re-wrap per frame tick at most, and only
+		// when the source actually moved, instead of one per incoming token.
+		// The detach latch (reasoningDetached) is honoured inside the sync, so
+		// a reader parked mid-trace keeps their window while tokens keep
+		// arriving underneath it.
+		m.flushReasoningViewport()
 		// ── DEBOUNCED FRAME TICKER (30ms / ~33 FPS) ─────────────────────
 		// STREAM BUFFER CONTRACT: Option A — Cumulative Overwrite.
 		// See flushStreamContentToView: the emission is a pure function of the
 		// byte buffer and the current visible content, so it is shared with the
 		// interrupt teardown rather than duplicated here.
-		if m.flushStreamContentToView() {
+		moved := m.flushStreamContentToView()
+		if moved {
+			m.ensureStreamPacer().note(pacedAnswer, !m.userIsScrollingUp)
+		}
+		// ── TYPEWRITER REVEAL ADVANCE (character-level interpolation) ───
+		// The frame that promoted a batch into the visible buffers also
+		// releases one adaptive slice of it to the renderer. This must run
+		// EVEN WHEN flushStreamContentToView reports no new bytes: a burst
+		// queued on an earlier frame still owes the remaining characters, and
+		// the loop is already alive while m.streaming is true. A move here is
+		// folded into `moved` so the single-flight gate paints the new slice.
+		moved = m.advanceTypewriter() || moved
+		// ── UNIFIED STREAM PACER: EVERY BACKGROUND SOURCE, ONE FRAME ────
+		// The answer, the reasoning trace, the /exec command output and the tool
+		// log all report into one pacer, and this is the single place it is
+		// drained. The answer was already paced; the other three used to render
+		// ON ARRIVAL, so a fast one (a `cat` of a build log is hundreds of chunks
+		// a second) replaced the 30 FPS clock with its own arrival rate and the UI
+		// stopped being smooth while nothing was actually being produced. A note
+		// is a bit write, a drain is a four-element scan, and the per-frame cost
+		// is the same whether four chunks or four hundred arrived.
+		//
+		// The drain does not compose; it reports. Composition goes through the
+		// single-flight repaint gate below, so a frame on which both the answer
+		// and a background source moved still costs exactly ONE document.
+		moved = m.drainPacedSources() || moved
+		if moved {
 			if repaint := m.scheduleRepaint(); repaint != nil {
 				// Batched with the tick so the wave keeps advancing while the
 				// repaint is in flight, not only once it lands.
@@ -2558,7 +2648,26 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// hang, so the mounted row owns the loop for as long as it is
 		// mounted. Every terminal path releases the skeleton, so the loop
 		// still self-terminates with no leaked timer.
-		if m.streaming || waitingForFirstByte || m.shimmerActive || m.skeletonActive() {
+		//
+		// A MOUNTED REASONING PANEL is a fourth reason to stay alive: it is
+		// the only thing that notices a change to the reasoning source, and
+		// reasoning is appended from seams that are not tied to the answer
+		// stream (the sub-task ReasoningChunkMsg path and the event-driven
+		// buffer both mutate it while m.streaming is false). Gating the loop on
+		// staleness instead would be cheaper when idle, but it would need a tick
+		// in order to discover the staleness it is gating on — so a change
+		// arriving with no tick in flight would never be seen. A mounted panel
+		// is a claim that the trace is being watched, and the price of honouring
+		// that claim is one O(1) comparison per 33ms.
+		//
+		// PENDING PACED SOURCES are a fifth. The pacer exists precisely so a
+		// source cannot render on arrival, and that design has one obligation in
+		// the other direction: the loop must outlive its producers. A source that
+		// noted bytes into a stopped loop has parked them forever — that is the
+		// /exec output that never appears. So the same rule as a mounted skeleton
+		// applies: while there is something to draw, the clock keeps running.
+		if m.streaming || waitingForFirstByte || m.shimmerActive ||
+			m.skeletonActive() || m.reasoningExpanded || m.pacedStreamsActive() {
 			m.frameTickActive = true
 			return m, m.frameTickCmd()
 		}
@@ -2921,6 +3030,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamCh = nil
 		m.streamRing = nil
 		m.resetTokenPacer()
+		m.streamAccum = nil
 		m.streaming = false
 		m.streamCancel = nil
 		// Clean up the inter-token timeout timer and deadline.
@@ -3425,6 +3535,15 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			titleCmd = m.refineTitleCmd()
 		}
 
+		// ── TURN BOUNDARY: RE-ARM AUTO-FOLLOW ───────────────────────
+		// The turn is over, so there is no longer a growing tail worth holding
+		// the reader off of, and the document has just been re-laid out (the
+		// streaming tail became a committed record and a status line was
+		// appended). Re-arm before the flush below so the completed answer is
+		// anchored once, in the same frame, instead of leaving the viewport on a
+		// stale offset that no longer addresses the content it was chosen for.
+		m.resetAutoScrollLatch()
+
 		// ── MANDATORY SYNCHRONOUS FLUSH (STREAM COMPLETION) ─────────
 		// The final frame must render NOW, on this turn — never deferred to a
 		// pending repaintTickMsg that could be dropped, starved, or processed
@@ -3434,6 +3553,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// it is visible instantly without requiring an external UI event (the
 		// "prompt response invisible until the second prompt" regression).
 		m.refreshViewportContentImmediate()
+		// The reasoning panel is content-throttled to the frame tick, and the
+		// tick loop is about to stop. Push the final trace synchronously so the
+		// completed answer and the reasoning that produced it are never a frame
+		// apart, then let the latch decide the window: a reader parked mid-trace
+		// keeps their position, everyone else sits on the tail.
+		m.flushReasoningViewport()
 		// Full stream transparency: mark the live thought block complete so the
 		// Ctrl+O drawer collapses to its "▸ Thought for Xs (N tokens)" summary.
 		return m, tea.Batch(m.thoughtUpdateCmd("", true), titleCmd)
@@ -3473,6 +3598,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		m.streamCh = nil
 		m.streamRing = nil
 		m.resetTokenPacer()
+		m.streamAccum = nil
 		m.streaming = false
 		m.streamParser = nil
 		m.streamCancel = nil
@@ -3843,6 +3969,16 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// mouse scroll short-circuit) and never reaches this case; only the
 		// left-button selection lifecycle is handled here. Neither path
 		// touches m.ti — see the guard above the text-input pass-through.
+		//
+		// REASONING PANEL: a press that lands on the panel is NOT a selection
+		// anchor. mousePosToGlobal maps rows through the main viewport's
+		// rectangle, so a drag started on the panel would highlight whichever
+		// conversation record happened to share that row index — selecting text
+		// the user never touched. The panel owns those rows, so the press is
+		// dropped and the conversation is left alone.
+		if m.reasoningPanelAt(msg.Y) {
+			return m, nil
+		}
 		// Left-button selection lifecycle: Down → drag → Up → auto-copy.
 		// Works in any non-modal state, including during streaming.
 		switch msg.Action {
@@ -3867,6 +4003,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			}
 		case tea.MouseActionMotion:
 			if m.mouseSel.Dragging {
+				// A drag that wanders OVER the panel is still a conversation
+				// drag — the anchor is above it — so the drag continues, but
+				// the cursor is clamped to the viewport's last row. Without
+				// the clamp the auto-scroll engine below reads a panel row as
+				// "past the bottom of the viewport" and starts ticking the
+				// conversation while the pointer is nowhere near it.
+				overPanel := m.reasoningPanelAt(msg.Y)
 				m.mouseSel.lastY = msg.Y
 				m.mouseSel.lastX = msg.X
 				m.mouseSel.Cursor = m.mousePosToGlobal(msg)
@@ -3879,7 +4022,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				relY := msg.Y - geo.Top
 				isOutside := msg.Y >= geo.Top+geo.Height || msg.Y < geo.Top
 				inEdge := relY < selectionEdgeRows || relY >= geo.Height-selectionEdgeRows
-				shouldTick := isOutside || inEdge
+				shouldTick := !overPanel && (isOutside || inEdge)
 				if shouldTick && !m.mouseSel.TickActive {
 					m.mouseSel.TickActive = true
 					return m, AutoScrollTickCmd(msg.Y, msg.X)
@@ -3940,6 +4083,21 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 				return m, cmd
 			}
 			return m, nil
+		}
+
+		// ── REASONING PANEL FOCUS LOCK (keyboard) ──────────────────────
+		// The expanded panel owns the scroll keys while it holds the lock, and
+		// this has to sit ABOVE the history-navigation and viewport-scroll
+		// intercepts below: those are unconditional, so a lock claimed further
+		// down the file would be a lock that never applies.
+		//
+		// Only non-printable keys are considered. PRIORITY 1 below is a
+		// deliberate invariant — a printable character typed into the prompt is
+		// ALWAYS text — and a reasoning viewer that stole "j" out of a
+		// half-typed word would be a far worse defect than one whose j does not
+		// scroll. The panel is fully drivable without it.
+		if handled, cmd := m.routeReasoningKey(msg); handled {
+			return m, cmd
 		}
 
 		// ── PRIORITY 1: ACTIVE TEXT INPUT ────────────────────────────
@@ -4141,6 +4299,12 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			if m.Ready {
 				m.gotoBottomIfAllowed()
 			}
+			// The panel, if it holds the lock, is the surface the reader is
+			// actually looking at — "jump to the tail" has to land there too,
+			// or the key silently does nothing while reasoning is expanded.
+			if m.reasoningScrollLocked() {
+				m.reasoningViewport.GotoBottom()
+			}
 		}
 
 		resModel, cmd := m.handleKey(msg)
@@ -4184,7 +4348,527 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	if _, ok := msg.(cursor.BlinkMsg); ok {
 		m.invalidatePromptCache()
 	}
+	// PROMPT INPUT PATH ISOLATION: whatever reached the input — a backspace, a
+	// caret move, a paste delivered as a rune run — changed the prompt region and
+	// nothing else. Marking it here is what gives those keys the same isolated
+	// recomposition the printable fast path gets, instead of leaving the most
+	// common edit after a character to re-compose the whole document.
+	m.markPromptChanged()
 	return m, tiCmd
+}
+
+// ── DUAL-VIEWPORT REASONING FOCUS (Ctrl+O) ─────────────────────────────────
+//
+// # WHAT THIS IS
+//
+// The LLM reasoning block is inspected through a SECOND viewport, not through a
+// box painted inside the conversation. Three facts make that the only honest
+// arrangement:
+//
+//  1. The reasoning is a stream in its own right. It grows while the answer
+//     grows, and the part of it a reader actually wants (the reasoning just
+//     before the answer) is not where the conversation's own scroll offset is.
+//  2. Scroll focus has to be EXCLUSIVE or it is ambiguous. One wheel event must
+//     move one viewport. A layout that renders both and splits the wheel between
+//     them by hit-testing is a layout whose answer depends on sub-row geometry,
+//     and every off-by-one in that geometry is a user-visible wrong scroll.
+//  3. The pane is a fixed-size surface. A panel that renders "about ten rows"
+//     of reasoning is not a bounded surface; it is a frame whose height is a
+//     function of how much text arrived.
+//
+// # THE FOCUS LOCK
+//
+// Ctrl+O takes both the expansion state and the mouse-scroll focus, and
+// releasing Ctrl+O gives both back. The lock is a field, not an inference from
+// geometry, so the hand-back is exact: the frame after the keypress routes every
+// wheel event to the main viewport again, with no re-measure, no re-budget and
+// no dependency on where the pointer happened to be resting.
+
+// releaseReasoningPanelIfHidden unmounts the reasoning panel when CoT visibility
+// has been switched off underneath it.
+//
+// The setting is the authority over the block, not just over the shortcut that
+// opens it: a panel left mounted across the change would go on rendering a
+// reasoning trace the user has just asked not to see, and — because the wheel
+// lock is a field — would keep swallowing scroll events on the conversation
+// behind it.
+func (m *model) releaseReasoningPanelIfHidden() {
+	if m == nil || !m.reasoningExpanded {
+		return
+	}
+	if m.reasoningDisplayEnabled() {
+		return
+	}
+	m.setReasoningExpanded(false)
+}
+
+// newReasoningViewport constructs the dedicated reasoning sub-viewport.
+//
+// It is built through viewport.New rather than left as a zero value on purpose:
+// the zero Model has not run its initializer, so its mouse-wheel handling is
+// disabled until the first Update, which would make the very first wheel event
+// after Ctrl+O a no-op. The height is zero until the layout budget allocates
+// rows — the panel is mounted by the budget, not by its constructor.
+func newReasoningViewport() viewport.Model {
+	vp := viewport.New(0, 0)
+	vp.MouseWheelEnabled = true
+	return vp
+}
+
+// reasoningDisabledToast is the status notice shown when Ctrl+O is pressed while
+// CoT visibility is switched off in /settings. The preference is authoritative —
+// a disabled block must not be reachable through a second control path — but
+// swallowing the keypress silently reads as a broken key, so the refusal says
+// itself and names the setting that caused it.
+const reasoningDisabledToast = "Reasoning display is disabled in settings"
+
+// reasoningDisplayEnabled reports the /settings authority for CoT visibility.
+//
+// Two authorities describe the same preference: the persisted config and
+// m.hideThinkingBlocks, its runtime projection. EITHER of them may refuse, and
+// neither may be more permissive than the other — the renderers gate on
+// m.hideThinkingBlocks, so a focus machine that could open a panel they would
+// decline to draw would put the block on screen for exactly the reader the
+// setting exists to hide it from. m.cfg covers the window before the config has
+// been projected onto the runtime flag.
+func (m *model) reasoningDisplayEnabled() bool {
+	if m == nil {
+		return false
+	}
+	if m.hideThinkingBlocks {
+		return false
+	}
+	if m.cfg != nil {
+		return !m.cfg.HideThinkingBlocks()
+	}
+	return true
+}
+
+// reasoningScrollLocked reports whether the reasoning panel currently owns
+// mouse-scroll input. Both halves of the toggle must agree: an expanded panel
+// that is not focused has handed scroll control back, and a focused panel that
+// is not expanded has nothing to scroll.
+func (m *model) reasoningScrollLocked() bool {
+	return m != nil && m.reasoningExpanded && m.reasoningFocused && m.reasoningViewport.Height > 0
+}
+
+// reasoningPanelAt reports whether an absolute terminal row falls inside the
+// expanded reasoning panel.
+//
+// The panel's rectangle is published by the layout pass rather than re-measured
+// here: the wheel path is on the zero-timer, O(1) fast path, and re-rendering the
+// top bar, the prompt region and the footer to answer a bounds question would
+// both violate that contract and make scrolling cost more than a frame.
+func (m *model) reasoningPanelAt(y int) bool {
+	if m == nil || m.reasoningPanelRows <= 0 {
+		return false
+	}
+	return y >= m.reasoningPanelTop && y < m.reasoningPanelTop+m.reasoningPanelRows
+}
+
+// toggleReasoningPanel is the Ctrl+O / Alt+O entry point for the reasoning
+// viewport. It is deliberately state-agnostic: a reasoning block is inspectable
+// while tokens are still arriving, after a completed turn, after a stream
+// failure, and while idle — the only thing that can refuse the toggle is the
+// settings preference.
+func (m *model) toggleReasoningPanel() {
+	if !m.reasoningDisplayEnabled() {
+		// No state change at all: not the toggle, not the focus, not the panel
+		// height. Only the notice.
+		m.setToast(reasoningDisabledToast)
+		return
+	}
+	m.setReasoningExpanded(!m.reasoningExpanded)
+}
+
+// setReasoningExpanded applies the expansion state together with the scroll
+// focus that goes with it, because the two are one user-visible decision: the
+// panel is either on screen and receiving the wheel, or it is off screen and the
+// conversation has it back.
+//
+// It performs no state gating, which is what makes the panel usable after a
+// stream halts (a [PARTIAL] truncation, a provider error) and while idle: the
+// captured reasoning outlives the turn that produced it.
+func (m *model) setReasoningExpanded(v bool) {
+	if m == nil {
+		return
+	}
+	m.reasoningExpanded = v
+	m.reasoningFocused = v
+
+	if m.thinkingBuffer != nil {
+		// Keep the event-driven buffer's own expansion flag in lockstep: the
+		// compact one-liner in the conversation body is the panel's handle, and
+		// it reads the same state the keybinding writes.
+		m.thinkingBuffer.SetExpanded(v)
+	}
+
+	if v {
+		// Mount: pull the newest reasoning into the sub-viewport before the
+		// first frame is drawn, so the panel never appears empty for a frame.
+		m.syncReasoningContent()
+		return
+	}
+
+	// Unmount: the focus goes back to the main viewport, and the panel's row
+	// budget is released. The CONTENT and the scroll position are deliberately
+	// retained, along with the freshness watermark: a reader who collapses to
+	// check the answer and expands again must land back on the line they were
+	// reading, and an unchanged buffer that had to be re-wrapped to be
+	// re-recognised would be indistinguishable from a new one.
+	m.reasoningViewport.Height = 0
+	m.reasoningPanelRows = 0
+	m.reasoningPanelTop = 0
+}
+
+// routeReasoningScroll hands a wheel event to the reasoning sub-viewport.
+//
+// The bubbles viewport returns a nil command unless high-performance rendering
+// is on, so the strict mouse-scroll contract (no timers, no goroutines, no
+// state-changing messages) is preserved on this path exactly as it is on the
+// main viewport's. The main conversation is NOT scrolled, NOT scroll-locked and
+// NOT marked as a scroll burst: the wheel belongs to the panel while the panel
+// holds the focus lock, and the conversation's auto-follow must not be disturbed
+// by it.
+//
+// The panel's own detach latch moves with the wheel, and only with the wheel —
+// this is the single place panel scroll intent is observed for the mouse:
+//
+//   - Wheel up always detaches. Even a wheel that cannot move the window
+//     engages the latch, because the intent is unambiguous and the alternative
+//     (deciding from the resulting offset) cannot distinguish "I scrolled up"
+//     from "there was nowhere to go".
+//   - Wheel down re-arms only at the absolute bottom, matching the
+//     conversation's rule. Re-arming anywhere else would make the next
+//     arriving chunk yank a reader who was still catching up.
+func (m *model) routeReasoningScroll(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	m.reasoningViewport, cmd = m.reasoningViewport.Update(msg)
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.reasoningDetached = true
+	case tea.MouseButtonWheelDown:
+		if m.reasoningViewport.AtBottom() {
+			m.reasoningDetached = false
+		}
+	}
+	return m, cmd
+}
+
+// reasoningSourceID identifies the reasoning the panel is a view onto, without
+// materialising it: how many bytes it holds, and which of the two buffers holds
+// them (0 = event-driven buffer, 1 = legacy panel, 2 = nothing).
+//
+// The split exists for the per-frame freshness check. Handing the string over
+// instead would mean copying the whole reasoning trace — megabytes, on a long
+// trace — several times a second purely to compare it with itself, and the pair
+// of integers answers the same question for the cost of two mutex-guarded
+// length reads.
+//
+// The event-driven buffer is preferred: it is the authority for a model with a
+// formal reasoning channel, and it survives stream completion. The legacy panel
+// is the fallback for the fast-track path that feeds the panel directly. Neither
+// is preferred by content volume, and no attempt is made to concatenate them —
+// that would duplicate the reasoning the sentinel path already flushed into the
+// buffer.
+func (m *model) reasoningSourceID() (n, kind int) {
+	if m.thinkingBuffer != nil && m.thinkingBuffer.Len() > 0 {
+		return m.thinkingBuffer.Len(), 0
+	}
+	if m.thinkingPanel != nil && m.thinkingPanel.Len() > 0 {
+		return m.thinkingPanel.Len(), 1
+	}
+	return 0, 2
+}
+
+func (m *model) reasoningSource() string {
+	switch kind := m.reasoningSourceKind(); kind {
+	case 0:
+		return m.thinkingBuffer.String()
+	case 1:
+		return m.thinkingPanel.String()
+	}
+	return ""
+}
+
+// reasoningSourceKind reports which buffer backs the panel's content: 0 for the
+// event-driven buffer, 1 for the legacy panel, 2 for "no reasoning at all".
+func (m *model) reasoningSourceKind() int {
+	_, kind := m.reasoningSourceID()
+	return kind
+}
+
+// reasoningContentWidth is the wrap width for the panel's lines, measured
+// against the same pane width the conversation uses. The 20-cell floor matches
+// the rest of the renderer: a narrower pane degrades to a hard-wrapped column
+// rather than to a zero-width one.
+func (m *model) reasoningContentWidth() int {
+	w := m.PaneWidth()
+	if w < 20 {
+		w = 20
+	}
+	return w
+}
+
+// buildReasoningContent renders the reasoning into the panel's scrollable body.
+//
+// Every line carries a left accent so the block reads as a subordinate stream
+// rather than as part of the answer — the same gutter the inline reasoning box
+// uses, and the reason the panel needs no frame of its own: the accent IS the
+// boundary, and a boundary that costs zero rows is what lets the panel hold the
+// budget to the exact row.
+func (m *model) buildReasoningContent() string {
+	text := sanitizeText(m.reasoningSource())
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	wrapW := m.reasoningContentWidth() - 2
+	if wrapW < 8 {
+		wrapW = 8
+	}
+	var lines []string
+	for _, src := range strings.Split(text, "\n") {
+		src = strings.TrimRight(src, " \r")
+		if src == "" {
+			lines = append(lines, thinkingStyle.Render("│"))
+			continue
+		}
+		for _, w := range wrapString(src, wrapW) {
+			lines = append(lines, thinkingStyle.Render("│ "+w))
+		}
+	}
+	// A static affordance at the tail. It carries no scroll position on purpose:
+	// a position badge has to be recomputed on every scroll event, and rebuilding
+	// the content to move the badge is how a panel ends up re-anchoring itself to
+	// the tail under the reader's own wheel.
+	lines = append(lines, thinkingStyle.Render("│ "+mutedStyle.Render("▸ Ctrl+O collapse")))
+	return strings.Join(lines, "\n")
+}
+
+// syncReasoningContent pushes the newest reasoning into the sub-viewport.
+//
+// It is the ONLY place the panel's content is built, and it is deliberately
+// not on the render path — see flushReasoningViewport, its frame-locked
+// caller. The (bytes, kind, width) freshness triple guards it so an unchanged
+// buffer is three integer compares rather than a full re-wrap.
+//
+// The window policy is where the detach latch earns its keep, and there are
+// four distinct answers:
+//
+//   - The first sync has no position to preserve, so it anchors at the tail.
+//   - Detached (reasoningDetached): the reader owns the window. The offset is
+//     restored EXACTLY, and GotoBottom is not merely avoided — it must be
+//     unreachable, because it is the one call that would discard the position
+//     the detach latch exists to protect.
+//   - Armed and streaming: follow the tail, because a reader watching
+//     reasoning arrive expects to see it arrive.
+//   - Armed and idle: nothing new is coming, so the position simply stands.
+//     Re-asserting GotoBottom here would be a no-op at best and a yank at
+//     worst if the latch was cleared by a means other than reaching the tail.
+func (m *model) syncReasoningContent() {
+	if m == nil || !m.reasoningExpanded || !m.reasoningDisplayEnabled() {
+		return
+	}
+	srcLen, kind := m.reasoningSourceID()
+	if srcLen == 0 {
+		// A panel with nothing behind it would claim rows, draw blanks, and
+		// keep holding the wheel lock away from a conversation that has content
+		// again. Every way the reasoning can disappear lands here — a new turn
+		// resetting the buffer, /clear, a provider that never opened a
+		// reasoning channel — and every one of them wants the same answer, so
+		// the unmount belongs here rather than in each of the call sites.
+		m.setReasoningExpanded(false)
+		return
+	}
+	width := m.reasoningContentWidth()
+	if srcLen == m.reasoningSyncedBytes && kind == m.reasoningSyncedKind &&
+		width == m.reasoningSyncedWidth {
+		return
+	}
+
+	prevOffset := m.reasoningViewport.YOffset
+	first := !m.reasoningSynced
+
+	m.reasoningSyncedBytes = srcLen
+	m.reasoningSyncedKind = kind
+	m.reasoningSyncedWidth = width
+	m.reasoningSynced = true
+	m.reasoningViewport.SetContent(m.buildReasoningContent())
+
+	switch {
+	case first:
+		m.reasoningViewport.GotoBottom()
+	case m.reasoningDetached:
+		m.reasoningViewport.SetYOffset(prevOffset)
+	case m.streaming:
+		m.reasoningViewport.GotoBottom()
+	default:
+		m.reasoningViewport.SetYOffset(prevOffset)
+	}
+}
+
+// reasoningContentStale reports whether the panel's content no longer matches
+// its source. It is the O(1) half of the frame-throttled sync: three integer
+// reads and a comparison, against a full re-wrap of the whole reasoning trace.
+//
+// The empty source needs no special case. reasoningSourceID reports an empty
+// source as kind 2, and a sync can never record kind 2 (it unmounts the panel
+// and returns first), so "the source emptied" always reads as stale and always
+// routes into the sync — which is what unmounts the panel. That is what keeps a
+// turn boundary from leaving a mounted panel holding the wheel lock with an
+// empty band behind it.
+//
+// It is deliberately a check rather than a stored dirty flag. The reasoning
+// text is appended from a dozen seams — the sentinel extractor, the event-driven
+// buffer, the sub-task chunk path — and a flag set at each of them is only ever
+// as correct as the last one somebody remembered. Deriving staleness from the
+// same triple the sync writes means the two can never disagree, so a
+// missed call site costs a frame of latency instead of a permanently stale
+// panel.
+func (m *model) reasoningContentStale() bool {
+	if m == nil || !m.reasoningExpanded || !m.reasoningDisplayEnabled() {
+		return false
+	}
+	srcLen, kind := m.reasoningSourceID()
+	return srcLen != m.reasoningSyncedBytes || kind != m.reasoningSyncedKind ||
+		m.reasoningContentWidth() != m.reasoningSyncedWidth
+}
+
+// flushReasoningViewport is the frame-locked content sync: the ONE place a
+// frame tick turns reasoning text into panel content.
+//
+// It exists to keep an O(len) re-wrap off the render path. The layout pass
+// (applyReasoningSplit) runs once per Bubble Tea Update, and Bubble Tea
+// renders once per message — so a sync driven from the layout re-wrapped the
+// entire reasoning trace once per incoming TOKEN during streaming. At high
+// token throughput that is the difference between a viewport update costing a
+// few hundred microseconds and one costing milliseconds, and it is spent on the
+// UI goroutine, which is the goroutine that has to drain the mouse queue. That
+// is precisely the "scroll lags while the answer streams" report: the wheel
+// event was not slow, it was queued behind a re-wrap.
+//
+// Here the cost is paid at most once per frame tick (~33 FPS) and only when the
+// source actually moved, so the event queue keeps its budget back.
+func (m *model) flushReasoningViewport() {
+	if m == nil || !m.reasoningExpanded {
+		return
+	}
+	if m.reasoningContentStale() {
+		m.syncReasoningContent()
+	}
+}
+
+// reasoningScrollable reports whether the panel holds more reasoning than it has
+// rows. It is the gate on every keyboard interception: keys that are only
+// meaningful for a scrollable region must not be consumed when the region fits.
+func (m *model) reasoningScrollable() bool {
+	return m != nil && m.reasoningViewport.Height > 0 &&
+		m.reasoningViewport.TotalLineCount() > m.reasoningViewport.Height
+}
+
+// reasoningHasContent reports whether there is reasoning behind the panel at
+// all, read from the SOURCE rather than from the rendered viewport.
+//
+// The layout pass needs this to budget the panel's rows, and it needs it
+// without having synced the content first (see applyReasoningSplit). It is the
+// same two integer reads reasoningContentStale uses, so the budget and the sync
+// can never disagree about whether a panel has anything to show.
+func (m *model) reasoningHasContent() bool {
+	if m == nil {
+		return false
+	}
+	n, _ := m.reasoningSourceID()
+	return n > 0
+}
+
+// reconcileReasoningMount releases a reasoning panel that has nothing behind it.
+//
+// This is the one half of the panel's projection that stays on the layout path,
+// and the split is deliberate: unmounting is a STATE decision that costs two
+// integer reads, while building the content is an O(len) re-wrap. Deferring the
+// cheap decision to the frame tick would buy nothing and cost a frame in which
+// a panel that is empty still holds the wheel lock and still claims its rows —
+// the reader's next scroll would go to a band with nothing in it.
+//
+// So: "should this panel exist?" is answered synchronously, here.
+// "What does it say?" is answered by flushReasoningViewport, on the frame tick.
+func (m *model) reconcileReasoningMount() {
+	if m == nil || !m.reasoningExpanded {
+		return
+	}
+	if m.reasoningHasContent() {
+		return
+	}
+	m.setReasoningExpanded(false)
+}
+
+// routeReasoningKey is the Update-layer half of the keyboard focus lock.
+//
+// It exists separately from handleReasoningScrollKey because the two are reached
+// by different routes: this one runs on the main key path, where the history and
+// viewport-scroll intercepts would otherwise claim arrows and PgUp/PgDn first;
+// the other runs inside handleKey, which the Processing/Approval states call
+// directly. Both delegate to the same handler so there is one definition of what
+// a scroll key means inside the panel.
+func (m *model) routeReasoningKey(msg tea.KeyMsg) (bool, tea.Cmd) {
+	if !m.reasoningScrollLocked() || !m.reasoningScrollable() {
+		return false, nil
+	}
+	if isPrintableRunes(msg) {
+		// Text is never scroll input. See the call site for why.
+		return false, nil
+	}
+	return m.handleReasoningScrollKey(msg)
+}
+
+// handleReasoningScrollKey routes the in-panel scroll keys to the reasoning
+// sub-viewport. It reports whether it consumed the key.
+//
+// The panel's detach latch is maintained here for the keyboard, mirroring
+// routeReasoningScroll for the wheel, so the two input surfaces cannot disagree
+// about whether the reader is parked at the tail. Every key that walks the
+// window away from the tail detaches; every key that lands back on the absolute
+// bottom re-arms.
+//
+// Space is the deliberate exception to "re-arm only at the bottom": it is an
+// explicit "take me to the tail" request, so it both moves the window and
+// re-arms the follow. It is the keyboard equivalent of releasing the latch on
+// the conversation.
+//
+// j/k appear here for the routes that reach handleKey with the prompt blurred.
+// They are inert on the main key path by design — see routeReasoningKey.
+func (m *model) handleReasoningScrollKey(msg tea.KeyMsg) (bool, tea.Cmd) {
+	downward := false
+	reattach := false
+	switch {
+	case msg.String() == "k", msg.Type == tea.KeyUp, msg.Type == tea.KeyCtrlU:
+		m.reasoningViewport.ScrollUp(3)
+	case msg.String() == "j", msg.Type == tea.KeyDown, msg.Type == tea.KeyCtrlD:
+		m.reasoningViewport.ScrollDown(3)
+		downward = true
+	case msg.Type == tea.KeyPgUp, msg.Type == tea.KeyHome:
+		m.reasoningViewport.PageUp()
+	case msg.Type == tea.KeyPgDown, msg.Type == tea.KeyEnd:
+		m.reasoningViewport.PageDown()
+		downward = true
+	case msg.Type == tea.KeySpace:
+		m.reasoningViewport.GotoBottom()
+		reattach = true
+	default:
+		return false, nil
+	}
+	switch {
+	case reattach:
+		m.reasoningDetached = false
+	case downward:
+		// Same rule as the wheel: only the absolute bottom re-arms.
+		if m.reasoningViewport.AtBottom() {
+			m.reasoningDetached = false
+		}
+	default:
+		m.reasoningDetached = true
+	}
+	return true, nil
 }
 
 func (m *model) spinnerTickCmd() tea.Cmd {
