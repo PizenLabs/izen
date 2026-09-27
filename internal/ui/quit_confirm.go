@@ -102,8 +102,8 @@ func (m *model) renderQuitConfirmModal(contentW int) string {
 // confirmation dialog on top of it, so the session stays faintly visible
 // (blurred) behind the modal.
 func (m *model) renderQuitConfirmOverlay(base string) string {
-	width := m.width
-	height := m.height
+	width := m.PaneWidth()
+	height := m.PaneHeight()
 
 	contentW := width - 12
 	if contentW > 60 {

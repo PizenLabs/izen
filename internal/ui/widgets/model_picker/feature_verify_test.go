@@ -158,14 +158,17 @@ func TestRolesOverrideEmit(t *testing.T) {
 			RoleOverridePlan: {ModelID: "openrouter/deepseek/deepseek-r1", Provider: "openrouter", Effort: "high"},
 		})
 
-	// Roles pane summary surfaces the seeded binding (full model is in the
-	// Active line; the pane row itself is hard-truncated by design).
+	// The roles pane is a TREE, so the seeded binding is the role's [1] Primary
+	// CHILD row, not a summary line under the role name. The assertion is on the
+	// row's own content, because a `→ <model>` check would also be satisfied by
+	// the active-model line at the bottom of the view — which is true whether or
+	// not the tree renders anything at all.
 	rolesView := m.SetPaneFocus(PaneRoles).View()
 	if !strings.Contains(rolesView, "Plan / Thinking") || !strings.Contains(rolesView, "Commit / Fast") {
 		t.Errorf("roles pane must list both override entries, got:\n%s", rolesView)
 	}
-	if !strings.Contains(rolesView, "→ openrouter/deepseek") {
-		t.Errorf("roles pane must summarize the seeded plan binding, got:\n%s", rolesView)
+	if !strings.Contains(rolesView, "[1] Primary") {
+		t.Errorf("roles pane must render the primary child row, got:\n%s", rolesView)
 	}
 	if !strings.Contains(rolesView, "Role: plan → openrouter/deepseek/deepseek-r1") {
 		t.Errorf("active line must render full plan binding, got:\n%s", rolesView)

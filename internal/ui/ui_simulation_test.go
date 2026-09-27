@@ -79,8 +79,14 @@ func newTestModel() *model {
 	}
 }
 
-// ── Test 1: tickMsg keeps the spinner chain alive ────────────────────────
+// ── Test 1: the render loop keeps the ANIMATION ticker alive ─────────────
 
+// TestSpinnerTickInStateAwaitingApproval pins the ownership split between the
+// two loops. tickMsg owns RENDER cadence: it repaints the viewport from the
+// live buffers and re-arms itself, but it does NOT advance the glyph — the
+// 100ms SpinnerTickMsg is the sole writer. The command it returns must include
+// that arming, which is what keeps the indicator animating in a state (an
+// approval wait) where no token will ever arrive to drive anything else.
 func TestSpinnerTickInStateAwaitingApproval(t *testing.T) {
 	m := newTestModel()
 	initialFrame := m.spinnerFrame
@@ -88,12 +94,15 @@ func TestSpinnerTickInStateAwaitingApproval(t *testing.T) {
 	newModel, cmd := m.Update(tickMsg(time.Now()))
 	m2 := newModel.(*model)
 
-	expectFrame := (initialFrame + 1) % len(ProposalSpinnerFrames)
-	if m2.spinnerFrame != expectFrame {
-		t.Errorf("spinnerFrame = %d, want %d", m2.spinnerFrame, expectFrame)
+	if m2.spinnerFrame != initialFrame {
+		t.Errorf("the render loop advanced the spinner: %d → %d; the animation ticker is "+
+			"the only writer", initialFrame, m2.spinnerFrame)
 	}
 	if cmd == nil {
-		t.Fatal("tickMsg returned nil cmd — spinner tick chain broken")
+		t.Fatal("tickMsg returned nil cmd — the render/animation chain is broken")
+	}
+	if !m2.spinnerTickArmed {
+		t.Error("tickMsg did not arm the decoupled animation ticker while work is in flight")
 	}
 }
 
@@ -115,6 +124,9 @@ func TestSpinnerTickInStateChat(t *testing.T) {
 	// State changes are driven by other messages, not tickMsg.
 	if cmd != nil {
 		t.Fatal("tickMsg in idle StateChat should return nil cmd — tick loop stops when idle")
+	}
+	if m2.spinnerTickArmed {
+		t.Error("the animation ticker was armed on an idle prompt bar")
 	}
 }
 
@@ -208,17 +220,25 @@ func TestSmoothStreamTickKeepsStreamingAlive(t *testing.T) {
 func TestComputeVpHeightWithProposalBlock(t *testing.T) {
 	m := newTestModel()
 
-	// computeVpHeight uses the new zero-gap formula:
-	// height=40 - inputHeight(2) - statusLineHeight(1) - dockHeight(10) - bottomSep(1) = 26
-	vpHeight := m.computeVpHeight()
-	expectVp := 26
-	if vpHeight != expectVp {
-		t.Errorf("computeVpHeight = %d, want %d", vpHeight, expectVp)
-	}
-
-	// Render the proposal block and count lines
+	// The viewport budget is derived from the MEASURED heights of the four
+	// rendered regions, not from a hand-maintained line count per region. That
+	// is the whole point: the old estimate reserved 10 rows for a dock that
+	// actually draws 14, so the frame was four rows taller than the terminal
+	// and the terminal scrolled — which is how `ask )` prompt bars ended up
+	// stacked in scrollback.
+	header := m.renderTopBar(m.width)
+	footer := m.renderFixedFooter(m.width, nil)
+	input := m.renderInputRegion(m.width, m.modeStyle(m.resolver.Current()))
 	proposalBlock := m.renderProposalBlock()
-	proposalLines := len(strings.Split(strings.TrimRight(proposalBlock, "\n"), "\n"))
+	proposalLines := regionHeight(proposalBlock)
+
+	vpHeight := m.computeVpHeight()
+	want := m.height - regionHeight(header) - regionHeight(input) - regionHeight(footer) - proposalLines
+	if vpHeight != want {
+		t.Errorf("computeVpHeight = %d, want %d (header=%d input=%d footer=%d dock=%d)",
+			vpHeight, want, regionHeight(header), regionHeight(input),
+			regionHeight(footer), proposalLines)
+	}
 	t.Logf("Proposal block rendered %d lines (vpHeight=%d)", proposalLines, vpHeight)
 
 	// The View() output total should not exceed m.height

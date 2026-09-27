@@ -274,6 +274,11 @@ func (m *model) finalizeOperation(outcome OperationOutcome, err error) {
 	// progress indicator can survive the operation that produced it.
 	m.finishStage(outcome)
 	m.clearBusyFlags()
+	// Same rule for the pre-execution skeleton: an indicator for a surface that
+	// will now never be produced must not outlive the operation. Released
+	// without substituting content — the operation's own terminal record is the
+	// finalized content, and it arrives on its own message.
+	m.unmountSkeleton()
 	m.stopShimmer()
 	m.syncUIState()
 }

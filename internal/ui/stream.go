@@ -275,12 +275,36 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamRing = newStreamRing(streamRingCapacity)
 	m.resetTokenPacer()
 	m.tokenPacer = NewTokenPacer(m.streamRing, 0, 0, m.frameInterval())
+	// ── THREAD-SAFE TOKEN ACCUMULATOR (per-token messages removed) ──
+	// The producer goroutine appends every content and reasoning delta here and
+	// returns. No tea.Msg is constructed for it, nothing is pushed onto
+	// streamCh, and no read command is re-armed per token — so the Bubble Tea
+	// event loop receives NO per-token message and the queue a wheel event is
+	// waiting in cannot be filled by the stream.
+	m.streamAccum = NewStreamAccumulator()
 	m.streaming = true
 	m.spinnerFrame = 0
 	// A fresh stream starts a new assistant record: the streaming tail is
 	// re-established (with a fresh block-boundary separator) on the first token.
 	m.streamingDocStart = -1
 	m.resetStreamingRenderer()
+	// CHARACTER-LEVEL TYPEWRITER PACER: arm the reveal interpolation for this
+	// answer. The pacer is constructed HERE — the single production stream
+	// start — so a headless model that sets streaming=true directly keeps a nil
+	// pacer and the immediate-reveal render, while the live TUI turns a bursty
+	// provider into a fluid typewriter animation. It is released by
+	// resetStreamingRenderer once the stream is no longer live.
+	m.typewriter = newTypewriterPacer()
+	// TURN BOUNDARY for the unified stream pacer: a new turn's background sources
+	// are not a continuation of the last one's, so a pending flag carried across
+	// would make the first frame of this turn report a change that never
+	// happened — and, worse, request a tail-follow the user never asked for.
+	//
+	// It is reset HERE, at the start of a turn, and not inside
+	// resetStreamingRenderer: that function also runs on every non-streaming
+	// document refresh, and zeroing the pacer there would discard bytes a live
+	// /exec had already produced.
+	m.resetStreamPacer()
 	// TRUTHFUL PROVIDER STATUS: the loading dock derives its indicator from
 	// the authoritative stage — a provider round-trip before the first byte
 	// renders as "Model ● waiting", never as "Thinking...".
@@ -330,7 +354,7 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	m.streamBuffer = ""
 	m.currentStreamContent = ""
 	m.resetStreamBlocks()
-	m.streamParser = NewIncrementalStreamParser(m.width - 2)
+	m.streamParser = NewIncrementalStreamParser(m.PaneWidth() - 2)
 	m.streamParser.Reset()
 	if m.sess.ObjectiveState != nil && m.sess.ObjectiveState.HumanConfirmed {
 		m.sess.ObjectiveState.CurrentStatus = domain.ObjectiveExecuting
@@ -467,19 +491,40 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// panic with "close of nil channel".
 	streamCh := m.streamCh
 	ring := m.streamRing
+	// The accumulator is captured for the same reason: the producer must never
+	// read m.streamAccum after Update() clears it to nil.
+	accum := m.streamAccum
 
 	// ── NON-BLOCKING PRODUCER (engine→UI decoupling) ───────────────────
-	// Every message the producer emits goes through send. The primary path is
-	// a non-blocking channel send (the UI re-arms readStream on every token,
-	// so the channel drains on each Update delivery). When the channel is
-	// temporarily full — the event loop is mid-frame and hasn't re-armed —
-	// overflow is parked in the lock-free streamRing instead of blocking the
-	// LLM thread; the UI frame-pass drain (FrameTickMsg) and the terminal
-	// stream handlers flush it. Terminal messages (done/err) are rare (1-2
-	// per stream) and MUST cross in order, so their overflow falls back to a
-	// blocking send — never to the ring — guaranteeing they are always
-	// delivered ahead of the next stream's lifetime.
+	// Three lanes, in the order a message must cross them:
+	//
+	//  1. TOKEN DELTAS → the thread-safe accumulator, and nowhere else. This
+	//     is the lane that used to be per-token tea.Msgs. A message per token
+	//     is a message PLUS the read command that fetches it PLUS whatever
+	//     Update() does to answer it, and all three land on the same goroutine
+	//     that has to answer a wheel event. Appending costs one mutex
+	//     acquisition and produces nothing for the event queue; the frame tick
+	//     drains the whole batch in one copy. This is what makes the
+	//     "bubbletea receives NO per-token messages" contract structural rather
+	//     than aspirational — there is no code path left that could emit one.
+	//
+	//  2. RARE CONTROL MESSAGES (usage updates, the explicit role-fallback
+	//     switch) → a non-blocking channel send, with the lock-free streamRing
+	//     as overflow when the event loop is mid-frame and has not re-armed.
+	//     These are O(1) per stream, so the queue cost is bounded and the
+	//     ordering that matters (the fallback line must precede the fallback
+	//     model's first token) is preserved by keeping them off the ring.
+	//
+	//  3. TERMINAL MESSAGES (done/err) → the channel, blocking if full. They
+	//     are 1-2 per stream and MUST cross in order, so their overflow falls
+	//     back to a blocking send — never to the ring — guaranteeing they are
+	//     always delivered ahead of the next stream's lifetime. Blocking here
+	//     is safe precisely because the UI drains the ring on its frame pass,
+	//     which frees channel slots without any per-token message.
 	send := func(msg tea.Msg) {
+		if accumulateStreamMsg(accum, msg) {
+			return
+		}
 		select {
 		case streamCh <- msg:
 			return
@@ -737,7 +782,30 @@ func (m *model) streamCmd(content string) tea.Cmd {
 		})
 	}()
 
-	return tea.Batch(m.streamTraceCmd(), m.readStream(), m.smoothStreamTickCmd(), m.shimmerTickCmd(), m.executingHeaderTickCmd())
+	// ── FRAME LOOP ARMED AT STREAM START ─────────────────────────────
+	// The frame tick used to be armed by the first tokenMsg, which is
+	// impossible now that no token produces a message: a stream whose provider
+	// is slow to first byte would have no frame loop and no way to notice its
+	// own deltas. Arming it here makes the loop a property of the STREAM
+	// rather than of its traffic. The handler re-arms itself while m.streaming
+	// is true and releases the loop at completion, so this is one arm, not a
+	// per-token one.
+	//
+	// The DECOUPLED ANIMATION TICKER is armed on the same batch. It is a
+	// separate loop on purpose — the glyph rotation is a property of the glyph
+	// cycle, not of the render cadence — so a stream that produces its first
+	// token after four seconds animates the whole four seconds instead of
+	// showing a frozen ⠋ until the answer starts arriving.
+	m.frameTickActive = true
+	return tea.Batch(
+		m.streamTraceCmd(),
+		m.readStream(),
+		m.frameTickCmd(),
+		m.smoothStreamTickCmd(),
+		m.shimmerTickCmd(),
+		m.executingHeaderTickCmd(),
+		m.ensureSpinnerTick(),
+	)
 }
 
 // executingHeaderTickMsg advances the Top Header execution sweep by one

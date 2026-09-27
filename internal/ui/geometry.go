@@ -20,65 +20,39 @@ type ViewportGeometry struct {
 }
 
 // viewportGeometry returns the authoritative geometry used by both the renderer
-// (assembleScreen / View) and the mouse-to-logical coordinate mapper. It
-// mirrors the layout partitioning in assembleScreen/View exactly so there is
-// only one source of truth.
+// (assembleScreen / View) and the mouse-to-logical coordinate mapper.
+//
+// It renders the same regions assembleScreen renders, normalises them the same
+// way, and hands them to the same ViewportHeight arithmetic, so the two can never
+// disagree. That matters most for the mouse mapper: a click is turned into a
+// record index using this rectangle, and a rectangle that is one row taller than
+// the drawn viewport maps every click in the last row to the wrong record.
+//
+// The proposal dock is MEASURED rather than estimated. It used to be sized by a
+// hand-maintained per-branch line count that reserved 10 rows for a dock that
+// actually drew 14, so the frame was four rows taller than the terminal and the
+// terminal scrolled. The dock only renders in the two states that show it, so
+// the extra work is confined to those states.
 func (m *model) viewportGeometry() ViewportGeometry {
-	width := m.width
-	if width < 40 {
-		width = 40
+	width := max(m.PaneWidth(), minViewportWidth)
+
+	borderStyle := m.modeStyle(m.resolver.Current())
+	if m.inViMode {
+		borderStyle = viBorderStyle
 	}
 
-	// Header height: rendered fixed header line count (0 when no runtime ctx).
-	headerView := m.renderTopBar(width)
-	headerLines := countLines(headerView)
+	headerView := normalizeRegion(m.renderTopBar(width))
+	footerView := normalizeRegion(m.renderFixedFooter(width, nil))
+	inputView := normalizeRegion(m.renderInputRegion(width, borderStyle))
 
-	footerView := m.renderFixedFooter(width, nil)
-	footerLines := countLines(footerView)
-
-	// Input + proposal heights use the same helpers as assembleScreen.
-	// We must reconstruct the same inputView/proposal heights without
-	// duplicating the view strings arbitrarily.
-	// Autocomplete dropdown height when active.
-	autoH := m.getAutocompleteHeight()
-	// The old idle-telemetry status bar row is gone: the prompt bar anchors
-	// directly above the single-line lifecycle footer, so no separate status
-	// height is reserved here.
-	statusH := 0
-	// Proposal dock height when present.
-	proposalH := 0
+	var proposalView string
 	if m.state == StateAwaitingApproval || m.state == StateProcessing {
-		proposalH = m.getProposalDockCurrentHeight()
+		proposalView = normalizeRegion(m.renderProposalBlock())
 	}
-	// Input area already includes autocomplete because assembleScreen builds
-	// inputView with autocomplete inside and counts it. Our autoH is part of
-	// that, but the constant 3 is just the rule+prompt+rule. When autocomplete
-	// is active the inputView gains autoH extra lines, which we add here.
-	// Similarly proposal is separate.
-	//
-	// Total fixed height outside the viewport:
-	// header + footer + input (3 + autoH) + proposal
-	//
-	// assembleScreen computes:
-	//   totalFixed = headerLines + inputLines + footerLines
-	//   where inputLines = countLines(inputView) which already includes autoH
-	//   and the footer is the single-line lifecycle bar (no status row).
-	// So we replicate that:
-	inputLines := 3 + autoH
-	// When we are in a narrow mode where header/footer may be empty we already
-	// have 0 for those; keep the same formula.
-	totalFixed := headerLines + inputLines + statusH + footerLines
-	height := m.height - totalFixed - proposalH
-	if height < 1 {
-		height = 1
-	}
+	proposalView = capProposalDock(proposalView, m.Screen().Height,
+		regionHeight(headerView), regionHeight(inputView), regionHeight(footerView))
 
-	return ViewportGeometry{
-		Top:    headerLines + m.viewportPaneTop,
-		Left:   m.viewportPaneLeft,
-		Width:  m.Viewport.Width,
-		Height: height,
-	}
+	return m.measureViewportGeometry(headerView, proposalView, inputView, footerView)
 }
 
 // viewportContentPrefixHeight returns the number of physical lines at the top
@@ -90,7 +64,7 @@ func (m *model) viewportGeometry() ViewportGeometry {
 func (m *model) viewportContentPrefixHeight() int {
 	var prefix strings.Builder
 	if m.showBanner && len(m.records) == 0 {
-		b := m.renderStartupBanner(m.width)
+		b := m.renderStartupBanner(m.PaneWidth())
 		if b != "" {
 			prefix.WriteString(b)
 			prefix.WriteString("\n")

@@ -81,9 +81,29 @@ func (m *model) clearPresentation() {
 	if m.thinkingPanel != nil {
 		m.thinkingPanel.Reset()
 	}
+	// The reasoning PANEL is a rendered surface, and it describes a turn the user
+	// just discarded: leaving it mounted would spend rows on a band with nothing
+	// in it, and — worse — leave the wheel locked on an empty viewport. It is
+	// unmounted here for the same reason the skeleton indicator is released.
+	m.setReasoningExpanded(false)
 	if m.liveCodePreview != nil {
 		m.liveCodePreview.Reset()
 	}
+	// The pre-execution skeleton is PRESENTATION: /clear clears what I see, and
+	// an indicator for work the user just dismissed is a claim about a
+	// conversation that no longer exists. It is released here (not in
+	// clearExecutionActivity) because it is a rendered surface, not an
+	// execution-activity record.
+	m.unmountSkeleton()
+	// Same reasoning for the table holdback: a held-back table describes a
+	// response the user just discarded, so the latch is released and its
+	// buffered bytes dropped rather than surfacing in the next turn.
+	m.closeTableHoldback()
+	m.resetStreamingRenderer()
+	// Same reasoning for the unified stream pacer: a pending background source
+	// describes output from a conversation the user just discarded, so it is
+	// dropped rather than drawn into the next turn's first frame.
+	m.resetStreamPacer()
 	m.stopShimmer()
 }
 
@@ -132,6 +152,9 @@ func (m *model) resetTransientInteraction() {
 	m.records = nil
 	m.PreRenderedHistory = ""
 	m.showBanner = true
+	// A cleared document is not an extension of the old one: every per-frame
+	// cache is derived from the records that just went away.
+	m.invalidateFrameCaches()
 
 	m.clearPresentation()
 	m.clearExecutionActivity()
@@ -190,6 +213,11 @@ func (m *model) resetTransientInteraction() {
 	// operation (beginOperation) opens it again. ──
 	m.sealActivitySurface()
 
+	// A cleared document has no tail, so any offset carried over from the
+	// conversation the user just dismissed describes a document that no longer
+	// exists. Re-arm the detach latch before the refresh below anchors the
+	// empty surface, so the two can never disagree about where "the bottom" is.
+	m.resetAutoScrollLatch()
 	m.refreshViewportContent()
 	if m.Ready {
 		m.Viewport.GotoBottom()

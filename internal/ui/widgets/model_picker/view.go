@@ -35,10 +35,16 @@ func formatCapabilities(caps []registry.ModelCapability) string {
 // surface: [PROVIDERS pane | MODELS pane] with capability-truthful variant
 // rendering (Supported / Unsupported / Unknown). The 5-workspace matrix and
 // 3-role assignment matrix are removed per Phase 3 spec. When the secure
-// inline API-key overlay is open it renders exclusively as that dialog.
+// inline API-key overlay is open it renders exclusively as that dialog, and
+// when the role-parameter editor (Alt+E) is open it renders exclusively as that
+// dialog — a modal that renders behind the list it is editing is a modal whose
+// focus indicator is a lie.
 func (m Model) View() string {
 	if m.apiKeyInput != nil {
 		return m.renderApiKeyOverlay()
+	}
+	if m.roleConfig != nil {
+		return m.renderRoleConfigOverlay()
 	}
 	if m.state == StateDetail {
 		return m.renderDetailLayout()
@@ -131,6 +137,10 @@ func (m Model) renderBrowsingLayout() string {
 	b.WriteString("\n")
 	b.WriteString(m.clipLine(m.renderRuntimePathLine()))
 	b.WriteString("\n")
+	b.WriteString(m.clipLine(m.renderFallbackChainLine()))
+	b.WriteString("\n")
+	b.WriteString(m.clipLine(m.renderRoleParamsLine()))
+	b.WriteString("\n")
 
 	if m.status != "" {
 		b.WriteString(m.clipLine(mutedStyle.Render(" " + m.status)))
@@ -219,45 +229,98 @@ func (m Model) renderBrowsingFooter() string {
 		inner = 64
 	}
 
-	segments := [][2]string{
-		{"Tab", "select"},
-		{"↑/↓", "nav"},
-		{"Enter", "activate"},
-		{"Alt+A", "API key"},
-		{"Alt+i", "details"},
-		{"Esc", "close"},
-	}
-	buildStyled := func(segs [][2]string) string {
+	// The footer is PANE-AWARE, and priority-ordered.
+	//
+	// Pane-aware because the three surfaces have genuinely different keys: a
+	// hint line that offers "Alt+J reorder" while the user is in the models
+	// list is telling them about a key that does nothing there, and one long
+	// merged line is a line whose middle gets truncated away on any normal
+	// terminal — which is how the tree's own keys became invisible in the first
+	// place.
+	//
+	// Priority-ordered because the alternative (dropping the middle hint
+	// repeatedly) makes WHICH hint survives a function of the list's length
+	// rather than of its importance. Dropping by declared priority means the
+	// line degrades along a designed order: the exotic key falls off before the
+	// one the user is about to press.
+	segments := m.footerHints()
+	buildStyled := func(segs []footerHint) string {
 		parts := make([]string, 0, len(segs))
 		for _, s := range segs {
-			parts = append(parts, keyStyle.Render(s[0])+" "+descStyle.Render(s[1]))
+			parts = append(parts, keyStyle.Render(s.Key)+" "+descStyle.Render(s.Desc))
 		}
 		return strings.Join(parts, "   ")
 	}
-	buildPlain := func(segs [][2]string) string {
+	buildPlain := func(segs []footerHint) string {
 		parts := make([]string, 0, len(segs))
 		for _, s := range segs {
-			parts = append(parts, s[0]+" "+s[1])
+			parts = append(parts, s.Key+" "+s.Desc)
 		}
 		return strings.Join(parts, "   ")
 	}
 	if m.innerWidth <= 0 && m.width <= 0 {
 		return buildStyled(segments)
 	}
-	// Adaptively drop middle hints until the plain line fits, preserving
-	// the leading Tab and trailing Esc-close anchors.
+	// Drop the least important hint until the plain line fits. The two
+	// anchors (Tab / Esc, priority 0) are never candidates: without them the
+	// user cannot leave this surface, and a modal you cannot leave is worse
+	// than a modal whose help line is short.
 	for lipgloss.Width(buildPlain(segments)) > inner && len(segments) > 3 {
-		idx := len(segments) / 2
-		if idx <= 0 {
-			idx = 1
+		worst, worstPriority := -1, -1
+		for i, s := range segments {
+			if s.Priority <= 0 {
+				continue
+			}
+			if s.Priority > worstPriority {
+				worst, worstPriority = i, s.Priority
+			}
 		}
-		if idx >= len(segments)-1 {
-			idx = len(segments) - 2
+		if worst < 0 {
+			break
 		}
-		segments = append(segments[:idx], segments[idx+1:]...)
+		segments = append(segments[:worst], segments[worst+1:]...)
 	}
 	help := buildStyled(segments)
 	return truncateStyled(help, inner)
+}
+
+// footerHint is one "KEY description" pair plus its drop priority. Lower is
+// more important; 0 means "never drop".
+type footerHint struct {
+	Key      string
+	Desc     string
+	Priority int
+}
+
+// footerHints returns the keybinding hints for the focused pane, most important
+// first. The ROLES pane leads with the keys that only exist there, because it
+// is the surface whose operations are invisible from the rows themselves: no
+// fallback row says "Alt+J moves me", and a reorder nobody can discover is a
+// reorder nobody performs.
+func (m Model) footerHints() []footerHint {
+	if m.paneFocus == PaneRoles || m.showingRoles {
+		return []footerHint{
+			{Key: "Tab", Desc: "select", Priority: 0},
+			{Key: "↑/↓", Desc: "nav tree", Priority: 1},
+			{Key: "Alt+F", Desc: "add fallback", Priority: 1},
+			{Key: "Alt+K/J", Desc: "reorder", Priority: 2},
+			{Key: "Alt+D", Desc: "delete", Priority: 2},
+			{Key: "Alt+E", Desc: "params", Priority: 2},
+			{Key: "←/→", Desc: "fold", Priority: 3},
+			{Key: "Enter", Desc: "assign", Priority: 3},
+			{Key: "Esc", Desc: "close", Priority: 0},
+		}
+	}
+	return []footerHint{
+		{Key: "Tab", Desc: "select", Priority: 0},
+		{Key: "↑/↓", Desc: "nav", Priority: 1},
+		{Key: "Enter", Desc: "activate", Priority: 1},
+		{Key: "Alt+A", Desc: "API key", Priority: 2},
+		{Key: "Alt+F", Desc: "chain", Priority: 2},
+		{Key: "Alt+E", Desc: "params", Priority: 3},
+		{Key: "Alt+i", Desc: "info", Priority: 3},
+		{Key: "Esc", Desc: "close", Priority: 0},
+	}
 }
 
 // renderDetailView renders the model detail card: a bordered information card
@@ -408,9 +471,10 @@ func (m Model) renderDetailFooter() string {
 	keyStyle := lipgloss.NewStyle().Foreground(colorText).Bold(true)
 	descStyle := lipgloss.NewStyle().Foreground(colorSubtext0)
 
-	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s",
-		keyStyle.Render("↑↓"), descStyle.Render("select"),
-		keyStyle.Render("r"), descStyle.Render("reasoning policy"),
+	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s   %s %s",
+		keyStyle.Render("←/→"), descStyle.Render("effort"),
+		keyStyle.Render("Alt+R"), descStyle.Render("reasoning policy"),
+		keyStyle.Render("Alt+F"), descStyle.Render("fallback chain"),
 		keyStyle.Render("Enter"), descStyle.Render("activate & exit"),
 		keyStyle.Render("Esc"), descStyle.Render("back"),
 	)
@@ -471,11 +535,11 @@ func (m Model) renderBottomPanel() string {
 	help := fmt.Sprintf("%s %s   %s %s   %s %s   %s %s",
 		keyStyle.Render("↑/↓"), descStyle.Render("select"),
 		keyStyle.Render("type to search"), descStyle.Render(""),
-		keyStyle.Render("Alt+d/p/s/v/a"), descStyle.Render("bind role"),
+		keyStyle.Render("Alt+F"), descStyle.Render("fallback chain"),
 		keyStyle.Render("Enter"), descStyle.Render("activate"),
 	)
 	// Ensure the spec-required substrings survive clipping:
-	// "↑/↓ select", "type to search", "Alt+d/p/s/v/a bind role", "Enter activate"
+	// "↑/↓ select", "type to search", "Alt+F fallback chain", "Enter activate"
 	_ = help
 	helpClipped := truncateStyled(strings.ReplaceAll(help, "\n", " "), innerW)
 	// Fallback to legacy footer text if help somehow empty, ensures test "Enter: activate" always present.
@@ -537,9 +601,26 @@ func (m Model) snapshotModels() []registry.ModelDescriptor {
 }
 
 // paneHeight returns the height available for the dual-pane content area.
-// Chrome above and below the panes: header(1) + divider(1) + divider(1) +
-// active(1) + provider(1) + variant(1) + runtime path(1) = 7 lines, plus
-// padFooter's 1-line footer = 8 total.
+//
+// # THE ARITHMETIC, AND THE OFF-BY-ONE IT USED TO HAVE
+//
+// padFooter keeps at most innerH-1 body lines and then appends the 1-line
+// footer, so the body must total at most innerH-1. The body's fixed rows are
+// listed in browserChromeRows below; with that constant, N (the panes) must be
+// at most innerH-browserChromeRows-1.
+//
+// It used to be innerH-8 (and, before the fallback-chain line existed,
+// innerH-9): one row too many in both cases, and the consequence was not a
+// cosmetic crop — padFooter hard-clips from the END of the body, so the row that
+// fell off was the STATUS line. Every status the modal has ever shown — "added
+// to chain", "API key cannot be empty", "syncing..." — was silently discarded on
+// a modal of a normal size, which is why a user pressing Alt+F appeared to get
+// no feedback at all.
+//
+// The same trap is why the role-parameters row and browserChromeRows were added
+// together: a chrome row added in the layout and not in that constant is a
+// silent one-row overflow that eats whatever is last — and the last thing is
+// always the thing a user is waiting to read.
 func (m Model) paneHeight() int {
 	innerH := m.innerHeight
 	if innerH <= 0 {
@@ -548,8 +629,22 @@ func (m Model) paneHeight() int {
 	if innerH <= 0 {
 		return 15
 	}
-	return max(3, innerH-8)
+	return max(3, innerH-browserChromeRows-1)
 }
+
+// browserChromeRows is the number of NON-PANE body rows the browsing layout
+// renders between the panes and the footer.
+//
+//	header(1) divider(1) [PANE BODY] divider(1)
+//	active(1) provider(1) variant(1) runtimePath(1) fallbackChain(1)
+//	roleParams(1) status(1)
+//
+// which is 10 + N, so N must be at most innerH-11 (the extra 1 is the footer
+// line padFooter always reserves). It is a named constant rather than a literal
+// at each of the two sites that need it — paneHeight and SetSize's
+// listRowBudget — because the two must agree exactly: a page-key budget one row
+// more generous than the pane is a page key that scrolls past the last row.
+const browserChromeRows = 10
 
 // renderLeftPane dispatches the left pane: the Roles policy list when the
 // Roles tab is active, else the provider list (with [All models] first).
@@ -566,7 +661,28 @@ const (
 	// providersPaneWidth is the fixed width of the left providers pane
 	// in the dual-pane browsing layout. Right pane gets the remainder.
 	providersPaneWidth = 24
+	// rolesPaneWidth is the fixed width of the left ROLES TREE pane.
+	//
+	// It is WIDER than the providers pane because a tree row has a structure a
+	// provider name does not: a gutter, a bracketed hop number, a label and a
+	// model slug. At the providers pane's 24 cells a child row renders as
+	// "  [2] Fallback ollama/l…" — the hop number legible, the model, which is
+	// the part the user is reading it for, not. Widening the left pane is
+	// cheap because the right pane is sized from the remainder, and the
+	// providers pane keeps its own width so nothing about that layout moves.
+	rolesPaneWidth = 36
 )
+
+// leftPaneWidth is the width of the pane on the left of the divider, which
+// depends on which surface the left pane is currently showing. The right pane
+// is derived from the remainder, so the two must agree EXACTLY or the divider
+// and the outer border stop lining up.
+func (m Model) leftPaneWidth() int {
+	if m.showingRoles {
+		return rolesPaneWidth
+	}
+	return providersPaneWidth
+}
 
 // Tabular column widths for the MODELS pane: Model ID (flexible), Context
 // Window (fixed), Pricing (fixed), Capability badges (dynamic).
@@ -657,66 +773,11 @@ func (m Model) appendProviderRow(lines *[]string, idx int, cell string, isAll bo
 	}
 }
 
-// renderRolesPane renders the left pane in Roles mode: the two top-level
-// policy overrides (Plan/Thinking and Commit/Fast) with their bound model /
-// reasoning effort summary lines.
-func (m Model) renderRolesPane() string {
-	paneW := providersPaneWidth
-	paneH := m.paneHeight()
-
-	var lines []string
-	lines = append(lines, mutedStyle.Render("ROLES"))
-	lines = append(lines, "")
-
-	for i, ro := range roleOverrideEntries {
-		if len(lines) >= paneH {
-			break
-		}
-		selected := i == m.roleCursor && m.paneFocus == PaneRoles
-		cell := fmt.Sprintf("%s %s", "▶", ro.Label)
-		raw := runewidth.Truncate(cell, paneW, "…")
-		raw = padRightExact(raw, paneW)
-		if selected {
-			lines = append(lines, selectedRowStyle.Render(raw))
-		} else {
-			lines = append(lines, mutedStyle.Render(raw))
-		}
-		// Binding summary sub-line.
-		if len(lines) < paneH {
-			sub := m.roleOverrideSummary(ro.Key)
-			sub = runewidth.Truncate(sub, paneW-subPrefixW, "…")
-			sub = padRightExact(sub, paneW-subPrefixW)
-			lines = append(lines, mutedStyle.Render("  "+sub))
-		}
-	}
-
-	for len(lines) < paneH {
-		lines = append(lines, strings.Repeat(" ", paneW))
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
-}
-
-// roleOverrideEntries is the closed set of top-level role policy overrides.
-var roleOverrideEntries = []struct{ Key, Label string }{
-	{RoleOverridePlan, "Plan / Thinking"},
-	{RoleOverrideCommit, "Commit / Fast"},
-}
-
-// subPrefixW reserves the leading "  " indent for roles-pane summary rows.
-const subPrefixW = 2
-
-// roleOverrideSummary renders the bound model + reasoning effort for a role
-// override key, or the unbound marker when none is set.
-func (m Model) roleOverrideSummary(key string) string {
-	if ob, ok := m.policyOverrides[key]; ok && ob.ModelID != "" {
-		s := "→ " + ob.ModelID
-		if ob.Effort != "" && ob.Effort != DefaultReasoningOption {
-			s += " · " + ob.Effort
-		}
-		return s
-	}
-	return "→ —"
-}
+// renderRolesPane, the ROLES tree, roleOverrideEntries, subPrefixW and
+// roleOverrideSummary live in roles_pane.go. They are not here because the pane
+// is small; they are there because the TREE is the feature, and a hierarchy
+// whose structure is spread across the layout file and the model file is a
+// hierarchy nobody can change without breaking the geometry.
 
 // allModelsCount reports the total number of models in the snapshot.
 func (m Model) allModelsCount() int {
@@ -737,8 +798,8 @@ func (m Model) renderModelsPane() string {
 	if innerW <= 0 {
 		innerW = 64
 	}
-	paneW := innerW - providersPaneWidth - 1 // -1 for separator; guarantee equality
-	_ = paneW + providersPaneWidth + 1       // assert: left + sep + right == innerW
+	paneW := innerW - m.leftPaneWidth() - 1 // -1 for separator; guarantee equality
+	_ = paneW + m.leftPaneWidth() + 1       // assert: left + sep + right == innerW
 	if paneW < 16 {
 		paneW = 16
 	}
@@ -1230,6 +1291,56 @@ func (m Model) buildVerticalSeparator() string {
 // renderActiveLine shows the currently active model ID without the filter
 // category prefix (no "All models /" prefix). In Roles mode it surfaces the
 // highlighted role policy override instead.
+// renderFallbackChainLine renders the active fallback chain for the role the
+// Alt+F edit targets, in the numbered, arrow-joined form the spec pins:
+//
+//	Fallback Chain: 1. qwen2.5-coder:7b -> 2. ollama/llama3.2
+//
+// # WHY NUMBERED AND ARROWED
+//
+// A chain is an ORDER, and the order is the entire semantic content: "1. a ->
+// 2. b" says a is tried before b, and a bare "a, b" does not. The numbering
+// makes the position unambiguous at a glance and survives truncation — a chain
+// clipped to its first two hops still reads as a chain, not as a complete list.
+//
+// It also names the ROLE on the same line, for the same reason the status line
+// does: the same keypress edits a different chain depending on which pane the
+// user is on, and a line that showed only the models would leave that invisible.
+//
+// # THE UNSAVED MARKER
+//
+// A staged-but-unconfirmed edit renders with a trailing marker, and an empty
+// chain renders as an explicit "none" rather than as an absence. Both exist for
+// the same reason: this surface is where a user checks what their config says,
+// and a blank is the one rendering that cannot be distinguished from "the
+// feature is off".
+func (m Model) renderFallbackChainLine() string {
+	roleKey := m.fallbackRole
+	if roleKey == "" {
+		roleKey = m.effectiveFallbackRole()
+	}
+	label := "Fallback Chain: " + roleKey + ":  "
+	body := mutedStyle.Render("(none) — Alt+F adds the highlighted model")
+	if chain := m.FallbackChain(roleKey); len(chain) > 0 {
+		parts := make([]string, 0, len(chain))
+		for i, entry := range chain {
+			parts = append(parts, fmt.Sprintf("%d. %s", i+1, entry))
+		}
+		body = accentStyle.Render(strings.Join(parts, mutedStyle.Render(" -> ")))
+	}
+	// The dirty marker is derived from the widget, not tracked separately: a
+	// marker that could disagree with the chain it is marking is worse than no
+	// marker.
+	marker := ""
+	if m.fallbackDirty {
+		marker = mutedStyle.Render(" *unsaved — Enter saves, Esc discards")
+	}
+	return mutedStyle.Render(label) + body + marker
+}
+
+// renderActiveLine shows the currently active model ID without the filter
+// category prefix (no "All models/" prefix). In Roles mode it surfaces the
+// highlighted role policy override instead.
 func (m Model) renderActiveLine() string {
 	if m.showingRoles {
 		role := m.HighlightedRole()
@@ -1412,7 +1523,8 @@ func (m Model) syncIndicator() (string, interface {
 // visibleWindow computes the dynamic viewport: chrome-aware budget from
 // innerHeight with cursor-following scroll offset. Spec: Total Chrome = 8
 // (Title, Divider, Divider, Active Model, Provider, Variant, Runtime Path,
-// Help footer). listRowBudget = max(3, innerHeight - 8). Zero height = show all.
+// Fallback Chain, Status, Help footer). listRowBudget =
+// max(3, innerHeight - 10). Zero height = show all.
 //
 //nolint:unused // retained as the pane-agnostic contract ancestor of visibleWindowBudget
 func (m Model) visibleWindow() (start, end int) {
@@ -1429,7 +1541,7 @@ func (m Model) visibleWindow() (start, end int) {
 		if m.listRowBudget > 0 {
 			budget = m.listRowBudget
 		} else {
-			budget = max(3, innerH-8)
+			budget = max(3, innerH-10)
 		}
 		if budget > total {
 			budget = total

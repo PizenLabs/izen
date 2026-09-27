@@ -138,7 +138,73 @@ func snapshotFromDescriptors(prev *registry.ModelSnapshot, models []registry.Mod
 	return out
 }
 
+// ── FALLBACK CHAIN TOGGLING ──────────────────────────────────────────────────
+
+// toggleFallbackChain stages an add/remove of the highlighted model in the
+// current role's chain and reports what happened in the status line.
+//
+// It stages; it does not persist. The confirming Enter emits
+// FallbackChainChangedMsg and the parent writes ~/.izen/config.yml, so a user
+// who toggles four models and then presses Esc has not silently rewritten their
+// config file.
+//
+// It NEVER falls through to the search input. That is the property the whole
+// binding exists for, and it is why this is a named case in the switch above
+// rather than a branch of the search handler: a key that is not handled here
+// reaches handleSearchInput, and there it becomes a query mutation. The list
+// filtering is the most-used thing on this surface; a feature key that quietly
+// feeds it is a feature nobody can reach.
+func (m Model) toggleFallbackChain() (Model, tea.Cmd) {
+	sel := m.Highlighted()
+	if sel == nil {
+		sel = m.SelectedModel()
+	}
+	if sel == nil {
+		m.status = "No model highlighted"
+		return m, nil
+	}
+	roleKey := m.effectiveFallbackRole()
+	slug := fallbackSlug(*sel)
+	// Capture the highlighted tree row BEFORE the edit. Adding or removing a
+	// hop renumbers every row below it, so an index-based cursor would end up
+	// pointing at a different model — or a different role — the moment the
+	// chain changed shape.
+	before, hadNode := m.HighlightedRoleNode()
+	updated, added := m.ToggleFallbackForHighlighted()
+	if updated.fallbackRole != roleKey {
+		updated.fallbackRole = roleKey
+	}
+	if hadNode && updated.showingRoles {
+		updated.focusNode(before)
+	}
+	updated.status = describeFallbackToggle(roleKey, slug, added)
+	return updated, nil
+}
+
+// describeFallbackToggle is the one-line status the user reads immediately after
+// pressing Alt+F.
+//
+// It names the ROLE, not just the model, because the role is the part a user is
+// most likely to have wrong: the same key on the same model edits different
+// chains depending on which pane they were on, and a message that said only
+// "added llama3.2" would leave a user who meant the plan chain with no way to
+// tell that they edited the default one.
+func describeFallbackToggle(roleKey, slug string, added bool) string {
+	verb := "Removed"
+	if added {
+		verb = "Added"
+	}
+	return fmt.Sprintf("%s %s from the %s fallback chain — Enter to save, Esc to discard", verb, slug, roleKey)
+}
+
 func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
+	// The role-parameter editor (Alt+E) is MODAL: while it is open it owns the
+	// whole surface, because a dialog that lets keys through to the list behind
+	// it is a dialog that eats keystrokes. It is checked before the API-key
+	// overlay so the two can never both be "the thing that has the keyboard".
+	if m.roleConfig != nil {
+		return m.handleRoleConfigKeys(msg)
+	}
 	// While the secure inline API-key overlay is open, every browsing key
 	// routes to the textinput (EchoPassword). Esc cancels, Enter submits.
 	if m.apiKeyInput != nil {
@@ -151,24 +217,19 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.cyclePane()
 		return m, nil
 	case "up":
-		switch m.paneFocus {
-		case PaneProviders:
-			m.moveProviderCursor(-1)
-		case PaneRoles:
-			m.moveRoleCursor(-1)
-		default:
-			m.moveCursor(-1)
-		}
+		m = m.moveActiveCursor(-1)
 		return m, nil
 	case "down":
-		switch m.paneFocus {
-		case PaneProviders:
-			m.moveProviderCursor(1)
-		case PaneRoles:
-			m.moveRoleCursor(1)
-		default:
-			m.moveCursor(1)
-		}
+		m = m.moveActiveCursor(1)
+		return m, nil
+	case "left":
+		// Collapse the highlighted role, or walk from a child row up to its
+		// parent. Arrows are navigation keys on every terminal, which is why
+		// the tree's expand/collapse is on them rather than on a mnemonic.
+		m.collapseRoleNode()
+		return m, nil
+	case "right":
+		m.expandRoleNode()
 		return m, nil
 	case "ctrl+n":
 		// Keep non-arrow navigation available in list focus, but never let a
@@ -176,14 +237,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if m.searchInputActive() {
 			return m, nil
 		}
-		switch m.paneFocus {
-		case PaneProviders:
-			m.moveProviderCursor(1)
-		case PaneRoles:
-			m.moveRoleCursor(1)
-		default:
-			m.moveCursor(1)
-		}
+		m = m.moveActiveCursor(1)
 		return m, nil
 	case "j", "k":
 		if m.searchInputActive() {
@@ -193,70 +247,47 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			return m.handleSearchInput(msg)
 		}
 		if k == "j" {
-			switch m.paneFocus {
-			case PaneProviders:
-				m.moveProviderCursor(1)
-			case PaneRoles:
-				m.moveRoleCursor(1)
-			default:
-				m.moveCursor(1)
-			}
+			m = m.moveActiveCursor(1)
 		} else {
-			switch m.paneFocus {
-			case PaneProviders:
-				m.moveProviderCursor(-1)
-			case PaneRoles:
-				m.moveRoleCursor(-1)
-			default:
-				m.moveCursor(-1)
-			}
+			m = m.moveActiveCursor(-1)
 		}
 		return m, nil
 	case "pgup":
 		if m.searchInputActive() {
 			return m, nil
 		}
-		budget := m.listRowBudget
-		if budget <= 0 {
-			budget = max(5, m.innerHeight-8)
-			if budget <= 0 {
-				budget = 5
-			}
-		}
-		switch m.paneFocus {
-		case PaneModels:
-			m.moveCursor(-budget)
-		case PaneRoles:
-			m.moveRoleCursor(-1)
-		default:
-			m.moveProviderCursor(-budget)
-		}
+		m = m.pageActiveCursor(-1)
 		return m, nil
 	case "pgdown":
 		if m.searchInputActive() {
 			return m, nil
 		}
-		budget := m.listRowBudget
-		if budget <= 0 {
-			budget = max(5, m.innerHeight-8)
-			if budget <= 0 {
-				budget = 5
-			}
-		}
-		switch m.paneFocus {
-		case PaneModels:
-			m.moveCursor(budget)
-		case PaneRoles:
-			m.moveRoleCursor(1)
-		default:
-			m.moveProviderCursor(budget)
-		}
+		m = m.pageActiveCursor(1)
 		return m, nil
 	case "enter":
+		// A STAGED FALLBACK-CHAIN EDIT IS CONFIRMED BEFORE ANYTHING ELSE. Enter
+		// on this surface is ambiguous by construction — it activates a model,
+		// and it writes the config file — and resolving it in favour of the
+		// unsaved edit is the only order that is not data loss: activating a
+		// model closes the modal, and a closed modal cannot confirm anything.
+		// The alternative (activate, and silently drop the chain) means a user
+		// who pressed Enter to save four staged models gets a model switch
+		// instead.
+		//
+		// Role parameters are confirmed first for the same reason: they are
+		// also staged, and they are also invisible afterwards.
+		if m.fallbackDirty {
+			return m, m.EmitFallbackChainConfirm()
+		}
+		if m.roleParamsDirty {
+			return m, m.EmitRoleParamsConfirm()
+		}
 		switch m.paneFocus {
 		case PaneRoles:
 			// Choose the highlighted role override; switch to the models
-			// pane to pick the binding model.
+			// pane to pick the binding model. The role is the one the
+			// highlighted TREE ROW belongs to, so Enter works identically
+			// whether the cursor is on a role or on one of its fallback hops.
 			m.paneFocus = PaneModels
 			return m, nil
 		case PaneProviders:
@@ -269,6 +300,8 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			return m.openApiKeyInput(m.highlightedProvider())
 		case PaneModels:
 			// Roles-target assignment: bind highlighted model to the role.
+			// This is the "set the highlighted model as the role's PRIMARY"
+			// operation — the role policy override IS the primary binding.
 			if m.showingRoles {
 				return m.emitRoleOverride()
 			}
@@ -283,6 +316,40 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case FallbackToggleKey, FallbackToggleKeyAlt, FallbackToggleKeyCtrl:
+		// THE CONFLICT-FREE BINDING. A modifier is not a printable rune in any
+		// terminal's default mode, so it cannot land in the fuzzy search field
+		// — which is the whole point: on this surface the bare runes belong to
+		// the search box, always.
+		return m.toggleFallbackChain()
+	case FallbackMoveUpKey, FallbackMoveUpKeyAlt, FallbackMoveUpArrow:
+		// Scoped to the ROLES pane: a reorder is only meaningful against a
+		// chain, and a chain only exists in the tree. On the models pane these
+		// are unhandled, which is the same thing they were before the tree
+		// existed.
+		if m.paneFocus != PaneRoles {
+			return m, nil
+		}
+		return m.reorderHighlightedFallback(-1)
+	case FallbackMoveDownKey, FallbackMoveDownKeyAlt, FallbackMoveDownArrow:
+		if m.paneFocus != PaneRoles {
+			return m, nil
+		}
+		return m.reorderHighlightedFallback(1)
+	case FallbackRemoveKey, FallbackRemoveKeyAlt:
+		// Alt+D here means "delete the highlighted hop", NOT the legacy
+		// role-policy binding for the `default` role. The two cannot collide
+		// because the browsing surface never dispatched RoleDefaultKey and this
+		// one is gated on the ROLES pane, so the models pane is unaffected.
+		//
+		// The Delete KEY is matched by TYPE, below, never by its string name —
+		// see the note there.
+		if m.paneFocus != PaneRoles {
+			return m, nil
+		}
+		return m.removeHighlightedFallback()
+	case RoleConfigKey, RoleConfigKeyAlt:
+		return m.openRoleConfig()
 	case "alt+i", "alt+I":
 		// Inspect: pin the highlighted model into StateDetail. Enables
 		// detail view + reasoning policy cycling without committing.
@@ -315,6 +382,22 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, func() tea.Msg { return modelapp.SyncRequestedMsg{} }
 	}
 
+	// The Delete KEY, matched by TYPE and not by its String() name.
+	//
+	// This is not pedantry. tea.KeyMsg.String() renders a runes message as its
+	// text, so a switch case on the literal "delete" also matches a user who
+	// TYPES the word "delete" into the search box — deleting a fallback hop
+	// because someone searched for it. A control key must be recognised by its
+	// key type, which is the only thing that distinguishes it from text. (The
+	// Alt+ spellings above are safe: String() only produces "alt+d" when the Alt
+	// modifier is actually set.)
+	if msg.Type == tea.KeyDelete {
+		if m.paneFocus != PaneRoles {
+			return m, nil
+		}
+		return m.removeHighlightedFallback()
+	}
+
 	// Typing: auto-switch to models pane and filter. Non-printable control
 	// keys (including the globally-owned control shortcut) must not mutate
 	// pane focus.
@@ -322,6 +405,31 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.paneFocus = PaneModels
 	}
 	return m.handleSearchInput(msg)
+}
+
+// pageActiveCursor pages the focused pane by the visible row budget. The
+// ROLES tree pages by ONE row rather than by the budget: a page key on a tree
+// that jumps a whole screenful of nodes skips over the hops the user is
+// trying to inspect, and the tree has no notion of a "page" to preserve.
+func (m Model) pageActiveCursor(dir int) Model {
+	if m.paneFocus == PaneRoles {
+		m.moveRoleCursor(dir)
+		return m
+	}
+	budget := m.listRowBudget
+	if budget <= 0 {
+		budget = max(5, m.innerHeight-browserChromeRows)
+		if budget <= 0 {
+			budget = 5
+		}
+	}
+	switch m.paneFocus {
+	case PaneModels:
+		m.moveCursor(dir * budget)
+	default:
+		m.moveProviderCursor(dir * budget)
+	}
+	return m
 }
 
 // cyclePane advances the pane focus Providers -> Models -> Roles -> Providers,
@@ -464,7 +572,7 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.state = StateBrowsing
 		m.clearDetail()
 		return m, nil
-	case "r":
+	case ReasoningCycleKey, ReasoningCycleKeyAlt:
 		// Dynamic capability guard: ONLY cycle through caps.Options when the
 		// model actually supports configurable reasoning. Non-configurable
 		// models are a NO-OP with zero state change.
@@ -479,7 +587,20 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		// Cycle strictly through valid model options
 		m.cycleReasoningPolicy()
 		return m, nil
+	case FallbackToggleKey, FallbackToggleKeyAlt, FallbackToggleKeyCtrl:
+		// The chain editor is reachable from the detail view too, on the same
+		// modifier as in the list — a user who is already inspecting a model is
+		// exactly the user who wants to add it to a fallback chain, and making
+		// them go back out to do it would make the feature discoverable only by
+		// people who already know it exists.
+		return m.toggleFallbackChain()
 	case "enter":
+		// A staged chain edit is confirmed before the activation, for the same
+		// reason as in the list view: activating closes the modal, and a closed
+		// modal cannot save anything.
+		if m.fallbackDirty {
+			return m, m.EmitFallbackChainConfirm()
+		}
 		// 2-step activation confirm: commit the pinned detail selection
 		// with its selected reasoning variant into the runtime authority.
 		// The parent closes the modal after the commit lands.
@@ -531,7 +652,9 @@ func isSearchEditKey(msg tea.KeyMsg) bool {
 //nolint:unused // retained for spec compatibility
 func isListHotkey(s string) bool {
 	switch s {
-	case RoleDefaultKey, RolePlanKey, RoleSmolKey, RoleVisionKey, RoleAdviserKey, ScopeToggleKey:
+	case RoleDefaultKey, RolePlanKey, RoleSmolKey, RoleVisionKey, RoleAdviserKey,
+		FallbackToggleKey, FallbackToggleKeyAlt, FallbackToggleKeyCtrl,
+		ReasoningCycleKey, ReasoningCycleKeyAlt:
 		return true
 	}
 	return false

@@ -130,6 +130,15 @@ func (m *model) renderFixedFooter(width int, actions []Action) string {
 	if width < 20 {
 		return ""
 	}
+	// SINGLE SOURCE OF TRUTH FOR TRANSIENT STATE. The bar carries CORE TELEMETRY
+	// only — model, latency/duration, token usage, tok/s. It deliberately does
+	// NOT repeat a transient lifecycle indicator ("[struct] Constructing table
+	// view..."): that sentence lives exclusively inside the viewport, on the
+	// streaming cursor line, because that is the only place it is TRUE. A second
+	// copy on a fixed surface is a second claim about a moving target — the two
+	// surfaces render at different cadences, so any divergence between them
+	// shows a user a bar and a stream disagreeing about the same fact, which is
+	// strictly worse than the bar staying silent about it. See skeleton.go.
 	var s string
 	switch {
 	case m.isExecuting():
@@ -331,6 +340,7 @@ func (m *model) renderActiveIdleFooter(width int, actions []Action) string {
 	if chip != "" && width >= 70 {
 		right = chip
 	}
+
 	return flexPinRight(left, right, width)
 }
 

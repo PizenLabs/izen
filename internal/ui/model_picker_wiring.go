@@ -140,10 +140,21 @@ func newModelPickerFromCache(m *model) model_picker.Model {
 	// the picker opens with true cross-session context (zero I/O in-widget).
 	mp = mp.SetRecentBindings(loadRecentBindings())
 	mp = mp.SetRoleOverrides(policyOverridesFromConfig(m.cfg))
+	// Seed the role fallback chains from the persisted config so the picker's
+	// metadata panel opens showing what is actually on disk rather than an empty
+	// chain the user has to guess about.
+	mp = mp.SetFallbackChains(fallbackChainsFromConfig(m.cfg))
+	// Seed the role OPERATIONAL parameters the same way, so the Alt+E editor
+	// opens on the values in the file and the metadata line does not show a
+	// default that the user's config contradicts.
+	mp = mp.SetRoleParams(roleParamsFromConfig(m.cfg))
+	// A raw-field guard, not a PaneWidth() one: the question here is "has the
+	// model been sized yet", and PaneWidth() always answers, so a check against it
+	// would be vacuous.
 	if m.width > 0 || m.height > 0 {
 		var cmd tea.Cmd
 		_ = cmd
-		updated, _ := mp.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+		updated, _ := mp.Update(tea.WindowSizeMsg{Width: m.PaneWidth(), Height: m.PaneHeight()})
 		if um, ok := updated.(model_picker.Model); ok {
 			mp = um
 		}
@@ -439,13 +450,28 @@ func (m *model) applyRoleOverride(msg model_picker.RolePolicyOverrideMsg) tea.Cm
 		if m.cfg.Bindings.Policy == nil {
 			m.cfg.Bindings.Policy = make(map[string]config.ActiveBindingConfig)
 		}
+		// Capture the persisted binding BEFORE writing it. The primary model is
+		// the top of a role's tree (its [1] Primary row), so a write that fails
+		// and leaves the session believing a new primary is the same failure the
+		// chain path guards against: the running session would use a binding that
+		// exists nowhere the user can find it.
+		previous, hadPrevious := m.cfg.Bindings.Policy[msg.Role]
 		m.cfg.Bindings.Policy[msg.Role] = config.ActiveBindingConfig{
 			Provider: msg.Provider,
 			Model:    msg.ModelID,
 			Variant:  msg.Effort,
 		}
-		if err := config.Save(m.cfg); err != nil {
-			m.push(roleError, fmt.Sprintf("[✗] Role override persist failed: %s", err.Error()))
+		if err := config.SaveAtomic(m.cfg); err != nil {
+			if hadPrevious {
+				m.cfg.Bindings.Policy[msg.Role] = previous
+			} else {
+				delete(m.cfg.Bindings.Policy, msg.Role)
+			}
+			m.push(roleError, fmt.Sprintf(
+				"[✗] Role override persist failed: %s — the %s primary is unchanged in ~/.izen/config.yml",
+				err.Error(), msg.Role))
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
 			return nil
 		}
 	}

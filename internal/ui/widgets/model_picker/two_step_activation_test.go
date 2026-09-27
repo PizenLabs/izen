@@ -60,9 +60,13 @@ func TestEnterInDetailsActivatesWithVariant(t *testing.T) {
 		t.Fatalf("list Enter must move to StateDetail, got %v", updated.State())
 	}
 
-	// Step 2: press r twice to reach medium (default -> low -> medium).
-	updated, _ = updated.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
-	updated, _ = updated.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	// Step 2: cycle the effort twice to reach medium (default -> low -> medium).
+	// The key is a MODIFIER, not a bare `r`: on a model surface a bare rune is
+	// search input, so a bare `r` binding silently ate the user's filter query
+	// while appearing to do nothing else. See ReasoningCycleKey.
+	cycle := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r"), Alt: true}
+	updated, _ = updated.UpdateModel(cycle)
+	updated, _ = updated.UpdateModel(cycle)
 	if opt, ok := updated.CurrentReasoningOption(); !ok || opt != "medium" {
 		t.Fatalf("reasoning option = %q,%v, want medium,true", opt, ok)
 	}

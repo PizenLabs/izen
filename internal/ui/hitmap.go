@@ -75,7 +75,7 @@ func countPhysicalRows(s string) int {
 // for wrapping and prefix widths; selection MUST NOT re-derive them.
 func buildFullHitMap(m *model) []RowLayout {
 	var rows []RowLayout
-	width := m.width
+	width := m.PaneWidth()
 	if width < 40 {
 		width = 40
 	}

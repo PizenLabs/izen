@@ -12,6 +12,13 @@ import (
 // StreamChunkMsg; instead they only append to the byte-safe StreamBuffer.
 // FrameTickMsg drains the buffer via ReadValidString and triggers a re-render
 // only when updated==true.
+//
+// It is also the single content emitter for the reasoning panel
+// (flushReasoningViewport). That sync is O(len) — it re-wraps the whole trace —
+// so it is frame-locked here rather than run from the layout pass, which would
+// fire once per Bubble Tea message and therefore once per incoming token. The
+// panel's detach latch (reasoningDetached) is honoured inside the sync, so
+// throttling the rebuild never costs a reader their scroll position.
 type FrameTickMsg time.Time
 
 // FrameTickInterval is the default debounced frame interval: 30ms (~33 FPS).

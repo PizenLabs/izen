@@ -2323,7 +2323,13 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			m.pendingArchArgs = args
 			m.push(roleSystem, infoStyle.Render("[⠋] Mapping codebase structure... (indexing in progress)"))
 			m.refreshViewportContent()
-			return m.spinnerTickCmd()
+			// Route through the single-flight arming rather than calling
+			// spinnerTickCmd directly: this site has no other loop live, so a
+			// direct dispatch would leave the armed flag false and a later
+			// ensureSpinnerTick would then start a SECOND ticker on top of this
+			// one. The indicator would rotate at 20Hz — precisely the coupling
+			// the decoupled ticker exists to remove.
+			return m.ensureSpinnerTick()
 		}
 		m.push(roleSystem, "Mapping codebase...")
 		m.refreshViewportContent()
@@ -3050,7 +3056,7 @@ func (m *model) runTestCmd(target string) tea.Cmd {
 					"    target path (e.g. ./pkg/foo, ./internal/bar/...).",
 				goFileCount, goFileCount*8,
 			)
-			m.push(roleSystem, boundedWarning(warning, m.width))
+			m.push(roleSystem, boundedWarning(warning, m.PaneWidth()))
 			m.refreshViewportContent()
 			m.gotoBottomIfAllowed()
 			m.pendingTestConfirm = true
@@ -3082,7 +3088,7 @@ func (m *model) runRunCmd(target string) tea.Cmd {
 					"    target path (e.g. ./pkg/foo, ./internal/bar/...).",
 				goFileCount, goFileCount*8,
 			)
-			m.push(roleSystem, boundedWarning(warning, m.width))
+			m.push(roleSystem, boundedWarning(warning, m.PaneWidth()))
 			m.refreshViewportContent()
 			m.gotoBottomIfAllowed()
 			m.pendingTestConfirm = true
@@ -3418,7 +3424,7 @@ func (m *model) runLogViewCmd(showAll bool) tea.Cmd {
 
 		// ── Fixed box geometry ────────────────────────────────────────────
 		// Total visual width of the box, derived from main viewport width.
-		boxWidth := m.width - 4
+		boxWidth := m.PaneWidth() - 4
 		if boxWidth < 40 {
 			boxWidth = 40
 		}

@@ -45,8 +45,12 @@ func (m *model) openSettings() tea.Cmd {
 	// second modal active underneath the settings surface.
 	m.showModelPicker = false
 	m.settingsModel = settings_widget.NewFromConfig(cfg)
+	// A raw-field guard, not a PaneWidth() one: the question here is "has the
+	// model been sized yet", and PaneWidth() always answers, so a check against it
+	// would be vacuous and would size the modal from the fallback rectangle before
+	// the first resize.
 	if m.width > 0 && m.height > 0 {
-		modalW, modalH := SettingsModalSize(m.width, m.height)
+		modalW, modalH := SettingsModalSize(m.PaneWidth(), m.PaneHeight())
 		m.settingsModel = m.settingsModel.SetSize(modalW, modalH)
 	}
 	m.showSettings = true
@@ -134,6 +138,7 @@ func (m *model) applySettingsCommit(msg settings_widget.CommitMsg) {
 	prompt.SetActiveStyle(activeStyle)
 	m.hideThinkingBlocks = cfg.UI.HideThinking
 	m.setAutoScrollMode(cfg.ActiveAutoScrollMode())
+	m.releaseReasoningPanelIfHidden()
 	m.settingsModel = m.settingsModel.
 		SetValues(settings_widget.Values{
 			ResponseStyle: activeStyle,
@@ -153,6 +158,7 @@ func (m *model) applyLoadedConfig(cfg *config.Config) {
 	m.cfg = cfg
 	m.hideThinkingBlocks = cfg.UI.HideThinking
 	m.setAutoScrollMode(cfg.ActiveAutoScrollMode())
+	m.releaseReasoningPanelIfHidden()
 	prompt.SetActiveStyle(cfg.ActiveStylePolicy())
 	if m.showSettings {
 		m.settingsModel = m.settingsModel.SetValues(settings_widget.Values{

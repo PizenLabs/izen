@@ -21,7 +21,7 @@ var (
 )
 
 func (m *model) renderInitView() string {
-	width := m.width
+	width := m.PaneWidth()
 	if width < 60 {
 		width = 60
 	}

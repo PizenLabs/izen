@@ -150,7 +150,7 @@ func (m *model) toggleStatusModal() tea.Cmd {
 	m.showStatus = true
 	m.statusRequest++
 	m.statusCommandBuffer = ""
-	width, height := m.width, m.height
+	width, height := m.PaneWidth(), m.PaneHeight()
 	if width <= 0 {
 		width = 80
 	}

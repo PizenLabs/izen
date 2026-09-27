@@ -40,6 +40,32 @@ var (
 	toolFailedStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f38ba8"))
 )
 
+// toolBoxBorderCells is the horizontal space toolBoxStyle's left+right rounded
+// border consumes.
+//
+// It is the load-bearing constant for every width bound in this file. Lipgloss
+// treats Width as the CONTENT box and appends the border afterwards, so a
+// rendered card is Width + toolBoxBorderCells cells wide. Any `.Width(n)` meant
+// to keep the card inside an n-cell viewport must therefore declare
+// n - toolBoxBorderCells, or the right border lands n cells past the edge and
+// the terminal wraps — which corrupts every line below it, not just this card.
+const toolBoxBorderCells = 2
+
+// boundToolBox re-renders body inside toolBoxStyle constrained to a viewport of
+// width cells, or returns the natural render untouched when there is no budget
+// to honour.
+//
+// A non-positive width means "unconstrained": the pre-bootstrap case where
+// WindowSizeMsg has not arrived and any clamp would be a guess. A positive one
+// is a hard ceiling on the OUTER width, so the border is subtracted from the
+// declared content width before rendering.
+func boundToolBox(body string, width int) string {
+	if width <= 0 {
+		return toolBoxStyle.Render(body)
+	}
+	return toolBoxStyle.Width(max(width-toolBoxBorderCells, 1)).Render(body)
+}
+
 // ToolCard is a collapsible streaming terminal card for one background
 // process execution. OutputBuf is append-only; Lines enforces the MaxLines
 // ring-buffer window.
@@ -121,10 +147,26 @@ func (b *BatchCard) Render(frame, width, tailLines int) string {
 		}
 		out.WriteString("\n" + mark + status + " " + t.ToolName + " (" + t.ID + ")")
 		if b.Expanded && i == b.Selected {
-			out.WriteString("\n" + t.Render(frame, width, tailLines))
+			// The child is itself a framed card, so nesting one frame inside this
+			// one would put the child's own right border 2 cells past the parent's.
+			// The child is rendered against the width this card's CONTENT box will
+			// actually have (viewport minus both frames' borders and the child's
+			// padding), so the nested frame lands strictly inside the outer one.
+			out.WriteString("\n" + t.Render(frame, nestedToolWidth(width), tailLines))
 		}
 	}
-	return toolBoxStyle.Render(out.String())
+	return boundToolBox(out.String(), width)
+}
+
+// nestedToolWidth is the budget a BatchCard's expanded child gets so the child's
+// frame fits inside the parent's CONTENT box. The parent spends
+// toolBoxBorderCells on its own border and the child spends its own border plus
+// its horizontal padding, so all three are removed from the viewport budget.
+func nestedToolWidth(width int) int {
+	if width <= 0 {
+		return 0
+	}
+	return max(width-2*toolBoxBorderCells-toolBoxStyle.GetHorizontalPadding(), 1)
 }
 
 // New creates a RUNNING tool card with a fresh buffer.
@@ -315,11 +357,7 @@ func (c *ToolCard) Render(frame, width, tailLines int) string {
 		footer = toolRunningStyle.Render(spinner + " Running " + formatElapsed(c.Elapsed()))
 	}
 	b.WriteString("\n" + footer)
-	box := toolBoxStyle.Render(b.String())
-	if width > 0 && lipgloss.Width(box) > width {
-		box = toolBoxStyle.Width(width).Render(b.String())
-	}
-	return box
+	return boundToolBox(b.String(), width)
 }
 
 func truncateLine(s string, max int) string {

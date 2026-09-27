@@ -44,9 +44,12 @@ func TestPickerEnterInDetailsActivatesWithVariant(t *testing.T) {
 	if updated.State() != model_picker.StateDetail {
 		t.Fatalf("list Enter must open details, got %v", updated.State())
 	}
-	// Cycle default -> low -> medium via the r key.
-	updated, _ = updated.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
-	updated, _ = updated.UpdateModel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	// Cycle default -> low -> medium via Alt+R. The bare `r` this used to be
+	// bound to is search input on a model surface, and a bare binding silently
+	// ate the user's filter query; see model_picker.ReasoningCycleKey.
+	cycle := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r"), Alt: true}
+	updated, _ = updated.UpdateModel(cycle)
+	updated, _ = updated.UpdateModel(cycle)
 	if opt, ok := updated.CurrentReasoningOption(); !ok || opt != "medium" {
 		t.Fatalf("reasoning option = %q,%v, want medium,true", opt, ok)
 	}

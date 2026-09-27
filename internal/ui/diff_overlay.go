@@ -22,11 +22,11 @@ func (m *model) openDiffView(raw, title string) {
 		m.refreshViewportContent()
 		return
 	}
-	w := m.width
+	w := m.PaneWidth()
 	if w <= 0 {
 		w = 80
 	}
-	h := m.height
+	h := m.PaneHeight()
 	if h <= 0 {
 		h = 24
 	}
@@ -83,7 +83,7 @@ func (m *model) renderDiffOverlay() string {
 	if m.diffView == nil {
 		return ""
 	}
-	w := m.width
+	w := m.PaneWidth()
 	if w < 20 {
 		w = 80
 	}
