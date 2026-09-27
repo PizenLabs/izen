@@ -116,10 +116,10 @@ func TestUsageAcrossRecoverySimple(t *testing.T) {
 func TestFinishReasonLengthIsTruncated(t *testing.T) {
 	root := t.TempDir()
 	writeTarget(t, root, "index.html", strings.Repeat("x", 100))
-	mock := &mockProvider{responses: []*ai.Response{{
-		Content: "full file content that would be truncated",
-		Usage:   ai.ProviderUsage{PromptTokens: 10, CompletionTokens: 1024, Known: true, FinishReason: "length"},
-	}}}
+	// PHASE 12: the full-artifact contract continues the SAME bounded step
+	// across every affordable invocation before the runtime reports exhaustion.
+	responses := exhaustedFullArtifactStep("full file content that would be truncated", 10, 1024)
+	mock := &mockProvider{responses: responses}
 	bus := events.NewBus(events.DefaultBufferSize)
 	x := testExecutor(t, root, mock, bus)
 	adapter := NewExecutorAdapter(root, execution.NewIntentGateway(root), x)

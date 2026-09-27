@@ -203,6 +203,15 @@ var verificationPatterns = []string{
 }
 
 // planningPatterns signal design/architecture work with no execution.
+//
+// They are matched ONLY when the objective carries no change verb, exactly
+// like investigationPatterns and verificationPatterns. A design word
+// DESCRIBES a change request far more often than it asks for advice —
+// "redesign the landing page" and "design a dashboard and write the files"
+// are both mutations — so a bare "design" substring must never veto an
+// explicit change verb. Pure design advice ("how should we design the
+// migration", "design the migration architecture") carries no change verb and
+// stays read-only planning.
 var planningPatterns = []string{
 	"plan", "design", "architecture", "how should", "what's the best way",
 	"what is the best way", "blueprint", "roadmap", "strategy",
@@ -215,13 +224,22 @@ var refactoringPatterns = []string{
 }
 
 // modificationPatterns signal a concrete change to the workspace. They are
-// matched after diagnostic/verification/planning signals so "why is the build
-// failing" never routes to mutation, but "check @index.html and remove extra
-// contents" (check + remove) does.
+// matched after diagnostic signals so "why is the build failing" never routes
+// to mutation, but "check @index.html and remove extra contents" (check +
+// remove) does.
+//
+// The trailing compound change verbs (redesign/restyle/recreate/rework/
+// overhaul/revamp) are part of the same table because they ARE change verbs,
+// not design vocabulary: "redesign the portfolio page" asks for the workspace
+// to change. Without them the design substring inside "redesign" matched
+// planningPatterns first and a clearly mutating objective was classified
+// read-only — which forced the human to re-issue the request as /build.
 var modificationPatterns = []string{
 	"remove ", "delete ", "add ", "create ", "generate ", "implement ",
 	"write ", "update ", "modify ", "change ", "fix ", "correct ",
 	"edit ", "insert ", "replace ", "rewrite ", "build ",
+	"redesign", "restyle", "recreate", "re-create", "rework",
+	"overhaul", "revamp",
 }
 
 func containsAny(lower string, patterns []string) bool {
@@ -302,9 +320,15 @@ func classifyDeterministic(input string) (Intent, float64, string) {
 		return IntentVerification, 0.85, "verification signal"
 	}
 
-	for _, p := range planningPatterns {
-		if strings.Contains(lower, p) {
-			return IntentPlanning, 0.85, "architecture/design signal"
+	// Planning is the last read-only signal and, like investigation and
+	// verification, it only wins when the objective carries NO change verb. A
+	// mutation verb decides the intent: "redesign @index.html and remove the
+	// redundant blocks" is a mutation request, never a design question.
+	if !hasMutationLike {
+		for _, p := range planningPatterns {
+			if strings.Contains(lower, p) {
+				return IntentPlanning, 0.85, "architecture/design signal"
+			}
 		}
 	}
 

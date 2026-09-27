@@ -258,6 +258,17 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 	retrieval.SetActivityLogger(activityFn)
 	execution.SetActivityLogger(activityFn)
 
+	// PHASE 12 — the TRACE/DEBUG channel. Raw runtime telemetry (workspace
+	// cache facts, provider forensics, per-stage internals) is published as a
+	// distinct event type and projected ONLY through the debug-gated
+	// logRuntimeDetail path, so it can never reach the human execution
+	// narrative at VisibilityNormal. Before this split, `emitSnapshotActivity`
+	// called the activity sink directly and bypassed the execVisibility gate.
+	detailFn := func(format string, args ...interface{}) {
+		eventBus.Publish(events.NewRuntimeDetail(fmt.Sprintf(format, args...)))
+	}
+	execution.SetDetailLogger(detailFn)
+
 	// ── WIRE TYPED EVENT LOGGERS ─────────────────────────────────────────
 	// The typed engine I/O events (bytes read, lines patched, hits, elapsed)
 	// are wrapped as EventEngineTelemetry on the bus and projected into the
@@ -356,6 +367,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		// ── CANONICAL RUNTIME EXECUTION LIFECYCLE (RuntimeExecutor) ──
 		// The runtime owns every execution; the UI renders its lifecycle purely
 		// as a projection of these events.
+		events.EventRuntimeDetail,
 		events.EventExecutionStarted,
 		events.EventStrategySelected,
 		events.EventTargetResolved,

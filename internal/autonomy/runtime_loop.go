@@ -252,6 +252,13 @@ type Observation struct {
 	// state: the matrix refuses a second OUTPUT_EXHAUSTED transition when it
 	// is already set.
 	RecoveryStrategy string
+	// ArtifactShape names the artifact contract this attempt was dispatched
+	// under ("create_file", "replace_block", "search_replace", ...). It is
+	// authoritative for the recovery matrix: a CREATION contract has no
+	// existing content to anchor a bounded SEARCH/REPLACE patch against, so
+	// relabelling it is structurally impossible rather than merely wasteful.
+	// Such an attempt escalates to an explicit budget decision instead.
+	ArtifactShape string
 	// AttemptNum is the attempt counter for the current objective.
 	AttemptNum int
 	// RecoveryCycle is the recovery-cycle counter for the current objective.
@@ -506,13 +513,71 @@ type LoopBounds struct {
 }
 
 // DefaultLoopBounds returns the standard runtime-owned termination bounds.
+//
+// PHASE 12 — the run-level token bound is now a FLOOR, not the whole budget.
+// `MaxTotalTokens` used to be a fixed 8 000, which is smaller than a single
+// legitimate multi-invocation task: one 4 096-token full-artifact generation
+// plus its bounded continuations already crosses it, so the token bound — not
+// the structural bounds — was the first thing to terminate a run that was
+// making progress. The authoritative run ceiling is
+// `RunTokenBudget(perInvocationOutputTokens, …)`, derived at Run time from the
+// budget the invocations are actually bound to. This floor only guarantees the
+// run-level bound is never the tightest constraint; it never authorizes
+// anything.
+const (
+	// MinRunTokenBudget is the floor for the derived run-level token bound.
+	MinRunTokenBudget = 64_000
+	// MaxRunTokenBudget is the hard ceiling for the derived run-level token
+	// bound. A pathological loop is still terminated by the structural bounds
+	// (MaxAttempts, MaxIdenticalDecisions, MaxExecutionSteps); this is only a
+	// spend guard.
+	MaxRunTokenBudget = 400_000
+	// runInputAllowancePerAttempt is the deterministic per-attempt input
+	// allowance: the strategy-owned repository context budget
+	// (ContextPolicyRepository = 16 000 tokens) plus the objective/evidence
+	// ledger and the contract envelope.
+	runInputAllowancePerAttempt = 24_000
+)
+
+// RunTokenBudget derives the run-level provider-token ceiling for one loop run.
+//
+// A budget bounds MODEL INVOCATIONS; it must not arbitrarily truncate a logical
+// task. The derivation is a pure function of facts the runtime already owns:
+//
+//	perInvocationOutput × (attempts × (1 + continuationSteps))
+//	  + attempts × inputAllowancePerAttempt
+//
+// clamped to [MinRunTokenBudget, MaxRunTokenBudget]. It is deterministic,
+// inspectable and unit-testable, and it never lowers a bound the caller set.
+func RunTokenBudget(perInvocationOutputTokens, attempts, continuationSteps int) int {
+	if perInvocationOutputTokens <= 0 {
+		perInvocationOutputTokens = 4096
+	}
+	if attempts <= 0 {
+		attempts = DefaultLoopBounds().MaxAttempts
+	}
+	if continuationSteps < 0 {
+		continuationSteps = 0
+	}
+	invocations := attempts * (1 + continuationSteps)
+	total := perInvocationOutputTokens*invocations + attempts*runInputAllowancePerAttempt
+	if total < MinRunTokenBudget {
+		return MinRunTokenBudget
+	}
+	if total > MaxRunTokenBudget {
+		return MaxRunTokenBudget
+	}
+	return total
+}
+
+// DefaultLoopBounds returns the standard runtime-owned termination bounds.
 func DefaultLoopBounds() LoopBounds {
 	return LoopBounds{
 		MaxAttempts:           3,
 		MaxRecoveryCycles:     2,
 		MaxExecutionSteps:     10,
 		MaxIdenticalDecisions: 2,
-		MaxTotalTokens:        8000,
+		MaxTotalTokens:        MinRunTokenBudget,
 	}
 }
 

@@ -108,6 +108,30 @@ func transitionAvailable(o autonomy.Observation) bool {
 	return o.RecoveryStrategy != autonomy.StrategyBoundedPatch
 }
 
+// patchAnchoredShape is the artifact contract a bounded SEARCH/REPLACE patch is
+// structurally anchored to. Every other shape — most importantly a creation —
+// has no existing content to anchor against.
+const patchAnchoredShape = "replace_block"
+
+// patchAnchored reports whether the given artifact contract can be re-expressed
+// as a bounded SEARCH/REPLACE patch. It is a pure function of the contract the
+// executor actually dispatched under, so the recovery matrix never has to
+// guess by inspecting the filesystem.
+//
+// An unknown shape is treated as patch-anchored: the matrix keeps its historical
+// behavior rather than inventing a halt it cannot justify.
+func patchAnchored(shape string) bool {
+	switch shape {
+	case "", patchAnchoredShape, "search_replace", "replace_file", "plan",
+		"investigation", "explanation", "response":
+		return true
+	default:
+		// A creation contract (and anything else the runtime names for a
+		// brand-new artifact) has no anchor.
+		return !strings.HasPrefix(shape, "create")
+	}
+}
+
 // isAnchorContinuation recognizes the executor's stable diagnostic reason after
 // its typed error crosses the serializable observation boundary.
 func isAnchorContinuation(o autonomy.Observation) bool {
@@ -203,6 +227,24 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 
 	switch sub {
 	case SubtypeOutputExhausted:
+		// ── PHASE 12: the exhaustion of a CREATION contract is not a re-scope ──
+		// typedRepair's typed transition rewrites the attempt as a bounded
+		// SEARCH/REPLACE patch. That transition is only SOUND when the target
+		// already has content to anchor the patch against. A creation contract
+		// ("create index.html") has none: the relabelled attempt asks the model
+		// for a patch against a file that does not exist, so it can never
+		// succeed and it burns a whole recovery cycle proving so.
+		//
+		// The truthful decision is to escalate to the existing ZERO-TOKEN
+		// DecisionSurface, whose `retry_with_explicit_budget` option asks the
+		// human to raise the per-invocation ceiling — the only lever that can
+		// actually make a large creation fit. Authority is unchanged: the human
+		// chooses, the executor still admits and authorizes.
+		if !patchAnchored(o.ArtifactShape) {
+			return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+				Reason: fmt.Sprintf("creation contract %q exhausted at budget=%d finish_reason=%s — a new file has no content to anchor a bounded patch; explicit budget re-scope required",
+					o.ArtifactShape, o.MaxOutputTokens, o.FinishReason)}
+		}
 		if !transitionAvailable(o) {
 			return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
 				Reason: "invariant I1: output exhausted twice — strict halt, manual re-scope required"}
@@ -349,6 +391,13 @@ func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.Loo
 
 	switch sub {
 	case SubtypeOutputExhausted:
+		if !patchAnchored(o.ArtifactShape) {
+			// A creation contract cannot be relabelled into a bounded patch;
+			// fabricating one would guarantee a second, wasted failure. The
+			// zero-trust matrix halts and the human decides the budget.
+			return req, fmt.Errorf("%w: creation contract %q for %s exhausted at budget=%d — a new file has no content to anchor a bounded patch; explicit budget re-scope required",
+				ErrRecoveryHalted, o.ArtifactShape, target, o.MaxOutputTokens)
+		}
 		if !transitionAvailable(o) {
 			return req, fmt.Errorf("%w: output exhausted twice for %s (attempt %d)",
 				ErrRecoveryHalted, target, o.AttemptNum)

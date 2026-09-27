@@ -322,6 +322,10 @@ type Compiler struct {
 	initOnce sync.Once
 	mu       sync.Mutex
 	cache    map[string]*CompiledContext
+	// cacheOrder records the insertion sequence of each cached fingerprint so
+	// eviction can be FIFO instead of a wholesale flush (see putCacheLocked).
+	cacheOrder map[string]uint64
+	cacheSeq   uint64
 }
 
 // Option configures a Compiler.
@@ -390,6 +394,9 @@ func (c *Compiler) ensureInitialized() {
 		}
 		if c.cache == nil {
 			c.cache = make(map[string]*CompiledContext)
+		}
+		if c.cacheOrder == nil {
+			c.cacheOrder = make(map[string]uint64)
 		}
 	})
 }
@@ -629,12 +636,55 @@ func (c *Compiler) Compile(ctx context.Context, in Input) (*CompiledContext, err
 		return nil, err
 	}
 	c.mu.Lock()
-	if len(c.cache) >= c.cacheLimit {
-		c.cache = make(map[string]*CompiledContext)
-	}
-	c.cache[fp] = cloneCompiled(out)
+	c.putCacheLocked(fp, out)
 	c.mu.Unlock()
 	return out, nil
+}
+
+// putCacheLocked stores one compiled context, evicting the OLDEST inserted
+// entry when the cache is at its limit.
+//
+// PHASE 12: the previous store flushed the WHOLE map on overflow, discarding
+// every warm entry at once — including the one a live recovery sequence was
+// about to reuse. FIFO eviction is bounded exactly like the flush was, so the
+// memory bound is unchanged, but a working set survives a burst of unrelated
+// compilations. The caller must hold c.mu.
+func (c *Compiler) putCacheLocked(fp string, out *CompiledContext) {
+	if c.cache == nil {
+		c.cache = make(map[string]*CompiledContext)
+	}
+	if c.cacheOrder == nil {
+		c.cacheOrder = make(map[string]uint64)
+	}
+	if _, exists := c.cache[fp]; !exists {
+		for c.cacheLimit > 0 && len(c.cache) >= c.cacheLimit {
+			c.evictOldestLocked()
+		}
+	}
+	c.cacheSeq++
+	c.cacheOrder[fp] = c.cacheSeq
+	c.cache[fp] = cloneCompiled(out)
+}
+
+// evictOldestLocked drops the single least-recently-inserted entry. The caller
+// must hold c.mu.
+func (c *Compiler) evictOldestLocked() {
+	oldestKey := ""
+	var oldestSeq uint64
+	for key, seq := range c.cacheOrder {
+		if oldestKey == "" || seq < oldestSeq {
+			oldestKey, oldestSeq = key, seq
+		}
+	}
+	if oldestKey == "" {
+		// No insertion order recorded (defensive): fall back to a full reset
+		// rather than growing without bound.
+		c.cache = make(map[string]*CompiledContext)
+		c.cacheOrder = make(map[string]uint64)
+		return
+	}
+	delete(c.cache, oldestKey)
+	delete(c.cacheOrder, oldestKey)
 }
 
 func (c *Compiler) resolveTotal(in Input) (int, TokenBudget, error) {

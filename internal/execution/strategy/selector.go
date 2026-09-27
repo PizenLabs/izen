@@ -652,13 +652,54 @@ func reasoningForComplexity(level ComplexityLevel) int {
 	}
 }
 
+// ── PHASE 12: the output budget is DERIVED, not a universal constant ─────────
+//
+// max_tokens is an INVOCATION-level bound. It must be derived from the task
+// shape so it is large enough for the artifact the task actually produces, and
+// it must be bounded so no invocation can spend unboundedly. A single
+// hard-coded 4 096 for every creation is neither: any new file larger than
+// ~16 KB of source was GUARANTEED to truncate at the output gate
+// (finish_reason=length), and the truncated prefix was then discarded — a
+// guaranteed failure paid for in full model computation.
+//
+// The derivation is a pure, inspectable table over the complexity tier, which
+// the runtime already computes from measurable execution factors
+// (Assess(ComplexityInputs)), never from prompt vocabulary. The resulting
+// REQUEST is still clamped against the model's real ceiling by the shared
+// capability chain (llmstep.ResolveMaxTokens / ModelProfile.ClampMaxTokens), so
+// raising the request can never make a constrained model overspend.
+
+// CreationTokenTiers maps a complexity tier onto the per-invocation output
+// REQUEST for a whole-new-file creation. A creation must carry the new file's
+// full content, so every tier is larger than the anchored-patch budget of the
+// same tier; the medium/high tiers are the ones a realistic page or module
+// needs, and the low tier keeps the cheap case cheap.
+var CreationTokenTiers = map[ComplexityLevel]int{
+	ComplexityLow:    4096,
+	ComplexityMedium: 8192,
+	ComplexityHigh:   16384,
+}
+
+// CreationTokenBudget is the hard ceiling of a derived creation request. It
+// bounds a single invocation; the run-level ceiling is derived separately
+// (autonomy.RunTokenBudget) and the structural loop bounds still terminate a
+// pathological run.
+const CreationTokenBudget = 16384
+
 // outputForArtifact maps the artifact contract onto a bounded output budget.
-// create_file is the only kind that legitimately needs a large budget because
-// it must carry the new file's full content.
+// create_file derives its budget from the complexity tier (see
+// CreationTokenTiers); every other kind is a fixed, contract-shaped bound
+// because its response is not a whole artifact.
 func outputForArtifact(kind string, level ComplexityLevel) int {
 	switch kind {
 	case "create_file":
-		return 4096
+		if b, ok := CreationTokenTiers[level]; ok {
+			if b > CreationTokenBudget {
+				return CreationTokenBudget
+			}
+			return b
+		}
+		return CreationTokenTiers[ComplexityMedium]
 	case "plan":
 		return 1536
 	case "investigation":

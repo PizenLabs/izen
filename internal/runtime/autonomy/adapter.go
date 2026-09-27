@@ -527,6 +527,7 @@ func (a *ExecutorAdapter) observe(req autonomy.LoopRequest, res *execution.Execu
 		FinishReason:          finishReason,
 		MaxOutputTokens:       maxOut,
 		RecoveryStrategy:      req.RecoveryStrategy,
+		ArtifactShape:         res.ArtifactShape,
 	}
 }
 

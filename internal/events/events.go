@@ -45,6 +45,12 @@ const (
 	// retrieval/execution packages' activity sinks. Routing it through the bus
 	// keeps the UI a pure projection: engines never call UI routines directly.
 	EventActivity = "engine.activity"
+	// EventRuntimeDetail is the TRACE/DEBUG channel (PHASE 12). It carries raw
+	// runtime telemetry — workspace-context cache facts, provider forensics,
+	// per-stage internals — that must never reach the human execution narrative
+	// at the default visibility. The presentation layer projects it through the
+	// debug gate only.
+	EventRuntimeDetail = "engine.runtime_detail"
 	// EventEngineTelemetry is a typed engine I/O event (file read, search,
 	// resolve, mutate metrics) wrapped for bus transport. The UI projects it
 	// into its structured activity tree.
@@ -394,6 +400,13 @@ type ActivityPayload struct {
 	Line string
 }
 
+// RuntimeDetailPayload is the trace/debug telemetry envelope. Like
+// ActivityPayload it is content-free metadata: a formatted detail line, never a
+// provider body and never artifact content.
+type RuntimeDetailPayload struct {
+	Line string
+}
+
 // EngineTelemetryPayload is the transport envelope for a typed engine I/O
 // event (retrieval.FileReadEvent, retrieval.SearchEvent, etc.). The payload
 // stays interface{} here because the concrete types live in their source
@@ -545,6 +558,11 @@ type ContextCompilationPayload struct {
 	PromptChars        int      `json:"prompt_chars,omitempty"`
 	PromptFingerprint  string   `json:"prompt_fingerprint,omitempty"`
 	ProtocolTelemetry
+	// CacheHit reports that this MODEL CONTEXT was reused from the context
+	// compiler's fingerprint cache instead of being re-derived (PHASE 12). It
+	// is a different fact from a workspace snapshot-cache hit and is never
+	// conflated with one.
+	CacheHit bool `json:"cache_hit,omitempty"`
 }
 
 // ProviderExecutionPayload is the terminal, structured provider telemetry
@@ -638,6 +656,11 @@ type ContextPreparedPayload struct {
 	PromptChars        int
 	PromptFingerprint  string
 	ProtocolTelemetry
+	// CacheHit reports that this MODEL CONTEXT was reused from the context
+	// compiler's fingerprint cache instead of being re-derived (PHASE 12). It
+	// is a different fact from a workspace snapshot-cache hit and is never
+	// conflated with one.
+	CacheHit bool `json:"cache_hit,omitempty"`
 }
 
 // ModelInvokedPayload records a single provider invocation. TokenInput/Output
@@ -1073,6 +1096,14 @@ func NewSelfHealingExhausted(attempts int, output string) DomainEvent {
 // NewActivity publishes a single free-form engine telemetry line. It is the
 // bus transport for the retrieval/execution activity sinks, decoupling the
 // engine packages from any direct UI callback.
+// NewRuntimeDetail publishes one raw runtime telemetry line onto the
+// trace/debug channel. It is deliberately a DIFFERENT event type from
+// NewActivity so no projection can route it to the user-facing activity log by
+// accident.
+func NewRuntimeDetail(line string) DomainEvent {
+	return newEvent(EventRuntimeDetail, RuntimeDetailPayload{Line: line})
+}
+
 func NewActivity(line string) DomainEvent {
 	return newEvent(EventActivity, ActivityPayload{Line: line})
 }

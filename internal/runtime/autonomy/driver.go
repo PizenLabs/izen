@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/continuation"
@@ -14,6 +15,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
+	"github.com/PizenLabs/izen/internal/llmstep"
 	"github.com/PizenLabs/izen/internal/loop"
 	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
@@ -379,6 +381,17 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		InteractionContract: interaction,
 		Contract:            interactionDescriptor,
 	}
+	// ── PHASE 12: DERIVE THE RUN-LEVEL TOKEN BOUND ──────────────────────
+	// The run-level budget is derived from the per-invocation budget this run
+	// is actually bound to, so a legitimate multi-invocation task is not
+	// truncated by a fixed constant. `WidenBounds` only ever RAISES a floor, so
+	// an explicit `WithLoopBounds` from an operator is never reduced. Authority
+	// is untouched: the bound terminates a run, it never admits work.
+	d.loop.WidenBounds(0, 0,
+		autonomy.RunTokenBudget(d.resolved.Profile.MaxOutputTokens,
+			d.loop.Bounds().MaxAttempts,
+			llmstep.DefaultMaxContinuationSteps), 0)
+
 	// Adaptive heuristic (Task 1): bypass FULL_REWRITE for large targets
 	// or small model budgets; force BOUNDED_PATCH as initial strategy.
 	if len(d.resolved.Targets) > 0 && d.resolved.Targets[0] != "" {
@@ -1092,6 +1105,20 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			d.obs.AttemptNum = d.loop.Attempts()
 			d.obs.RecoveryCycle = d.loop.RecoveryCycles()
 			decision := d.decide(d.obs, d.loop.Bounds())
+			// ── PHASE 12: CANONICAL CONTINUATION CONSULTATION ────────────
+			// An exhausted invocation is an INVOCATION outcome, not a task
+			// failure. Before the matrix acts on it, the pure continuation
+			// library classifies the durable task state — it already
+			// distinguishes "partial but still advanceable" from "nothing
+			// evidence-backed remains". A verdict that is NOT "continue"
+			// escalates to the human instead of spending another attempt; the
+			// library never re-enters execution by itself.
+			if decision.Action == autonomy.LoopRepair &&
+				RecoverySubtype(d.obs) == SubtypeOutputExhausted {
+				if escalated := d.consultContinuationOnExhaustion(); escalated {
+					return d.term(), nil
+				}
+			}
 			// ── ZERO-TOKEN PREFLIGHT GATE (invariant I5) ────────────────
 			// On the INITIAL attempt (no human proposal selected, no recovery
 			// strategy in flight) the driver runs the local structural
@@ -1319,6 +1346,85 @@ func (d *Driver) handlePreflightInfeasible(ctx context.Context, runID uint64) bo
 	d.loop.AwaitHuman(*b)
 	d.enrichBoundary()
 	d.publish(ctx)
+	return true
+}
+
+// consultContinuationOnExhaustion asks the pure continuation library to
+// classify the durable task state after an exhausted invocation and maps a
+// non-CONTINUE verdict onto an explicit human decision.
+//
+// It returns true when the run was parked (the caller must stop), false when
+// the library agrees the task can continue under the matrix's own decision.
+//
+// The library is a PROPOSAL function: it never schedules, never authorizes and
+// never re-enters execution. Only a non-continue verdict is acted on, and it
+// is acted on by parking the loop — the most conservative possible outcome.
+func (d *Driver) consultContinuationOnExhaustion() bool {
+	allowed := append([]string(nil), d.req.Targets...)
+	if len(allowed) == 0 {
+		allowed = append(allowed, d.resolved.Targets...)
+	}
+	// Durable, transcript-free task state: the plan's own unit bookkeeping when
+	// a decomposition is staged, otherwise the current attempt itself. A
+	// monolithic (non-decomposed) attempt is always pending work until the
+	// executor reports otherwise.
+	var completed, pending []string
+	if plan := d.Plan(); plan != nil && len(plan.SubTasks) > 0 {
+		for i, st := range plan.SubTasks {
+			// Units before the current cursor have been dispatched; the DAG
+			// reports how many were satisfied without a mutation.
+			if i < plan.NoOpSatisfiedSubTasks {
+				completed = append(completed, st.ID)
+				continue
+			}
+			pending = append(pending, st.ID)
+		}
+	}
+	if len(pending) == 0 && d.req.Target != "" {
+		pending = append(pending, d.req.Target)
+	}
+	if len(pending) == 0 && len(allowed) > 0 {
+		pending = append(pending, allowed...)
+	}
+	cont := DeriveDriverContinuation(DriverContinuationInput{
+		Objective:        d.prompt,
+		Targets:          d.resolved.Targets,
+		StateFingerprint: d.req.WorkspaceDigest,
+		IsPartialOutput:  true,
+		PreviousOutcome:  "partial",
+		PreviousReason:   "OUTPUT_CEILING",
+		Verified:         d.obs.Verification.Passed,
+		AllowedScope:     allowed,
+		ProviderCeiling:  d.obs.MaxOutputTokens,
+		CompletedSteps:   completed,
+		PendingSteps:     pending,
+		Observations: []continuation.Observation{{
+			Kind:             continuation.KindExecutionResult,
+			Subject:          d.obs.Target,
+			Detail:           "model invocation exhausted its output ceiling",
+			StateFingerprint: d.req.WorkspaceDigest,
+			Timestamp:        time.Now(),
+		}},
+	})
+	if cont.Action == continuation.ActionContinue {
+		// The pure function agrees the task is still advanceable: the matrix's
+		// own decision stands and the run re-enters the SAME executor.
+		return false
+	}
+	// Any other verdict is an explicit human decision, never a silent retry and
+	// never a fabricated completion.
+	reason := "continuation blocked after output exhaustion: " + cont.Reason
+	if cont.Action == continuation.ActionAwaitingApproval {
+		reason = "continuation would exceed the authorized scope: " + cont.Reason
+	}
+	b := &autonomy.HumanBoundary{
+		Reason:  reason,
+		Targets: append([]string(nil), d.req.Targets...),
+	}
+	autonomy.DeriveBoundaryAction(b)
+	d.loop.AwaitHuman(*b)
+	d.enrichBoundary()
+	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 	return true
 }
 

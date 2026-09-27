@@ -195,6 +195,7 @@ func contextTelemetry(req ExecuteRequest, agent *contextcompiler.AgentContext) (
 		DropCount:          result.DropCount,
 		PromptChars:        result.PromptChars,
 		PromptFingerprint:  result.PromptFingerprint,
+		CacheHit:           result.CacheHit,
 		ProtocolTelemetry:  binding,
 	}
 	metrics := events.ContextCompilationPayload{
@@ -220,6 +221,7 @@ func contextTelemetry(req ExecuteRequest, agent *contextcompiler.AgentContext) (
 		Sources:            make([]string, 0, len(result.Sources)),
 		PromptChars:        result.PromptChars,
 		PromptFingerprint:  result.PromptFingerprint,
+		CacheHit:           result.CacheHit,
 		ProtocolTelemetry:  binding,
 	}
 	for _, source := range result.Sources {

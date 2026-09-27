@@ -2913,6 +2913,7 @@ func (m *model) logActivity(format string, args ...interface{}) {
 		return
 	}
 	msg := sanitizeIngressANSI(fmt.Sprintf(format, args...))
+	m.ingestTrace(msg)
 	r := record{role: roleActivity, text: msg}
 	m.records = append(m.records, r)
 	if m.width > 0 {
@@ -2931,11 +2932,70 @@ func (m *model) logActivity(format string, args ...interface{}) {
 // token usage, event names) ONLY when the gated execution is in the DEBUG
 // layer. In NORMAL and EXPANDED the human narrative panel is the only execution
 // surface — internal runtime states are never rendered directly by default.
+// contextReuseSuffix renders the MODEL-CONTEXT identity fact. Reuse is decided by
+// the context compiler's fingerprint cache; an empty fingerprint (no compile
+// happened) is reported as nothing rather than as reuse.
+func contextReuseSuffix(fingerprint string, reused bool) string {
+	if fingerprint == "" {
+		return ""
+	}
+	if reused {
+		return ", model context reused (" + shortFingerprint(fingerprint) + ")"
+	}
+	return ", compiled " + shortFingerprint(fingerprint)
+}
+
+// contextTruncationSuffix renders what the compiler had to leave out of the
+// model context. Truncation is always reported: silently dropping material is
+// exactly the kind of implementation noise the human must not have to discover
+// from a failure.
+func contextTruncationSuffix(truncated bool, truncatedFiles, drops int) string {
+	switch {
+	case truncated:
+		return fmt.Sprintf(", %d file(s) truncated, %d section(s) dropped", truncatedFiles, drops)
+	case drops > 0:
+		return fmt.Sprintf(", %d section(s) dropped", drops)
+	default:
+		return ""
+	}
+}
+
+// shortFingerprint renders the leading edge of a hex digest for a compact,
+// user-facing context line.
+func shortFingerprint(digest string) string {
+	if len(digest) > 8 {
+		return digest[:8]
+	}
+	return digest
+}
+
+// logRuntimeDetail writes a runtime lifecycle detail line (strategy, provider,
+// token usage, event names) ONLY when the gated execution is in the DEBUG
+// layer. In NORMAL and EXPANDED the human narrative panel is the only execution
+// surface — internal runtime states are never rendered directly by default.
+//
+// PHASE 12: the line is ALSO ingested into the Trace buffer unconditionally, so
+// Alt+T is actually populated. Previously only `m.push` fed the demuxer and
+// every runtime detail line bypassed it, leaving Trace empty precisely when a
+// human was debugging.
 func (m *model) logRuntimeDetail(format string, args ...interface{}) {
+	line := sanitizeIngressANSI(fmt.Sprintf(format, args...))
+	m.ingestTrace(line)
 	if m.execVisibility != presentation.VisibilityDebug {
 		return
 	}
-	m.logActivity(format, args...)
+	m.logActivity("%s", line)
+}
+
+// ingestTrace feeds one line into the Trace overlay buffer. It is the single
+// ingestion point so every execution-state source — activity, runtime detail,
+// boundary reasons — lands in Trace exactly once and in the same order it was
+// produced.
+func (m *model) ingestTrace(line string) {
+	if m.telemetryDemuxer == nil || strings.TrimSpace(line) == "" {
+		return
+	}
+	m.telemetryDemuxer.Ingest(line)
 }
 
 // handleEngineEvent receives typed event payloads from the execution
@@ -3110,13 +3170,41 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// indicator's row is released and the compiled context — which the
 		// context/mutation surfaces below render — takes its place.
 		m.finalizeSkeleton(states.StateAstIndexing, "")
-		m.logRuntimeDetail("[runtime] context prepared: %d channel(s), ~%d tokens", len(p.Channels), p.Tokens)
+		// PHASE 12: this is the ONE user-facing MODEL-CONTEXT line. It reports
+		// what is actually SENT to the model (compiled tokens, channel count,
+		// whether anything was truncated or dropped, and whether the compiled
+		// context was reused from the fingerprint cache) — never a workspace
+		// cache hit, which is a different fact about a different layer.
+		if m.execVisibility == presentation.VisibilityExpanded ||
+			m.execVisibility == presentation.VisibilityDebug {
+			m.logActivity("Context: %d channels, ~%d model tokens (budget %d, available %d)%s%s",
+				len(p.Channels), p.Tokens, p.BudgetTokens, p.AvailableTokens,
+				contextReuseSuffix(p.PromptFingerprint, p.CacheHit),
+				contextTruncationSuffix(p.Truncated, p.TruncatedFileCount, p.DropCount))
+		} else {
+			m.logActivity("Context prepared: %d channels, ~%d model tokens",
+				len(p.Channels), p.Tokens)
+		}
+		m.logRuntimeDetail("[runtime] context prepared: %d channel(s), ~%d tokens scope=%s policy=%s truncated=%t drops=%d fingerprint=%s",
+			len(p.Channels), p.Tokens, p.Scope, p.Policy, p.Truncated, p.DropCount, p.PromptFingerprint)
 	case events.ContextCompilationPayload:
 		// PRE-EXECUTION INDICATOR: the context compiler is running. Nothing has
 		// been read or sent yet, and a context scan on a large workspace is a
 		// real, non-instant pause with nothing else to show for it. The payload is
 		// content-free by construction, so the indicator names no file.
 		m.mountSkeleton(states.StateAstIndexing, "")
+		// PHASE 12: the raw compilation metrics are TRACE telemetry. They were
+		// previously received and discarded entirely; they now reach the debug
+		// layer instead of vanishing, and the user-facing line above stays the
+		// single canonical model-context statement.
+		m.logRuntimeDetail("[runtime] context compiled: phase=%s policy=%s budget=%d reserved=%d available=%d used=%d context=%d system=%d schema=%d tool=%d truncated=%t dropped=%d sections=%d reused=%t fingerprint=%s",
+			p.Phase, p.Policy, p.BudgetTokens, p.ReservedTokens, p.AvailableTokens,
+			p.UsedTokens, p.ContextTokens, p.SystemTokens, p.SchemaTokens, p.ToolTokens,
+			p.Truncated, p.DropCount, p.SectionCount, p.CacheHit, p.PromptFingerprint)
+	case events.RuntimeDetailPayload:
+		// PHASE 12: the trace/debug channel. Raw runtime telemetry reaches
+		// Trace and only Trace — never the human execution narrative.
+		m.logRuntimeDetail("%s", p.Line)
 	case events.ToolBatchStartedPayload:
 		// PRE-EXECUTION INDICATOR: the tool set is committed and about to be
 		// dispatched. Nothing has been handed to a subprocess yet, so the

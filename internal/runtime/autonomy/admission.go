@@ -117,13 +117,30 @@ type DriverContinuationInput struct {
 	ProviderCeiling int
 	// Observations carries authoritative execution/verification evidence.
 	Observations []continuation.Observation
+	// CompletedSteps / PendingSteps are the durable, transcript-free task state
+	// the pure continuation function reads to derive the next bounded step.
+	// Empty means "no plan breakdown is known", which the function treats as
+	// "no evidence-backed next step determinable" and BLOCKS rather than
+	// inventing one.
+	CompletedSteps []string
+	PendingSteps   []string
+	// PreviousReason is the bounded reason recorded for the previous step
+	// (e.g. OUTPUT_CEILING for a truncation). It is advisory context for the
+	// pure function, never an instruction.
+	PreviousReason string
 }
 
 // DeriveDriverContinuation consults continuation.DeriveNextStep as a pure
-// transition function. The Driver recovery matrix remains the decision
-// owner: today only the STALE verdict is acted on (it confirms the
-// Boundary-5 workspace_drift abort through the existing drift path); every
-// other verdict is advisory and progression stays with the matrix.
+// transition function. The Driver recovery matrix remains the decision owner;
+// the pure function only ever proposes.
+//
+// PHASE 12: the library is no longer reachable from exactly one place. The
+// OUTPUT_EXHAUSTED path now consults it too, so a truncation is classified by
+// the canonical transition function (which already treats a partial output as
+// CONTINUE, not failure) instead of being re-derived by the matrix. A
+// non-CONTINUE verdict is mapped onto the matrix's own vocabulary — BLOCKED /
+// NO_PROGRESS / STALE become an explicit human decision — it never re-enters
+// execution by itself.
 func DeriveDriverContinuation(in DriverContinuationInput) continuation.ContinuationDecision {
 	allowed := append([]string(nil), in.AllowedScope...)
 	if len(allowed) == 0 {
@@ -135,8 +152,11 @@ func DeriveDriverContinuation(in DriverContinuationInput) continuation.Continuat
 			ActiveScope:      append([]string(nil), in.Targets...),
 			StateFingerprint: in.StateFingerprint,
 			ProviderCeiling:  in.ProviderCeiling,
+			CompletedSteps:   append([]string(nil), in.CompletedSteps...),
+			PendingSteps:     append([]string(nil), in.PendingSteps...),
 		},
 		PreviousOutcome: in.PreviousOutcome,
+		PreviousReason:  in.PreviousReason,
 		Observations:    in.Observations,
 		Verified:        in.Verified,
 		HasStaleState:   in.HasStaleState,

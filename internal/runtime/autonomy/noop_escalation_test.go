@@ -106,8 +106,16 @@ const noOpUnresolvedObjective = `remove every "DEPRECATED-MARKER" comment @big.g
 // TestDriver_SingleSubTaskNoOpSatisfiedCompletes proves the terminal SUCCESS
 // sub-state on a one-unit DAG: the sentinel claim stands uncontradicted, the
 // unit counts as applied, and the DAG completes with zero wasted invocations.
+//
+// The objective is deliberately READ-ONLY ("inspect every handler"). The
+// success sub-state is only reachable for an objective that did not demand a
+// change: a modification-classified DAG that applies zero bytes is execution
+// inertia and parks at EXECUTION_INERTIA_NO_OP instead (see
+// TestPhase12_ModificationNoOpDAGNeverClaimsCompletion). This test previously
+// used "restyle every handler" and only reached the success path because the
+// classifier did not yet recognise "restyle" as a change verb.
 func TestDriver_SingleSubTaskNoOpSatisfiedCompletes(t *testing.T) {
-	root, driver, _, p := stageNoOpDecompositionRun(t, "restyle every handler @big.go", 60, 1)
+	root, driver, _, p := stageNoOpDecompositionRun(t, "inspect every handler @big.go", 60, 1)
 	before := readTarget(t, root, "big.go")
 
 	// st-1's slice needs no edit and the generic objective gives the
@@ -129,6 +137,48 @@ func TestDriver_SingleSubTaskNoOpSatisfiedCompletes(t *testing.T) {
 	}
 	if got := readTarget(t, root, "big.go"); got != before {
 		t.Fatal("a satisfied no-op unit mutated the workspace")
+	}
+}
+
+// TestPhase12_ModificationNoOpDAGNeverClaimsCompletion is the PHASE 12
+// companion lock. A change-request objective whose entire DAG applied zero
+// bytes is EXECUTION INERTIA, not success: it parks at
+// EXECUTION_INERTIA_NO_OP and the loop never reaches RuntimeCompleted.
+//
+// Before Phase 12 this invariant was unreachable in practice for design-shaped
+// change verbs. `requiresMutation` (objective_verify.go) re-derives the intent
+// through autonomy.Classify, and "restyle …" classified as a read-only
+// explanation because no change verb matched — so a request that plainly
+// demanded edits could report a zero-byte DAG as completed. Phase 12 classifies
+// the change verb, which re-arms the circuit.
+func TestPhase12_ModificationNoOpDAGNeverClaimsCompletion(t *testing.T) {
+	for _, objective := range []string{
+		"restyle every handler @big.go",
+		"redesign every handler @big.go",
+		"rework every handler @big.go",
+	} {
+		t.Run(objective, func(t *testing.T) {
+			root, driver, _, p := stageNoOpDecompositionRun(t, objective, 60, 1)
+			before := readTarget(t, root, "big.go")
+			p.noop = map[int]bool{1: true}
+
+			term, err := driver.ResumeApproveProposal(context.Background())
+			if err != nil {
+				t.Fatalf("ResumeApproveProposal: %v", err)
+			}
+			if term != nil {
+				t.Fatalf("termination = %+v, want a parked loop (a change request that applied nothing must not complete)", term)
+			}
+			if driver.State() != autonomy.RuntimeAwaitingHuman {
+				t.Fatalf("state = %s, want awaiting_human", driver.State())
+			}
+			if got := driver.Plan().Status; got != planner.ExecutionInertiaNoOp {
+				t.Fatalf("plan status = %s, want %s", got, planner.ExecutionInertiaNoOp)
+			}
+			if got := readTarget(t, root, "big.go"); got != before {
+				t.Fatal("a no-op unit mutated the workspace")
+			}
+		})
 	}
 }
 

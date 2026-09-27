@@ -273,6 +273,14 @@ func (m *model) composeDockTextWithFlake(flake string) string {
 	return ""
 }
 
+// loadingDockActive reports whether the viewport's canonical in-flight
+// execution line is currently rendered. The execution-view projection is the
+// single authority: it is derived from real runtime events, so an empty
+// HumanStep means there is no authoritative in-flight state to restate.
+func (m *model) loadingDockActive() bool {
+	return m.execView != nil && m.executionResolving && m.execView.Active() && m.execView.HumanStep() != ""
+}
+
 // composeDockText builds the dynamic status text using the default snowflake.
 func (m *model) composeDockText() string {
 	return m.composeDockTextWithFlake(SpinnerSnowflake())
