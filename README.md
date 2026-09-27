@@ -131,6 +131,47 @@ trigger — models that require an agentic harness (such as
 `thinkingmachines/inkling-small:free`) execute natively through Dynamic Contract
 Promotion, which binds Izen's read-only tools before dispatch.
 
+##### Editing a chain and its runtime parameters
+
+The Model Registry's ROLES pane is a tree. Each role is a row; an expanded role
+shows its `[1] Primary` and one numbered row per fallback hop, so the priority
+order IS the row order and nothing about the chain has to be inferred.
+
+| Key | On the ROLES tree | On the MODELS list |
+|-----|-------------------|--------------------|
+| `Alt+F` | add/remove the highlighted model in the role's chain | append the highlighted model to the role selected on the left |
+| `Alt+K` / `Alt+J` | move the highlighted fallback hop up/down | - |
+| `Alt+D` / `Delete` | remove the highlighted fallback hop | - |
+| `Enter` | move to the models list to bind a primary | bind the highlighted model as the role's **primary** |
+| `Alt+E` | open the role-parameter editor | same |
+| `left` / `right` | collapse / expand the role (left on a child walks to its parent) | - |
+
+Every edit is **staged** and lands in `~/.izen/config.yml` only on the
+confirming `Enter`, in one atomic write; `Esc` discards. There are no bare
+feature keys: a bare rune is always the fuzzy-search filter.
+
+Role parameters are per role, and default to two fallback attempts, the
+provider profile's own deadline, and the two network-transient triggers:
+
+```yaml
+roles:
+  plan:
+    model: "openrouter/anthropic/claude-sonnet-4"
+    fallbacks:
+      - "ollama/llama3.2"
+      - "openai/gpt-4o"
+    max_retries: 3          # 0/omitted = the default of 2
+    timeout_seconds: 45     # 0/omitted = the provider profile's own
+    fallback_triggers:
+      rate_limit: true       # HTTP 429
+      server_error: true     # HTTP 5xx
+      context_length: false  # prompt exceeded the model's context window
+```
+
+Each trigger is tri-state: omit it for the documented default, or state it
+explicitly. Writing `server_error: false` really turns it off - a flag that came
+back on by itself would be worse than one that was missing.
+
 ---
 
 ## Modes

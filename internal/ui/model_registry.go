@@ -37,8 +37,9 @@ import (
 
 // persistRoleFallbackChainFn is the seam the confirmation writes through. It is a
 // variable so tests never touch the real home directory; production always uses
-// config.Save, the same writer every other config mutation in the UI uses.
-var persistRoleFallbackChainFn = config.Save
+// config.SaveAtomic, the same writer every other config mutation in the UI uses
+// and the one that guarantees a reader never sees a half-written config.
+var persistRoleFallbackChainFn = config.SaveAtomic
 
 // applyFallbackChain persists a confirmed fallback-chain edit to
 // ~/.izen/config.yml and projects the result onto the live session config.
@@ -98,6 +99,107 @@ func (m *model) applyFallbackChain(msg model_picker.FallbackChainChangedMsg) tea
 	m.refreshViewportContent()
 	m.gotoBottomIfAllowed()
 	return nil
+}
+
+// applyRoleTreeFn is the seam the role-parameter confirmation writes through.
+// It is a variable for the same reason persistRoleFallbackChainFn is: tests must
+// never touch the real home directory. Production is config.ApplyRoleTree, which
+// serializes before it mutates and rolls back on a failed write.
+var applyRoleTreeFn = config.ApplyRoleTree
+
+// applyRoleParams persists a confirmed role-parameter edit (Max Retries,
+// Timeout, Fallback Triggers) and projects it onto the live session config.
+//
+// It goes through config.ApplyRoleTree rather than mutating and calling Save,
+// because that helper is the one place that serializes BEFORE mutating and rolls
+// back on a failed write — and these parameters are read at turn time by the
+// same code that reads the chain, so a session running parameters that are not
+// on disk is the same class of bug as a session running a chain that is not on
+// disk, with the added confusion of a retry budget the user cannot find.
+func (m *model) applyRoleParams(msg model_picker.RoleParamsChangedMsg) tea.Cmd {
+	roleKey := strings.TrimSpace(msg.Role)
+	if m == nil || m.cfg == nil || roleKey == "" {
+		return nil
+	}
+	entry := m.cfg.Roles[roleKey]
+	update := config.RoleTreeUpdate{
+		Role:    roleKey,
+		Primary: entry.Model,
+		Chain:   m.cfg.RoleFallbackChain(roleKey),
+		Params:  roleParamsFromPicker(msg.Params),
+	}
+	if err := applyRoleTreeFn(m.cfg, update); err != nil {
+		m.push(roleError, fmt.Sprintf(
+			"[✗] Role parameters persist failed: %s — the %s parameters are unchanged in ~/.izen/config.yml",
+			err.Error(), roleKey))
+		m.refreshViewportContent()
+		m.gotoBottomIfAllowed()
+		return nil
+	}
+	m.modelPicker = m.modelPicker.ApplyRoleParamsConfirm().SetRoleParams(roleParamsFromConfig(m.cfg))
+	m.push(roleSystem, roleParamsNotice(roleKey, msg.Params))
+	m.refreshViewportContent()
+	m.gotoBottomIfAllowed()
+	return nil
+}
+
+// roleParamsFromPicker maps the widget's value-typed parameters onto the
+// config's tri-state block.
+//
+// It writes every field EXPLICITLY rather than only the ones the user touched.
+// A partial write would make the persisted file depend on which arrow key was
+// pressed last, and a file that means two different things depending on how it
+// was edited is a file nobody can review by reading it.
+func roleParamsFromPicker(p model_picker.RoleParams) config.RoleParamsConfig {
+	return config.RoleParamsConfig{
+		MaxRetries:     p.MaxRetries,
+		TimeoutSeconds: p.TimeoutSeconds,
+		Triggers: config.RoleTriggerConfig{
+			RateLimit:     boolPtr(p.RateLimit),
+			ServerError:   boolPtr(p.ServerError),
+			ContextLength: boolPtr(p.ContextLength),
+		},
+	}
+}
+
+// roleParamsFromConfig projects the persisted parameters into the picker's read
+// model, resolving every absent field to its documented default. It is called
+// when the modal opens and after a successful write, so the widget can never
+// display parameters that are not the ones on disk.
+func roleParamsFromConfig(cfg *config.Config) map[string]model_picker.RoleParams {
+	if cfg == nil {
+		return nil
+	}
+	out := make(map[string]model_picker.RoleParams, len(cfg.Roles))
+	for roleKey := range cfg.Roles {
+		params := cfg.RoleParamsFor(roleKey)
+		rate, server, ctx := params.EffectiveTriggers()
+		out[roleKey] = model_picker.RoleParams{
+			MaxRetries:     params.EffectiveMaxRetries(),
+			TimeoutSeconds: params.EffectiveTimeoutSeconds(),
+			RateLimit:      rate,
+			ServerError:    server,
+			ContextLength:  ctx,
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+// roleParamsNotice renders the single trace line for a confirmed parameter
+// edit.
+//
+// It names the ROLE, because a parameters block is per role and "retries 3" on
+// its own leaves a user who edited the plan role unable to tell whether they
+// edited the plan role. The values themselves are rendered by the WIDGET's
+// formatter, so the confirmation and the metadata row a user reads next are
+// guaranteed to describe the edit the same way.
+func roleParamsNotice(roleKey string, p model_picker.RoleParams) string {
+	return fmt.Sprintf("✓ %s role parameters: %s", roleKey, model_picker.FormatRoleParams(p))
 }
 
 // normalizeFallbackChain is the defensive copy on the way in: trimmed, non-empty,

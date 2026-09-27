@@ -550,6 +550,10 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// already happened, so a second confirm is a second write of a
 			// different chain, not an accumulation.
 			return m, m.applyFallbackChain(msg)
+		case model_picker.RoleParamsChangedMsg:
+			// A CONFIRMED role-parameter edit (Max Retries / Timeout / Fallback
+			// Triggers), reached the same way: Alt+E stages, Enter writes.
+			return m, m.applyRoleParams(msg)
 		case model_picker.ApiKeyInputOpenedMsg, model_picker.ApiKeyInputClosedMsg:
 			// Informational only; the picker keeps its own overlay state.
 			return m, nil

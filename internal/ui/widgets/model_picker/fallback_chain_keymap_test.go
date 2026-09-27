@@ -271,10 +271,18 @@ func TestFallbackRoleFollowsTheSurface(t *testing.T) {
 		t.Errorf("FallbackRole in the plan workspace = %q, want \"plan\"", got)
 	}
 	// Roles pane: the highlighted role wins, because the user navigated to it.
+	//
+	// The index is computed from the TREE rather than hard-coded, because the
+	// roles pane is no longer a list of two names: it is a flattened hierarchy
+	// of roles and their [1] Primary / [n] Fallback children. A literal 1 here
+	// would silently select the plan role's PRIMARY CHILD — which still names
+	// the plan role, so the assertion would still be about the plan role while
+	// claiming to be about the second one. That is the failure mode a hard-coded
+	// index produces here, and it is why the row is located by identity.
 	m = fallbackPicker(t, "ollama/llama3.2")
 	m.paneFocus = PaneRoles
 	m.showingRoles = true
-	m.roleCursor = 1
+	m = m.SetRoleCursor(roleRowIndex(m, RoleOverrideCommit, RoleNodeParent))
 	if got := m.FallbackRole(); got != RoleOverrideCommit {
 		t.Errorf("FallbackRole on the second Roles entry = %q, want %q", got, RoleOverrideCommit)
 	}
@@ -511,4 +519,16 @@ func equalRuneSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// roleRowIndex locates a tree row by IDENTITY (role + kind + hop) rather than by
+// position, so a test about "the plan role's second fallback" keeps testing the
+// plan role's second fallback after the tree gains a level or the chain grows.
+func roleRowIndex(m Model, role string, kind RoleNodeKind) int {
+	for i, n := range m.RoleTree() {
+		if n.Role == role && n.Kind == kind {
+			return i
+		}
+	}
+	return -1
 }

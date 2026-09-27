@@ -64,6 +64,33 @@ var (
 	deepseekBadge   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#94e2d5"))
 	providerBadge   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#6c7086"))
 
+	// ── ROLES TREE (roles_pane.go) ──
+	//
+	// Four registers, not two. A parent row and a child row must be told apart
+	// even without colour, because the pane's whole job is answering "which row
+	// will Alt+D act on", and a tree whose rows all look alike makes that
+	// question unanswerable exactly when it matters:
+	//
+	//	roleParentStyle      mauve, bold, ▶/▼ — a CONTAINER
+	//	roleChildStyle       teal, indented, [n] — an ELEMENT
+	//	roleParentFocusStyle Surface1 bg, mauve, ▸ — focused container
+	//	roleChildFocusStyle  Surface1 bg, text,  ▸ — focused element
+	//
+	// The two focus styles share a background (so "focused" is one glance) and
+	// differ in foreground and marker, so "focused parent" vs "focused child" is
+	// still one glance. Surface1 rather than the models list's Surface0: the
+	// roles pane and the models list sit side by side, and two lists whose
+	// selected rows are the same colour is how a user ends up editing the chain
+	// of the role they thought they were activating a model for.
+	roleParentStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#cba6f7"))
+	roleChildStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#94e2d5"))
+	roleParentFocusStyle = lipgloss.NewStyle().Bold(true).
+				Foreground(lipgloss.Color("#cba6f7")).
+				Background(lipgloss.Color("#45475a"))
+	roleChildFocusStyle = lipgloss.NewStyle().Bold(true).
+				Foreground(lipgloss.Color("#cdd6f4")).
+				Background(lipgloss.Color("#45475a"))
+
 	// Catppuccin Mocha reasoning effort palette (spec: Header Layout Lock task).
 	// default=mauve, none=subtext0, low=green, medium=yellow, high=peach,
 	// xhigh=flamingo, max=red. Bold for visibility; selected adds underline.

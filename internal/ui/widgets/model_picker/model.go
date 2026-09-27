@@ -183,8 +183,15 @@ type Model struct {
 	// showingRoles selects the top-level Roles policy pane on the left side
 	// (Plan/Thinking and Commit/Fast overrides) instead of the providers list.
 	showingRoles bool
-	// roleCursor selects within the Roles list while displaying the roles pane.
+	// roleCursor selects within the FLATTENED ROLES TREE — parents and their
+	// Primary/Fallback children are one sequence (see roles_pane.go). It is an
+	// index into Model.roleTree(), not an index into roleOverrideEntries, which
+	// is why every structural edit has to re-clamp it.
 	roleCursor int
+	// roleCollapsed records the roles whose children are hidden. A role with no
+	// entry is EXPANDED, not collapsed: a picker that has never been asked to
+	// remember anything must render the tree, not the flat list it replaced.
+	roleCollapsed map[string]bool
 
 	// apiKeyInput is non-nil while the secure inline API-key overlay is open.
 	// When set, all browsing keys route to the textinput (EchoPassword) and
@@ -213,6 +220,21 @@ type Model struct {
 	// difference between a user who believes their edit is live and one who is
 	// about to lose it.
 	fallbackDirty bool
+
+	// roleParams is the picker-local read model of each role's OPERATIONAL
+	// parameters (attempt budget, per-call deadline, fallback triggers), seeded
+	// by the parent from persisted config via SetRoleParams. Same
+	// staged-not-persisted contract as fallbackChains: Alt+E edits this map and
+	// the confirming Enter emits RoleParamsChangedMsg.
+	roleParams map[string]RoleParams
+	// roleConfig is non-nil while the inline parameter editor (Alt+E) is open.
+	// When set, every browsing key routes to it and View renders it alone.
+	roleConfig *roleParamsOverlay
+	// roleParamsDirty records that a parameter edit is staged but not
+	// persisted, and roleParamsRole names the role it applies to — the same
+	// "unsaved" honesty the chain line provides for the chain.
+	roleParamsDirty bool
+	roleParamsRole  string
 
 	// state is the two-step picker state machine (browsing vs detail).
 	state PickerState
@@ -294,6 +316,8 @@ func New(snap *registry.ModelSnapshot) Model {
 		providerCursor:  0,
 		showingRoles:    false,
 		roleCursor:      0,
+		roleCollapsed:   make(map[string]bool),
+		roleParams:      make(map[string]RoleParams),
 		searchInput:     searchInputModel{Width: searchInputWidth, focused: false},
 		state:           StateBrowsing,
 		activeWorkspace: "",
@@ -418,9 +442,9 @@ func (m Model) ProviderFilter() string { return m.provider }
 //	W_inner = modalW - 4 (border 2 + padding 1+1)
 //	H_inner = modalH - 2 (border 2, padding 0 vertical)
 //
-// Chrome = 10 lines (Title, Divider, Divider, Active Model, Provider,
-// Variant, Runtime Path, Fallback Chain, Status, Footer)
-// listRowBudget = max(3, innerHeight - 10)
+// Chrome = browserChromeRows + 1 lines (Header, Divider, Divider, Active Model,
+// Provider, Variant, Runtime Path, Fallback Chain, Role Params, Status, Footer)
+// listRowBudget = max(3, innerHeight - browserChromeRows - 1)
 //
 // The status row is chrome even though it is empty most of the time: it is the
 // one line that must be present WHEN it is not empty, and a budget computed as
@@ -437,7 +461,7 @@ func (m Model) SetSize(w, h int) Model {
 	m.modalH = h
 	m.innerWidth = max(20, w-4)
 	m.innerHeight = max(5, h-2)
-	m.listRowBudget = max(3, m.innerHeight-10)
+	m.listRowBudget = max(3, m.innerHeight-browserChromeRows-1)
 	// Legacy aliases: width/height now represent inner bounds for all
 	// rendering helpers (clipLine, padFooter, render*).
 	m.width = m.innerWidth
@@ -687,44 +711,6 @@ func (m Model) SetShowingRoles(v bool) Model {
 // tearing down the whole modal.
 func (m Model) ApiKeyInputActive() bool { return m.apiKeyInput != nil }
 
-// RoleCursor returns the highlight index within the Roles list.
-func (m Model) RoleCursor() int { return m.roleCursor }
-
-// SetRoleCursor jumps to a Roles-list index, clamped to bounds.
-func (m Model) SetRoleCursor(i int) Model {
-	if i < 0 {
-		i = 0
-	}
-	if i >= roleOverrideCount {
-		i = roleOverrideCount - 1
-	}
-	m.roleCursor = i
-	return m
-}
-
-// moveRoleCursor shifts the Roles highlight, clamped to bounds.
-func (m *Model) moveRoleCursor(delta int) {
-	m.roleCursor += delta
-	if m.roleCursor < 0 {
-		m.roleCursor = 0
-	}
-	if m.roleCursor >= roleOverrideCount {
-		m.roleCursor = roleOverrideCount - 1
-	}
-}
-
-// HighlightedRole returns the role override key at the Roles cursor
-// (RoleOverridePlan | RoleOverrideCommit).
-func (m Model) HighlightedRole() string {
-	if m.roleCursor <= 0 {
-		return RoleOverridePlan
-	}
-	return RoleOverrideCommit
-}
-
-// RoleOverrideCount is the number of top-level role policy entries.
-const roleOverrideCount = 2
-
 // SetRoleOverrides seeds the picker-local read model of role policy
 // overrides from the parent's persisted config. Keys are the role override
 // constants (RoleOverridePlan | RoleOverrideCommit).
@@ -793,12 +779,17 @@ func (m Model) FallbackChain(role string) []string {
 // persisted.
 func (m Model) FallbackChainDirty() bool { return m.fallbackDirty }
 
-// effectiveFallbackRole is the role an Alt+F edit applies to.
+// effectiveFallbackRole is the role a chain edit applies to.
 //
 // It is derived from the surface the user is on, in this order:
 //
-//  1. The highlighted role in the Roles pane. The user navigated to it
-//     deliberately, so it is the one they mean.
+//  1. The highlighted ROLES-TREE role, whenever the roles pane is up — NOT only
+//     when the keyboard is in it. The role lives in the left pane, and a user
+//     who picked a role on the left and then pressed Tab to choose a model on
+//     the right has made a choice that outlives the Tab. Keying the target off
+//     the keyboard's pane instead would send Alt+F to the workspace role
+//     silently, and the user would be looking at a chain that did not change
+//     while editing a different one that did.
 //  2. The turn role implied by the active workspace — the plan role inside the
 //     plan workspace, the default role everywhere else. This is the SAME mapping
 //     the runtime uses to pick a chain at turn time (currentTurnRole), so the
@@ -810,10 +801,8 @@ func (m Model) FallbackChainDirty() bool { return m.fallbackDirty }
 // a visible label, so the default role is returned even for a picker that has
 // never seen a workspace.
 func (m Model) effectiveFallbackRole() string {
-	if m.paneFocus == PaneRoles && m.showingRoles {
-		if r := m.HighlightedRole(); r != "" {
-			return r
-		}
+	if r, ok := m.roleNodeSelectedRole(); ok {
+		return r
 	}
 	return m.workspaceFallbackRole()
 }

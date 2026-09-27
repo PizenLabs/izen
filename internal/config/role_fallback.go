@@ -56,6 +56,16 @@ type RoleFallbackConfig struct {
 	// after the primary fails for a network-transient reason. See the section
 	// comment for how it relates to Fallback.
 	Fallbacks []string `yaml:"fallbacks,omitempty" json:"fallbacks,omitempty"`
+
+	// Params carries the role's OPERATIONAL parameters — attempt budget,
+	// per-call deadline, and which refusals advance the chain. It is inlined
+	// into the role's own YAML key rather than nested under a `params:` block
+	// so that hand-editing one number is a one-line diff. See role_config.go,
+	// which also owns every writer for it.
+	//
+	// A role entry that declares only Params is a legitimately configured
+	// role: it has a primary (inherited), no chain, and a budget the user set.
+	Params RoleParamsConfig `yaml:",inline" json:",inline"`
 }
 
 // Chain returns the effective ORDERED chain for this role.
@@ -275,20 +285,7 @@ func (c *Config) SetRoleFallbackChain(role string, chain []string) {
 	if key == "" {
 		return
 	}
-	cleaned := make([]string, 0, len(chain))
-	seen := make(map[string]struct{}, len(chain))
-	for _, v := range chain {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			continue
-		}
-		lk := strings.ToLower(v)
-		if _, dup := seen[lk]; dup {
-			continue
-		}
-		seen[lk] = struct{}{}
-		cleaned = append(cleaned, v)
-	}
+	cleaned := normalizeChain(chain)
 	if len(cleaned) == 0 {
 		if c.Roles == nil {
 			return

@@ -161,3 +161,20 @@ type FallbackChainChangedMsg struct {
 	// Model is the model the edit was about, as a "provider/model" slug.
 	Model string
 }
+
+// RoleParamsChangedMsg is emitted when the user CONFIRMS a role's operational
+// parameters with Enter. It follows the same staged-not-persisted contract as
+// FallbackChainChangedMsg, and for the same reason: the widget stages, the
+// parent writes ~/.izen/config.yml.
+//
+// The message carries the COMPLETE parameter set rather than the field the user
+// last touched. A partial update would leave the parent unable to distinguish
+// "the user set the 5xx trigger off" from "the user set it off and left the
+// other four at whatever they were a moment ago", and would make the persisted
+// file depend on which key was pressed last.
+type RoleParamsChangedMsg struct {
+	// Role is the semantic role key whose parameters changed.
+	Role string
+	// Params is the role's complete, effective parameter block AFTER the edit.
+	Params RoleParams
+}
