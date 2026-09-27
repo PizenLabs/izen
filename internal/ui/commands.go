@@ -2323,7 +2323,13 @@ func (m *model) handleCommand(cmd string) tea.Cmd {
 			m.pendingArchArgs = args
 			m.push(roleSystem, infoStyle.Render("[⠋] Mapping codebase structure... (indexing in progress)"))
 			m.refreshViewportContent()
-			return m.spinnerTickCmd()
+			// Route through the single-flight arming rather than calling
+			// spinnerTickCmd directly: this site has no other loop live, so a
+			// direct dispatch would leave the armed flag false and a later
+			// ensureSpinnerTick would then start a SECOND ticker on top of this
+			// one. The indicator would rotate at 20Hz — precisely the coupling
+			// the decoupled ticker exists to remove.
+			return m.ensureSpinnerTick()
 		}
 		m.push(roleSystem, "Mapping codebase...")
 		m.refreshViewportContent()

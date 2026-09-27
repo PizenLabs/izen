@@ -18,21 +18,85 @@ import (
 //
 //	roles:
 //	  plan:
-//	    model:    "openrouter/thinkingmachines/inkling-small:free"
-//	    fallback: "openrouter/anthropic/claude-3.5-sonnet"
+//	    model:     "openrouter/thinkingmachines/inkling-small:free"
+//	    fallback:  "openrouter/anthropic/claude-3.5-sonnet"
 //	  default:
-//	    fallback: "openrouter/anthropic/claude-3.5-sonnet"
+//	    fallbacks:
+//	      - "ollama/llama3.2"
+//	      - "openrouter/anthropic/claude-3.5-sonnet"
 //
 // Model values are either bare model IDs (resolved against the active
 // provider) or provider-qualified "provider/model" slugs.
+//
+// # FALLBACK vs FALLBACKS
+//
+// `fallback` is a single model and `fallbacks` is an ORDERED CHAIN, and they are
+// not two spellings of one field. `fallback` is the documented, hand-editable
+// single-model form and it remains the FIRST element of the effective chain; a
+// chain is what a user builds interactively (the Model Registry's Alt+F toggle),
+// where "the model AFTER the one that just failed" is a real question that a
+// single slot cannot answer.
+//
+// So writing a chain means writing BOTH: Fallbacks carries the order, and
+// Fallback mirrors element zero — so a hand-edited config that only knows about
+// `fallback` keeps working, and a reader that only knows about `fallback` sees a
+// truthful first hop rather than nothing. SetRoleFallbackChain is the one writer
+// that keeps the two in step.
 type RoleFallbackConfig struct {
 	// Model is the role's primary model. Empty means "inherit whatever model is
-	// active" — only Fallback participates in the chain.
+	// active" — only the fallback chain participates in the switch.
 	Model string `yaml:"model,omitempty" json:"model,omitempty"`
 
-	// Fallback is the explicit fallback model for the role. Empty disables the
-	// chain for that role (no implicit reversion is ever invented).
+	// Fallback is the explicit fallback model for the role, and the first element
+	// of Fallbacks. Empty, with an empty Fallbacks, disables the chain for that
+	// role (no implicit reversion is ever invented).
 	Fallback string `yaml:"fallback,omitempty" json:"fallback,omitempty"`
+
+	// Fallbacks is the ordered fallback chain for the role, consulted in order
+	// after the primary fails for a network-transient reason. See the section
+	// comment for how it relates to Fallback.
+	Fallbacks []string `yaml:"fallbacks,omitempty" json:"fallbacks,omitempty"`
+}
+
+// Chain returns the effective ORDERED chain for this role.
+//
+// The two forms are MERGED rather than chosen between — Fallback first — so a
+// config that declares only `fallback` and one that declares only `fallbacks`
+// produce the same shape to every reader, and a config that (transiently)
+// declares both cannot disagree with itself.
+//
+// Duplicates are dropped case-insensitively with the first occurrence winning.
+// A chain that names the same model twice is a retry loop against a provider
+// that has already refused it: the runtime would spend a whole request
+// discovering that, and a user who meant to write it deserves to see it collapse
+// on screen rather than discover it as a mysterious extra request in the trace.
+func (r RoleFallbackConfig) Chain() []string {
+	single := strings.TrimSpace(r.Fallback)
+	if len(r.Fallbacks) == 0 {
+		if single == "" {
+			return nil
+		}
+		return []string{single}
+	}
+	out := make([]string, 0, len(r.Fallbacks)+1)
+	seen := make(map[string]struct{}, len(r.Fallbacks)+1)
+	appendModel := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		key := strings.ToLower(v)
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, v)
+	}
+	appendModel(single)
+	for _, v := range r.Fallbacks {
+		appendModel(v)
+	}
+	return out
 }
 
 // RoleChain is the resolved (provider, model) pair a role's fallback switches
@@ -92,7 +156,7 @@ func SplitProviderModel(value string) (provider, model string) {
 	return "", v
 }
 
-// RoleChainFor resolves the fallback chain for a turn.
+// RoleChainFor resolves the NEXT HOP of the fallback chain for a turn.
 //
 // Resolution order (first match wins):
 //  1. The turn role's own entry, when its declared primary matches activeModel
@@ -102,53 +166,165 @@ func SplitProviderModel(value string) (provider, model string) {
 //     alphabetical order of the remaining keys) — the chain belongs to the
 //     model that failed, not to the surface that invoked it.
 //
+// Within the matching role, the chain is walked IN ORDER and the first entry
+// that resolves to a provider and differs from activeModel is returned. A
+// multi-entry chain is therefore not a loop: each retry that resolves the next
+// hop advances the position, because the caller passes the model that just
+// failed back in as activeModel. That is what makes "1. a -> 2. b" mean
+// "try a, then b" rather than "try a, and also b, forever".
+//
 // activeProvider is the provider of the currently active binding and supplies
 // the provider for a bare (unqualified) fallback model ID. The returned
-// RoleChain is only meaningful when ok is true, i.e. when a non-empty fallback
-// exists that differs from the primary.
+// RoleChain is only meaningful when ok is true, i.e. when a next hop exists that
+// differs from the primary.
 func (c *Config) RoleChainFor(role, activeModel, activeProvider string) (RoleChain, bool) {
 	if c == nil || len(c.Roles) == 0 {
 		return RoleChain{}, false
 	}
-	primary := strings.TrimSpace(activeModel)
+	// The primary is normalised to a BARE model ID before any comparison, and
+	// that is not cosmetic. Chain entries are stored as slugs ("ollama/llama3.2")
+	// because a bare ID is resolved against whatever provider happens to be bound
+	// at turn time, but the CALLER may hold either form — a request's Model field
+	// is bare, a config-read or a trace string is a slug. Comparing a bare primary
+	// against a slugged hop would never match, so hop 1 would look like a valid
+	// target and the chain would switch a model to itself.
+	_, primary := SplitProviderModel(activeModel)
+	primary = strings.TrimSpace(primary)
+	if primary == "" {
+		primary = strings.TrimSpace(activeModel)
+	}
 	for _, key := range c.roleChainScanOrder(role) {
 		entry, ok := c.Roles[key]
 		if !ok {
 			continue
 		}
-		primaryProvider, primaryModel := SplitProviderModel(entry.Model)
+		primaryProvider, declaredPrimary := SplitProviderModel(entry.Model)
 		// A role with a different declared primary never claims this turn.
-		if primaryModel != "" && primary != "" && !strings.EqualFold(primaryModel, primary) {
+		if declaredPrimary != "" && primary != "" && !strings.EqualFold(declaredPrimary, primary) {
 			continue
 		}
-		fbProvider, fbModel := SplitProviderModel(entry.Fallback)
-		fbModel = strings.TrimSpace(fbModel)
-		if fbModel == "" {
-			continue
-		}
-		if fbProvider == "" {
-			// A bare fallback model inherits the role's provider, else the
-			// provider of the model that failed.
-			if primaryProvider != "" {
-				fbProvider = primaryProvider
-			} else {
-				fbProvider = strings.TrimSpace(activeProvider)
+		for _, candidate := range entry.Chain() {
+			fbProvider, fbModel := SplitProviderModel(candidate)
+			fbModel = strings.TrimSpace(fbModel)
+			if fbModel == "" {
+				continue
 			}
+			if fbProvider == "" {
+				// A bare fallback model inherits the role's provider, else the
+				// provider of the model that failed.
+				if primaryProvider != "" {
+					fbProvider = primaryProvider
+				} else {
+					fbProvider = strings.TrimSpace(activeProvider)
+				}
+			}
+			// A hop identical to the failed model is a no-op loop: refuse it and
+			// keep walking, because a chain whose SECOND entry is the model that
+			// just failed should still reach its third.
+			if strings.EqualFold(fbModel, primary) {
+				continue
+			}
+			chain := RoleChain{
+				Role:     key,
+				Primary:  primary,
+				Provider: fbProvider,
+				Model:    fbModel,
+			}
+			chain.Label = chain.LabelOrEmpty()
+			return chain, true
 		}
-		// A fallback identical to the failed primary is a no-op loop: refuse it.
-		if strings.EqualFold(fbModel, primary) {
-			continue
-		}
-		chain := RoleChain{
-			Role:     key,
-			Primary:  primary,
-			Provider: fbProvider,
-			Model:    fbModel,
-		}
-		chain.Label = chain.LabelOrEmpty()
-		return chain, true
 	}
 	return RoleChain{}, false
+}
+
+// RoleFallbackChain returns the effective ordered chain for a role, or nil when
+// the role is unconfigured. It is the read side of the Model Registry's
+// fallback editor: the widget is seeded from this and every user edit is written
+// back through SetRoleFallbackChain, so the widget never derives the chain
+// itself and the file on disk is never the widget's private state.
+func (c *Config) RoleFallbackChain(role string) []string {
+	if c == nil {
+		return nil
+	}
+	entry, ok := c.Roles[strings.TrimSpace(role)]
+	if !ok {
+		return nil
+	}
+	chain := entry.Chain()
+	if len(chain) == 0 {
+		return nil
+	}
+	return chain
+}
+
+// SetRoleFallbackChain writes the ordered chain for a role, keeping Fallback and
+// Fallbacks in step (see RoleFallbackConfig). It creates the role entry when
+// needed and removes the entry entirely when the chain becomes empty, so a
+// cleared chain leaves no `roles: {default: {}}` husk behind to be read as a
+// configured role.
+//
+// Persistence is the CALLER's job: this mutates the in-memory config, and the
+// caller decides when to write ~/.izen/config.yml. That separation is what
+// makes the Model Registry's two-step confirm honest — the widget stages an
+// edit, the user confirms, and only then does anything touch the disk.
+func (c *Config) SetRoleFallbackChain(role string, chain []string) {
+	if c == nil {
+		return
+	}
+	key := strings.TrimSpace(role)
+	if key == "" {
+		return
+	}
+	cleaned := make([]string, 0, len(chain))
+	seen := make(map[string]struct{}, len(chain))
+	for _, v := range chain {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		lk := strings.ToLower(v)
+		if _, dup := seen[lk]; dup {
+			continue
+		}
+		seen[lk] = struct{}{}
+		cleaned = append(cleaned, v)
+	}
+	if len(cleaned) == 0 {
+		if c.Roles == nil {
+			return
+		}
+		delete(c.Roles, key)
+		return
+	}
+	if c.Roles == nil {
+		c.Roles = make(map[string]RoleFallbackConfig)
+	}
+	entry := c.Roles[key]
+	entry.Fallback = cleaned[0]
+	entry.Fallbacks = append([]string(nil), cleaned...)
+	c.Roles[key] = entry
+}
+
+// ToggleRoleFallback adds model to the role's chain, or removes it when it is
+// already present. It reports the resulting chain and whether the model is now
+// IN it.
+//
+// Removal preserves the order of what remains, so a chain a user has carefully
+// ordered does not reshuffle because they removed its third element. Adding
+// appends, because a chain is a queue of "and then what?" — prepending a
+// fallback would silently reorder hops the user never touched.
+func (c *Config) ToggleRoleFallback(role, model string) (chain []string, inChain bool) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return c.RoleFallbackChain(role), false
+	}
+	current := c.RoleFallbackChain(role)
+	for i, existing := range current {
+		if strings.EqualFold(existing, model) {
+			return append(append([]string(nil), current[:i]...), current[i+1:]...), false
+		}
+	}
+	return append(append([]string(nil), current...), model), true
 }
 
 // roleChainScanOrder returns the deterministic role iteration order: the turn

@@ -426,28 +426,132 @@ func TestReasoningPanelPreservesItsPositionWhenIdle(t *testing.T) {
 // including the panes where the clamps fight each other. A budget that can
 // produce a negative or zero main viewport is a budget that produces a frame one
 // row taller than the pane.
+//
+// The two ceilings are asserted as constants rather than as literals, so a
+// change to the ceiling cannot silently move the expectations with it — which is
+// the failure this table exists to prevent. The contract is
+//
+//	min(contentLines, ⌊0.25 × available⌋, 6)
+//
+// with an UNKNOWN content count (0) meaning "bound by the ceilings alone".
 func TestReasoningPanelHeightClamp(t *testing.T) {
-	for _, tc := range []struct{ available, want int }{
-		{available: 0, want: 0},
-		{available: 1, want: 0},
-		{available: 5, want: 0}, // too cramped to split: refuse rather than lie
-		{available: 6, want: 1}, // the ceiling wins: the conversation gets 5
-		{available: 8, want: 1}, // …because 8-8 leaves the panel nothing
-		{available: 10, want: 2},
-		{available: 12, want: 4},
-		{available: 20, want: 8}, // 40% exactly
-		{available: 25, want: 10},
-		{available: 40, want: 16},
-		{available: 100, want: 40},
-		{available: 1000, want: 400},
+	// Content deeper than the ceiling: the budget is then a pure function of
+	// `available`, which is what makes the table below a table about geometry.
+	const deep = 1 << 20
+
+	for _, tc := range []struct {
+		available, contentLines, want int
+	}{
+		{available: 0, contentLines: deep, want: 0},
+		{available: 1, contentLines: deep, want: 0},
+		{available: 7, contentLines: deep, want: 0}, // too cramped to split: refuse rather than lie
+		{available: 8, contentLines: deep, want: 1}, // …because 8-8 leaves the panel nothing
+		{available: 10, contentLines: deep, want: 2},
+		{available: 12, contentLines: deep, want: 3},
+		{available: 20, contentLines: deep, want: 5}, // ⌊0.25 × 20⌋
+		{available: 25, contentLines: deep, want: 6}, // ⌊0.25 × 25⌋ = 6
+		{available: 40, contentLines: deep, want: 6}, // 10 by percentage, 6 by the ceiling
+		{available: 100, contentLines: deep, want: 6},
+		{available: 1000, contentLines: deep, want: 6},
+		// The contentLines term: a short trace never gets a full-ceiling band.
+		{available: 40, contentLines: 1, want: 1},
+		{available: 40, contentLines: 3, want: 3},
+		{available: 40, contentLines: 4, want: 4},
+		{available: 40, contentLines: 6, want: 6},
+		{available: 40, contentLines: 7, want: 6}, // still capped
+		// UNKNOWN content: bounded by the ceilings alone, never by a guess.
+		{available: 40, contentLines: 0, want: 6},
+		{available: 20, contentLines: 0, want: 5},
 	} {
-		if got := reasoningPanelHeight(tc.available); got != tc.want {
-			t.Errorf("reasoningPanelHeight(%d) = %d, want %d", tc.available, got, tc.want)
+		if got := reasoningPanelHeight(tc.available, tc.contentLines); got != tc.want {
+			t.Errorf("reasoningPanelHeight(%d, %d) = %d, want %d",
+				tc.available, tc.contentLines, got, tc.want)
 		}
 		// The invariant the whole budget exists to keep, asserted on every case.
-		if got := tc.available - reasoningPanelHeight(tc.available); got < 1 && tc.available >= 1 {
+		if got := tc.available - reasoningPanelHeight(tc.available, tc.contentLines); got < 1 && tc.available >= 1 {
 			t.Errorf("available %d left the conversation %d rows", tc.available, got)
 		}
+	}
+}
+
+// TestReasoningPanelIsBoundedToAQuarterAndSixRows is the DoD clause stated
+// independently of the table above: across every pane a terminal can be resized
+// to, the band never exceeds a quarter of the scrollable area and never exceeds
+// six rows, and the two clamps are load-bearing (removing either one would
+// change an answer).
+func TestReasoningPanelIsBoundedToAQuarterAndSixRows(t *testing.T) {
+	const deep = 1 << 20
+	for _, available := range []int{0, 1, 5, 8, 12, 16, 20, 24, 30, 40, 60, 100, 200, 1000} {
+		got := reasoningPanelHeight(available, deep)
+		if got > reasoningPanelMaxRows {
+			t.Errorf("available %d: the panel took %d rows, over the %d-row ceiling",
+				available, got, reasoningPanelMaxRows)
+		}
+		if pct := available * reasoningPanelPercent / 100; got > pct && available >= reasoningPanelMinAvailable {
+			t.Errorf("available %d: the panel took %d rows, over ⌊%d%% × %d⌋ = %d",
+				available, got, reasoningPanelPercent, available, pct)
+		}
+	}
+	if reasoningPanelMaxRows != 6 {
+		t.Errorf("the preview ceiling is %d rows, want 6", reasoningPanelMaxRows)
+	}
+	if reasoningPanelPercent != 25 {
+		t.Errorf("the panel share is %d%%, want 25%%", reasoningPanelPercent)
+	}
+}
+
+// TestReasoningPanelAutoScrollsToTheTail is the other half of the ceiling: a
+// bounded window is only useful if it is a WINDOW. A band capped at six rows that
+// parked its offset at the top would show the first six lines of a
+// three-hundred-line trace and call it a preview.
+func TestReasoningPanelAutoScrollsToTheTail(t *testing.T) {
+	m := reasoningTestModel(t, 300)
+	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
+	m.assembleScreen(nil)
+
+	if m.reasoningPanelRows <= 0 {
+		t.Fatal("precondition: the panel should hold rows")
+	}
+	if m.reasoningPanelRows > 6 {
+		t.Fatalf("the panel took %d rows, over the six-row preview ceiling", m.reasoningPanelRows)
+	}
+	if !m.reasoningViewport.AtBottom() {
+		t.Errorf("the window is anchored at row %d of %d, not the tail",
+			m.reasoningViewport.YOffset, m.reasoningViewport.TotalLineCount())
+	}
+	// The tail is the newest reasoning AND the affordance that closes the band.
+	// Rendering the LAST row is the assertion that matters: a viewport that
+	// thinks it is at the bottom and draws something else is worse than one that
+	// admits it is not.
+	rows := frameRows(ansi.Strip(m.assembleScreen(nil).ReasoningPanel))
+	last := rows[len(rows)-1]
+	if !strings.Contains(last, "Ctrl+O collapse") {
+		t.Errorf("the tail of the window is not the tail of the content: %q", last)
+	}
+}
+
+// TestReasoningPanelShrinksToItsContent is the contentLines term driven through
+// the real model rather than the pure function: a two-line trace must not claim
+// six rows, because blank gutter is rows taken from the answer for nothing.
+func TestReasoningPanelShrinksToItsContent(t *testing.T) {
+	m := newWorkspaceModel(t)
+	m = setPane(t, m, 100, 40)
+	m.thinkingBuffer = NewThinkingBuffer()
+	m.thinkingBuffer.Append("only one step here\n")
+	m.thinkingBuffer.MarkComplete()
+	m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO})
+	m.assembleScreen(nil)
+
+	// One content row plus the static tail affordance.
+	want := m.reasoningViewport.TotalLineCount()
+	if want <= 0 {
+		t.Fatal("precondition: the panel should hold content")
+	}
+	if m.reasoningPanelRows != want {
+		t.Errorf("the panel took %d rows for %d rows of content", m.reasoningPanelRows, want)
+	}
+	if m.reasoningPanelRows > 3 {
+		t.Errorf("a one-line trace claimed %d rows", m.reasoningPanelRows)
 	}
 }
 

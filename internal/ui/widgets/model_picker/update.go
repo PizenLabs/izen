@@ -138,6 +138,57 @@ func snapshotFromDescriptors(prev *registry.ModelSnapshot, models []registry.Mod
 	return out
 }
 
+// ── FALLBACK CHAIN TOGGLING ──────────────────────────────────────────────────
+
+// toggleFallbackChain stages an add/remove of the highlighted model in the
+// current role's chain and reports what happened in the status line.
+//
+// It stages; it does not persist. The confirming Enter emits
+// FallbackChainChangedMsg and the parent writes ~/.izen/config.yml, so a user
+// who toggles four models and then presses Esc has not silently rewritten their
+// config file.
+//
+// It NEVER falls through to the search input. That is the property the whole
+// binding exists for, and it is why this is a named case in the switch above
+// rather than a branch of the search handler: a key that is not handled here
+// reaches handleSearchInput, and there it becomes a query mutation. The list
+// filtering is the most-used thing on this surface; a feature key that quietly
+// feeds it is a feature nobody can reach.
+func (m Model) toggleFallbackChain() (Model, tea.Cmd) {
+	sel := m.Highlighted()
+	if sel == nil {
+		sel = m.SelectedModel()
+	}
+	if sel == nil {
+		m.status = "No model highlighted"
+		return m, nil
+	}
+	roleKey := m.effectiveFallbackRole()
+	slug := fallbackSlug(*sel)
+	updated, added := m.ToggleFallbackForHighlighted()
+	if updated.fallbackRole != roleKey {
+		updated.fallbackRole = roleKey
+	}
+	updated.status = describeFallbackToggle(roleKey, slug, added)
+	return updated, nil
+}
+
+// describeFallbackToggle is the one-line status the user reads immediately after
+// pressing Alt+F.
+//
+// It names the ROLE, not just the model, because the role is the part a user is
+// most likely to have wrong: the same key on the same model edits different
+// chains depending on which pane they were on, and a message that said only
+// "added llama3.2" would leave a user who meant the plan chain with no way to
+// tell that they edited the default one.
+func describeFallbackToggle(roleKey, slug string, added bool) string {
+	verb := "Removed"
+	if added {
+		verb = "Added"
+	}
+	return fmt.Sprintf("%s %s from the %s fallback chain — Enter to save, Esc to discard", verb, slug, roleKey)
+}
+
 func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 	// While the secure inline API-key overlay is open, every browsing key
 	// routes to the textinput (EchoPassword). Esc cancels, Enter submits.
@@ -218,7 +269,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		budget := m.listRowBudget
 		if budget <= 0 {
-			budget = max(5, m.innerHeight-8)
+			budget = max(5, m.innerHeight-10)
 			if budget <= 0 {
 				budget = 5
 			}
@@ -238,7 +289,7 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		budget := m.listRowBudget
 		if budget <= 0 {
-			budget = max(5, m.innerHeight-8)
+			budget = max(5, m.innerHeight-10)
 			if budget <= 0 {
 				budget = 5
 			}
@@ -253,6 +304,17 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 	case "enter":
+		// A STAGED FALLBACK-CHAIN EDIT IS CONFIRMED BEFORE ANYTHING ELSE. Enter
+		// on this surface is ambiguous by construction — it activates a model,
+		// and it writes the config file — and resolving it in favour of the
+		// unsaved edit is the only order that is not data loss: activating a
+		// model closes the modal, and a closed modal cannot confirm anything.
+		// The alternative (activate, and silently drop the chain) means a user
+		// who pressed Enter to save four staged models gets a model switch
+		// instead.
+		if m.fallbackDirty {
+			return m, m.EmitFallbackChainConfirm()
+		}
 		switch m.paneFocus {
 		case PaneRoles:
 			// Choose the highlighted role override; switch to the models
@@ -283,6 +345,12 @@ func (m Model) handleBrowsingKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case FallbackToggleKey, FallbackToggleKeyAlt, FallbackToggleKeyCtrl:
+		// THE CONFLICT-FREE BINDING. A modifier is not a printable rune in any
+		// terminal's default mode, so it cannot land in the fuzzy search field
+		// — which is the whole point: on this surface the bare runes belong to
+		// the search box, always.
+		return m.toggleFallbackChain()
 	case "alt+i", "alt+I":
 		// Inspect: pin the highlighted model into StateDetail. Enables
 		// detail view + reasoning policy cycling without committing.
@@ -464,7 +532,7 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.state = StateBrowsing
 		m.clearDetail()
 		return m, nil
-	case "r":
+	case ReasoningCycleKey, ReasoningCycleKeyAlt:
 		// Dynamic capability guard: ONLY cycle through caps.Options when the
 		// model actually supports configurable reasoning. Non-configurable
 		// models are a NO-OP with zero state change.
@@ -479,7 +547,20 @@ func (m Model) handleDetailKeys(msg tea.KeyMsg) (Model, tea.Cmd) {
 		// Cycle strictly through valid model options
 		m.cycleReasoningPolicy()
 		return m, nil
+	case FallbackToggleKey, FallbackToggleKeyAlt, FallbackToggleKeyCtrl:
+		// The chain editor is reachable from the detail view too, on the same
+		// modifier as in the list — a user who is already inspecting a model is
+		// exactly the user who wants to add it to a fallback chain, and making
+		// them go back out to do it would make the feature discoverable only by
+		// people who already know it exists.
+		return m.toggleFallbackChain()
 	case "enter":
+		// A staged chain edit is confirmed before the activation, for the same
+		// reason as in the list view: activating closes the modal, and a closed
+		// modal cannot save anything.
+		if m.fallbackDirty {
+			return m, m.EmitFallbackChainConfirm()
+		}
 		// 2-step activation confirm: commit the pinned detail selection
 		// with its selected reasoning variant into the runtime authority.
 		// The parent closes the modal after the commit lands.
@@ -531,7 +612,9 @@ func isSearchEditKey(msg tea.KeyMsg) bool {
 //nolint:unused // retained for spec compatibility
 func isListHotkey(s string) bool {
 	switch s {
-	case RoleDefaultKey, RolePlanKey, RoleSmolKey, RoleVisionKey, RoleAdviserKey, ScopeToggleKey:
+	case RoleDefaultKey, RolePlanKey, RoleSmolKey, RoleVisionKey, RoleAdviserKey,
+		FallbackToggleKey, FallbackToggleKeyAlt, FallbackToggleKeyCtrl,
+		ReasoningCycleKey, ReasoningCycleKeyAlt:
 		return true
 	}
 	return false

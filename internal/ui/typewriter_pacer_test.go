@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/x/ansi"
 
@@ -19,51 +20,139 @@ import (
 // immediate reveal that the rest of the suite depends on, and the interpolation
 // that the live TUI uses to turn a bursty provider into flowing text.
 
-// TestTypewriterStepIsOneThirdBounded pins the drain formula. The step is
-// `max(1, pending/3)`, so a one-byte queue still moves (or a stream would stall)
-// and a large queue is worked off geometrically without ever releasing the whole
-// burst in one frame.
-func TestTypewriterStepIsOneThirdBounded(t *testing.T) {
-	cases := []struct {
-		pending, want int
-	}{
+// TestTypewriterStepIsRuneDominatedInTwoRegimes pins the drain formula, which is
+// the whole tunability surface of the reveal:
+//
+//	pending < 60   →  1..3 runes per frame (a sequential typewriter cadence)
+//	pending >= 60  →  min(12, pending/5)      (stream-lag insurance)
+//
+// Both regimes are asserted at their boundaries, because the boundaries are the
+// only places a wrong divisor or a wrong cap is invisible: at 55 runes a
+// `pending/3` formula gives 18 and a `pending/5` gives 11, so any formula that
+// is not one of these two fails the table rather than passing "most" of it.
+func TestTypewriterStepIsRuneDominatedInTwoRegimes(t *testing.T) {
+	sequential := []struct{ pending, want int }{
 		{0, 0},
 		{1, 1},
 		{2, 1},
 		{3, 1},
 		{4, 1},
-		{6, 2},
-		{9, 3},
-		{30, 10},
-		{90, 30},
-		{150, 50},
+		{10, 1},
+		{20, 1}, // 20*3/60 = 1
+		{21, 1},
+		{30, 1}, // 30*3/60 = 1
+		{40, 2}, // 40*3/60 = 2
+		{50, 2},
+		{59, 2}, // still inside the sequential regime
 	}
-	for _, tc := range cases {
+	for _, tc := range sequential {
 		if got := typewriterStep(tc.pending); got != tc.want {
-			t.Errorf("typewriterStep(%d) = %d, want %d", tc.pending, got, tc.want)
+			t.Errorf("typewriterStep(%d) = %d, want %d (sequential regime)", tc.pending, got, tc.want)
+		}
+		// The DoD clause: a small backlog drains strictly 1..3 runes per frame.
+		if tc.pending > 0 {
+			if got := typewriterStep(tc.pending); got < 1 || got > 3 {
+				t.Errorf("typewriterStep(%d) = %d, outside the 1..3 sequential range", tc.pending, got)
+			}
+		}
+	}
+
+	burst := []struct{ pending, want int }{
+		{60, 12}, // 60/5 = 12
+		{59, 2},  // the threshold itself: one below is still sequential
+		{61, 12},
+		{100, 12}, // 100/5 = 20, capped at 12
+		{300, 12},
+		{1000, 12},
+	}
+	for _, tc := range burst {
+		if got := typewriterStep(tc.pending); got != tc.want {
+			t.Errorf("typewriterStep(%d) = %d, want %d (burst regime)", tc.pending, got, tc.want)
+		}
+	}
+
+	// The formula, restated independently so a change to one regime cannot be
+	// masked by a change to the other.
+	for pending := 1; pending < 4000; pending++ {
+		got := typewriterStep(pending)
+		if got < 1 || got > pending {
+			t.Fatalf("typewriterStep(%d) = %d is outside [1, %d]", pending, got, pending)
+		}
+		if pending < 60 {
+			continue // the range assertion above already covered this range
+		}
+		if want := min(pending/5, 12); got != want {
+			t.Fatalf("typewriterStep(%d) = %d, want min(12, pending/5) = %d", pending, got, want)
 		}
 	}
 }
 
+// TestTypewriterStepIsRuneDominatedNotByteDominated is the reason the queue was
+// converted from bytes: the cadence a reader perceives is a CHARACTER, and a
+// byte-denominated step reveals four times as many glyphs for a CJK answer as for
+// an ASCII one. With a rune step, N pending characters of either script take the
+// same number of frames to drain.
+func TestTypewriterStepIsRuneDominatedNotByteDominated(t *testing.T) {
+	framesToDrain := func(text string) int {
+		p := newTypewriterPacer()
+		p.Push(text)
+		frames := 0
+		for p.Pending() > 0 {
+			if !p.Advance() {
+				t.Fatal("Advance reported nothing while characters were pending")
+			}
+			frames++
+			if frames > 10_000 {
+				t.Fatal("the reveal did not converge")
+			}
+		}
+		return frames
+	}
+	// Thirty characters either way: thirty ASCII letters (30 bytes) or fifteen
+	// CJK glyphs (45 bytes). A byte-denominated step would drain the CJK answer
+	// in half the frames, and a byte-denominated QUEUE would report 45 pending
+	// against 30 — so both halves of the conversion are caught by this one
+	// comparison.
+	const ascii = "abcdefghijklmnopqrstuvwxyz0123"
+	cjk := strings.Repeat("漢字", 15)
+	framesASCII := framesToDrain(ascii)
+	framesCJK := framesToDrain(cjk)
+	if framesASCII != framesCJK {
+		t.Errorf("the cadence is not character-denominated: %d ASCII characters (%d bytes) "+
+			"took %d frames, %d CJK characters (%d bytes) took %d",
+			len([]rune(ascii)), len(ascii), framesASCII,
+			len([]rune(cjk)), len(cjk), framesCJK)
+	}
+}
+
 // TestTypewriterQueueIsFIFOAndRuneSafe pins the two properties the renderer
-// relies on: bytes come out in the order they went in, and a multi-byte rune is
-// never split across frames (a split would paint a replacement character for a
-// frame). The pop is forced onto a boundary by cutting one byte at a time.
+// relies on: characters come out in the order they went in, and a multi-byte
+// rune is never split across frames (a split would paint a replacement character
+// for a frame). Because the queue is rune-denominated, the boundary is exact —
+// there is nothing to repair after the fact.
 func TestTypewriterQueueIsFIFOAndRuneSafe(t *testing.T) {
 	var q typewriterQueue
 	const content = "aé漢😀z"
 	q.push(content)
 
-	if got := q.len(); got != len(content) {
-		t.Fatalf("queue len = %d, want %d", got, len(content))
+	if got := q.pendingRunes(); got != len([]rune(content)) {
+		t.Fatalf("queue depth = %d runes, want %d", got, len([]rune(content)))
 	}
 	var built strings.Builder
-	for q.len() > 0 {
+	for q.pendingRunes() > 0 {
 		chunk := q.pop(1)
 		if len(chunk) == 0 {
-			t.Fatal("pop returned nothing while bytes remained")
+			t.Fatal("pop returned nothing while characters remained")
 		}
-		built.Write(chunk)
+		if len(chunk) != 1 {
+			t.Fatalf("pop(1) released %d runes", len(chunk))
+		}
+		// Every pop is exactly one WHOLE rune: this is the assertion the byte
+		// implementation could not make.
+		if chunk[0] == utf8.RuneError {
+			t.Fatal("pop released a replacement character — a rune was split")
+		}
+		built.WriteRune(chunk[0])
 	}
 	if built.String() != content {
 		t.Errorf("queue round-trip = %q, want %q", built.String(), content)
@@ -78,8 +167,8 @@ func TestTypewriterQueuePopClampsToAvailable(t *testing.T) {
 	if got := string(q.pop(100)); got != "abc" {
 		t.Fatalf("pop(100) = %q, want the whole queue", got)
 	}
-	if q.len() != 0 {
-		t.Fatalf("queue still holds %d bytes", q.len())
+	if q.pendingRunes() != 0 {
+		t.Fatalf("queue still holds %d characters", q.pendingRunes())
 	}
 	if got := q.pop(1); len(got) != 0 {
 		t.Fatalf("popping an empty queue returned %q", got)
@@ -88,8 +177,13 @@ func TestTypewriterQueuePopClampsToAvailable(t *testing.T) {
 
 // TestTypewriterPacerConvergesAndNeverRevealsTooMuch is the smoothing contract:
 // a burst is revealed across several frames, each frame releasing no more than
-// its adaptive step (plus at most one rune of boundary extension), and the whole
-// burst is eventually on screen. Nothing is dropped.
+// its adaptive step, and the whole burst is eventually on screen. Nothing is
+// dropped.
+//
+// The per-frame bound is now EXACT rather than "step plus at most three bytes":
+// the queue is rune-denominated, so a frame releases precisely the number of
+// characters the step asked for. A frame that released more would be the jump
+// this file exists to remove, and it is now detectable without an allowance.
 func TestTypewriterPacerConvergesAndNeverRevealsTooMuch(t *testing.T) {
 	p := newTypewriterPacer()
 	const burst = "the answer arrives in one packet but streams out fluidly. "
@@ -102,35 +196,39 @@ func TestTypewriterPacerConvergesAndNeverRevealsTooMuch(t *testing.T) {
 	}
 
 	frames := 0
-	var revealed int
+	revealed := 0
 	for p.Pending() > 0 {
 		before := p.Pending()
 		if !p.Advance() {
-			t.Fatal("Advance reported nothing while bytes were pending")
+			t.Fatal("Advance reported nothing while characters were pending")
 		}
 		frames++
 		if frames > total+2 {
 			t.Fatal("the reveal did not converge")
 		}
-		// The bytes released this frame cannot exceed the step plus the at-most
-		// three bytes needed to finish a rune.
-		newly := before - p.Pending()
-		if max := typewriterStep(before) + 3; newly > max {
-			t.Fatalf("frame %d revealed %d bytes, over the %d-byte step", frames, newly, max)
+		if newly := before - p.Pending(); newly > typewriterStep(before) {
+			t.Fatalf("frame %d revealed %d characters, over the %d-character step",
+				frames, newly, typewriterStep(before))
 		}
-		revealed += newly
+		revealed += before - p.Pending()
 	}
 	if revealed != total {
-		t.Errorf("revealed %d of %d bytes", revealed, total)
+		t.Errorf("revealed %d of %d characters", revealed, total)
 	}
-	if got := p.Revealed(); len(got) != total {
-		t.Errorf("revealed prefix = %d bytes, want %d", len(got), total)
+	if got := len([]rune(p.Revealed())); got != total {
+		t.Errorf("revealed prefix = %d characters, want %d", got, total)
+	}
+	// A burst this size is in the catch-up regime, so it must take several
+	// frames — a single-frame drain is exactly the artefact being removed.
+	if frames < 2 {
+		t.Errorf("a %d-character burst drained in %d frame: the reveal is a jump, not a reveal",
+			total, frames)
 	}
 }
 
 // TestTypewriterPacerSlowStreamConverges pins the floor: a queue smaller than
-// three bytes still moves one byte per frame (step floors at one), so a slow
-// stream is revealed within a frame or two rather than stalled.
+// three characters still moves one character per frame (the step floors at one),
+// so a slow stream is revealed within a frame or two rather than stalled.
 func TestTypewriterPacerSlowStreamConverges(t *testing.T) {
 	p := newTypewriterPacer()
 	p.Push("hi")
@@ -146,7 +244,7 @@ func TestTypewriterPacerSlowStreamConverges(t *testing.T) {
 		t.Errorf("second advance revealed %q, want %q", got, "hi")
 	}
 	if p.Pending() != 0 {
-		t.Errorf("slow stream left %d bytes queued", p.Pending())
+		t.Errorf("slow stream left %d characters queued", p.Pending())
 	}
 }
 
@@ -192,8 +290,8 @@ func TestModelTypewriterDefersThenReveals(t *testing.T) {
 	if m.currentStreamContent != burst {
 		t.Fatalf("authoritative content = %q, want the whole burst", m.currentStreamContent)
 	}
-	if got := m.typewriter.Pending(); got != len(burst) {
-		t.Fatalf("the burst was not queued: pending = %d, want %d", got, len(burst))
+	if got := m.typewriter.Pending(); got != len([]rune(burst)) {
+		t.Fatalf("the burst was not queued: pending = %d runes, want %d", got, len([]rune(burst)))
 	}
 	if m.streamingDocStart >= 0 {
 		t.Fatal("the burst was painted whole despite the pacer")
@@ -203,10 +301,10 @@ func TestModelTypewriterDefersThenReveals(t *testing.T) {
 	frames := 0
 	for m.typewriter.Pending() > 0 {
 		if !m.advanceTypewriter() {
-			t.Fatal("advanceTypewriter reported no movement while bytes were pending")
+			t.Fatal("advanceTypewriter reported no movement while characters were pending")
 		}
 		frames++
-		if frames > len(burst)+2 {
+		if frames > len([]rune(burst))+2 {
 			t.Fatal("the model reveal did not converge")
 		}
 	}
@@ -315,8 +413,8 @@ func TestTypewriterArmsAtProductionStreamStart(t *testing.T) {
 
 // TestTypewriterQueueIsSafeUnderConcurrentProducer runs the shape the queue is
 // built for: appends from several goroutines while the UI goroutine consumes.
-// The assertion is exhaustiveness — every pushed byte is eventually revealed —
-// which is what makes the queue safe to move a producer onto.
+// The assertion is exhaustiveness — every pushed character is eventually
+// revealed — which is what makes the queue safe to move a producer onto.
 func TestTypewriterQueueIsSafeUnderConcurrentProducer(t *testing.T) {
 	p := newTypewriterPacer()
 	const producers = 4
@@ -359,7 +457,7 @@ func TestTypewriterQueueIsSafeUnderConcurrentProducer(t *testing.T) {
 		p.Advance()
 	}
 	want := producers * perProducer
-	if got := len(p.Revealed()); got != want {
-		t.Fatalf("revealed %d bytes, pushed %d — the queue dropped a push", got, want)
+	if got := len([]rune(p.Revealed())); got != want {
+		t.Fatalf("revealed %d characters, pushed %d — the queue dropped a push", got, want)
 	}
 }

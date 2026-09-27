@@ -42,6 +42,12 @@ import tea "github.com/charmbracelet/bubbletea"
 // reads on a pre-rendered viewport. That is the whole contract: a scroll frame
 // allocates nothing, so it cannot be the frame that triggers a GC pause in the
 // middle of a stream.
+//
+// # THE ZERO-ALLOCATION CONTRACT, IN ONE SENTENCE
+//
+// A wheel notch moves a row offset into a pre-rendered line cache; it never
+// builds a string, never parses Markdown, never walks an AST, and never
+// recomputes the layout.
 
 // wheelScrollRows is the number of document rows one wheel notch moves on both
 // scroll surfaces. It is a single constant because the two surfaces must feel
@@ -49,6 +55,55 @@ import tea "github.com/charmbracelet/bubbletea"
 // the conversation three rows per notch is reading at the same speed, and a
 // split would make the panel feel slower than the answer it belongs to.
 const wheelScrollRows = 3
+
+// renderedLineCache is the pre-rendered, already-wrapped, already-styled line
+// pool the conversation viewport slices from: m.scrollDocLines, one entry per
+// physical row of the full scrollable document, produced once per
+// refreshViewportContent and untouched until the document itself changes.
+//
+// # WHY THE WHEEL READS THIS AND NOTHING ELSE
+//
+// Every alternative to reading a rendered cache costs something the wheel
+// cannot afford:
+//
+//   - Rendering the Markdown for the visible window re-parses the AST. On a
+//     40-record conversation that is milliseconds, on the UI goroutine, per
+//     notch, while a stream is producing tokens faster than the frame loop can
+//     retire them.
+//   - Re-measuring the chrome re-renders the header, the prompt region and the
+//     footer to answer "which rows are on screen" — a question the cache
+//     already answers with a slice.
+//   - Re-wrapping the document to discover how tall it is is the O(len) work the
+//     cache exists to make unnecessary; the height is len(cache).
+//
+// So the wheel's entire contribution is an integer write to the offset the
+// compositor reads, and the compositor's contribution is a slice of a slice.
+// Freshness is the one thing that has to be checked, and it is checked with a
+// length comparison rather than a timestamp (see scrollPoolValid): a stale cache
+// is a correctness problem, but a clock read on every notch to guard against one
+// is a cost paid always to prevent a failure that a length can rule out exactly.
+//
+// WIDTH PADDING is applied at compose time (composeViewportWindow), never stored:
+// padding is a function of the pane width, which a wheel notch cannot change, so
+// caching it would be caching something the wheel can invalidate.
+func (m *model) renderedLineCache() []string {
+	if m == nil {
+		return nil
+	}
+	return m.scrollDocLines
+}
+
+// renderedLineCacheWarm reports whether the cache can serve the wheel without a
+// re-render.
+//
+// It is the precondition for the O(1) promise, and it is deliberately total: a
+// cold or mismatched cache falls back to a self-healing refresh inside scrollBy,
+// because drawing a blank window is a worse answer than paying for one refresh.
+// The fallback cannot fire during active streaming — every arriving chunk
+// refreshes the pool — so the promise holds exactly where it is hardest to keep.
+func (m *model) renderedLineCacheWarm() bool {
+	return m != nil && m.scrollPoolValid() && !m.inViMode && !m.mouseSel.Active
+}
 
 // wheelTarget is the resolved destination of one wheel event. It is computed by
 // a single O(1) classification so the decision "which surface owns this scroll"
@@ -154,6 +209,15 @@ func (m *model) interceptWheel(msg tea.MouseMsg) (tea.Model, tea.Cmd, bool) {
 	}
 
 	// ── CONVERSATION ────────────────────────────────────────────────
+	// THE O(1) CONTRACT, ENFORCED HERE. The rendered line cache must be able to
+	// answer "which rows are on screen" without re-deriving anything; if it
+	// cannot, the model is in a state the fast path was never designed for (a
+	// cold pool from a harness, or Vi-mode/selection geometry the fast path
+	// does not serve) and it is better to pay for one self-healing refresh
+	// inside scrollBy than to draw a blank window. During active streaming the
+	// cache is always warm — every arriving chunk refreshes it — so the rest of
+	// this branch is the whole of a notch's work.
+	//
 	// This is a pure scroll frame, which is the ONE case in which the chrome
 	// cache is not invalidated: the header, the prompt and the footer are
 	// byte-identical across consecutive scroll notches, so re-deriving them
@@ -177,5 +241,10 @@ func (m *model) interceptWheel(msg tea.MouseMsg) (tea.Model, tea.Cmd, bool) {
 	// bottom. A reader who is still catching up is therefore never yanked by
 	// the next arriving token, and the release is not deferred to a frame or
 	// a timer, so the very next wheel event already agrees with it.
+	//
+	// No AST parse, no Markdown re-render, no layout rebuild happened on the
+	// way here. The visible window for the new offset is a slice of
+	// m.renderedLineCache(), composed at the next View() with a width the notch
+	// could not have changed.
 	return m, nil, true
 }

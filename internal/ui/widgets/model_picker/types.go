@@ -116,3 +116,48 @@ type OverrideBinding struct {
 	Provider string
 	Effort   string // reasoning effort; "" = provider default
 }
+
+// ── ROLE FALLBACK CHAIN EDITING ──────────────────────────────────────────────
+//
+// The fallback chain is a per-ROLE, per-TURN retry order: when the model that
+// failed refuses for a network-transient reason, the runtime MAY retry the turn
+// on the next model in the chain, and the switch is always reported in the
+// trace. It is the only model-switch mechanism Izen has — nothing reverts
+// implicitly.
+//
+// # WHY THE EDITING LIVES BEHIND Alt+F AND NOT A BARE KEY
+//
+// The models pane is also a fuzzy search field. Every printable rune typed in it
+// narrows the list, which is the fastest thing a user does with this surface —
+// so a bare `f` binding does not "add a fallback", it makes the word "fallback"
+// impossible to type, and it does so silently: the list just empties. The same
+// argument retires bare `a` and bare `r` on the list surface.
+//
+// So the chain editor is on a MODIFIER (Alt+F, or Ctrl+F) and, in the detail
+// view, on the same key. A bare rune in the models pane is and stays search
+// input. That is the entire reason the binding looks unusual: the ordinary key
+// is the ordinary key.
+
+// FallbackChainChangedMsg is emitted when the user CONFIRMS a fallback-chain
+// edit with Enter. The widget stages edits locally; nothing is persisted until
+// this message reaches the parent and the parent writes ~/.izen/config.yml.
+//
+// Staging is not a formality. config.Save rewrites the user's whole config file,
+// and a user who has toggled four models into a chain and then pressed Esc has
+// expressed a clear opinion: not that. One write, on one explicit keypress, is
+// the only shape of this that is reversible by a second keypress.
+type FallbackChainChangedMsg struct {
+	// Role is the semantic role key whose chain changed (plan | default | ...).
+	Role string
+	// Chain is the complete ordered chain for that role AFTER the edit. It
+	// replaces the stored chain wholesale; an empty slice means the chain was
+	// cleared.
+	Chain []string
+	// Added reports whether the confirming keypress ADDED the highlighted model
+	// (true) or removed it (false). It is carried for the trace line, because
+	// "Fallback chain updated" is not a message a user can act on and
+	// "Added ollama/llama3.2 to the default fallback chain (2 hops)" is.
+	Added bool
+	// Model is the model the edit was about, as a "provider/model" slug.
+	Model string
+}

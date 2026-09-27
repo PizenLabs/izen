@@ -542,6 +542,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// (roles pane). Applies onto authority.ModelPolicy + config and
 			// re-seeds the open picker; modal stays open for further edits.
 			return m, m.applyRoleOverride(msg)
+		case model_picker.FallbackChainChangedMsg:
+			// A CONFIRMED role fallback-chain edit. This is the one path in the
+			// picker that writes ~/.izen/config.yml, and it is reached only by an
+			// explicit Enter — every Alt+F before it stages in RAM. The modal
+			// stays open so a user can keep building the chain; the write has
+			// already happened, so a second confirm is a second write of a
+			// different chain, not an accumulation.
+			return m, m.applyFallbackChain(msg)
 		case model_picker.ApiKeyInputOpenedMsg, model_picker.ApiKeyInputClosedMsg:
 			// Informational only; the picker keeps its own overlay state.
 			return m, nil
@@ -978,34 +986,42 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// is live. The idle-gate in the reconcile block above relies on
 			// this to avoid prematurely force-clearing a healthy spinner.
 			m.lastAgentActivity = time.Now()
-			// 1. Physically advance the spinner frame.
-			m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
-			// 2. Repaint the viewport from the live stream/agent buffers.
+			// 1. Repaint the viewport from the live stream/agent buffers.
 			// Layout freezing: while dragging, background ticks must not
 			// trigger re-layout that would shift rows under the cursor.
+			//
+			// The spinner frame is NOT advanced here. It has exactly one writer
+			// (advanceSpinnerFrame) and it is the 100ms animation ticker; this
+			// loop owns RENDER cadence. See spinner.go.
 			if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.state == StateProcessing || m.shellRunning {
 				if !m.mouseSel.Dragging {
 					m.refreshViewportContent()
 				}
 			}
-			// 3. Re-dispatch the smooth tick to keep the render loop alive.
-			return m, m.smoothStreamTickCmd()
+			// 2. Re-dispatch the smooth tick to keep the render loop alive, and
+			// make sure the decoupled animation ticker is armed: a background op
+			// that dispatches only this loop (/plan synthesis is the canonical
+			// case) must still animate, which is what the removed in-line
+			// increment used to provide by hand.
+			return m, tea.Batch(m.smoothStreamTickCmd(), m.ensureSpinnerTick())
 		}
 
 		return m, nil
 
 	case spinnerTickMsg:
-		m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
+		// THE ONE WRITER OF THE SPINNER FRAME. Everything else about a frame
+		// loop may vary — 20ms, 30ms, 50ms, 60 FPS — and the indicator's rotation
+		// must not, because the rotation is a property of the ten-frame glyph
+		// cycle rather than of the render loop that draws it.
+		m.spinnerTickArmed = false
+		if m.spinnerAnimated() {
+			m.advanceSpinnerFrame()
+		}
 		m.refreshViewportContent()
 		// Continuously re-arm the spinner tick whenever any execution work
 		// is active — this prevents frozen spinners during model invocation,
 		// long-running tool execution, or any background producer.
-		if m.isExecuting() || m.streaming || m.agentRunning || m.reviewRunning ||
-			m.pipelineRunning || m.shellRunning || m.planPending || m.autonomousActive ||
-			m.indexingStatus == "indexing" || m.pendingArchArgs != "" {
-			return m, m.spinnerTickCmd()
-		}
-		return m, nil
+		return m, m.ensureSpinnerTick()
 
 	case proTipTickMsg:
 		now := time.Now()
@@ -2720,21 +2736,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// producer still owns the flags.
 		//
 		// frameAdvanced tracks whether any visual state changed this tick
-		// (new token OR spinner-frame advance); it drives the single-flight
-		// 30FPS repaint gate so an idle loop never schedules repaints.
+		// (a new token or a repaint of a live indicator); it drives the
+		// single-flight 30FPS repaint gate so an idle loop never schedules
+		// repaints.
 		frameAdvanced := false
 		backgroundActive := m.streaming || m.agentRunning || m.reviewRunning ||
 			m.pipelineRunning || m.planPending || m.shellRunning || m.autonomousActive
 		if backgroundActive {
 			m.lastAgentActivity = time.Now()
-			// GUARD: when the shimmer is active, the shimmerTickCmd already
-			// advances m.spinnerFrame at 50ms cadence. Skip the smooth-stream
-			// advance to prevent double-incrementing the snowflake frames.
-			if !m.shimmerActive && time.Since(m.lastSpinnerAdvance) >= 100*time.Millisecond {
-				m.spinnerFrame = (m.spinnerFrame + 1) % len(ProposalSpinnerFrames)
-				m.lastSpinnerAdvance = time.Now()
-				frameAdvanced = true
-			}
 		}
 
 		// ── FRAME-THROTTLED FLUSH ──────────────────────────────────────
@@ -2786,12 +2795,13 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// ── SINGLE-FLIGHT 30FPS REPAINT ───────────────────────────────
 		// Do NOT force a refresh here: refreshViewportContent is gated behind
 		// scheduleRepaint (one repaintTickMsg at a time, never chained). Only
-		// visual changes (a new token or a spinner-frame advance) request a
-		// repaint; an idle tick loop re-schedules itself but never repaints.
+		// a new token requests a repaint; an idle tick loop re-schedules itself
+		// but never repaints. The animation ticker owns indicator repaints, so
+		// a spinning indicator no longer needs this loop to fire.
 		if m.Ready && frameAdvanced {
 			if repaint := m.scheduleRepaint(); repaint != nil {
 				m.streamTickActive = true
-				return m, tea.Batch(m.smoothStreamTickCmd(), repaint)
+				return m, tea.Batch(m.smoothStreamTickCmd(), m.ensureSpinnerTick(), repaint)
 			}
 		}
 
@@ -2806,9 +2816,14 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// stream flags. m.autonomousActive keeps the loop armed through the
 		// whole driver run/DAG_EXECUTING even when a mid-run stream event
 		// cleared the shimmer.
+		//
+		// The spinner tick rides along on the same batch. That is the whole
+		// replacement for the removed in-line increment: a background op that
+		// dispatches only this loop still animates, because the loop arms the
+		// decoupled ticker rather than advancing the frame itself.
 		if m.streaming || m.agentRunning || m.reviewRunning || m.pipelineRunning || m.planPending || m.shellRunning || m.shimmerActive || m.autonomousActive {
 			m.streamTickActive = true
-			return m, m.smoothStreamTickCmd()
+			return m, tea.Batch(m.smoothStreamTickCmd(), m.ensureSpinnerTick())
 		}
 		// Streaming complete
 		m.streamTickActive = false
@@ -2868,18 +2883,22 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 	case executingHeaderTickMsg:
 		// ── TOP HEADER EXECUTION SWEEP (capped 90ms) ────────────────
 		// Advances the windowed right-to-left gradient one frame and
-		// re-arms only while execution is in flight (self-terminating).
-		// The frame index shares m.spinnerFrame so all animation loops stay
-		// on one cadence; the header render itself is one styled 4-cell
-		// window (<0.5% CPU, no per-rune math).
+		// re-arms only while execution is in flight (self-terminating). The
+		// header render itself is one styled 4-cell window (<0.5% CPU, no
+		// per-rune math).
+		//
+		// The gradient reads the spinner frame, so this loop does not advance
+		// it: the sweep is a RENDER of the animation, not a driver of it, and a
+		// second writer at a third rate is exactly what the decoupling in
+		// spinner.go exists to eliminate. The decoupled ticker is armed instead,
+		// and its own handler does the repaint.
 		if !m.isExecuting() {
 			return m, nil
 		}
-		m.spinnerFrame++
 		if m.Ready {
 			m.refreshViewportContent()
 		}
-		return m, m.executingHeaderTickCmd()
+		return m, tea.Batch(m.executingHeaderTickCmd(), m.ensureSpinnerTick())
 
 	case planSlowNoticeMsg:
 		// One-shot soft-timeout probe for /plan synthesis. Only act if THIS
@@ -4400,6 +4419,16 @@ func (m *model) releaseReasoningPanelIfHidden() {
 		return
 	}
 	m.setReasoningExpanded(false)
+	// A settings change is the same event as a Ctrl+O as far as the frame is
+	// concerned: the band just went from H_reasoning rows to 0, so H_main has to
+	// grow by exactly that much in the SAME frame. Without the synchronous
+	// re-budget the frame the user sees is composed against the old split — the
+	// prompt bar floats above the pane's bottom edge and stale terminal content
+	// shows through beneath it. This is the clause "disabling reasoning in
+	// settings never corrupts the viewport", and it is why the two paths share
+	// one function rather than two lines each.
+	m.recomputeLayout()
+	m.refreshViewportContent()
 }
 
 // newReasoningViewport constructs the dedicated reasoning sub-viewport.
@@ -4869,12 +4898,6 @@ func (m *model) handleReasoningScrollKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		m.reasoningDetached = true
 	}
 	return true, nil
-}
-
-func (m *model) spinnerTickCmd() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
-		return spinnerTickMsg(t)
-	})
 }
 
 func (m *model) proTipTickCmd() tea.Cmd {

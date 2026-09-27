@@ -79,8 +79,14 @@ func newTestModel() *model {
 	}
 }
 
-// ── Test 1: tickMsg keeps the spinner chain alive ────────────────────────
+// ── Test 1: the render loop keeps the ANIMATION ticker alive ─────────────
 
+// TestSpinnerTickInStateAwaitingApproval pins the ownership split between the
+// two loops. tickMsg owns RENDER cadence: it repaints the viewport from the
+// live buffers and re-arms itself, but it does NOT advance the glyph — the
+// 100ms SpinnerTickMsg is the sole writer. The command it returns must include
+// that arming, which is what keeps the indicator animating in a state (an
+// approval wait) where no token will ever arrive to drive anything else.
 func TestSpinnerTickInStateAwaitingApproval(t *testing.T) {
 	m := newTestModel()
 	initialFrame := m.spinnerFrame
@@ -88,12 +94,15 @@ func TestSpinnerTickInStateAwaitingApproval(t *testing.T) {
 	newModel, cmd := m.Update(tickMsg(time.Now()))
 	m2 := newModel.(*model)
 
-	expectFrame := (initialFrame + 1) % len(ProposalSpinnerFrames)
-	if m2.spinnerFrame != expectFrame {
-		t.Errorf("spinnerFrame = %d, want %d", m2.spinnerFrame, expectFrame)
+	if m2.spinnerFrame != initialFrame {
+		t.Errorf("the render loop advanced the spinner: %d → %d; the animation ticker is "+
+			"the only writer", initialFrame, m2.spinnerFrame)
 	}
 	if cmd == nil {
-		t.Fatal("tickMsg returned nil cmd — spinner tick chain broken")
+		t.Fatal("tickMsg returned nil cmd — the render/animation chain is broken")
+	}
+	if !m2.spinnerTickArmed {
+		t.Error("tickMsg did not arm the decoupled animation ticker while work is in flight")
 	}
 }
 
@@ -115,6 +124,9 @@ func TestSpinnerTickInStateChat(t *testing.T) {
 	// State changes are driven by other messages, not tickMsg.
 	if cmd != nil {
 		t.Fatal("tickMsg in idle StateChat should return nil cmd — tick loop stops when idle")
+	}
+	if m2.spinnerTickArmed {
+		t.Error("the animation ticker was armed on an idle prompt bar")
 	}
 }
 

@@ -68,15 +68,23 @@ func (s searchInputModel) Update(msg tea.KeyMsg) (searchInputModel, tea.Cmd) {
 	return s, nil
 }
 
-// Role hotkeys.
+// Role-binding hotkeys.
+//
+// They are MODIFIERS, and the constants name the MODIFIER form — "alt+d", not
+// "d" — because the bare forms are the ones that used to be declared here, and
+// declaring them is how a bare `a` ends up in a switch case four files away
+// from the argument explaining why it must not be. Naming the modifier makes the
+// bare spelling impossible to write by accident: `case RoleAdviserKey:` now
+// resolves to "alt+a" and simply does not match a typed `a`.
+//
+// See keys.go for the full contract and for why every feature key on this
+// surface is a modifier.
 const (
-	RoleDefaultKey = "d"
-	RolePlanKey    = "p"
-	RoleSmolKey    = "s"
-	RoleVisionKey  = "v"
-	RoleAdviserKey = "a"
-	// ScopeToggleKey flips local vs global binding scope.
-	ScopeToggleKey = "g"
+	RoleDefaultKey = "alt+d"
+	RolePlanKey    = "alt+p"
+	RoleSmolKey    = "alt+s"
+	RoleVisionKey  = "alt+v"
+	RoleAdviserKey = "alt+a"
 )
 
 // ModelsLoadedMsg carries a fresh RAM snapshot into Update (sent by the
@@ -188,6 +196,23 @@ type Model struct {
 	// (seeded by the parent from persisted config via SetRoleOverrides). It
 	// powers the Roles pane summaries; mutations go out as RolePolicyOverrideMsg.
 	policyOverrides map[string]OverrideBinding
+
+	// fallbackChains is the picker-local read model of the per-role FALLBACK
+	// chains, seeded by the parent from persisted config via SetFallbackChains.
+	// It is the same staged-not-persisted pattern as policyOverrides: Alt+F
+	// mutates this map, the metadata panel renders it live, and only the
+	// confirming Enter emits FallbackChainChangedMsg for the parent to write.
+	fallbackChains map[string][]string
+	// fallbackRole is the role the Alt+F edit applies to. It is recomputed on
+	// every edit from the surface the user is actually on (the highlighted role
+	// in the Roles pane, else the turn role implied by the active workspace) so
+	// the chain being edited is never a value the user cannot see.
+	fallbackRole string
+	// fallbackDirty records that the chain has been staged but not persisted.
+	// It is what puts a "unsaved" marker on the metadata line, and it is the
+	// difference between a user who believes their edit is live and one who is
+	// about to lose it.
+	fallbackDirty bool
 
 	// state is the two-step picker state machine (browsing vs detail).
 	state PickerState
@@ -393,9 +418,14 @@ func (m Model) ProviderFilter() string { return m.provider }
 //	W_inner = modalW - 4 (border 2 + padding 1+1)
 //	H_inner = modalH - 2 (border 2, padding 0 vertical)
 //
-// Chrome = 8 lines (Title, Divider, Divider, Active Model, Provider,
-// Variant, Runtime Path, Footer)
-// listRowBudget = max(3, innerHeight - 8)
+// Chrome = 10 lines (Title, Divider, Divider, Active Model, Provider,
+// Variant, Runtime Path, Fallback Chain, Status, Footer)
+// listRowBudget = max(3, innerHeight - 10)
+//
+// The status row is chrome even though it is empty most of the time: it is the
+// one line that must be present WHEN it is not empty, and a budget computed as
+// though it did not exist is a budget whose last row padFooter clips. See
+// paneHeight for the arithmetic.
 func (m Model) SetSize(w, h int) Model {
 	if w < 1 {
 		w = 1
@@ -407,7 +437,7 @@ func (m Model) SetSize(w, h int) Model {
 	m.modalH = h
 	m.innerWidth = max(20, w-4)
 	m.innerHeight = max(5, h-2)
-	m.listRowBudget = max(3, m.innerHeight-8)
+	m.listRowBudget = max(3, m.innerHeight-10)
 	// Legacy aliases: width/height now represent inner bounds for all
 	// rendering helpers (clipLine, padFooter, render*).
 	m.width = m.innerWidth
@@ -713,6 +743,216 @@ func (m Model) SetRoleOverrides(overrides map[string]OverrideBinding) Model {
 func (m Model) RoleOverrideFor(key string) (OverrideBinding, bool) {
 	ob, ok := m.policyOverrides[key]
 	return ob, ok
+}
+
+// ── FALLBACK CHAIN READ/WRITE MODEL ─────────────────────────────────────────
+
+// SetFallbackChains seeds the picker-local fallback chains from the parent's
+// persisted config (role key -> ordered "provider/model" slugs).
+//
+// It resets the unsaved marker deliberately: a re-seed is the parent telling the
+// widget "this is the truth on disk", and any staged-but-unconfirmed edit has
+// just been overruled by an authoritative value. Leaving the marker set would
+// show a user an "unsaved" badge for an edit that no longer exists.
+func (m Model) SetFallbackChains(chains map[string][]string) Model {
+	m.fallbackChains = make(map[string][]string, len(chains))
+	for role, chain := range chains {
+		if role == "" {
+			continue
+		}
+		m.fallbackChains[role] = append([]string(nil), chain...)
+	}
+	m.fallbackDirty = false
+	return m
+}
+
+// FallbackChains returns a defensive copy of the staged chains, in the shape the
+// parent persists. It is what the confirm path emits, and what a test asserts
+// against without reaching into the widget's fields.
+func (m Model) FallbackChains() map[string][]string {
+	out := make(map[string][]string, len(m.fallbackChains))
+	for role, chain := range m.fallbackChains {
+		out[role] = append([]string(nil), chain...)
+	}
+	return out
+}
+
+// FallbackChain returns the ordered chain for a role, or nil when none is
+// configured. It returns a copy: the chain is what gets persisted, and a caller
+// that could mutate the widget's slice by accident could write a chain the user
+// never staged.
+func (m Model) FallbackChain(role string) []string {
+	chain, ok := m.fallbackChains[role]
+	if !ok || len(chain) == 0 {
+		return nil
+	}
+	return append([]string(nil), chain...)
+}
+
+// FallbackChainDirty reports whether a chain edit is staged but not yet
+// persisted.
+func (m Model) FallbackChainDirty() bool { return m.fallbackDirty }
+
+// effectiveFallbackRole is the role an Alt+F edit applies to.
+//
+// It is derived from the surface the user is on, in this order:
+//
+//  1. The highlighted role in the Roles pane. The user navigated to it
+//     deliberately, so it is the one they mean.
+//  2. The turn role implied by the active workspace — the plan role inside the
+//     plan workspace, the default role everywhere else. This is the SAME mapping
+//     the runtime uses to pick a chain at turn time (currentTurnRole), so the
+//     chain a user edits here is the chain their next turn will consult. A
+//     widget that defaulted to anything else would let a user configure a chain
+//     that provably never fires.
+//
+// Never empty: a fallback chain with no role is not an edit, it is a no-op with
+// a visible label, so the default role is returned even for a picker that has
+// never seen a workspace.
+func (m Model) effectiveFallbackRole() string {
+	if m.paneFocus == PaneRoles && m.showingRoles {
+		if r := m.HighlightedRole(); r != "" {
+			return r
+		}
+	}
+	return m.workspaceFallbackRole()
+}
+
+// FallbackRole returns the role key an Alt+F edit on the CURRENT surface would
+// apply to — the highlighted role in the Roles pane, else the turn role implied
+// by the active workspace.
+//
+// It is exported because the parent needs to name the same role when it
+// reports the outcome ("Added X to the plan fallback chain"), and a parent that
+// re-derived the mapping would be free to disagree with the widget about which
+// chain was just written. One authority, read by both.
+func (m Model) FallbackRole() string {
+	if m.fallbackRole != "" {
+		return m.fallbackRole
+	}
+	return m.effectiveFallbackRole()
+}
+
+// workspaceFallbackRole maps the active workspace onto the semantic role key
+// the runtime consults for a turn in that workspace.
+func (m Model) workspaceFallbackRole() string {
+	if strings.EqualFold(m.activeWorkspace, "plan") {
+		return role.RolePlan
+	}
+	return role.RoleDefault
+}
+
+// ToggleFallbackForHighlighted adds the highlighted model to the current role's
+// fallback chain, or removes it when it is already in the chain. It reports
+// whether the model is now IN the chain.
+//
+// The slug it writes is "provider/model", never a bare model ID: a chain entry
+// has to survive the user switching the active provider between configuring the
+// chain and the turn that consults it, and a bare ID is resolved against
+// whatever provider happens to be bound at that moment. A wrong provider
+// resolution is a 404 from a different company, not a visible error.
+func (m Model) ToggleFallbackForHighlighted() (Model, bool) {
+	sel := m.Highlighted()
+	if sel == nil {
+		// In StateDetail the pinned model is the subject, not the cursor.
+		sel = m.SelectedModel()
+	}
+	if sel == nil || sel.ID == "" {
+		return m, false
+	}
+	roleKey := m.effectiveFallbackRole()
+	current := m.FallbackChain(roleKey)
+	slug := fallbackSlug(*sel)
+
+	for i, existing := range current {
+		if strings.EqualFold(existing, slug) {
+			next := append(append([]string(nil), current[:i]...), current[i+1:]...)
+			m.setFallbackChain(roleKey, next)
+			return m, false
+		}
+	}
+	m.setFallbackChain(roleKey, append(append([]string(nil), current...), slug))
+	return m, true
+}
+
+// fallbackSlug renders a descriptor as the "provider/model" slug the config
+// stores. A descriptor with no provider degrades to the bare model ID, which
+// the resolver treats as "inherit the active provider" — the only honest
+// reading when the catalog did not say which provider owns it.
+func fallbackSlug(d registry.ModelDescriptor) string {
+	d.Provider = strings.TrimSpace(d.Provider)
+	d.ID = strings.TrimSpace(d.ID)
+	if d.Provider == "" {
+		return d.ID
+	}
+	return d.Provider + "/" + d.ID
+}
+
+// setFallbackChain writes a role's staged chain and marks the edit unsaved.
+//
+// The unsaved marker is set on ANY change, including a change that ends up
+// restoring the on-disk value (add then remove). Deciding that requires
+// comparing against the parent's seed, which the widget does not have — the
+// parent's re-seed is the authority — so the honest answer is "something was
+// staged", and the confirm path clears it.
+func (m *Model) setFallbackChain(roleKey string, chain []string) {
+	if m.fallbackChains == nil {
+		m.fallbackChains = make(map[string][]string)
+	}
+	if len(chain) == 0 {
+		delete(m.fallbackChains, roleKey)
+	} else {
+		m.fallbackChains[roleKey] = append([]string(nil), chain...)
+	}
+	m.fallbackDirty = true
+}
+
+// EmitFallbackChainConfirm emits the persist request for the role the user has
+// been editing. It is a no-op with nothing staged, so Enter on an untouched
+// picker cannot rewrite the user's config file.
+//
+// The message carries the model as a "provider/model" slug and the direction of
+// the edit, because the parent's trace line needs both and neither is
+// recoverable from the chain alone: a chain of one entry is both "added the only
+// fallback" and "removed everything else".
+func (m Model) EmitFallbackChainConfirm() tea.Cmd {
+	if !m.fallbackDirty {
+		return nil
+	}
+	roleKey := m.fallbackRole
+	if roleKey == "" {
+		roleKey = m.effectiveFallbackRole()
+	}
+	chain := m.FallbackChain(roleKey)
+	model := ""
+	if sel := m.Highlighted(); sel != nil {
+		model = fallbackSlug(*sel)
+	} else if sel := m.SelectedModel(); sel != nil {
+		model = fallbackSlug(*sel)
+	}
+	added := false
+	for _, entry := range chain {
+		if strings.EqualFold(entry, model) {
+			added = true
+			break
+		}
+	}
+	// Close over the snapshot: the command runs on the Bubble Tea goroutine
+	// AFTER this transition returns, and by then the widget value it was
+	// derived from may already have been replaced by the parent. Capturing the
+	// four scalars — not the Model — is what makes the emitted message
+	// deterministic regardless of what happens to the widget in between.
+	payload := FallbackChainChangedMsg{Role: roleKey, Chain: chain, Added: added, Model: model}
+	return func() tea.Msg { return payload }
+}
+
+// ApplyFallbackChainConfirm marks a confirmed edit as persisted, so the unsaved
+// badge clears. The parent calls this after a SUCCESSFUL write only — a
+// confirmation whose write failed must keep showing as unsaved, because it is.
+func (m Model) ApplyFallbackChainConfirm() Model {
+	m.fallbackDirty = false
+	m.fallbackRole = ""
+	return m
 }
 
 // State returns the current PickerState.

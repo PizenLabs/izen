@@ -1214,13 +1214,22 @@ type model struct {
 	// needs (a frozen animated indicator is indistinguishable from a hang).
 	frame        uint64
 	spinnerFrame int
+	// spinnerTickArmed records whether a 100ms spinner animation tick is
+	// outstanding. It is the single-flight flag that lets the frame loops ARM
+	// the decoupled animation ticker without dispatching a second one: every
+	// arming clears it, every tick sets it, so N live loops still produce
+	// exactly one live ticker. Cleared when the turn ends; the arming
+	// predicate (spinnerAnimated) restarts it cleanly on the next producer.
+	spinnerTickArmed bool
 	// dotFrame advances each viewport refresh to drive the animated
 	// truncation-dots counter in execution log entries (1 → 2 → 3 → 1…).
 	dotFrame int
-	// lastSpinnerAdvance throttles spinner-frame advancement inside the 20ms
-	// smoothStreamTickMsg loop to a ~100ms cadence, so the braille animation
-	// stays visually consistent with the 100ms tickMsg loop while token
-	// rendering keeps its 20ms pacing. Zero value means "advance immediately".
+	// lastSpinnerAdvance is the heartbeat of the DECOUPLED animation ticker:
+	// the wall-clock time at which m.spinnerFrame was last advanced. It is not
+	// a throttle any more — nothing consults it to decide whether to advance,
+	// because the ticker's own cadence IS the throttle — but the frozen-
+	// spinner reconcile reads it, and it answers the only question that
+	// matters there: was the indicator animating as recently as this?
 	lastSpinnerAdvance   time.Time
 	currentStreamContent string // accumulated raw text during active LLM stream
 	// streamBlocks stores the active stream as typed blocks (content vs
@@ -4679,6 +4688,12 @@ func (m *model) clearBusyFlags() {
 	m.executionStartedAt = time.Time{}
 	m.spinnerFrame = 0
 	m.lastSpinnerAdvance = time.Time{}
+	// The decoupled animation ticker is disarmed with the flags that fed it: a
+	// leaked 100ms wakeup on an idle prompt bar is cheap but not free, and the
+	// arming predicate (spinnerAnimated) is false for every flag just cleared, so
+	// the next producer restarts it cleanly rather than inheriting a tick whose
+	// predicate has already lapsed.
+	m.disarmSpinnerTick()
 }
 
 // reconcileSpinner is the single deterministic reset point that ties the

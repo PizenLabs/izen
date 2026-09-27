@@ -2,7 +2,6 @@ package ui
 
 import (
 	"sync"
-	"unicode/utf8"
 )
 
 // ── ADAPTIVE TYPEWRITER ANIMATION PACER ───────────────────────────────────────
@@ -31,11 +30,34 @@ import (
 //	                                      │
 //	                            FrameTickMsg ──Advance──▶ render
 //
-// The step is `max(1, pending/3)`: a third of the backlog per frame. That is
-// geometric, so a large burst is caught up in a handful of frames and always
-// converges to empty, while a slow stream reveals character by character and is
-// indistinguishable from the arrival itself. Nothing is ever dropped — the
-// terminal drains move the remaining queue wholesale.
+// The step is not one constant; it is a two-regime function of the backlog:
+//
+//	pending < 60   →  1..3 runes per frame (a natural, sequential cadence)
+//	pending >= 60  →  min(12, pending/5)     (stream-lag insurance)
+//
+// The reason it is measured in RUNES rather than bytes is that a "step" the
+// user perceives is a character, not a byte: revealing 12 bytes of a CJK answer
+// is 4 glyphs, and revealing 12 bytes of ASCII is 12 glyphs, so a byte-denominated
+// step animates at two different speeds depending on the language of the answer.
+//
+// The first regime is the one that carries the EFFECT. A fixed slice of 1..3
+// makes a short backlog arrive as a sequence — one character, then another, then
+// another — which is what a typewriter is. Draining a fixed FRACTION instead
+// (the old max(1, pending/3)) reveals 2 of 6, then 2 of 4, then all 2: the
+// second frame already shows half the burst, and the eye reads a jump rather than
+// a typing. Bounding the step at three also bounds the latency the reveal adds
+// to the answer, so the pacer can never become the reason a turn feels slow.
+//
+// The second regime is insurance, not choreography. A burst that deep is not
+// being read — it is a provider dumping a paragraph, and holding all of it back
+// to animate it character by character would make the pacer lag the stream by
+// seconds. pending/5 catches the backlog up geometrically (converging in a
+// handful of frames) and the cap of 12 keeps a single frame from revealing a
+// whole screenful at once, which is the artefact this file exists to remove.
+//
+// Nothing is ever dropped — the terminal drain moves the remaining queue
+// wholesale, and pop() never splits a UTF-8 rune, so a CJK glyph or an emoji is
+// painted complete rather than as a replacement character for one frame.
 //
 // # WHAT IS AUTHORITATIVE
 //
@@ -54,30 +76,44 @@ import (
 // package) leaves it nil and renders exactly as it always did, so the smoothing
 // is an additive production layer rather than a change to the tested contract.
 
-// typewriterQueue is the thread-safe FIFO of not-yet-revealed visible bytes.
+// typewriterQueue is the thread-safe FIFO of not-yet-revealed visible runes.
 //
 // The producer side runs on the UI goroutine today, but the queue is
 // mutex-guarded anyway: the whole point of a dedicated FIFO is that a future
 // producer can append from its own goroutine without the render path having to
 // care, and a "safe because it is only called from here" buffer is a comment
 // that rots the moment a second caller appears.
+//
+// It is rune-denominated rather than byte-denominated, and that is not
+// bookkeeping — it is what makes the reveal cadence a property of the TEXT
+// instead of a property of its encoding. A byte queue cannot be sliced to "three
+// characters" without either re-scanning for boundaries (a rune walk per frame)
+// or splitting one, so either the step is approximate or a CJK glyph is painted
+// as a replacement character for a frame. A rune queue makes both impossible by
+// construction.
 type typewriterQueue struct {
 	mu      sync.Mutex
-	pending []byte
+	pending []rune
 }
 
 // push appends visible content to the tail of the queue.
+//
+// The append is rune-by-rune rather than a []rune(s) conversion so the producer
+// path allocates nothing once the buffer has grown: a conversion would allocate
+// a fresh slice per pushed batch, and this sits behind the token handler.
 func (q *typewriterQueue) push(s string) {
 	if q == nil || s == "" {
 		return
 	}
 	q.mu.Lock()
-	q.pending = append(q.pending, s...)
+	for _, r := range s {
+		q.pending = append(q.pending, r)
+	}
 	q.mu.Unlock()
 }
 
-// len reports how many bytes are waiting to be revealed.
-func (q *typewriterQueue) len() int {
+// pendingRunes reports how many characters are waiting to be revealed.
+func (q *typewriterQueue) pendingRunes() int {
 	if q == nil {
 		return 0
 	}
@@ -86,22 +122,73 @@ func (q *typewriterQueue) len() int {
 	return len(q.pending)
 }
 
-// step returns the number of bytes this frame should reveal for a queue of the
-// given depth: `max(1, pending/3)`.
+// ── THE STEP FUNCTION ─────────────────────────────────────────────────────────
+
+// The two regimes of typewriterStep, as named constants. They are the whole
+// tunability surface of the reveal, and they are named rather than inlined in
+// the function because both are asserted directly by the pacer's tests: a
+// literal in a comparison is a literal a test cannot pin.
+const (
+	// typewriterMinStep is the floor: a mounted queue always moves, or the
+	// animation stops dead at whatever depth it happened to be at.
+	typewriterMinStep = 1
+	// typewriterMaxCadenceStep is the ceiling of the SEQUENTIAL regime. Three
+	// characters a frame at 30 FPS is ~90 characters a second — fast enough to
+	// feel live, slow enough that each character is a separate event rather than
+	// part of a smear.
+	typewriterMaxCadenceStep = 3
+	// typewriterBurstThreshold is the backlog depth at which the reveal stops
+	// being a cadence and becomes catch-up. Sixty pending characters is roughly
+	// two full lines of prose: past that the user is not reading character by
+	// character, they are waiting for the paragraph.
+	typewriterBurstThreshold = 60
+	// typewriterBurstDivisor scales the catch-up step, and
+	// typewriterMaxBurstStep caps it. pending/5 converges geometrically (the
+	// backlog shrinks to a fifth each frame) so a huge burst is gone in a
+	// handful of frames instead of a second of stalling; the cap keeps any
+	// single frame from revealing a whole screenful, which is the jump this
+	// file exists to remove.
+	typewriterBurstDivisor = 5
+	typewriterMaxBurstStep = 12
+)
+
+// typewriterStep returns how many RUNES this frame should reveal for a queue of
+// the given depth.
 //
-// A third is deliberately aggressive. A gentler fraction would leave a visible
-// trail on every burst (the reveal would lag the answer by more than a frame or
-// two), while revealing everything is the jump this file exists to remove. One
-// third reaches the tail within O(log n) frames and, for the steady state — a
-// few characters arriving per frame — releases them in one, so a slow stream is
-// not held back at all.
+// Runes, not bytes: a step is what the reader perceives as motion, and a
+// byte-denominated step reveals four times as many glyphs for a CJK answer as
+// for an ASCII one at the same step size. Draining by rune makes the cadence
+// identical in both.
+//
+// It always returns at least typewriterMinStep for a non-empty queue and never
+// more than the queue holds, so a caller can pass the result straight to pop
+// and Advance cannot stall on a backlog it declined to move.
 func typewriterStep(pending int) int {
 	if pending <= 0 {
 		return 0
 	}
-	step := pending / 3
-	if step < 1 {
-		step = 1
+	var step int
+	if pending >= typewriterBurstThreshold {
+		// Geometric catch-up, hard-capped. The cap is what keeps this regime
+		// from becoming the artefact: without it a 900-character burst reveals
+		// 180 characters in one frame, which is a page flip, not a reveal.
+		step = min(pending/typewriterBurstDivisor, typewriterMaxBurstStep)
+	} else {
+		// Sequential cadence: ramp by depth so a full 60-character backlog
+		// still drains at the top of the range rather than crawling at one
+		// character per frame for two seconds.
+		step = pending * typewriterMaxCadenceStep / typewriterBurstThreshold
+	}
+	// One clamp for both regimes rather than one per branch: the floor is the
+	// property that matters (a mounted queue always moves, or the animation
+	// stops dead at whatever depth it happened to be at) and the burst branch can
+	// produce a zero for a backlog just over the threshold only on an
+	// integer-division edge, which the floor then covers.
+	if step < typewriterMinStep {
+		step = typewriterMinStep
+	}
+	if step > typewriterMaxCadenceStep && pending < typewriterBurstThreshold {
+		step = typewriterMaxCadenceStep
 	}
 	if step > pending {
 		step = pending
@@ -109,11 +196,14 @@ func typewriterStep(pending int) int {
 	return step
 }
 
-// pop removes and returns up to n bytes from the head of the queue. It never
-// splits a UTF-8 rune: if the cut would land inside a multi-byte sequence the
-// slice is extended to include the whole rune, so a CJK glyph or an emoji is
-// painted complete rather than as a replacement character for one frame.
-func (q *typewriterQueue) pop(n int) []byte {
+// pop removes and returns up to n RUNES from the head of the queue.
+//
+// It cannot split a UTF-8 rune, and it does not need to try: the queue holds
+// runes, so index n is a character boundary by construction. That is the whole
+// reason the buffer is rune-denominated — the old byte implementation had to
+// walk forward to the next RuneStart on every pop, which made the step
+// approximate and a CJK glyph briefly visible as a replacement character.
+func (q *typewriterQueue) pop(n int) []rune {
 	if q == nil || n <= 0 {
 		return nil
 	}
@@ -125,26 +215,23 @@ func (q *typewriterQueue) pop(n int) []byte {
 	if n > len(q.pending) {
 		n = len(q.pending)
 	}
-	for n < len(q.pending) && !utf8.RuneStart(q.pending[n]) {
-		n++
-	}
 	out := q.pending[:n]
 	q.pending = q.pending[n:]
 	return out
 }
 
 // typewriterPacer is the character-level reveal state for one answer stream:
-// the queue of pending bytes plus the prefix already revealed to the renderer.
+// the queue of pending runes plus the prefix already revealed to the renderer.
 //
 // `revealed` is kept as a growing buffer rather than as an index into
 // `currentStreamContent` because the renderer's source string is sanitized and
-// delimiter-adjusted downstream; what it needs is exactly the bytes that have
-// been shown, in order.
+// delimiter-adjusted downstream; what it needs is exactly the characters that
+// have been shown, in order.
 type typewriterPacer struct {
 	queue typewriterQueue
 
 	mu       sync.Mutex
-	revealed []byte
+	revealed []rune
 }
 
 // newTypewriterPacer returns an empty pacer ready for one answer stream.
@@ -152,8 +239,8 @@ func newTypewriterPacer() *typewriterPacer {
 	return &typewriterPacer{}
 }
 
-// Push queues visible bytes for a future frame. It is the only producer entry
-// point and is O(bytes appended).
+// Push queues visible content for a future frame. It is the only producer entry
+// point and is O(runes appended).
 func (p *typewriterPacer) Push(s string) {
 	if p == nil {
 		return
@@ -161,12 +248,12 @@ func (p *typewriterPacer) Push(s string) {
 	p.queue.push(s)
 }
 
-// Pending reports how many bytes are queued but not yet revealed.
+// Pending reports how many characters are queued but not yet revealed.
 func (p *typewriterPacer) Pending() int {
 	if p == nil {
 		return 0
 	}
-	return p.queue.len()
+	return p.queue.pendingRunes()
 }
 
 // Revealed returns the prefix of the stream that should be rendered on this
@@ -180,14 +267,14 @@ func (p *typewriterPacer) Revealed() string {
 	return string(p.revealed)
 }
 
-// Advance reveals one adaptive step of queued bytes and reports whether
-// anything moved. The revealed bytes are appended to the prefix the renderer
+// Advance reveals one adaptive step of queued runes and reports whether
+// anything moved. The revealed runes are appended to the prefix the renderer
 // reads; the boolean is what the frame tick folds into its repaint decision.
 func (p *typewriterPacer) Advance() bool {
 	if p == nil {
 		return false
 	}
-	step := typewriterStep(p.queue.len())
+	step := typewriterStep(p.queue.pendingRunes())
 	if step == 0 {
 		return false
 	}
@@ -212,7 +299,7 @@ func (m *model) resetTypewriter() {
 	m.typewriter = nil
 }
 
-// advanceTypewriter reveals one frame's worth of queued answer bytes and
+// advanceTypewriter reveals one frame's worth of queued answer characters and
 // re-syncs the streaming tail. It reports whether the reveal moved, which the
 // frame tick folds into its "did anything change" answer so the single-flight
 // repaint gate arms a frame for the newly revealed characters.

@@ -790,8 +790,22 @@ func (m *model) streamCmd(content string) tea.Cmd {
 	// rather than of its traffic. The handler re-arms itself while m.streaming
 	// is true and releases the loop at completion, so this is one arm, not a
 	// per-token one.
+	//
+	// The DECOUPLED ANIMATION TICKER is armed on the same batch. It is a
+	// separate loop on purpose — the glyph rotation is a property of the glyph
+	// cycle, not of the render cadence — so a stream that produces its first
+	// token after four seconds animates the whole four seconds instead of
+	// showing a frozen ⠋ until the answer starts arriving.
 	m.frameTickActive = true
-	return tea.Batch(m.streamTraceCmd(), m.readStream(), m.frameTickCmd(), m.smoothStreamTickCmd(), m.shimmerTickCmd(), m.executingHeaderTickCmd())
+	return tea.Batch(
+		m.streamTraceCmd(),
+		m.readStream(),
+		m.frameTickCmd(),
+		m.smoothStreamTickCmd(),
+		m.shimmerTickCmd(),
+		m.executingHeaderTickCmd(),
+		m.ensureSpinnerTick(),
+	)
 }
 
 // executingHeaderTickMsg advances the Top Header execution sweep by one

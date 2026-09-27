@@ -140,6 +140,10 @@ func newModelPickerFromCache(m *model) model_picker.Model {
 	// the picker opens with true cross-session context (zero I/O in-widget).
 	mp = mp.SetRecentBindings(loadRecentBindings())
 	mp = mp.SetRoleOverrides(policyOverridesFromConfig(m.cfg))
+	// Seed the role fallback chains from the persisted config so the picker's
+	// metadata panel opens showing what is actually on disk rather than an empty
+	// chain the user has to guess about.
+	mp = mp.SetFallbackChains(fallbackChainsFromConfig(m.cfg))
 	// A raw-field guard, not a PaneWidth() one: the question here is "has the
 	// model been sized yet", and PaneWidth() always answers, so a check against it
 	// would be vacuous.

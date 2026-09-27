@@ -24,9 +24,11 @@ type shimmerFrameMsg = shimmer.FrameMsg
 // moment streaming output begins or a background producer completes (smooth
 // clearing with no leaked goroutine).
 //
-// This also advances the spinner frame so the animated snowflake character
-// (✻ ❅ ❆ ✦) cycles on the shimmer tick cadence, keeping the snowflake
-// animation in sync with the shimmer sweep.
+// It does NOT advance the spinner frame. The snowflake used to cycle on this
+// tick; it now rides the decoupled 100ms animation ticker (spinner.go), which
+// has exactly one writer. This loop is a RENDER of the animation, and a second
+// writer at a second rate is what the decoupling removed — the shimmer's own
+// cadence already matches, so nothing is lost by sharing.
 //
 // UNIFIED TICK RATE: the frame is produced directly (not via shimmer.Tick) so
 // every animation loop in the UI — shimmer, braille spinner, snowflake, the
@@ -42,7 +44,6 @@ func (m *model) shimmerTickCmd() tea.Cmd {
 	if !m.shimmerActive && !m.skeletonActive() {
 		return nil
 	}
-	m.spinnerFrame++
 	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
 		return shimmer.FrameMsg{}
 	})

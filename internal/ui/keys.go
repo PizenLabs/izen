@@ -206,7 +206,15 @@ func (m *model) toggleThoughtBlock() bool {
 	// slice the conversation to the old height and the frame would carry one
 	// stale row (or one blank) for a frame. The budget is a function of the
 	// chrome, so this is a measurement, not a guess.
-	m.recalcViewportHeight()
+	//
+	// recomputeLayout is the ATOMIC form of that measurement: it re-derives the
+	// split, re-anchors the reasoning window to the tail, invalidates the
+	// rendered line cache and re-clamps both offsets in one synchronous step, so
+	// no consumer of the layout can read a half-applied toggle. Running it here
+	// rather than in the next View() is what stops a mid-stream Ctrl+O from
+	// leaving one frame in which the composed height and the drawn height
+	// disagree — the frame that orphans the prompt bar in scrollback.
+	m.recomputeLayout()
 	m.refreshViewportContent()
 	// While the output-trace viewport is expanded during an active stream,
 	// preserve the user's scroll position: new chunks must never yank the

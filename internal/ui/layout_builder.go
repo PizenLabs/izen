@@ -209,51 +209,16 @@ func elasticIndex(stack []compositeRegion) int {
 //	mainViewportRows + reasoningPanelRows == availableRows
 //
 // and both terms are bounded integers, which is what makes a narrow or split
-// pane safe. A hand-tuned "40%" with no ceiling is not: in a pane with twelve
-// rows of chrome, forty percent of what is left can exceed what is left, and the
-// overage lands in the frame — which scrolls, and takes the prompt bar with it.
+// pane safe. A hand-tuned percentage with no ceiling is not: in a pane with
+// twelve rows of chrome, forty percent of what is left can exceed what is left,
+// and the overage lands in the frame — which scrolls, and takes the prompt bar
+// with it.
 //
-// The clamps below are the whole contract:
-//
-//	percent     the panel is subordinate to the conversation. It is a drawer, not
-//	            a second conversation.
-//	minimum     below five rows there is nothing to read: a three-row panel with
-//	            a one-line body is a widget that has to be scrolled to be used.
-//	reserve     the conversation always keeps its reserve. A panel that could
-//	            take every row would let one keypress hide the transcript.
-//	minAvailable below six rows there is no split in which both bands stay
-//	            legible, so the panel declines to mount at all rather than
-//	            rendering a strip.
-const (
-	reasoningPanelPercent      = 40
-	reasoningPanelMinRows      = 5
-	reasoningPanelReserveRows  = 8
-	reasoningPanelMinAvailable = reasoningPanelMinRows + 1
-)
-
-// reasoningPanelHeight returns the number of rows the expanded reasoning panel
-// may take out of `available`, or 0 when the pane cannot be split at all.
-//
-// The return of 0 for a cramped pane is a refusal, not an oversight: below
-// reasoningPanelMinAvailable rows there is no split in which both bands stay
-// legible, and the honest answer is to show the conversation alone rather than to
-// render a panel that would leave the prompt bar with no room to exist.
-func reasoningPanelHeight(available int) int {
-	if available < reasoningPanelMinAvailable {
-		return 0
-	}
-	rows := available * reasoningPanelPercent / 100
-	rows = max(rows, reasoningPanelMinRows)
-	// The ceiling is applied AFTER the floor on purpose. In a pane with room for
-	// only a handful of rows, available-reserve goes negative, and a max() applied
-	// last would hand the panel five rows out of six and leave the conversation
-	// one — the reserve is the promise, so it is the promise that survives.
-	ceiling := available - reasoningPanelReserveRows
-	if ceiling < 1 {
-		ceiling = 1
-	}
-	return max(1, min(rows, ceiling))
-}
+// The budget itself — the clamps, the reasoning behind each of them, and the tail
+// anchor that makes the ceiling usable — lives in reasoning_viewport.go, next to
+// the recomputeLayout the Ctrl+O and settings paths call. What is left here is
+// the split: the single place the band takes its rows out of the conversation's,
+// on the single geometry seam every consumer of the layout already reads.
 
 // applyReasoningSplit divides the rows available to the scrollable area between
 // the main conversation viewport and the expanded reasoning panel, publishes both
@@ -286,12 +251,15 @@ func (m *model) applyReasoningSplit(available int) int {
 	//
 	// The row budget therefore has to be answerable WITHOUT the viewport
 	// already holding the content, so it asks the SOURCE (two integer reads)
-	// rather than the rendered viewport. Asking the viewport would make the
-	// panel's height a function of the last frame's timing — it would claim
-	// rows on one frame and not the next.
+	// for whether there is anything to show, and the VIEWPORT (one O(1) read)
+	// for how much of it there is. Asking the viewport for the COUNT is safe
+	// precisely because it is a length, not a re-wrap: it is the number the
+	// viewport already computed when the frame tick pushed the content in, so
+	// the budget and the content cannot disagree — and a panel that has not
+	// synced yet is bounded by the ceilings alone rather than by a guess.
 	rows := 0
 	if m.reasoningExpanded && m.reasoningHasContent() {
-		rows = reasoningPanelHeight(available)
+		rows = reasoningPanelHeight(available, m.reasoningContentLines())
 	}
 	m.reasoningViewport.Height = rows
 	m.reasoningPanelRows = rows
