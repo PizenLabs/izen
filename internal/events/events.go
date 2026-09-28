@@ -716,10 +716,31 @@ type MutationStartedPayload struct {
 // MutationCompletedPayload records a mutation outcome. Outcome uses the
 // execution.MutationOutcome vocabulary (committed, rolled_back, apply_failed,
 // cancelled, ...).
+//
+// The evidence fields are the ACTUAL apply-boundary facts recorded by the
+// mutation boundary, transported so every downstream projector consumes the
+// same evidence object instead of re-deriving or estimating one for display:
+//
+//   - ArtifactPresent: the model produced a concrete mutation artifact.
+//   - DiffPresent / DiffAdds / DiffRemoves: the compiled unified-diff line
+//     metrics, measured from the diff the boundary actually compiled. When
+//     DiffPresent is false the counts are meaningless and MUST be rendered as
+//     absent — never as "+0 -0".
+//   - ApplyExecuted / FilesystemChanged: whether the apply step ran and whether
+//     the post-apply content actually differs from the pre-apply content.
+//
+// No field here is computed for presentation. A projector that has no diff
+// evidence has no diff statistics to show.
 type MutationCompletedPayload struct {
-	RequestID string
-	Target    string
-	Outcome   string
+	RequestID         string
+	Target            string
+	Outcome           string
+	ArtifactPresent   bool
+	DiffPresent       bool
+	DiffAdds          int
+	DiffRemoves       int
+	ApplyExecuted     bool
+	FilesystemChanged bool
 	ProtocolTelemetry
 }
 
@@ -1361,6 +1382,56 @@ func NewMutationCompleted(requestID, target, outcome string, bindings ...protoco
 		payload.ProtocolTelemetry = bindings[0].Normalize()
 	}
 	return newEvent(EventMutationCompleted, payload)
+}
+
+// NewMutationCompletedWithEvidence publishes a mutation outcome together with
+// the apply-boundary evidence that substantiates it. The evidence is supplied
+// by the mutation boundary itself (it measured the compiled diff and observed
+// the filesystem before/after the apply), so the event carries a verifiable
+// claim rather than a display estimate. The diff metrics are ignored when no
+// diff was actually compiled.
+func NewMutationCompletedWithEvidence(requestID string, ev MutationEvidence, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := MutationCompletedPayload{
+		RequestID:         requestID,
+		Target:            ev.Target,
+		Outcome:           ev.Outcome,
+		ArtifactPresent:   ev.ArtifactPresent,
+		DiffPresent:       ev.DiffPresent,
+		ApplyExecuted:     ev.ApplyExecuted,
+		FilesystemChanged: ev.FilesystemChanged,
+	}
+	if ev.DiffPresent {
+		payload.DiffAdds = ev.DiffAdds
+		payload.DiffRemoves = ev.DiffRemoves
+	}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventMutationCompleted, payload)
+}
+
+// MutationEvidence is the transport projection of one target's real
+// apply-boundary evidence. It is deliberately a scalar record: the bus carries
+// facts, never live objects. The executor fills it from the mutation boundary's
+// own evidence; the events package never computes a value here.
+type MutationEvidence struct {
+	// Target is the mutation target path.
+	Target string
+	// Outcome is the execution.MutationOutcome vocabulary value.
+	Outcome string
+	// ArtifactPresent reports whether a concrete mutation artifact existed.
+	ArtifactPresent bool
+	// DiffPresent reports whether a compiled, non-empty diff existed. The
+	// add/remove counts are only meaningful when it is true.
+	DiffPresent bool
+	// DiffAdds / DiffRemoves are the measured compiled-diff line metrics.
+	DiffAdds    int
+	DiffRemoves int
+	// ApplyExecuted reports whether the apply step ran against the filesystem.
+	ApplyExecuted bool
+	// FilesystemChanged reports whether the post-apply content actually differs
+	// from the pre-apply content.
+	FilesystemChanged bool
 }
 
 // NewVerificationCompleted publishes the verifier's real result.

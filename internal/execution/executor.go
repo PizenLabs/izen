@@ -1492,9 +1492,8 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// ── 4. Deterministic strategies (zero model) ───────────────────────
 	if profile.Deterministic {
 		skipTail(g, "deterministic execution")
-		g.CompleteExecution("deterministic")
 		res.Proof.Outcome = OutcomeNoArtifact
-		res.Proof.FinishedAt = time.Now()
+		x.completeExecution(res, g, "deterministic")
 		setProofGraph(res, g)
 		return x.finalizeResult(res), nil
 	}
@@ -1583,9 +1582,8 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		g.Skip(runtimegraph.StageApprovalGate, "read-only execution")
 		g.Skip(runtimegraph.StageMutationTransaction, "read-only execution")
 		g.Skip(runtimegraph.StageVerification, "read-only execution")
-		g.CompleteExecution(string(OutcomeCompleted))
 		res.Proof.Outcome = OutcomeCompleted
-		res.Proof.FinishedAt = time.Now()
+		x.completeExecution(res, g, string(OutcomeCompleted))
 		setProofGraph(res, g)
 		return x.finalizeResult(res), nil
 	}
@@ -1739,7 +1737,6 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 				return x.finalizeResult(res), unresolvedErr
 			case NoOpNoSafeMutation:
 				g.Skip(runtimegraph.StageVerification, "requires review")
-				g.CompleteExecution(string(OutcomeNoOpNoSafeMutation))
 				res.ArtifactKind = ""
 				res.Content = ""
 				res.Err = nil
@@ -1749,17 +1746,20 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 					"human review required before any further mutation", false,
 				))
 				res.Proof.Outcome = OutcomeNoOpNoSafeMutation
-				res.Proof.FinishedAt = time.Now()
+				// A no-op that produced no candidate and applied nothing seals
+				// REQUIRES_REVIEW evidence, which BLOCKS authoritative success.
+				// Sealing before the completion event means a consumer can never
+				// read "completed" for an attempt the evidence refuses.
+				x.completeExecution(res, g, string(OutcomeNoOpNoSafeMutation))
 				setProofGraph(res, g)
 				return x.finalizeResult(res), nil
 			default: // NoOpObjectiveSatisfied
 				g.Skip(runtimegraph.StageVerification, "no-op objective satisfied")
-				g.CompleteExecution(string(OutcomeNoOpObjectiveSatisfied))
 				res.ArtifactKind = ""
 				res.Content = ""
 				res.Err = nil
 				res.Proof.Outcome = OutcomeNoOpObjectiveSatisfied
-				res.Proof.FinishedAt = time.Now()
+				x.completeExecution(res, g, string(OutcomeNoOpObjectiveSatisfied))
 				setProofGraph(res, g)
 				return x.finalizeResult(res), nil
 			}
@@ -2055,6 +2055,13 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	// The runtime owns a fresh mutation boundary for this apply.
 	ms := NewMutationSet()
 	x.patches.SetMutationSet(ms)
+	// DIFF IS EVIDENCE: hand the boundary the runtime's OWN compiled unified
+	// diffs so the per-target diff evidence it records is measured from the
+	// same object the approval surface showed the human. Without this the
+	// boundary would have to measure the raw artifact, which for a bounded
+	// SEARCH/REPLACE contract carries no hunk header and would under-report a
+	// change that demonstrably happened.
+	x.patches.SetCompiledDiffs(compiledDiffsByTarget(pm.diffs, pm.patches))
 	x.patches.SetAuthorization(x.auth)
 	if x.verifier != nil {
 		// Phase 1 safety rule: the verifier is the APPLY GATE, not an
@@ -2140,7 +2147,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 			if o == OutcomeNoArtifact {
 				o = OutcomeApplyFailed
 			}
-			g.CompleteMutation(p.File, string(o))
+			publishMutationOutcome(g, ms, p.File, o)
 		}
 		if ms.Verification != nil {
 			if ms.Verification.Skipped {
@@ -2173,7 +2180,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		if o == OutcomeNoArtifact {
 			o = OutcomeNoChange
 		}
-		g.CompleteMutation(p.File, string(o))
+		publishMutationOutcome(g, ms, p.File, o)
 	}
 	if ms.Verification != nil {
 		if ms.Verification.Skipped {
@@ -2185,8 +2192,13 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		g.Skip(runtimegraph.StageVerification, "no verifier gate ran during apply")
 	}
 
-	g.CompleteExecution(string(outcome))
+	// ── EVIDENCE BEFORE COMPLETION ───────────────────────────────────
+	// The sealed evidence is published BEFORE execution.finished so every
+	// consumer that observes the completion event has already observed the
+	// authoritative terminal record that justifies it. A completion claim is
+	// therefore never broadcast ahead of the evidence that substantiates it.
 	res.Proof.FinishedAt = time.Now()
+	x.completeExecution(res, g, string(outcome))
 	setProofGraph(res, g)
 	return x.finalizeResult(res), nil
 }
@@ -4323,6 +4335,102 @@ func (x *RuntimeExecutor) emitEvidenceEvent(res *ExecutionResult, ev *ExecutionE
 			string(ai.SchemaModeAuto),
 		),
 	}))
+}
+
+// compiledDiffsByTarget maps the runtime's compiled unified diffs onto their
+// targets.
+//
+// pm.diffs is index-aligned with the target list, but a target can carry an
+// empty diff (the runtime compiled nothing for it). Mapping by target rather
+// than by position keeps an empty entry from being silently attributed to a
+// neighbour — which would publish another file's diff metrics on this target.
+func compiledDiffsByTarget(diffs []string, patches []*Patch) map[string]string {
+	out := make(map[string]string, len(patches))
+	for i, p := range patches {
+		if p == nil || i >= len(diffs) {
+			continue
+		}
+		if diffs[i] == "" {
+			// No compiled diff for this target: recorded as absent, not
+			// borrowed from a sibling.
+			continue
+		}
+		out[p.File] = diffs[i]
+	}
+	return out
+}
+
+// publishMutationOutcome closes one target of a mutation on the runtime graph,
+// transporting the apply boundary's REAL evidence for it.
+//
+// The diff metrics are read from the boundary's own MutationEvidence record
+// (measured from the unified diff the boundary compiled, by
+// PatchManager.recordMutationEvidence). Nothing is recomputed here, and a
+// target whose evidence carries no compiled diff publishes DiffPresent=false —
+// so a projector that renders diff statistics from this event can never print
+// fabricated counts, and "0 bytes written" stays truthful.
+//
+// fallback carries the reconciled outcome the executor assigned when the
+// boundary recorded none (a target that produced no artifact is reported as
+// no-change on success and apply-failed on rollback).
+func publishMutationOutcome(g *runtimegraph.Graph, ms *MutationSet, file string, fallback MutationOutcome) {
+	ev, ok := ms.EvidenceFor(file)
+	if !ok {
+		ev = MutationEvidence{File: file, Outcome: fallback}
+	}
+	// The executor's reconciled outcome is authoritative for the transport: a
+	// boundary record without a typed outcome adopts the reconciliation, while a
+	// recorded outcome is passed through unchanged.
+	if ev.Outcome == "" || ev.Outcome == OutcomeNoArtifact {
+		ev.Outcome = fallback
+	}
+	// A diff is evidence of a change; a target the boundary proved unchanged can
+	// never publish diff metrics, even if a diff was compiled for it.
+	if ev.Outcome != OutcomeChanged && ev.Outcome != OutcomeCreated {
+		ev.DiffPresent = false
+		ev.DiffAdds = 0
+		ev.DiffRemoves = 0
+	}
+	g.CompleteMutationWithEvidence(events.MutationEvidence{
+		Target:            file,
+		Outcome:           string(ev.Outcome),
+		ArtifactPresent:   ev.ArtifactPresent,
+		DiffPresent:       ev.DiffPresent,
+		DiffAdds:          ev.DiffAdds,
+		DiffRemoves:       ev.DiffRemoves,
+		ApplyExecuted:     ev.ApplyExecuted,
+		FilesystemChanged: ev.FilesystemChanged,
+	})
+}
+
+// completeExecution is the ONE terminal-success choke point of the executor.
+//
+// It enforces the ordering invariant the whole evidence pipeline depends on:
+//
+//	seal evidence  →  publish evidence  →  publish execution.finished(success)
+//
+// A completion claim is never broadcast ahead of the record that substantiates
+// it. A projector that observes execution.finished therefore always has the
+// sealed evidence in hand and can gate the completion verdict on it; it never
+// has to trust the success flag, and it never has to guess whether a record is
+// still in flight.
+//
+// Every terminal success in Execute / Approve routes through here, so there is
+// no path that emits a success without first sealing. finalizeResult remains the
+// idempotent backstop (sealTerminalEvidence refuses to re-seal), which keeps
+// the failure, cancellation and rejection paths covered by the same single seal.
+//
+// res, res.Proof and g are guaranteed non-nil by every call site: each passes
+// the proof it just populated and the graph of the request it is executing. The
+// single linear body is deliberate — an extra conditional call site would create
+// a second path to a success event, and the ordering invariant this function
+// exists to guarantee must be structural, not conventional.
+func (x *RuntimeExecutor) completeExecution(res *ExecutionResult, g *runtimegraph.Graph, outcome string) {
+	if res.Proof.FinishedAt.IsZero() {
+		res.Proof.FinishedAt = time.Now()
+	}
+	x.sealTerminalEvidence(res)
+	g.CompleteExecution(outcome)
 }
 
 // finalizeResult stamps the authoritative terminal usage account (provider,

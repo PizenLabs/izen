@@ -472,6 +472,23 @@ func (g *Graph) CompleteMutation(target, outcome string) {
 	g.emitEvent(events.NewMutationCompleted(g.RequestID, target, outcome, g.ProtocolBinding()))
 }
 
+// CompleteMutationWithEvidence closes a per-target mutation and emits
+// mutation.completed carrying the REAL apply-boundary evidence for that target
+// (whether a candidate artifact existed, whether a compiled diff existed and
+// its measured line metrics, whether the apply ran, and whether the
+// filesystem actually changed).
+//
+// The evidence is produced by the mutation boundary, which measured the diff it
+// compiled and compared the filesystem before/after the apply. The graph only
+// transports it: it never synthesizes, estimates, or defaults a value. A target
+// whose evidence carries no compiled diff therefore emits DiffPresent=false,
+// and every downstream projector must render no diff statistics for it — that
+// is what keeps "0 bytes written" truthful.
+func (g *Graph) CompleteMutationWithEvidence(ev events.MutationEvidence) {
+	g.Complete(StageMutationTransaction, ev.Target+"="+ev.Outcome)
+	g.emitEvent(events.NewMutationCompletedWithEvidence(g.RequestID, ev, g.ProtocolBinding()))
+}
+
 // CompleteVerification closes the verification stage and emits
 // verification.completed with the real verifier result.
 func (g *Graph) CompleteVerification(passed bool, steps []string) {

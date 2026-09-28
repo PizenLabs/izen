@@ -31,6 +31,22 @@ func runProjection(evs ...events.DomainEvent) *ExecutionProjection {
 	return p
 }
 
+// committedEvidence is the sealed terminal record of a committed, untainted
+// mutation attempt. The runtime publishes it BEFORE execution.finished, so any
+// test that claims a completed mutation must include it — that ordering is the
+// whole point of the completion gate.
+func committedEvidence(requestID string, filesMutated int, targets ...string) events.DomainEvent {
+	return events.NewExecutionEvidence(events.ExecutionEvidencePayload{
+		RequestID:    requestID,
+		ContractID:   "c-" + requestID,
+		AttemptID:    1,
+		Outcome:      "COMMITTED",
+		Tainted:      false,
+		Targets:      targets,
+		FilesMutated: filesMutated,
+	})
+}
+
 // TestReducerHumanNarrativePins the acceptance human timeline derived from the
 // ExecutionGraph transitions: Reading index.html → Gathering context →
 // Analyzing → Preparing result → Waiting for approval → Applying changes →
@@ -50,6 +66,7 @@ func TestReducerHumanNarrative(t *testing.T) {
 		events.NewMutationStarted("r1", []string{"index.html"}),
 		events.NewMutationCompleted("r1", "index.html", "changed"),
 		events.NewVerificationCompleted("r1", true, []string{"build"}),
+		committedEvidence("r1", 1, "index.html"),
 		events.NewExecutionFinished("r1", true, "completed"),
 	)
 

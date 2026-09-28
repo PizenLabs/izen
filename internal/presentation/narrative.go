@@ -171,6 +171,33 @@ func (n *ExecutionNarrative) CurrentHuman() string {
 	return n.lines[n.current].human
 }
 
+// RewriteHuman replaces the human sentence of the most recently recorded line.
+//
+// The terminal sentence is the ONE narrative line whose truth does not follow
+// from its own transition: whether an execution COMPLETED depends on the sealed
+// evidence accumulated across the whole attempt, not on execution.finished's
+// success flag alone (see completion_gate.go). The projection holds that gate,
+// so it supplies the sentence here while the narrative keeps the machine record
+// untouched — the event stream is never falsified, only the human sentence is
+// corrected to the evidence.
+//
+// A machine-only line (no human sentence, e.g. a plumbing transition) gains the
+// sentence, because the reducer recorded the transition and the sentence
+// describes it.
+func (n *ExecutionNarrative) RewriteHuman(sentence string) {
+	if n == nil || len(n.lines) == 0 || sentence == "" {
+		return
+	}
+	last := len(n.lines) - 1
+	if n.lines[last].human == sentence {
+		return
+	}
+	n.lines[last].human = sentence
+	if n.current != last {
+		n.current = last
+	}
+}
+
 // Project consumes one canonical runtime event and appends its deterministic
 // narrative record. The human sentence is derived from the ExecutionGraph
 // transition — events of other types and stale-request events are ignored.
@@ -234,7 +261,12 @@ func (n *ExecutionNarrative) Project(ev events.DomainEvent) {
 			human = "Verification failed"
 		}
 	case events.ExecutionFinishedPayload:
-		human = finishedSentence(p.Success, p.Outcome)
+		// The terminal sentence is evidence-gated, not transition-derived: the
+		// projection rewrites it once the completion gate has ruled. What is
+		// recorded here is the provisional reading of the transition alone, and
+		// it is deliberately NOT "Completed" for a mutation execution — the
+		// projector owns the final wording.
+		human = provisionalFinishedSentence(p.Success, p.Outcome)
 	}
 	if human == "" {
 		// Machine-only record: the transition carries no meaningful human
@@ -298,15 +330,28 @@ func requestIDOf(payload interface{}) string {
 	}
 }
 
-// finishedSentence is the deterministic terminal human sentence.
-func finishedSentence(success bool, outcome string) string {
-	if success {
-		return "Completed"
-	}
+// provisionalFinishedSentence is the terminal human sentence derived from the
+// execution.finished transition ALONE, before the evidence gate has ruled.
+//
+// It is deliberately conservative: success=true never yields "Completed" here,
+// because a provider returning and a loop ending do not prove the objective was
+// met. The projection replaces this sentence with the gated verdict
+// (ExecutionProjection.terminalState → terminalSentence) as soon as it reduces
+// the event, so a mutation execution that terminates without granted evidence
+// reads "Not completed — <reason>" rather than a fabricated success.
+//
+// A cancellation is stated plainly and a failure is stated plainly: neither is
+// provisional, both are facts of the transition.
+func provisionalFinishedSentence(success bool, outcome string) string {
 	if outcome == "cancelled" {
 		return "Cancelled"
 	}
-	return "Failed"
+	if !success {
+		return "Failed"
+	}
+	// Unsubstantiated until the gate confirms; the projection immediately
+	// rewrites this to either "Completed" or the refusal reason.
+	return "Execution finished"
 }
 
 // mutationOutcomeSucceeded reports whether a MutationOutcome string denotes

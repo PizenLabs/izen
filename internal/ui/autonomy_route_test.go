@@ -105,21 +105,28 @@ func TestAutonomyValidationCase3MutationProposalThenExecutes(t *testing.T) {
 		t.Fatalf("pending proposal must require mutate, got %v", m.pendingAutonomyProposal.Missing)
 	}
 
-	// The proposal must be rendered — and it must NOT instruct "Approve with
-	// /grant" (requirement 1: grant is internal).
-	if !strings.Contains(recordsText(m), "AUTONOMY PROPOSAL") {
-		t.Error("expected the proposal to be rendered")
+	// The authorization request must be rendered — and it must NOT instruct
+	// "Approve with /grant" (requirement 1: grant is internal).
+	if !strings.Contains(recordsText(m), "EXECUTION AUTHORIZATION") {
+		t.Error("expected the authorization request to be rendered")
 	}
 	if strings.Contains(recordsText(m), "/grant") {
-		t.Error("proposal must never instruct the user to type /grant")
+		t.Error("authorization card must never instruct the user to type /grant")
 	}
 
-	// The proposal surface must render with the decision facts and actions.
+	// The card must render the decision facts, the requested capability vector
+	// and the two actions that exist at request time. An authorization request
+	// is raised BEFORE any artifact is generated, so there is no diff to
+	// inspect: offering "Inspect Diff" would advertise an object that does not
+	// exist.
 	view := m.renderAutonomyProposalBlock(100)
-	for _, want := range []string{"modification", "build", "Execute", "Inspect", "Cancel", "Rollback"} {
+	for _, want := range []string{"modification", "build", "Execute", "Cancel", "Rollback", "Capabilities", "No mutation has occurred."} {
 		if !strings.Contains(view, want) {
-			t.Errorf("proposal missing %q:\n%s", want, view)
+			t.Errorf("authorization card missing %q:\n%s", want, view)
 		}
+	}
+	if strings.Contains(view, "Inspect") {
+		t.Errorf("no candidate exists at authorization time, so no Inspect action may render:\n%s", view)
 	}
 
 	// Select Execute (the highlighted action on a fresh proposal) and activate:
@@ -140,19 +147,35 @@ func TestAutonomyValidationCase3MutationProposalThenExecutes(t *testing.T) {
 	}
 }
 
-// TestAutonomyProposalKeyboardNavigation pins the keyboard-driven proposal
-// interaction: ↑/↓ navigate the action list, Enter activates the highlighted
-// action, Esc cancels. No /grant command exists anywhere in the surface.
+// TestAutonomyProposalKeyboardNavigation pins the keyboard-driven authorization
+// interaction: ↑/↓ navigate the DERIVED action list, Enter activates the
+// highlighted action, Esc cancels. No /grant command exists anywhere in the
+// surface.
+//
+// The derived set at authorization-request time is [Execute, Cancel]: no
+// candidate exists, so Inspect is absent — and navigation must wrap over
+// exactly those two, never landing on a hidden action.
 func TestAutonomyProposalKeyboardNavigation(t *testing.T) {
+	// A real workspace so "cancel mutates nothing" is asserted against actual
+	// bytes rather than the absence of an error.
+	dir := t.TempDir()
+	t.Chdir(dir)
+	original := "<html><body><main><p>keep</p></main>stray text</body></html>\n"
+	if err := os.WriteFile("index.html", []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	m := autonomyTestModel()
 
 	m.routePromptDirective("read @index.html and remove extra contents")
 	if m.pendingAutonomyProposal == nil {
-		t.Fatal("expected a pending proposal")
+		t.Fatal("expected a pending authorization request")
+	}
+	if m.hasAuthorizationAction(autonomy.ActionInspect) {
+		t.Fatal("no candidate exists yet, so Inspect must not be in the derived action set")
 	}
 
-	// ↓ moves from Execute (index 0) to Inspect (index 1); Enter toggles the
-	// read-only inspect detail.
+	// ↓ moves from Execute (index 0) to Cancel (index 1) — the derived set has
+	// two actions, not three.
 	res, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
 	after := res.(*model)
 	if after.autonomyProposalSelect != 1 {
@@ -161,27 +184,66 @@ func TestAutonomyProposalKeyboardNavigation(t *testing.T) {
 	if cmd != nil {
 		t.Fatalf("navigation must not execute anything, got cmd")
 	}
-	res, _ = after.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	// ↓ again wraps back to Execute rather than landing on a hidden action.
+	res, _ = after.handleKey(tea.KeyMsg{Type: tea.KeyDown})
 	after = res.(*model)
-	if !after.autonomyProposalInspect {
-		t.Fatal("Enter on Inspect must toggle the read-only detail view")
+	if after.autonomyProposalSelect != 0 {
+		t.Fatalf("selection = %d, want 0 after wrapping past the derived list", after.autonomyProposalSelect)
 	}
-	if after.pendingAutonomyProposal == nil {
-		t.Fatal("Inspect must not consume the proposal")
+	// The I binding is inert while Inspect is not part of the derived set.
+	res, _ = after.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	after = res.(*model)
+	if after.autonomyProposalInspect {
+		t.Fatal("I must be inert while no Inspect action is rendered")
 	}
-	view := after.renderAutonomyProposalBlock(100)
-	if !strings.Contains(view, "Decision detail") {
-		t.Errorf("inspect view missing decision detail:\n%s", view)
+	// ↑ from Execute wraps to Cancel.
+	res, _ = after.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	after = res.(*model)
+	if after.autonomyProposalSelect != 1 {
+		t.Fatalf("selection = %d, want 1 after ↑ wrap", after.autonomyProposalSelect)
 	}
+	// Back to Execute.
+	res, _ = after.handleKey(tea.KeyMsg{Type: tea.KeyUp})
+	after = res.(*model)
 
-	// Esc cancels the proposal: no grant, no execution.
-	res, _ = after.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+	// Esc cancels the authorization request: no grant, no execution. The
+	// workspace file must be byte-identical afterwards — cancelling authorizes
+	// nothing and mutates nothing.
+	res, cmd = after.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
 	after = res.(*model)
+	if cmd != nil {
+		t.Fatal("Esc must not start any execution")
+	}
 	if after.pendingAutonomyProposal != nil {
-		t.Fatal("Esc must cancel the proposal")
+		t.Fatal("Esc must cancel the authorization request")
 	}
 	if after.autonomy.Grants().Count() != 0 {
 		t.Fatal("cancel must not issue any capability grant")
+	}
+	afterBytes, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if original != string(afterBytes) {
+		t.Fatalf("cancel mutated the workspace:\n%s", afterBytes)
+	}
+
+	// A fresh request followed by Enter on Execute issues the internal grant
+	// and continues.
+	m.routePromptDirective("read @index.html and remove extra contents")
+	if m.pendingAutonomyProposal == nil {
+		t.Fatal("expected a fresh pending authorization request")
+	}
+	res, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	after = res.(*model)
+	if cmd == nil {
+		t.Fatal("Enter on Execute must continue the pending decision")
+	}
+	if after.pendingAutonomyProposal != nil {
+		t.Fatal("Execute must consume the authorization request")
+	}
+	if !after.autonomy.Authority(autonomy.RequiredCapabilities(autonomy.IntentModification)) {
+		t.Fatal("Execute must issue the internal grant")
 	}
 }
 

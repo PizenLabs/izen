@@ -10,23 +10,44 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 )
 
-// ── AUTONOMY PROPOSAL ────────────────────────────────────────────────────
+// ── EXECUTION AUTHORIZATION (ask_user decision surface) ───────────────────
 //
-// The proposal is the ONLY user-facing decision surface for a DecisionAskUser
+// The card is the ONLY user-facing decision surface for a DecisionAskUser
 // verdict. It replaces the /grant command: the human never types a grant
-// command — they select Execute on the proposal, and the runtime issues the
-// capability grant internally, re-runs the decision and continues execution.
+// command — they select Execute, and the runtime issues the capability grant
+// internally, re-runs the decision and continues execution.
 //
-//   - Execute → internal grant → revalidate decision → execute
-//   - Inspect  → expand the full decision/evidence detail (read-only)
-//   - Cancel   → abandon the objective; no grant, no execution
+// ── Three concepts, kept distinct ─────────────────────────────────────────
+//
+//	AUTONOMY DECISION     the policy verdict (continue / ask / block / answer).
+//	AUTHORIZATION REQUEST the question that verdict raises. Nothing has been
+//	                     proposed, planned, or written.
+//	AUTHORIZATION GRANT   the capability the human releases on Execute. The UI
+//	                     never mints one; the runtime does.
+//
+// A request for authorization is NOT an implementation proposal. The card is
+// therefore named EXECUTION AUTHORIZATION, and it renders what is actually
+// known at request time: the intent, the workspace, the scope, and the
+// capability vector being requested — plus the explicit fact that no mutation
+// has occurred. Nothing here implies a change is already drafted.
+//
+// ── The action set is DERIVED, never templated ────────────────────────────
+//
+// An action is rendered only when the object it acts on exists. Inspect is
+// offered only when the runtime actually holds a candidate/diff to inspect; an
+// authorization request is raised BEFORE any artifact is generated, so at that
+// point there is nothing to diff and Inspect is simply absent. Offering it
+// would advertise a diff that does not exist.
 
-// proposalActions is the ordered action list the proposal navigates.
-var proposalActions = []autonomy.ProposalAction{
-	autonomy.ActionExecute,
-	autonomy.ActionInspect,
-	autonomy.ActionCancel,
-}
+var (
+	// actionExecuteLabel / actionCancelLabel are unconditional: the
+	// authorization request exists, so releasing the grant and abandoning the
+	// objective are always meaningful.
+	actionExecuteLabel = "Execute"
+	actionCancelLabel  = "Cancel"
+	// actionInspectLabel is used only when a candidate/diff object exists.
+	actionInspectLabel = "Inspect Diff"
+)
 
 // isLowRiskAutoApprovable reports whether a proposal can bypass the
 // awaiting_human barrier: ScopeCapability (read+analyze+propose+mutate) granted
@@ -45,6 +66,57 @@ func (m *model) isLowRiskAutoApprovable(prop *autonomy.Proposal) bool {
 	}
 	if m.autonomy.Grants().Has(".", required) || m.autonomy.Grants().Has(m.autonomy.Scope(), required) || m.autonomy.Authority(required) {
 		return true
+	}
+	return false
+}
+
+// authorizationCandidate reports whether the runtime currently holds a real
+// mutation candidate/diff the human could inspect, and returns it.
+//
+// This is the ONLY source of truth for whether an Inspect action may be
+// rendered. It reads the objects the runtime actually produced:
+//
+//   - a held patch at the approval gate (RuntimeExecutor staged a candidate and
+//     compiled its diff), or
+//   - a staged proposal carrying a non-empty compiled diff.
+//
+// A bare authorization request — the state the runtime is in when it asks the
+// human for the mutate capability — has produced no artifact yet, so this
+// returns false and Inspect is not offered.
+func (m *model) authorizationCandidate() (string, bool) {
+	if m.pendingHotfixPatch != nil && m.pendingHotfixPatch.Modified != "" {
+		return m.pendingHotfixPatch.Modified, true
+	}
+	for _, p := range m.pendingProposals {
+		if p.Diff != "" {
+			return p.Diff, true
+		}
+	}
+	return "", false
+}
+
+// authorizationActions returns the ordered action list derived from the
+// CURRENT runtime state. It is the single source for both the rendered labels
+// and the ↑/↓ navigation, so the two can never disagree about which actions
+// exist.
+func (m *model) authorizationActions() []autonomy.ProposalAction {
+	actions := make([]autonomy.ProposalAction, 0, 3)
+	actions = append(actions, autonomy.ActionExecute)
+	if _, ok := m.authorizationCandidate(); ok {
+		actions = append(actions, autonomy.ActionInspect)
+	}
+	actions = append(actions, autonomy.ActionCancel)
+	return actions
+}
+
+// hasAuthorizationAction reports whether the derived action set contains an
+// action. Key handlers consult it so a key bound to a hidden action is inert
+// rather than silently performing something the UI never advertised.
+func (m *model) hasAuthorizationAction(a autonomy.ProposalAction) bool {
+	for _, candidate := range m.authorizationActions() {
+		if candidate == a {
+			return true
+		}
 	}
 	return false
 }
@@ -138,13 +210,20 @@ func (m *model) requestAutonomyProposal(trace autonomy.Trace) tea.Cmd {
 	m.enterApprovalState()
 
 	var b strings.Builder
-	b.WriteString(boldSapphireStyle.Render(Icon.Blueprint+" AUTONOMY PROPOSAL") + "\n")
+	b.WriteString(boldSapphireStyle.Render(Icon.Blueprint+" EXECUTION AUTHORIZATION") + "\n")
 	fmt.Fprintf(&b, "  intent      : %s\n", trace.Intent.Intent)
 	if len(trace.Intent.Targets) > 0 {
 		fmt.Fprintf(&b, "  targets     : %s\n", strings.Join(trace.Intent.Targets, ", "))
 	}
 	fmt.Fprintf(&b, "  workspace   : %s\n", trace.Route.Workspace)
-	b.WriteString("\n  " + infoStyle.Render("Select Execute to authorize, Inspect to review details, or Cancel. Esc cancels.") + "\n")
+	// The instruction names only the actions that exist RIGHT NOW. When no
+	// candidate has been generated there is no diff to inspect, so Inspect is
+	// not offered and not mentioned.
+	instruction := "Select Execute to authorize the capabilities above, or Esc to cancel. No mutation has occurred."
+	if m.hasAuthorizationAction(autonomy.ActionInspect) {
+		instruction = "Select Execute to authorize, Inspect the candidate diff, or Esc to cancel."
+	}
+	b.WriteString("\n  " + infoStyle.Render(instruction) + "\n")
 	m.push(roleStatus, b.String())
 	m.refreshViewportContent()
 	m.Viewport.GotoBottom()
@@ -267,24 +346,36 @@ func (m *model) toggleAutonomyProposalInspect() {
 }
 
 // navigateAutonomyProposal moves the action highlight. delta is -1 (up) or +1
-// (down); the selection wraps within the action list.
+// (down); the selection wraps within the DERIVED action list, so navigation can
+// never land on an action the card does not render.
 func (m *model) navigateAutonomyProposal(delta int) {
 	if m.pendingAutonomyProposal == nil {
 		return
 	}
-	m.autonomyProposalSelect = (m.autonomyProposalSelect + delta + len(proposalActions)) % len(proposalActions)
+	actions := m.authorizationActions()
+	if len(actions) == 0 {
+		return
+	}
+	// Re-anchor the selection when the derived set shrank (a candidate was
+	// consumed), so a stale index cannot activate the wrong action.
+	if m.autonomyProposalSelect < 0 || m.autonomyProposalSelect >= len(actions) {
+		m.autonomyProposalSelect = 0
+	}
+	m.autonomyProposalSelect = (m.autonomyProposalSelect + delta + len(actions)) % len(actions)
 	m.refreshViewportContent()
 }
 
-// activateAutonomyProposal runs the currently highlighted action.
+// activateAutonomyProposal runs the currently highlighted action of the DERIVED
+// action set.
 func (m *model) activateAutonomyProposal() tea.Cmd {
 	if m.pendingAutonomyProposal == nil {
 		return nil
 	}
-	if m.autonomyProposalSelect < 0 || m.autonomyProposalSelect >= len(proposalActions) {
+	actions := m.authorizationActions()
+	if m.autonomyProposalSelect < 0 || m.autonomyProposalSelect >= len(actions) {
 		m.autonomyProposalSelect = 0
 	}
-	switch proposalActions[m.autonomyProposalSelect] {
+	switch actions[m.autonomyProposalSelect] {
 	case autonomy.ActionExecute:
 		return m.executeAutonomyProposal()
 	case autonomy.ActionInspect:
@@ -308,9 +399,19 @@ func (m *model) clearAutonomyProposal() {
 	m.clearAutonomyTargetSelector()
 }
 
-// renderAutonomyProposalBlock renders the compact action banner (4-5 lines max)
+// renderAutonomyProposalBlock renders the compact authorization card
 // positioned directly above the input prompt region. It is the ONLY user-facing
 // authorization gate — there is no /grant command anywhere in the surface.
+//
+// Everything on the card is a FACT observed at authorization-request time:
+//
+//	Intent / Workspace / Scope — the classified objective and its boundary.
+//	Capabilities               — the capability vector being requested.
+//	No mutation has occurred.   — the explicit absence of any change.
+//
+// The action line is derived from runtime state (authorizationActions), so an
+// action is shown only when the object it acts on exists. With no candidate
+// generated yet, the card offers exactly Execute and Cancel.
 func (m *model) renderAutonomyProposalBlock(width int) string {
 	prop := m.pendingAutonomyProposal
 	if prop == nil {
@@ -349,46 +450,79 @@ func (m *model) renderAutonomyProposalBlock(width int) string {
 		scopeStr = fmt.Sprintf("%d file(s)", prop.AffectedScope)
 	}
 
-	planStr := "Read -> Propose -> Mutate -> Verify"
-	if len(prop.Actions) > 0 {
-		planStr = strings.Join(prop.Actions, " -> ")
-	}
-
 	rollbackStr := "OK"
 	if !prop.Rollback {
 		rollbackStr = "NO"
 	}
 
 	var b strings.Builder
-	// Line 1: Target, Risk, Scope, Rollback info
-	modeStr := strings.ToLower(prop.Workspace.String())
-	intentStr := strings.ToLower(prop.Intent.String())
+	// Line 1: the decision facts, risk and rollback availability.
 	fmt.Fprintf(&b, "Target: %s │ Risk: %s │ Scope: %s │ %s/%s (Rollback: %s)\n",
 		permissionTargetStyle.Render(target),
 		riskStyled,
 		permissionTargetStyle.Render(scopeStr),
-		intentStr,
-		modeStr,
+		strings.ToLower(prop.Intent.String()),
+		strings.ToLower(prop.Workspace.String()),
 		rollbackStr,
 	)
 
-	// Line 2: Plan
-	fmt.Fprintf(&b, "Plan:   %s\n", mutedStyle.Render(planStr))
+	// Line 2: the capability vector being requested. This is the substance of
+	// the authorization request — it is what the human is actually releasing.
+	// It replaces the old "Plan: read -> propose -> mutate -> verify" line,
+	// which described an execution chain that had not been planned or begun.
+	requested := prop.Required.String()
+	if requested == "" {
+		requested = prop.CapabilityLabel()
+	}
+	fmt.Fprintf(&b, "Capabilities: %s\n", mutedStyle.Render(requested))
 
-	// Line 3: Actions
-	actionExec := permissionKeyStyle.Render("[Enter]") + " " + boldTextStyle.Render("Approve & Run (Execute)")
-	actionInspect := permissionKeyStyle.Render("[I]") + " " + boldTextStyle.Render("Inspect Diff")
-	actionReject := permissionKeyStyle.Render("[Esc]") + " " + boldTextStyle.Render("Reject (Cancel)")
-	fmt.Fprintf(&b, "Action: %s   %s   %s", actionExec, actionInspect, actionReject)
+	// Line 3: the explicit absence of any change. An authorization request is
+	// raised before anything is generated; saying so keeps the card from
+	// reading as though a change already exists.
+	b.WriteString("No mutation has occurred.\n")
 
-	// Inspect detail expansion (toggled via I)
+	// Line 4: the DERIVED action set.
+	b.WriteString(m.renderAuthorizationActionLine())
+
+	// Inspect expansion: reachable only when a candidate/diff exists (the
+	// action that reveals it is state-derived), so this line cannot appear
+	// without something real to show.
 	if m.autonomyProposalInspect {
-		b.WriteString("\n" + permissionDescStyle.Render("Decision detail:") + " " + mutedStyle.Render(fmt.Sprintf("objective=%s required=%s missing=%s scope=%s",
+		if diff, ok := m.authorizationCandidate(); ok {
+			b.WriteString("\n" + permissionDescStyle.Render("Candidate diff:"))
+			b.WriteString("\n" + mutedStyle.Render(truncateDisplay(diff, boxWidth*2)))
+		}
+		b.WriteString("\n" + permissionDescStyle.Render("Decision detail:") + " " + mutedStyle.Render(fmt.Sprintf("objective=%s requested=%s missing=%s scope=%s",
 			truncateDisplay(prop.Input, 40), prop.Required.String(), prop.Missing.String(), prop.Scope)))
 	}
 
-	headerTitle := fmt.Sprintf(" %s AUTONOMY REQUEST: %s ", Icon.Warning, prop.Intent.String())
+	headerTitle := fmt.Sprintf(" %s EXECUTION AUTHORIZATION ", Icon.Warning)
 	return renderBoxWithTitle(headerTitle, b.String(), boxWidth)
+}
+
+// renderAuthorizationActionLine renders the key hints for the DERIVED action
+// set. Every rendered hint is bound to a key that the handler will honour, and
+// every honoured action is rendered here — the two are the same list.
+func (m *model) renderAuthorizationActionLine() string {
+	labels := map[autonomy.ProposalAction]string{
+		autonomy.ActionExecute: "[Enter] " + actionExecuteLabel,
+		autonomy.ActionInspect: "[I] " + actionInspectLabel,
+		autonomy.ActionCancel:  "[Esc] " + actionCancelLabel,
+	}
+	keys := map[autonomy.ProposalAction]string{
+		autonomy.ActionExecute: "[Enter]",
+		autonomy.ActionInspect: "[I]",
+		autonomy.ActionCancel:  "[Esc]",
+	}
+	// The derived set is read ONCE per render, so every hint on this line is
+	// built from a single snapshot of the runtime state — the line can never be
+	// assembled from two different moments.
+	actions := m.authorizationActions()
+	parts := make([]string, 0, len(actions))
+	for _, a := range actions {
+		parts = append(parts, permissionKeyStyle.Render(keys[a])+" "+boldTextStyle.Render(labels[a]))
+	}
+	return "Action: " + strings.Join(parts, "   ")
 }
 
 func renderBoxWithTitle(title, content string, boxWidth int) string {

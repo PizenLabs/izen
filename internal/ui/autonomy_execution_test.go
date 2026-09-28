@@ -99,16 +99,21 @@ func TestBuildHotAutonomyExecution(t *testing.T) {
 		t.Errorf("proposal must request the mutate capability, got %v", prop.Missing)
 	}
 
-	// The proposal must be actionable (Execute/Inspect/Cancel) and must NEVER
-	// instruct the user to type /grant.
+	// The authorization card must be actionable (Execute/Cancel) and must NEVER
+	// instruct the user to type /grant. No Inspect action may render: the
+	// runtime raised the authorization request BEFORE generating any candidate,
+	// so there is no diff object to inspect yet.
 	view := m.renderAutonomyProposalBlock(100)
-	for _, want := range []string{"Execute", "Inspect", "Cancel", "build", "index.html", "modification"} {
+	for _, want := range []string{"Execute", "Cancel", "build", "index.html", "modification", "No mutation has occurred."} {
 		if !strings.Contains(view, want) {
-			t.Errorf("proposal missing %q:\n%s", want, view)
+			t.Errorf("authorization card missing %q:\n%s", want, view)
 		}
 	}
+	if strings.Contains(view, "Inspect") {
+		t.Errorf("no candidate exists at authorization time, so no Inspect action may render:\n%s", view)
+	}
 	if strings.Contains(recordsText(m), "/grant") {
-		t.Error("proposal must not instruct the user to type /grant")
+		t.Error("authorization card must not instruct the user to type /grant")
 	}
 
 	// Enter on the highlighted action (Execute) authorizes internally and

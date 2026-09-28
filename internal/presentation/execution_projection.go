@@ -34,11 +34,18 @@ const (
 	// PhaseWaitingApproval blocks on the human approval gate.
 	PhaseWaitingApproval
 	// PhaseCompleted is a terminal state: the execution reached a real
-	// terminal success (or a clean cancellation). No running step may follow.
+	// terminal success (or a clean cancellation) AND the sealed evidence
+	// substantiates it. No running step may follow.
 	PhaseCompleted
 	// PhaseFailed is a terminal state: the execution failed. No running step
 	// may follow.
 	PhaseFailed
+	// PhaseUnsubstantiated is a terminal NON-success state: the runtime
+	// terminated, but the sealed evidence does not substantiate a completion
+	// claim (no record was published, the outcome is not COMMITTED, or the
+	// mutation set is tainted). It exists so an unsubstantiated attempt can
+	// never be rendered as a completed one. State carries the refusal reason.
+	PhaseUnsubstantiated
 )
 
 // String returns the canonical phase name.
@@ -52,14 +59,17 @@ func (p ViewPhase) String() string {
 		return "completed"
 	case PhaseFailed:
 		return "failed"
+	case PhaseUnsubstantiated:
+		return "unsubstantiated"
 	default:
 		return "idle"
 	}
 }
 
-// Terminal reports whether the phase is terminal (Completed or Failed).
+// Terminal reports whether the phase is terminal (Completed, Failed or
+// Unsubstantiated).
 func (p ViewPhase) Terminal() bool {
-	return p == PhaseCompleted || p == PhaseFailed
+	return p == PhaseCompleted || p == PhaseFailed || p == PhaseUnsubstantiated
 }
 
 // ExecutionViewState is the SINGLE projection state of a runtime execution. It
@@ -98,7 +108,7 @@ func (s ExecutionViewState) Valid() bool {
 		return true
 	case PhaseWaitingApproval:
 		return true
-	case PhaseCompleted, PhaseFailed:
+	case PhaseCompleted, PhaseFailed, PhaseUnsubstantiated:
 		return s.Outcome != ""
 	default:
 		return s.Step == "" && s.Outcome == ""
@@ -114,6 +124,12 @@ type ExecutionProjection struct {
 	// survives the terminal state reassignment (which rebuilds ExecutionViewState
 	// wholesale) so the EXPANDED layer keeps its metadata at completion.
 	details ExecutionDetails
+	// gate accumulates the observed facts a completion claim is judged against.
+	// See completion_gate.go: it is a reducer over published evidence, not an
+	// authority of its own.
+	gate CompletionGate
+	// targetIndex maps a mutation target to its row in details.Targets.
+	targetIndex map[string]int
 	// narrative is the deterministic human/machine narrative layer. The UI
 	// reads it; it never authors narration text.
 	narrative *ExecutionNarrative
@@ -189,6 +205,51 @@ func (p *ExecutionProjection) Begin(requestID string) {
 		state:     ExecutionViewState{RequestID: requestID},
 		narrative: NewExecutionNarrative(),
 	}
+	// targetIndex is the target → ledger-position index of details.Targets. It
+	// is rebuilt whenever the ledger is reset so a fresh execution can never
+	// inherit a prior attempt's target rows.
+	p.reindexTargets()
+}
+
+// reindexTargets rebuilds the target → ledger-position index.
+func (p *ExecutionProjection) reindexTargets() {
+	p.targetIndex = make(map[string]int, len(p.details.Targets))
+	for i := range p.details.Targets {
+		p.targetIndex[p.details.Targets[i].Target] = i
+	}
+}
+
+// targetSlot returns the ledger row for a target, creating it on first
+// observation. A target's row is created from an OBSERVED event only, so the
+// ledger never contains a row for work that was never announced.
+func (p *ExecutionProjection) targetSlot(target string) int {
+	if p.targetIndex == nil {
+		p.targetIndex = make(map[string]int)
+	}
+	if i, ok := p.targetIndex[target]; ok {
+		return i
+	}
+	p.details.Targets = append(p.details.Targets, TargetEvidence{Target: target})
+	p.targetIndex[target] = len(p.details.Targets) - 1
+	return p.targetIndex[target]
+}
+
+// recountTargets recomputes the candidate and mutated-file counters from the
+// ledger. Both are counts of OBSERVED evidence, so they are derived once, here,
+// rather than incremented at each event site where a double arrival would
+// inflate them.
+func (p *ExecutionProjection) recountTargets() {
+	candidates, mutated := 0, 0
+	for i := range p.details.Targets {
+		if p.details.Targets[i].Candidate {
+			candidates++
+		}
+		if p.details.Targets[i].Mutated() {
+			mutated++
+		}
+	}
+	p.details.CandidateCount = candidates
+	p.details.MutatedFiles = mutated
 }
 
 // Project consumes one canonical runtime lifecycle event and advances the
@@ -243,6 +304,7 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		}
 		p.details.ContextChannels = append([]string(nil), pl.Channels...)
 		p.details.ContextTokens = pl.Tokens
+		p.details.ContextCacheHit = pl.CacheHit
 		p.syncDetails()
 		if p.state.Phase == PhaseRunning {
 			p.state.Step = p.narrative.CurrentHuman()
@@ -252,6 +314,10 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 			return
 		}
 		p.details.Model = pl.Model
+		// ProviderCalls counts OBSERVED invocations. It is the denominator for
+		// "useful outcome / model computation" and the basis for detecting a
+		// duplicated invocation — it is never estimated.
+		p.details.ProviderCalls++
 		p.syncDetails()
 		if p.state.Phase == PhaseRunning {
 			p.state.Step = p.narrative.CurrentHuman()
@@ -264,6 +330,10 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		p.details.TokenInput = pl.TokenInput
 		p.details.TokenOutput = pl.TokenOutput
 		p.details.ProviderState = "done"
+		// The finish reason describes the GENERATION, not the objective. It is
+		// kept explicitly so "model invocation complete" can never be read as
+		// "task complete" from the same field.
+		p.details.FinishReason = pl.FinishReason
 		p.syncDetails()
 		if p.state.Phase == PhaseRunning {
 			p.state.Step = p.narrative.CurrentHuman()
@@ -320,6 +390,14 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 			Kind:   pl.Kind,
 			Target: pl.Target,
 		})
+		// An artifact record for a target IS the candidate state: the model
+		// produced a concrete artifact for that path. This is what makes the
+		// target "active" in the artifact ledger — it is never inferred.
+		if pl.Target != "" {
+			slot := p.targetSlot(pl.Target)
+			p.details.Targets[slot].Candidate = true
+			p.recountTargets()
+		}
 		p.syncDetails()
 		if p.state.Phase == PhaseRunning {
 			p.state.Step = p.narrative.CurrentHuman()
@@ -334,14 +412,56 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		if !p.matches(pl.RequestID) {
 			return
 		}
+		// Entering the mutation boundary is the fact that makes a completion
+		// claim require sealed evidence (completion_gate.go).
+		p.gate.ObserveMutation()
+		// Each announced target becomes a ledger row BEFORE any candidate or
+		// outcome exists for it — that is what lets the UI show a real
+		// per-artifact progress ledger (active vs pending) instead of a generic
+		// activity line.
+		//
+		// The boundary ANNOUNCING a target is not the same as a candidate
+		// existing for it, so this does not set Candidate. Only an
+		// artifact.produced record or an apply that observed an artifact
+		// proves a candidate is real; everything else stays honestly pending.
+		for _, t := range pl.Targets {
+			if t == "" {
+				continue
+			}
+			p.targetSlot(t)
+		}
+		p.recountTargets()
 		if p.state.Phase == PhaseWaitingApproval {
 			p.state.Phase = PhaseRunning
 		}
+		p.syncDetails()
 		p.state.Step = p.narrative.CurrentHuman()
 	case events.MutationCompletedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
+		// Transport the apply boundary's REAL evidence. The diff metrics are
+		// stored verbatim; when DiffPresent is false they are absent, and every
+		// renderer is required to render no diff statistics at all rather than
+		// a fabricated zero.
+		slot := p.targetSlot(pl.Target)
+		row := &p.details.Targets[slot]
+		row.Outcome = pl.Outcome
+		row.ArtifactPresent = pl.ArtifactPresent
+		row.ApplyExecuted = pl.ApplyExecuted
+		row.FilesystemChanged = pl.FilesystemChanged
+		row.DiffPresent = pl.DiffPresent
+		if pl.DiffPresent {
+			row.DiffAdds = pl.DiffAdds
+			row.DiffRemoves = pl.DiffRemoves
+		} else {
+			row.DiffAdds, row.DiffRemoves = 0, 0
+		}
+		if pl.ArtifactPresent || pl.ApplyExecuted {
+			row.Candidate = true
+		}
+		p.recountTargets()
+		p.syncDetails()
 		if p.state.Phase == PhaseRunning {
 			p.state.Step = p.narrative.CurrentHuman()
 		}
@@ -349,29 +469,38 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		if !p.matches(pl.RequestID) {
 			return
 		}
+		p.details.VerificationRan = true
+		p.details.VerificationPassed = pl.Passed
+		p.details.VerificationSteps = append([]string(nil), pl.Steps...)
+		p.syncDetails()
 		if p.state.Phase == PhaseRunning {
 			p.state.Step = p.narrative.CurrentHuman()
 		}
+	case events.ExecutionEvidencePayload:
+		if !p.matches(pl.RequestID) {
+			return
+		}
+		// The sealed terminal record. It is the ONLY authority for a completion
+		// claim on a mutation execution, and the runtime publishes it BEFORE
+		// execution.finished so the gate is always populated by the time the
+		// completion event is reduced.
+		p.gate.ObserveEvidence(pl.Outcome, pl.Tainted, pl.FilesMutated)
+		p.details.EvidenceObserved = true
+		p.details.EvidenceOutcome = pl.Outcome
+		p.details.EvidenceTainted = pl.Tainted
+		p.details.FilesMutated = pl.FilesMutated
+		p.syncDetails()
 	case events.ExecutionFinishedPayload:
 		if !p.matches(pl.RequestID) {
 			return
 		}
 		p.details.FinishedAt = ev.Timestamp()
-		switch {
-		case pl.Success:
-			p.state = ExecutionViewState{
-				Phase: PhaseCompleted, Outcome: pl.Outcome, RequestID: pl.RequestID, Details: p.details,
-			}
-		case pl.Outcome == "cancelled":
-			// A clean cancellation is a terminal, non-failure outcome.
-			p.state = ExecutionViewState{
-				Phase: PhaseCompleted, Outcome: "cancelled", RequestID: pl.RequestID, Details: p.details,
-			}
-		default:
-			p.state = ExecutionViewState{
-				Phase: PhaseFailed, Outcome: pl.Outcome, RequestID: pl.RequestID, Details: p.details,
-			}
-		}
+		p.state = p.terminalState(pl)
+		// The terminal sentence is the one narrative line whose truth depends on
+		// accumulated evidence rather than on a single transition, so the
+		// projection — which holds the gate — supplies it. The narrative keeps
+		// the machine record either way, so the event stream is never falsified.
+		p.narrative.RewriteHuman(terminalSentence(p.state))
 	case events.ExecutionFailedPayload:
 		// execution.failed may arrive before execution.finished; both are
 		// terminal transitions. The finished event carries the authoritative
@@ -381,6 +510,61 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 				Phase: PhaseFailed, Outcome: pl.Stage, RequestID: p.state.RequestID, Details: p.details,
 			}
 		}
+	}
+}
+
+// terminalState reduces a terminal execution.finished event into the ONE
+// canonical user-facing terminal state.
+//
+// The runtime's `success` flag answers "did the execution terminate without an
+// error". It does NOT answer "is the task done". Those are different questions,
+// and only the second one gates the completed state:
+//
+//   - A clean cancellation is terminal and non-failure, but it is labelled
+//     cancelled — never completed. Nothing was achieved and nothing is claimed.
+//   - success=false is a failure.
+//   - success=true is judged by the completion gate. Granted → completed.
+//     Refused → PhaseUnsubstantiated carrying the deterministic reason, which
+//     is an explicit NON-complete state rather than a fabricated success.
+func (p *ExecutionProjection) terminalState(pl events.ExecutionFinishedPayload) ExecutionViewState {
+	base := ExecutionViewState{RequestID: pl.RequestID, Details: p.details}
+	switch {
+	case pl.Outcome == "cancelled":
+		// A clean cancellation is a terminal, non-failure outcome. It is NOT a
+		// task completion: no work was achieved, so the state says cancelled.
+		base.Phase = PhaseCompleted
+		base.Outcome = "cancelled"
+		return base
+	case !pl.Success:
+		base.Phase = PhaseFailed
+		base.Outcome = pl.Outcome
+		return base
+	}
+	verdict := p.gate.Verdict()
+	if !verdict.Granted {
+		base.Phase = PhaseUnsubstantiated
+		base.Outcome = verdict.Reason
+		return base
+	}
+	base.Phase = PhaseCompleted
+	base.Outcome = pl.Outcome
+	return base
+}
+
+// terminalSentence is the deterministic human sentence for a terminal state. It
+// is the only place a completion sentence is produced, and it reads the
+// evidence-gated phase — never the raw success flag.
+func terminalSentence(s ExecutionViewState) string {
+	switch s.Phase {
+	case PhaseCompleted:
+		if s.Outcome == "cancelled" {
+			return "Cancelled"
+		}
+		return "Completed"
+	case PhaseUnsubstantiated:
+		return "Not completed — " + s.Outcome
+	default:
+		return "Failed"
 	}
 }
 

@@ -105,25 +105,30 @@ func TestCompactAutonomyGateBannerLayout(t *testing.T) {
 	raw := ansi.Strip(view)
 	lines := strings.Split(raw, "\n")
 
-	// Must be compact: 4-5 lines (or up to 6 with borders)
-	if len(lines) > 7 {
-		t.Errorf("banner height too tall (%d lines), want <= 6 lines:\n%s", len(lines), view)
+	// Must be compact: 4-5 content lines (or up to 7 with borders)
+	if len(lines) > 8 {
+		t.Errorf("banner height too tall (%d lines), want <= 7 lines:\n%s", len(lines), view)
 	}
 
-	// Check content requirements
+	// Check content requirements. The card states the authorization facts and
+	// the DERIVED action set: this request has no candidate, so Inspect is
+	// absent.
 	for _, want := range []string{
-		"AUTONOMY REQUEST",
+		"EXECUTION AUTHORIZATION",
 		"Target:", "internal/auth/token.go",
 		"Risk:", "LOW",
 		"Scope:", "1 file",
-		"Plan:", "Read -> Propose -> Mutate -> Verify",
-		"[Enter]", "Approve & Run",
-		"[I]", "Inspect Diff",
-		"[Esc]", "Reject",
+		"Capabilities:",
+		"No mutation has occurred.",
+		"[Enter]", "Execute",
+		"[Esc]", "Cancel",
 	} {
 		if !strings.Contains(raw, want) {
-			t.Errorf("compact banner missing %q:\n%s", want, raw)
+			t.Errorf("compact authorization card missing %q:\n%s", want, raw)
 		}
+	}
+	if strings.Contains(raw, "Inspect") {
+		t.Errorf("no candidate exists at authorization time, so no Inspect action may render:\n%s", raw)
 	}
 }
 

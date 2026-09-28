@@ -113,6 +113,11 @@ type PatchManager struct {
 	// Apply records each target into the set before mutating the filesystem.
 	mutationSet *MutationSet
 
+	// compiledDiffs holds the runtime's canonical compiled unified diff per
+	// target (see SetCompiledDiffs). It is the object diff evidence is
+	// measured from.
+	compiledDiffs map[string]string
+
 	// onMutation is an optional callback invoked after every successful file
 	// write (both FILE_CREATE and regular patch applies). It receives the
 	// workspace-relative file path and the freshly written bytes so the
@@ -155,6 +160,35 @@ func (pm *PatchManager) SetTransaction(tx *engine.Transaction) {
 // records targets into it during Apply.
 func (pm *PatchManager) SetMutationSet(ms *MutationSet) {
 	pm.mutationSet = ms
+}
+
+// SetCompiledDiffs attaches the runtime's CANONICAL compiled unified diffs, one
+// per target.
+//
+// This is the single diff object of an execution: RuntimeExecutor.compileDiff
+// produced it from the artifact and the pre-apply content, and it is the same
+// text the approval surface shows the human. The mutation boundary therefore
+// measures its diff evidence from THIS diff rather than from the raw artifact
+// text.
+//
+// The distinction matters. A bounded SEARCH/REPLACE artifact carries no "@@"
+// hunk header, so measuring the artifact text yields "no diff" for a change
+// that demonstrably happened — the boundary would under-report real evidence
+// and the UI would be forced to render nothing. Measuring the compiled diff
+// yields the true line metrics. Neither direction ever invents numbers: the
+// compiled diff is the runtime's own output, and a target absent from the map
+// simply has no diff to report.
+func (pm *PatchManager) SetCompiledDiffs(byTarget map[string]string) {
+	pm.compiledDiffs = byTarget
+}
+
+// compiledDiffFor returns the canonical compiled unified diff for a target
+// ("" when the runtime compiled none for it).
+func (pm *PatchManager) compiledDiffFor(target string) string {
+	if pm.compiledDiffs == nil {
+		return ""
+	}
+	return pm.compiledDiffs[target]
 }
 
 // MutationSet returns the boundary currently attached to this manager.
@@ -217,15 +251,36 @@ func (pm *PatchManager) recordMutationEvidence(patch *Patch, outcome MutationOut
 		Reason:  reason,
 	}
 	ev.ArtifactPresent = patch.Modified != ""
-	ev.DiffPresent = patch.Modified != "" && strings.Contains(patch.Modified, "@@")
 	ev.ApplyExecuted = facts.executed
 	ev.FilesystemChanged = facts.changed
 	ev.VerificationRun = facts.verifyRun
 	ev.VerificationPassed = facts.verifyPassed
+	// Diff evidence is measured from the runtime's CANONICAL compiled unified
+	// diff (RuntimeExecutor.compileDiff), never from the raw artifact text: a
+	// bounded SEARCH/REPLACE artifact carries no hunk header, so measuring the
+	// artifact would report "no diff" for a change that demonstrably happened.
+	// The compiled diff is the same object the approval surface showed the
+	// human, so the published evidence and the reviewed evidence are one thing.
+	//
+	// When no compiled diff was attached (a raw PatchManager caller outside the
+	// executor) the artifact text is still a valid measurement IF it is itself
+	// a unified diff. Neither path synthesises numbers.
+	diff := pm.compiledDiffFor(patch.File)
+	if diff == "" && strings.Contains(patch.Modified, "@@") {
+		diff = patch.Modified
+	}
+	ev.DiffPresent = diff != ""
 	if outcome == OutcomeChanged || outcome == OutcomeCreated {
-		added, removed := countUnifiedDiffLines(patch.Modified)
-		ev.DiffAdds = added
-		ev.DiffRemoves = removed
+		if ev.DiffPresent {
+			ev.DiffAdds, ev.DiffRemoves = countUnifiedDiffLines(diff)
+		}
+	} else {
+		// A target the boundary proved unchanged carries no diff: there is
+		// nothing to show, and reporting the line metrics of the artifact the
+		// runtime did NOT apply would be a false claim about a change that
+		// never landed.
+		ev.DiffPresent = false
+		ev.DiffAdds, ev.DiffRemoves = 0, 0
 	}
 	pm.mutationSet.AddOutcome(ev)
 }

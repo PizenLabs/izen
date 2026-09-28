@@ -11,6 +11,7 @@ import (
 
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/presentation"
 	"github.com/PizenLabs/izen/internal/retrieval"
 )
 
@@ -48,8 +49,6 @@ func TestHandleDomainEventProjection(t *testing.T) {
 			"[intent] classified: /build (91%, code mutation)"},
 		{"intent classified (ambiguous)", events.NewIntentClassified("plan", "what should we do", 0.42, "en", "ambiguous request", true),
 			"[intent] ambiguous: /plan (42%, ambiguous request) — asking user"},
-		{"phase changed", events.NewPhaseChanged("plan", "build"),
-			"[phase] plan → build"},
 		{"patch parsed", events.NewPatchParsed("x.go", "STRUCTURED_DIFF", 1),
 			"[patch] parsed x.go (strategy=STRUCTURED_DIFF, tier=1)"},
 		{"patch validated", events.NewPatchValidated("x.go", "SEARCH_REPLACE", 2),
@@ -60,10 +59,6 @@ func TestHandleDomainEventProjection(t *testing.T) {
 			"[approval] requested for x.go: full-file rewrite needs approval"},
 		{"approval requested (intent disambiguation)", events.NewApprovalRequested("", "unclear intent", ""),
 			"[approval] requested for intent disambiguation: unclear intent"},
-		{"stream usage interrupted", events.NewStreamUsage("cohere/north-mini-code", 512, 240, true, "context deadline exceeded"),
-			"[stream] interrupted: 512 tok input + 240 tok output (context deadline exceeded)"},
-		{"stream usage clean", events.NewStreamUsage("gpt-4o-mini", 100, 200, false, ""),
-			"[stream] finished: 100 tok input + 200 tok output ()"},
 	}
 
 	for _, tc := range tests {
@@ -79,6 +74,60 @@ func TestHandleDomainEventProjection(t *testing.T) {
 			}
 			if m.records[0].role != roleActivity {
 				t.Errorf("record role = %v, want roleActivity", m.records[0].role)
+			}
+		})
+	}
+}
+
+// TestDiagnosticTelemetryStaysOutOfTheMainNarrative pins the MAIN UI / TRACE
+// boundary for two events whose payload is pure diagnostic telemetry:
+//
+//   - stream.usage: provider token accounting. The footer already binds the same
+//     live prompt/completion counters, and the execution details panel reports
+//     them layer-labelled, so a third copy in the main narrative adds nothing a
+//     user can act on.
+//   - phase.changed: the workflow phase is already projected onto the state
+//     machine and rendered by the top bar badge and the EXECUTING header.
+//
+// Both must still reach Trace — the boundary moves information, it does not
+// discard it.
+func TestDiagnosticTelemetryStaysOutOfTheMainNarrative(t *testing.T) {
+	cases := []struct {
+		name      string
+		ev        events.DomainEvent
+		traceWant string
+	}{
+		{
+			name:      "stream usage interrupted",
+			ev:        events.NewStreamUsage("cohere/north-mini-code", 512, 240, true, "context deadline exceeded"),
+			traceWant: "[stream] interrupted: 512 tok prompt",
+		},
+		{
+			name:      "stream usage clean",
+			ev:        events.NewStreamUsage("gpt-4o-mini", 100, 200, false, ""),
+			traceWant: "[stream] finished: 100 tok prompt + 200 tok completion",
+		},
+		{
+			name:      "phase changed",
+			ev:        events.NewPhaseChanged("plan", "build"),
+			traceWant: "[phase] plan → build",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := readyChatModel(newTestModel())
+			m.telemetryDemuxer = NewTelemetryDemuxer()
+			// The NORMAL layer is the main execution narrative — the layer a
+			// user reads by default. Diagnostic telemetry must not appear there.
+			m.execVisibility = presentation.VisibilityNormal
+
+			m.handleDomainEvent(tc.ev)
+
+			if len(m.records) != 0 {
+				t.Fatalf("diagnostic telemetry leaked into the main narrative: %+v", m.records)
+			}
+			if !strings.Contains(m.telemetryDemuxer.RenderOverlay(120, 40), tc.traceWant) {
+				t.Fatalf("Trace overlay missing %q", tc.traceWant)
 			}
 		})
 	}

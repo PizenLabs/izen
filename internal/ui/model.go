@@ -3175,14 +3175,21 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// whether anything was truncated or dropped, and whether the compiled
 		// context was reused from the fingerprint cache) — never a workspace
 		// cache hit, which is a different fact about a different layer.
+		//
+		// PHASE 13 — LAYER LABELS. The number is the COMPILED CONTEXT estimate
+		// (the ~4-chars/token accounting of the assembled prompt), NOT the
+		// provider's prompt-token count and NOT a workspace size. Those are
+		// separate quantities reported separately. A bare "model tokens" label
+		// forced the user to infer which layer a number belonged to, so the
+		// label now names the layer and the units say "estimate".
 		if m.execVisibility == presentation.VisibilityExpanded ||
 			m.execVisibility == presentation.VisibilityDebug {
-			m.logActivity("Context: %d channels, ~%d model tokens (budget %d, available %d)%s%s",
+			m.logActivity("Context compiled: %d channel(s), ~%d tok (estimate; budget %d, available %d)%s%s",
 				len(p.Channels), p.Tokens, p.BudgetTokens, p.AvailableTokens,
 				contextReuseSuffix(p.PromptFingerprint, p.CacheHit),
 				contextTruncationSuffix(p.Truncated, p.TruncatedFileCount, p.DropCount))
 		} else {
-			m.logActivity("Context prepared: %d channels, ~%d model tokens",
+			m.logActivity("Context compiled: %d channel(s), ~%d tok (estimate)",
 				len(p.Channels), p.Tokens)
 		}
 		m.logRuntimeDetail("[runtime] context prepared: %d channel(s), ~%d tokens scope=%s policy=%s truncated=%t drops=%d fingerprint=%s",
@@ -3317,7 +3324,12 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			m.logActivity("[intent] classified: /%s (%.0f%%, %s)", p.Intent, p.Confidence*100, p.Explanation)
 		}
 	case events.PhaseChangedPayload:
-		m.logActivity("[phase] %s → %s", p.From, p.To)
+		// PHASE 13 — MAIN UI / TRACE BOUNDARY. The workflow phase is already
+		// projected onto the state machine and rendered by the top bar badge
+		// and the EXECUTING header. A second "[phase] a → b" line in the main
+		// narrative restates a state the chrome already shows, so the
+		// transition record goes to Trace only.
+		m.logRuntimeDetail("[phase] %s → %s", p.From, p.To)
 		// The presentation state is a pure projection of the canonical
 		// workflow phase: derive, never hand-set.
 		if m.viewState != nil {
@@ -3384,7 +3396,12 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		if p.InputTokens > 0 || p.OutputTokens > 0 {
 			m.markUsageKnown()
 		}
-		m.logActivity("[stream] %s: %s tok input + %s tok output (%s)", statusWord,
+		// PHASE 13 — MAIN UI / TRACE BOUNDARY. Provider token accounting is
+		// diagnostic telemetry: the footer already binds the same live
+		// ↑prompt/↓completion counters, and the execution details panel reports
+		// them layer-labelled. Printing a third copy into the main narrative
+		// added no information a user could act on, so it belongs in Trace.
+		m.logRuntimeDetail("[stream] %s: %s tok prompt + %s tok completion (%s)", statusWord,
 			status.FormatTokens(p.InputTokens), status.FormatTokens(p.OutputTokens), truncateForActivity(p.Reason))
 	case events.EngineTelemetryPayload:
 		// Typed engine I/O event wrapped for bus transport — projected into

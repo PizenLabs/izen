@@ -474,11 +474,16 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// ── AUTONOMY PROPOSAL (ask_user decision surface) ──────────────────
-	// The proposal is the ONLY authorization gate: ↑/↓ navigate the action
-	// list, Enter activates the highlighted action (Execute / Inspect /
-	// Cancel), Esc cancels. It takes precedence over every other key handler
-	// while a proposal is outstanding. No /grant command exists.
+	// ── EXECUTION AUTHORIZATION (ask_user decision surface) ───────────
+	// The authorization card is the ONLY authorization gate: ↑/↓ navigate the
+	// DERIVED action list, Enter activates the highlighted action, Esc cancels.
+	// It takes precedence over every other key handler while a request is
+	// outstanding. No /grant command exists.
+	//
+	// The I binding is present only while Inspect is part of the derived action
+	// set — i.e. while a candidate/diff object actually exists. Otherwise the
+	// key falls through to the input composer, so the UI never silently honours
+	// an action it did not render.
 	if m.pendingAutonomyProposal != nil {
 		switch {
 		case msg.Type == tea.KeyUp || msg.String() == "k":
@@ -491,7 +496,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.activateAutonomyProposal()
 		case msg.Type == tea.KeyEscape || msg.String() == "alt+x":
 			return m, m.cancelAutonomyProposal()
-		case msg.String() == "i" || msg.String() == "I":
+		case (msg.String() == "i" || msg.String() == "I") && m.hasAuthorizationAction(autonomy.ActionInspect):
 			m.toggleAutonomyProposalInspect()
 			return m, nil
 		default:

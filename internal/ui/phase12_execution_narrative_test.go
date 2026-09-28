@@ -87,13 +87,22 @@ func TestPhase12_RuntimeDetailNeverReachesTheNarrative(t *testing.T) {
 // TestPhase12_ModelContextIsTheOneUserFacingContextStatement proves the
 // user-facing context line reports MODEL context (what is actually sent), never
 // a workspace cache fact.
+//
+// PHASE 13: it also proves the figure is LAYER-LABELLED. The number is the
+// compiled-context estimate (~4 chars/token over the assembled prompt), which
+// is neither the provider's prompt-token count nor a workspace size. Calling it
+// "model tokens" left the user to infer the layer, so the label names the layer
+// and marks the value as an estimate.
 func TestPhase12_ModelContextIsTheOneUserFacingContextStatement(t *testing.T) {
 	m := newTestModel()
 	m.execVisibility = presentation.VisibilityNormal
 	m.handleDomainEvent(events.NewContextPrepared("req-1", []string{"artifacts"}, 812))
 	got := recordsText(m)
-	if !strings.Contains(got, "Context prepared") || !strings.Contains(got, "812") {
+	if !strings.Contains(got, "Context compiled") || !strings.Contains(got, "812") {
 		t.Fatalf("the model-context line must report the compiled token count, got %q", got)
+	}
+	if !strings.Contains(got, "estimate") {
+		t.Fatalf("the compiled-context figure must be labelled an estimate, got %q", got)
 	}
 	if strings.Contains(got, "snapshot cache hit") || strings.Contains(got, "reading disk") {
 		t.Fatalf("a workspace-context fact leaked into the model-context line: %q", got)
