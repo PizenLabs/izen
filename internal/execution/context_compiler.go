@@ -2,6 +2,8 @@ package execution
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -253,6 +255,66 @@ func contextLineage(req ExecuteRequest) string {
 		return ""
 	}
 	return req.Context.ID
+}
+
+// ErrIntentContextProvenance is returned when a re-compiled workspace context
+// does not satisfy the ACTIVE canonical intent's provenance contract: a
+// requested target is missing, the payload carries no workspace material, or
+// the compilation was bound to a different intent.
+//
+// It fails CLOSED. A mutation intent dispatched over a read-only context is
+// exactly the split-brain state the intent revision exists to prevent, and
+// running it would mean the model judged a workspace it was never shown.
+var ErrIntentContextProvenance = errors.New("execution: compiled context does not satisfy the active intent's provenance contract")
+
+// RecompileIntentContext re-compiles the workspace context for the given
+// targets under an intent's contract and returns the SEMANTIC provenance
+// verdict.
+//
+// It is the second half of the blocking intent revision: the payload compiled
+// for the previous intent is never reused, because a read-only projection is
+// not a valid mutation context no matter how completely it filled its budget.
+// The verdict is a scope + provenance + intent check — never a token threshold.
+// `required` is one of the contextcompiler.IntentContext* vocabularies.
+func (x *RuntimeExecutor) RecompileIntentContext(ctx context.Context, targets []string, intentLabel, required string) (contextcompiler.ContextProvenance, error) {
+	if x == nil {
+		return contextcompiler.ContextProvenance{}, fmt.Errorf("execution: nil executor")
+	}
+	if ctx == nil {
+		// Fail closed rather than substituting a fresh context: the caller's
+		// cancellation authority is the run's, and silently detaching from it
+		// would let a re-compilation outlive an aborted run.
+		return contextcompiler.ContextProvenance{}, errors.New("execution: intent context re-compilation requires a context")
+	}
+	// The MUTATION context contract always projects the declared targets as
+	// required (critical) file context: a read-only projection of them is not a
+	// mutation context.
+	critical := required == contextcompiler.IntentContextWorkspace
+	compiler := x.contextCompilerInstance()
+	// PHASE 14 — step 1 of the blocking intent revision: drop every payload
+	// compiled under the PREVIOUS intent before compiling under this one. The
+	// read-only projection of the previous intent is not a mutation context, and
+	// a cache hit on it would be indistinguishable from a correct compilation.
+	compiler.InvalidateCache()
+	compiled, err := compiler.Compile(ctx, contextcompiler.Input{
+		UserRequest:   intentLabel,
+		WorkflowState: string(strategy.TargetedMutation),
+		Phase:         contextcompiler.PhaseExecute,
+		Files:         x.workspaceFiles(targets, critical),
+		ContextPolicy: "target_file_only",
+		Scope:         strings.Join(targets, ","),
+	})
+	if err != nil {
+		return contextcompiler.ContextProvenance{}, err
+	}
+	provenance := compiled.ValidateContextProvenance(contextcompiler.IntentBinding{
+		Active:   intentLabel,
+		Required: required,
+	}, targets)
+	if !provenance.Valid {
+		return provenance, fmt.Errorf("%w: %s", ErrIntentContextProvenance, provenance.Reason)
+	}
+	return provenance, nil
 }
 
 func (x *RuntimeExecutor) workspaceFiles(targets []string, critical bool) []contextcompiler.FileContext {

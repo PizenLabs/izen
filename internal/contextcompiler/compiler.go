@@ -137,6 +137,11 @@ type CompiledContext struct {
 	// TruncatedFiles records only source-side file provenance. It contains
 	// paths, never file contents, and is safe to project into audit telemetry.
 	TruncatedFiles []string
+	// AdmittedPaths records the workspace file paths this compilation actually
+	// carried into the payload. It is the SCOPE provenance the semantic
+	// provenance gate reads: a requested target absent from this set was
+	// dropped, and no token arithmetic can substitute for it.
+	AdmittedPaths []string
 	// Policy is the caller-selected context policy that produced this result.
 	Policy string
 
@@ -483,6 +488,13 @@ func (c *Compiler) Compile(ctx context.Context, in Input) (*CompiledContext, err
 		Exclusions: append([]string(nil), normalized.Exclusions...),
 	}
 	for _, file := range normalized.Artifacts {
+		if strings.TrimSpace(file.Path) != "" {
+			// PHASE 14: scope provenance is recorded from the artifacts that
+			// SURVIVED exclusion — the exact set the payload can be asked
+			// about. Token counts stay telemetry; this set is the semantic
+			// truth the provenance gate reads.
+			out.AdmittedPaths = appendUniqueStrings(out.AdmittedPaths, file.Path)
+		}
 		if file.Truncated && strings.TrimSpace(file.Path) != "" {
 			out.TruncatedFiles = append(out.TruncatedFiles, file.Path)
 		}
@@ -685,6 +697,40 @@ func (c *Compiler) evictOldestLocked() {
 	}
 	delete(c.cache, oldestKey)
 	delete(c.cacheOrder, oldestKey)
+}
+
+// InvalidateCache drops every compiled projection.
+//
+// PHASE 14 — BLOCKING INTENT REVISION. When the canonical intent is elevated
+// (a read-only classification becomes a mutation contract), every payload
+// compiled under the PREVIOUS intent is invalid by definition: a read-only
+// projection is not a mutation context, and reusing it would let a model judge
+// a workspace it was never shown. Flushing the cache makes that structurally
+// impossible instead of relying on the fingerprint happening to differ.
+//
+// The caller MUST re-compile under the new contract afterwards; the compiler
+// never guesses which contract is now active.
+func (c *Compiler) InvalidateCache() {
+	if c == nil {
+		return
+	}
+	c.ensureInitialized()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache = make(map[string]*CompiledContext)
+	c.cacheOrder = make(map[string]uint64)
+}
+
+// CacheSize reports the number of cached projections. It is telemetry for
+// observing the revision's effect, never an input to any decision.
+func (c *Compiler) CacheSize() int {
+	if c == nil {
+		return 0
+	}
+	c.ensureInitialized()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.cache)
 }
 
 func (c *Compiler) resolveTotal(in Input) (int, TokenBudget, error) {

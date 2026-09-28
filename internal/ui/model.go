@@ -2904,6 +2904,14 @@ func (m *model) setApplyError(text string) {
 // streaming freeze). ActivityTree entries are NOT populated here —
 // they are fed directly from the engine via handleEngineEvent for
 // typed events with real I/O metrics.
+//
+// ── PHASE 14: MAIN NARRATIVE / TRACE BOUNDARY ────────────────────────────
+// This is the single TUI subscriber choke point, and it enforces the evidence
+// boundary structurally: an infrastructure-telemetry line is routed to the Trace
+// Overlay (Alt+T) and NEVER appended to the Main Narrative, whatever handler
+// produced it and whatever visibility layer is active. The runtime still
+// generates every one of those events — the boundary moves information, it does
+// not discard it.
 func (m *model) logActivity(format string, args ...interface{}) {
 	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
 	// After /clear the surface is sealed until the next operation or user
@@ -2914,6 +2922,9 @@ func (m *model) logActivity(format string, args ...interface{}) {
 	}
 	msg := sanitizeIngressANSI(fmt.Sprintf(format, args...))
 	m.ingestTrace(msg)
+	if !IsUserFacingEvidence(msg) {
+		return
+	}
 	r := record{role: roleActivity, text: msg}
 	m.records = append(m.records, r)
 	if m.width > 0 {
@@ -3447,14 +3458,19 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		m.logActivity("[grant] %s: %s granted for %s (expires %s)",
 			p.GrantID, strings.Join(p.Capabilities, "+"), p.Scope, orNever(p.ExpiresAt))
 	case events.LoopTransitionPayload:
-		// One step of the autonomous loop. Failure transitions are shown like
-		// any other: the loop produces diagnosis, never termination.
-		m.logActivity("[loop] %s → %s (%s): %s",
+		// One step of the autonomous loop. It is INFRASTRUCTURE telemetry about
+		// the runtime's own state machine — the same fact the execution
+		// narrative panel already projects for the user — so it is written to
+		// the Trace Overlay only. logRuntimeDetail is the Trace-bound writer;
+		// logActivity's evidence guard is the backstop that makes the routing
+		// structural rather than a convention.
+		m.logRuntimeDetail("[loop] %s → %s (%s): %s",
 			p.From, p.To, p.Event, truncateForActivity(p.Reason))
 	case events.ContextCompiledPayload:
 		// The context intelligence layer compiled a structural understanding
-		// of an artifact: findings, not raw bytes.
-		m.logActivity("[context] compiled %s (%s): %d finding(s)",
+		// of an artifact: findings, not raw bytes. This is compiler telemetry;
+		// the user-facing context line is the execution details panel.
+		m.logRuntimeDetail("[context] compiled %s (%s): %d finding(s)",
 			p.Path, p.Kind, p.FindingCount)
 	case events.DecisionSurfacePayload:
 		// The TYPED proposal payload of a Zero-Token DecisionSurface. The
@@ -3462,13 +3478,15 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// structured line (never inferred from a log string). The interactive
 		// recovery surface itself renders from the authoritative boundary the
 		// driver parks with — this projection is observability + the guarantee
-		// that awaiting_human always has a published decision surface.
-		m.logActivity("[preflight] decision surface: %s — %s (%d option(s))",
+		// that awaiting_human always has a published decision surface. It is
+		// preflight TELEMETRY, so it is Trace-bound; the renderable decision
+		// surface is a separate, user-facing surface.
+		m.logRuntimeDetail("[preflight] decision surface: %s — %s (%d option(s))",
 			p.Target, truncateForActivity(p.Reason), len(p.Options))
 	case events.DecisionSurfaceLifecyclePayload:
-		m.logActivity("[preflight] decision_surface.%s: %s", p.State, truncateForActivity(p.Reason))
+		m.logRuntimeDetail("[preflight] decision_surface.%s: %s", p.State, truncateForActivity(p.Reason))
 	case events.PreflightEventPayload:
-		m.logActivity("[preflight] %s: %s (target=%s est=%d max=%d)",
+		m.logRuntimeDetail("[preflight] %s: %s (target=%s est=%d max=%d)",
 			p.State, truncateForActivity(p.Reason), p.Target, p.EstimatedTokens, p.MaxOutputTokens)
 		// ── PREFLIGHT COMPLETE: MANDATORY SYNCHRONOUS LAYOUT SYNC ──
 		// A completed preflight collapses its multi-line trace to a single
@@ -3481,6 +3499,15 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			m.refreshViewportContentImmediate()
 		}
 	case events.AutonomousLifecyclePayload:
+		// PHASE 14: the objective-authority verdict is infrastructure
+		// telemetry. It is Trace-bound by construction; the user-facing
+		// statement of an unproven objective arrives through the runtime's own
+		// user-facing failure message, which says what stopped and why.
+		if IsInfrastructureTelemetry(p.Reason) || strings.Contains(strings.ToLower(p.Reason), "unproven") ||
+			strings.Contains(strings.ToLower(p.Reason), "unsubstantiated") {
+			m.logRuntimeDetail("[autonomy] %s: %s", strings.TrimPrefix(ev.Type(), "autonomous."), truncateForActivity(p.Reason))
+			return
+		}
 		m.logActivity("[autonomy] %s: %s", strings.TrimPrefix(ev.Type(), "autonomous."), truncateForActivity(p.Reason))
 	}
 }

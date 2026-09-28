@@ -59,7 +59,23 @@ const (
 	// SubtypeNoOpObjectiveUnresolved: a NO_CHANGES_REQUIRED claim was
 	// contradicted by deterministic structural analysis — escalation trigger.
 	SubtypeNoOpObjectiveUnresolved FailureSubtype = "no_op_objective_unresolved"
+	// SubtypeZeroArtifacts: the provider stream COMPLETED and carried no valid
+	// artifact — it was prose (execution.ErrZeroArtifactsParsed). The response
+	// is a structured re-prompt under the SAME artifact contract. It is
+	// deliberately NOT a schema violation: switching a creation contract to a
+	// bounded SEARCH/REPLACE patch would ask the model for a patch against a
+	// file that does not exist.
+	SubtypeZeroArtifacts FailureSubtype = "zero_artifacts"
 )
+
+// isZeroArtifacts reports whether an observation carries the executor's
+// zero-artifact rejection. The executor's diagnostic is the typed transport for
+// the sentinel across the serializable observation boundary, exactly as the
+// AMBIGUOUS_ANCHOR and REDUNDANT_SYMBOL diagnostics are.
+func isZeroArtifacts(o autonomy.Observation) bool {
+	return strings.Contains(o.Diagnostic, execution.ErrZeroArtifactsParsed.Error()) ||
+		strings.Contains(o.Diagnostic, "raw model text is not an artifact")
+}
 
 // ErrRecoveryHalted is returned by typedRepair when the zero-trust matrix
 // forbids any further continuation. The driver converges to its terminal /
@@ -70,6 +86,14 @@ var ErrRecoveryHalted = errors.New("recovery halted by the zero-trust matrix")
 // human-gate outcomes are not failures; they classify to "" and never reach
 // the recovery path.
 func RecoverySubtype(o autonomy.Observation) FailureSubtype {
+	// PHASE 14: the zero-artifact rejection is checked FIRST. It arrives as an
+	// artifact_retryable_rejected outcome (a repromptable rejection), which
+	// would otherwise be classified as a schema violation and trigger the
+	// FULL_REWRITE → BOUNDED_PATCH transition — relabelling a creation contract
+	// as a patch contract that is structurally impossible to satisfy.
+	if isZeroArtifacts(o) {
+		return SubtypeZeroArtifacts
+	}
 	switch o.Outcome {
 	case autonomy.OutcomeTruncated:
 		return SubtypeOutputExhausted
@@ -284,6 +308,19 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 	case SubtypeWorkspaceDrift:
 		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
 			Reason: "workspace version changed between attempts — aborting stale run"}
+	case SubtypeZeroArtifacts:
+		// ONE structured re-prompt under the SAME artifact contract. The
+		// directive tells the model its prose was discarded; nothing about the
+		// contract changes, so a creation stays a creation. A second prose-only
+		// response exhausts the recovery cycles and escalates to the human
+		// rather than looping.
+		cyclesLeft := b.MaxRecoveryCycles <= 0 || o.RecoveryCycle < b.MaxRecoveryCycles
+		if !cyclesLeft {
+			return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+				Reason: "prose-only responses exhausted the recovery cycles — the model is not honouring the artifact contract; explicit re-scope required"}
+		}
+		return autonomy.LoopDecision{Action: autonomy.LoopRepair,
+			Reason: "zero artifacts parsed: structured re-prompt under the SAME artifact contract (no relabelling)"}
 	case SubtypeNoOpObjectiveUnresolved:
 		cyclesLeft := b.MaxRecoveryCycles <= 0 || o.RecoveryCycle < b.MaxRecoveryCycles
 		if !cyclesLeft {
@@ -379,6 +416,25 @@ func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.Loo
 		if attempt < 1 {
 			attempt = 1
 		}
+	}
+
+	// ── PHASE 14: ZERO-ARTIFACT STRUCTURED RE-PROMPT ────────────────────
+	// The stream COMPLETED and carried prose. The recovery re-prompts under the
+	// SAME artifact contract: the artifact shape, the recovery strategy label
+	// and the mutation strategy all travel through UNCHANGED, so a creation is
+	// never relabelled as a bounded patch (which would ask the model for a
+	// SEARCH/REPLACE block against a file that does not yet exist, burning a
+	// whole recovery cycle to prove it). Only the attempt counter and the
+	// evidence ledger change.
+	if sub == SubtypeZeroArtifacts {
+		next := req
+		next.RecoveryAttempt = attempt
+		next.RecoveryReason = "zero_artifacts: the completed stream carried prose, not an artifact — re-issue under the SAME artifact contract"
+		if o.ContractID != "" {
+			next.ParentContractID = o.ContractID
+		}
+		next.Evidence = joinEvidence(req.Evidence, execution.ZeroArtifactRepromptDirective(target, o.ArtifactShape))
+		return next, nil
 	}
 
 	next := req

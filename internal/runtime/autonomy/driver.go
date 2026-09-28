@@ -159,6 +159,28 @@ type Driver struct {
 	// substrate is the execution target — the single authority that executes
 	// Proposals. The Driver never mutates the filesystem directly.
 	substrate substrate.ProposalExecutor
+
+	// ── Objective Completion Authority (Phase 14) ────────────────────────
+	// objectiveAuthority is the ONLY authority permitted to say an objective was
+	// PROVEN. The Driver owns the loop, the executor owns execution, and the
+	// authority owns the transition into `completed` — the three roles are
+	// deliberately distinct so no single component can both do the work and
+	// declare it finished.
+	objectiveAuthority ObjectiveAuthority
+	// preTargets is the durable target state captured BEFORE the lifecycle's
+	// first dispatch. It is the only admissible evidence for an idempotent
+	// ("already satisfied") claim.
+	preTargets map[string]bool
+	// lastObjective caches the most recent authorization verdict for tests and
+	// structured telemetry. It is never consulted to decide anything.
+	lastObjective execution.ObjectiveEvaluation
+	// lastContract is the canonical TaskContract the last verdict was judged
+	// against. Keeping it adjacent to the verdict makes the pairing auditable.
+	lastContract execution.TaskContract
+	// intents is the lifecycle's ONE canonical intent authority. Preflight, the
+	// context compiler and the driver all read it, and only a blocking revision
+	// advances it — so no two components can hold conflicting intent states.
+	intents *autonomy.IntentAuthority
 }
 
 // Option configures the Driver during construction.
@@ -301,6 +323,9 @@ func NewDriver(adapter *ExecutorAdapter, bus *events.Bus, opts ...Option) *Drive
 		repair:       typedRepair,
 		decompose:    defaultDecompose,
 		globalVerify: defaultGlobalVerify,
+		// The completion authority is domain code with no UI dependency: the
+		// driver stays fully executable and testable headless.
+		objectiveAuthority: objectiveReducer{},
 	}
 	for _, o := range opts {
 		o(d)
@@ -346,6 +371,14 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.allowASTBypass = false
 	d.explicitOutputBudget = 0
 	d.syntheticSubGoal = ""
+	d.lastObjective = execution.ObjectiveEvaluation{}
+	d.lastContract = execution.TaskContract{}
+	d.preTargets = nil
+	// A fresh run is a fresh LIFECYCLE, and the canonical intent is per
+	// lifecycle. Reusing the previous run's authority would let an elevation
+	// leak into a read-only objective — the exact split-brain this authority
+	// exists to prevent, one run later.
+	d.intents = autonomy.NewIntentAuthority()
 	d.runRequestID = fmt.Sprintf("run-%d", d.runID)
 	d.loop.Start("user objective: " + objective)
 	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
@@ -401,6 +434,13 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 			d.mutationStrategy = StrategyBoundedPatch
 		}
 	}
+	// ── PHASE 14: PRE-EXECUTION TARGET PROVENANCE ─────────────────────
+	// Capture the durable target state BEFORE any dispatch. This is the only
+	// admissible evidence for an idempotent ("already satisfied") claim: a
+	// post-hoc reading cannot distinguish "already done" from "done by this
+	// run", and a completion authority that trusted one would rubber-stamp
+	// execution inertia.
+	d.capturePreExecutionTargets()
 	// Clear the callback after capturing it for this run.
 	d.streamCb = nil
 	if d.resolved.Ambiguous {
@@ -417,6 +457,29 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 		d.runCtx, d.runCancel = nil, nil
 		return nil, err
+	}
+	// ── PHASE 14: CANONICAL INTENT AUTHORITY ───────────────────────────
+	// Synchronize the lifecycle's ONE canonical intent before the loop
+	// observes anything. When the strategy gateway elevates a read-only
+	// classification to a mutation contract, this performs the blocking
+	// revision: the previous intent and every artefact derived from it are
+	// invalidated, the canonical intent is synchronized, and the workspace
+	// context is re-compiled under the modification contract. A re-compilation
+	// that cannot satisfy the contract parks the run instead of dispatching a
+	// mutation over a read-only context.
+	if err := d.syncCanonicalIntent(d.runCtx, objective); err != nil { //nolint:contextcheck // runCtx is the run's own cancellation context
+		canonical, _ := d.intentAuthority().Current()
+		d.loop.AwaitHuman(autonomy.HumanBoundary{
+			Reason: "canonical intent revision incomplete: " + err.Error() +
+				fmt.Sprintf(" — the run holds intent %q with no valid workspace context for it; re-scope the objective or grant an explicit mutation contract", canonical),
+			Targets: d.objectiveTargets(),
+		})
+		d.enrichBoundary()
+		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
+		// A parked run terminates nothing, exactly like the preflight-infeasible
+		// and NO-OP-escalation paths: the reason travels on the boundary, not
+		// as a raw error, so the human gets a decision instead of a stack.
+		return d.term(), nil //nolint:nilerr // the incomplete revision is a park, not a run failure
 	}
 	d.obs = d.contextObservation()
 	term, err := d.observeAndRun(d.runCtx, runID) //nolint:contextcheck // runCtx is the run's own cancellation context
@@ -594,6 +657,10 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	d.req.ParentContractID = ""
 	d.req.StagedPlan = nil
 	d.req.FocusStartLine, d.req.FocusEndLine = 0, 0
+	// A human-specified target replaces the declared set, so the pre-execution
+	// provenance is re-captured against the NEW target before dispatch. It is a
+	// first observation of a changed scope, not a refresh of an existing claim.
+	d.capturePreExecutionTargets()
 	d.obs = d.contextObservation()
 	d.loop.ReleaseHuman("target specified: " + target)
 	d.publish(ctx)
@@ -1105,6 +1172,14 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			d.obs.AttemptNum = d.loop.Attempts()
 			d.obs.RecoveryCycle = d.loop.RecoveryCycles()
 			decision := d.decide(d.obs, d.loop.Bounds())
+			// ── PHASE 14: OBJECTIVE COMPLETION AUTHORITY ────────────────
+			// The decision matrix proposes; the authority disposes. A proposed
+			// completion is rewritten into the terminal state that matches WHY
+			// the evidence failed, so `interpreting -> completed` is reachable
+			// only when the Task Contract was actually satisfied. A provider
+			// that returned, a step that came back nil and a verifier that
+			// merely ran are structurally incapable of producing it.
+			d.authorizeObjectiveCompletion(&decision)
 			// ── PHASE 12: CANONICAL CONTINUATION CONSULTATION ────────────
 			// An exhausted invocation is an INVOCATION outcome, not a task
 			// failure. Before the matrix acts on it, the pure continuation
@@ -1668,6 +1743,40 @@ func (d *Driver) emitAutonomousAborted(ctx context.Context, reason string) {
 	}
 	runID, contractID, target, workspace := d.driverFacts()
 	d.bus.Publish(events.NewAutonomousAborted(runID, contractID, target, workspace, reason))
+}
+
+// emitObjectiveUnsubstantiated publishes the objective-authority verdict as
+// INFRASTRUCTURE telemetry. It deliberately carries no user-facing evidence, so
+// the TUI subscriber boundary routes it to the Trace Overlay (Alt+T) and never
+// into the Main Narrative. The runtime source is unchanged; only the projection
+// filters.
+//
+// The line names the run, the contract kind, the contract identity, the target
+// and the exact clause that went unmet: a refusal a human cannot reconstruct
+// from the trace overlay is a refusal they have to take on faith.
+func (d *Driver) emitObjectiveUnsubstantiated(contract execution.TaskContract, evaluation execution.ObjectiveEvaluation) {
+	if d == nil || d.bus == nil {
+		return
+	}
+	runID, contractID, target, _ := d.driverFacts()
+	d.bus.Publish(events.NewActivity(fmt.Sprintf(
+		"[objective] run=%s contract_id=%s kind=%s target=%s outcome=%s clause=%s — %s",
+		orUnknownField(runID), orUnknownField(contractID), contract.Kind, orUnknownField(target),
+		evaluation.Outcome, orClause(evaluation.Clause), evaluation.Reason)))
+}
+
+func orUnknownField(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "unknown"
+	}
+	return value
+}
+
+func orClause(clause string) string {
+	if strings.TrimSpace(clause) == "" {
+		return "unspecified"
+	}
+	return clause
 }
 
 func (d *Driver) term() *autonomy.LoopTermination {

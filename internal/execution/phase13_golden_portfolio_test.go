@@ -318,7 +318,25 @@ func TestGolden_HeldCandidateRendersNoDiffStatistics(t *testing.T) {
 		t.Errorf("verification.completed emitted %d time(s) before authorization", n)
 	}
 	// A candidate WAS produced: the work is staged, not absent.
-	if n := collector.count(events.EventArtifactProduced); n == 0 {
+	//
+	// The event bus dispatches asynchronously, so the assertion waits for
+	// delivery instead of racing the dispatcher. Without the wait this
+	// assertion is a coin flip on a loaded machine: the event is always
+	// PUBLISHED, sometimes not yet DELIVERED when the test reads the collector.
+	if n := waitForEventCount(collector, events.EventArtifactProduced, 1, 2*time.Second); n == 0 {
 		t.Error("artifact.produced must be emitted for a held candidate")
+	}
+}
+
+// waitForEventCount polls the collector until it holds at least `want` events of
+// the given type, or the deadline expires. It returns the observed count.
+func waitForEventCount(c *phase4Collector, typ string, want int, timeout time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	for {
+		n := c.count(typ)
+		if n >= want || time.Now().After(deadline) {
+			return n
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }

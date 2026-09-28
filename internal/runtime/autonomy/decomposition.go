@@ -1026,12 +1026,16 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 	dag.Status = planner.DagExecutionCompleted
 	reason := fmt.Sprintf("decomposition executed atomically: %d/%d sub-tasks applied to %s (base digest %s… restored nowhere — all units landed)",
 		n, n, dag.Target, short(dag.BaseTreeDigest))
-	if _, err := d.step(ctx, autonomy.LoopDecision{
-		Action: autonomy.LoopComplete,
-		Reason: reason,
-	}); err != nil {
+	// ── PHASE 14: the DAG path is NOT exempt from the authority ────────────
+	// Every unit passed its own boundary and the aggregate audit passed, which
+	// is necessary but not sufficient: the units' deltas still have to satisfy
+	// the ONE canonical Task Contract before the run may claim completion. A
+	// plan whose units all no-op'd, or whose audit passed on an unchanged
+	// document, is refused here exactly as it would be on the monolithic path.
+	decision := autonomy.LoopDecision{Action: autonomy.LoopComplete, Reason: reason}
+	d.authorizeObjectiveCompletion(&decision)
+	if _, err := d.step(ctx, decision); err != nil && decision.Action == autonomy.LoopComplete {
 		d.loop.Complete(reason)
-		d.publish(ctx)
 	}
 	d.publish(ctx)
 	return d.term()

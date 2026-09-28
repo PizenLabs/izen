@@ -276,6 +276,14 @@ type ExecutionProof struct {
 	Verification     VerificationReport           `json:"verification"`
 	// AffectedFiles is the set of files a mutation execution actually mutated.
 	AffectedFiles []string `json:"affected_files,omitempty"`
+	// WorkspaceObservations counts the declared targets whose bytes this
+	// execution actually READ and projected into the provider request.
+	//
+	// PHASE 14: this is PROVENANCE, not telemetry. A read/review objective is
+	// only proven when the runtime can show the model looked at the workspace;
+	// a response-content heuristic can never establish that. Token counts are
+	// budget arithmetic and are deliberately NOT a substitute for this field.
+	WorkspaceObservations int `json:"workspace_observations"`
 	// DiffSummary is the compact per-file diff accounting of the mutation
 	// (e.g. "index.html +12/-4").
 	DiffSummary []string `json:"diff_summary,omitempty"`
@@ -911,6 +919,27 @@ func (x *RuntimeExecutor) nextID() string {
 	return fmt.Sprintf("exec-%d", x.counter.Add(1))
 }
 
+// countWorkspaceObservations reports how many of the declared targets this
+// execution actually read. It is the durable provenance evidence for a read or
+// review objective: the runtime can point at the bytes the model was given, not
+// at a token estimate. Token counts are budget arithmetic and are deliberately
+// NOT treated as a substitute for this fact.
+func (x *RuntimeExecutor) countWorkspaceObservations(targets []string) int {
+	if x == nil {
+		return 0
+	}
+	n := 0
+	for _, t := range targets {
+		if t == "" {
+			continue
+		}
+		if _, ok := x.getSnapshotContent(t); ok {
+			n++
+		}
+	}
+	return n
+}
+
 // ErrProviderModelMismatch is the deterministic error returned when the model
 // resolved for an invocation does not belong to the provider the executor is
 // bound to. It fires BEFORE any network call, so an OpenRouter model can never
@@ -1541,6 +1570,11 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// model.invoked, NO provider.response and NO artifact.produced — a failed
 	// execution must never emit a misleading success artifact.
 	if profile.Strategy != strategy.TargetedMutation {
+		// PHASE 14: record the workspace OBSERVATION provenance before the
+		// read-only dispatch. It is the only durable evidence that a read or
+		// review objective actually looked at the workspace instead of
+		// answering from priors.
+		res.Proof.WorkspaceObservations = x.countWorkspaceObservations(targets)
 		content, invs, ingTrace, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
 		if ingTrace != nil {
 			res.IngestionTrace = ingTrace
@@ -1648,6 +1682,7 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// Record the contract the attempt is actually dispatched under so the
 	// recovery matrix never has to guess it (see ArtifactShape).
 	res.ArtifactShape = profile.Artifact.Kind
+	res.Proof.WorkspaceObservations = x.countWorkspaceObservations(targets)
 	patches, invs, diffs, artCandidates, ingTrace, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
 	if err != nil && IsHallucinatedAnchorError(err) && req.RecoveryAttempt < 1 {
 		// A zero-match SEARCH is an engine-recoverable anchor hallucination.
@@ -2782,27 +2817,31 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			}
 			verbatim = materialized
 		}
+		// ── NO-OP SENTINEL (pre-validation, EVERY artifact contract) ─────
+		// A model that answers NO_CHANGES_REQUIRED has satisfied the OUTPUT
+		// CONTRACT — but the claim itself is NOT yet a verdict. The raw claim is
+		// propagated verbatim and classified by deterministic structural
+		// analysis against the exact content the model judged; the terminal
+		// sub-state (satisfied / requires review / unresolved) is selected at
+		// the convergence site. Burning the retry budget on prose-free
+		// compliant output is never the right outcome.
+		//
+		// The check is hoisted ABOVE the contract split because the sentinel is
+		// not a bounded-patch concept: under a full-artifact contract the token
+		// would otherwise be parsed as document CONTENT and written to the
+		// user's file. A claim is never an artifact, under any contract.
+		if claim, claimed := ExtractNoOpClaim(raw); claimed {
+			assessment := ClassifyNoOpClaim(req.Prompt, judgedContent)
+			log.Printf("[execution] request=%s target=%s artifact=no_op (%s) verdict=%s reason=%q",
+				requestID, target, claim.Sentinel, assessment.Verdict, assessment.Reason)
+			return nil, invs, diffs, candidates, trace, &NoOpClaimError{
+				Claim:      claim,
+				Assessment: assessment,
+				Target:     target,
+			}
+		}
 		var modified string
 		if patchOnly {
-			// NO-OP SENTINEL (pre-validation): a model that answers
-			// NO_CHANGES_REQUIRED has satisfied the OUTPUT CONTRACT of the
-			// bounded patch — but the claim itself is NOT yet a verdict. The
-			// raw claim is propagated verbatim and classified by deterministic
-			// structural analysis against the exact window the model judged;
-			// the terminal sub-state (satisfied / requires review /
-			// unresolved) is selected at the convergence site. Burning the
-			// retry budget on prose-free compliant output is never the right
-			// outcome.
-			if claim, claimed := ExtractNoOpClaim(raw); claimed {
-				assessment := ClassifyNoOpClaim(req.Prompt, judgedContent)
-				log.Printf("[execution] request=%s target=%s artifact=no_op (%s) verdict=%s reason=%q",
-					requestID, target, claim.Sentinel, assessment.Verdict, assessment.Reason)
-				return nil, invs, diffs, candidates, trace, &NoOpClaimError{
-					Claim:      claim,
-					Assessment: assessment,
-					Target:     target,
-				}
-			}
 			// Bounded-patch artifact boundary: extract ONLY structured patch
 			// representations. A full-file (or otherwise unstructured)
 			// response can NEVER satisfy this contract — rejecting it here is
@@ -2873,11 +2912,34 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 				}
 			}
 		} else {
+			// ── PHASE 14: RAW MODEL TEXT IS NOT AN ARTIFACT ─────────────
+			// The full-artifact contract asks for the replacement content of
+			// THIS file. A provider that completed its stream with a paragraph
+			// of prose satisfied the transport boundary and NOTHING else: there
+			// is no artifact, so there is nothing to write. The legacy path
+			// treated any unresolvable payload as the replacement body, which
+			// wrote the model's essay into the user's file and let the run
+			// report the objective satisfied — the canonical false completion.
+			//
+			// The parser is called ONLY on a COMPLETE stream: a truncated
+			// generation was already circuit-broken at Boundary 3 and its
+			// delivered prefix survives as a preserved candidate on
+			// res.ArtifactCandidates for the continuation path.
+			artifact, parseErr := ParseMutationArtifacts(verbatim)
+			if parseErr != nil {
+				// TYPED + REPROMPTABLE under the SAME artifact contract. The
+				// directive names the contract so the successor attempt is not
+				// silently relabelled — a creation stays a creation.
+				return nil, invs, diffs, candidates, trace, fmt.Errorf(
+					"%w: %w: %s: %w", ErrZeroArtifactsParsed, ErrArtifactRetryableRejected,
+					target, parseErr)
+			}
 			modified = ResolveModifiedContent(original, raw)
 			if modified == "" {
-				// The model returned only prose or a fence without content — treat
-				// the full response as the replacement attempt (best-effort).
-				modified = raw
+				// The payload carried a recognizable artifact but the content
+				// resolver produced nothing: fall back to the parsed body
+				// rather than to the raw stream.
+				modified = artifact.Content
 			}
 		}
 		if strings.TrimSpace(modified) == "" {

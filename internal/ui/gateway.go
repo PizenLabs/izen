@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -653,11 +654,22 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 }
 
 func runtimeExecutionFailureMessage(res *execution.ExecutionResult, err error) string {
+	// ── PHASE 14: THE OBJECTIVE TRUTH STATES ────────────────────────────
+	// A provider that returned, a step that came back nil and a verifier that
+	// merely ran are NOT completion. The runtime's own verdict on whether the
+	// Task Contract was satisfied is the first thing the user is told, and an
+	// unproven objective is reported as exactly that — never as a failure it did
+	// not have and never as a success it did not earn.
 	if res != nil && res.Proof != nil {
 		switch res.Proof.Outcome {
+		case execution.OutcomeNoOpObjectiveSatisfied:
+			return ObjectiveUnprovenMessage("the model reported no changes were required and structural analysis confirmed it")
 		case execution.OutcomeTruncated:
 			return "Execution stopped: provider output was truncated (finish_reason=length)."
 		case execution.OutcomeArtifactRetryableRejected:
+			if errors.Is(err, execution.ErrZeroArtifactsParsed) {
+				return "Execution stopped: the model returned prose instead of an artifact — no file was changed."
+			}
 			return "Execution stopped: artifact validation requested a model repair, but no recovery invocation was run in this workflow."
 		case execution.OutcomeArtifactRejected:
 			return "Execution failed: artifact rejected."
@@ -665,10 +677,29 @@ func runtimeExecutionFailureMessage(res *execution.ExecutionResult, err error) s
 			return "Escalated: the model reported no changes required, but structural analysis found the objective still unaddressed. A human must review this objective."
 		}
 	}
+	switch {
+	case errors.Is(err, execution.ErrZeroArtifactsParsed):
+		return "Execution stopped: the model returned prose instead of an artifact — no file was changed."
+	case errors.Is(err, execution.ErrObjectiveUnsubstantiated):
+		return ObjectiveUnprovenMessage("")
+	}
 	if err != nil {
 		return "Execution failed: " + err.Error()
 	}
 	return "Execution failed."
+}
+
+// ObjectiveUnprovenMessage is the single user-facing rendering of an
+// unsubstantiated objective. It is deliberately not worded as a failure: the
+// run was legal, the workspace was not corrupted, and nothing was proven. The
+// distinction matters to the person reading it — a failed task invites a retry,
+// an unproven one invites a look at what was actually delivered.
+func ObjectiveUnprovenMessage(detail string) string {
+	const base = "Execution stopped: objective was not proven."
+	if detail == "" {
+		return base
+	}
+	return base + " " + detail
 }
 
 // runPromptExecution routes a $prompt action through the unified gateway. It is
