@@ -23,12 +23,26 @@ import "strings"
 
 // InfrastructureTelemetryPrefixes are the canonical infrastructure tags. A
 // record whose FIRST token is one of them describes the runtime, not the work.
+//
+// PHASE 15 completed the set. The Phase 14 list covered the four families the
+// loop itself emitted, and two tags the runtime publishes through the SAME
+// activity channel were left out — which is precisely the failure mode this
+// classifier exists to prevent:
+//
+//	[grant]   a capability authorization. A reader who sees "read+mutate granted"
+//	          in the narrative is reading the authorization layer, not the work.
+//	[intent]  an intent parse or an intent revision. The canonical intent is an
+//	          internal authority state; surfacing it mid-run tells the reader the
+//	          system is still deciding WHAT it was asked to do, which is the worst
+//	          possible moment for that fact.
 var InfrastructureTelemetryPrefixes = []string{
 	"[loop]",      // autonomous loop transitions
 	"[context]",   // context-compilation summaries
 	"[barrier]",   // synchronization barrier waits
+	"[grant]",     // session capability authorizations
 	"[preflight]", // zero-token preflight decisions
 	"[index]",     // workspace index / AST mapping phases
+	"[intent]",    // intent classification and intent-revision transactions
 	"[objective]", // objective-authority verdicts
 }
 

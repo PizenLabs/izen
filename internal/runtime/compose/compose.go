@@ -841,6 +841,15 @@ func Wire(opts ...Option) (*Application, error) {
 		a.Bus,
 		runtimeAutonomy.WithPreflightBarrier(loopBarrier),
 		runtimeAutonomy.WithPreflightState(preflightState),
+		// PHASE 15: the grant-gated workspace context barrier. The session grant
+		// ledger is the AUTHORITATIVE source for the read+analyze+propose+mutate
+		// vector, and it is bound here — at composition time, not at run time —
+		// because production order is authorize-then-dispatch: the UI grants the
+		// capabilities and only then starts the loop. A driver that learned about
+		// grants from the event bus alone would never see that grant, and the
+		// context it froze would be exactly the starved one this barrier exists
+		// to prevent.
+		runtimeAutonomy.WithGrantLedger(a.Autonomy.Grants()),
 		// PASS 1 MANIFEST AUTO-HOOK: a preflight-infeasible target issues a
 		// lightweight READ-ONLY manifest request before the DAG strategy is
 		// determined, so the plan is scoped to the mutation surface and
@@ -941,6 +950,15 @@ func (a *Application) Close() {
 	}
 	if a.Builder != nil {
 		a.Builder.Close()
+	}
+	// The autonomous driver owns an event-bus subscription (the grant observer,
+	// which must outlive individual runs so a second run of a session still sees
+	// authorizations issued for it). Closing the driver here is what releases that
+	// dispatch goroutine; without it every composition root leaks one for the life
+	// of the process.
+	if a.Autonomous != nil {
+		a.Autonomous.Close()
+		a.Autonomous = nil
 	}
 	if a.Runtime != nil {
 		a.Runtime.Close()

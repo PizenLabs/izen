@@ -234,6 +234,19 @@ func (m *model) runGatedLine(line string) tea.Cmd {
 			if ev.Content != "" {
 				ch <- ReasoningChunkMsg{Chunk: ev.Content}
 			}
+		// ── PHASE 15: LIVE TOKEN TELEMETRY REACHES THE HUD ─────────────
+		// This event was previously dropped on the gated path, which is why the
+		// live counter froze for every mutation execution while the read-only
+		// stream path updated. It travels over the SAME channel as every other
+		// stream event rather than touching the HUD here: this callback runs on
+		// the executor's goroutine, and writing model state from it would race
+		// the render. The update loop applies it to the fixed HUD's context slot —
+		// a value the previous reading is still on screen to be compared against —
+		// and never to the conversation, where it would append a line per chunk.
+		case "stream_token":
+			if ev.Usage.Known {
+				ch <- hudUsageMsg{promptTokens: ev.Usage.PromptTokens}
+			}
 		case "done":
 			ch <- streamDoneMsg{
 				content:        ev.Content,

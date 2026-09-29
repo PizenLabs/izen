@@ -599,6 +599,17 @@ func (a *ExecutorAdapter) RecompileIntentContext(ctx context.Context, targets []
 	return a.executor.RecompileIntentContext(ctx, targets, intentLabel, required)
 }
 
+// RecompileGrantedIntentContext is the GRANT-GATED re-compilation: the same
+// revision, plus the non-empty-target-context acceptance condition a granted
+// workspace capability must satisfy. See the executor method for why the two
+// entry points are not interchangeable.
+func (a *ExecutorAdapter) RecompileGrantedIntentContext(ctx context.Context, targets []string, intentLabel, required string) (contextcompiler.ContextProvenance, error) {
+	if a == nil || a.executor == nil {
+		return contextcompiler.ContextProvenance{}, errors.New("autonomy: granted-context re-compilation requires an executor")
+	}
+	return a.executor.RecompileGrantedIntentContext(ctx, targets, intentLabel, required)
+}
+
 func firstTarget(targets []string) string {
 	if len(targets) == 0 {
 		return ""

@@ -2607,6 +2607,15 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 
 		system := boundedMutationSystemPrompt() + "\nSystem: You are strictly modifying ONE file: " + target + ". Do NOT output code or patches for any other files in this response."
 		outputContract := "full_file_or_patch"
+		// ── PHASE 15: EXPLICIT ARTIFACT CONTRACT ON THE SYSTEM CHANNEL ────
+		// The structural envelope is stated BEFORE the request goes out, not
+		// only re-stated after a prose-only response. The old prompts listed
+		// three acceptable shapes and left the choice to the model, which is
+		// precisely the ambiguity a fluent prose model resolves by answering
+		// in prose — and that prose then reached the artifact boundary as a
+		// non-artifact. One named envelope, stated once, removes the choice.
+		system += "\n\n" + StrictArtifactContractInstruction(
+			ContractKindForShape(profile.Artifact.Kind, original != ""), target)
 		// The target bytes are supplied as an explicit workspace file to the
 		// Context Compiler. Do not embed them a second time in the hand-built
 		// prompt: one authority owns projection, truncation and accounting.
@@ -2627,6 +2636,11 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		if patchOnly {
 			system = boundedPatchSystemPrompt() + "\nSystem: You are strictly modifying ONE file: " + target + ". Do NOT output code or patches for any other files in this response."
 			outputContract = "search_replace"
+			// PHASE 15: the bounded lane names the ONE envelope it will accept.
+			// Its recovery path (RMAH) already tolerates fenced code as a
+			// fallback, but the primary contract is unambiguous, so the model
+			// is told exactly which of them is the contract.
+			system += "\n\n" + StrictArtifactContractInstruction(ArtifactContractPatch, target)
 			// Bounded INPUT contract: the runtime — not the model — decides
 			// what crosses. Only one small line-aligned window of the target
 			// is shown as the copyable source; rotating it by attempt gives
@@ -3841,11 +3855,25 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		metadataUp = metadata
 	}
 	var lastUsage ai.ProviderUsage
+	// ── PHASE 15: STREAM TOKEN AGGREGATION ────────────────────────────
+	// The aggregator owns this stream's token account from the first live
+	// reading to the final flush. `lastUsage` remains the SNAPSHOT the executor
+	// reads on the happy path, and the aggregator is the authority that keeps the
+	// two from diverging: every reading is merged into both, and the deferred
+	// teardown below finalizes the aggregator, so a stream that terminates at the
+	// artifact boundary still commits the counts the provider already billed.
+	streamTokens := NewStreamTokenAggregator(model, began)
+	streamTokens.SetFlushRequest(func(prompt, completion, reasoning int) {
+		if g != nil {
+			g.UpdateUsage(model, prompt, completion, reasoning)
+		}
+	})
 	emitUsage := func() {
 		if usageUp == nil {
 			return
 		}
 		u := usageUp.Usage()
+		streamTokens.OnReading(u)
 		if !u.Known || u.Estimated {
 			return
 		}
@@ -3864,15 +3892,11 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	// character-count estimate of what crossed the boundary (prompt request
 	// bytes + accumulated content), explicitly marked Estimated. Either way
 	// the caller records real counts instead of a silent zero.
-	snapshotUsage := func() ai.ProviderUsage {
-		if usageUp != nil {
-			if u := usageUp.Usage(); u.Known {
-				return u
-			}
-		}
-		if lastUsage.Known {
-			return lastUsage
-		}
+	//
+	// PHASE 15: the aggregator is consulted FIRST, so a reading that arrived
+	// outside the chunk loop's emit path still counts. Estimating while a real
+	// reading is in hand is how an aggregate starts drifting from the invoice.
+	estimateUsage := func() ai.ProviderUsage {
 		out := ai.ProviderUsage{Known: true, Estimated: true}
 		promptChars := len(req.System)
 		for _, m := range req.Messages {
@@ -3886,6 +3910,20 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		}
 		out.TotalTokens = out.PromptTokens + out.CompletionTokens
 		return out
+	}
+	snapshotUsage := func() ai.ProviderUsage {
+		if live := streamTokens.Live(); live.Known {
+			return live
+		}
+		if usageUp != nil {
+			if u := usageUp.Usage(); u.Known {
+				return u
+			}
+		}
+		if lastUsage.Known {
+			return lastUsage
+		}
+		return estimateUsage()
 	}
 	// ── Phase 6.4.4 Always-Flush Telemetry & Live Token Accounting ────
 	// Optimistic Prompt Token Invariant: commit estimated prompt tokens to
@@ -3907,6 +3945,7 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		// 2181/0 prefix on a size-1 bus channel.
 		if u := usageUp.Usage(); u.Known && u.Estimated && u.PromptTokens > 0 && g != nil {
 			g.UpdateUsage(model, u.PromptTokens, 0, 0)
+			streamTokens.OnReading(u)
 			if !lastUsage.Known {
 				lastUsage = ai.ProviderUsage{Known: true, Estimated: true, PromptTokens: u.PromptTokens}
 			} else if lastUsage.PromptTokens == 0 {
@@ -3914,68 +3953,52 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			}
 		}
 	}
-	// Always-Flush: every exit path (success, failure, timeout, cancel)
-	// commits whatever the live accumulator observed. The deferred read
-	// happens AFTER the return values are set, so it observes the final
-	// partial content even when the SSE loop bailed on ctx deadline before
-	// any usage chunk. On success with genuinely unknown usage (no tracker,
-	// no counts) nothing is flushed — "unknown" stays unknown, never a
-	// fabricated zero. On error/timeout the character fallback applies so
-	// billed partial work is never silently zeroed.
+	// ── PHASE 15: ONE FINALIZATION, EVERY TERMINATION ─────────────────
+	// Always-Flush Invariant, restated as a single unconditional step: this
+	// deferred teardown runs on EVERY exit — success, artifact-boundary
+	// rejection, transport failure, timeout, cancellation — because it is a
+	// defer, not a branch someone has to remember to add.
+	//
+	// What it commits is the aggregator's settled account, which is a merge of
+	// every reading the provider made. Before this phase each exit path
+	// re-derived its own telemetry and a path that terminated on a contract
+	// error could return before the counts the provider had already billed were
+	// folded into the result; the aggregate then diverged from the invoice. Now
+	// the numbers are settled in exactly one place, and `Finalize` is idempotent
+	// so a terminator that finalized eagerly cannot double-count.
+	//
+	// The estimate fallback is admitted ONLY when the stream failed or was
+	// cancelled: a clean completion with no reported usage stays UNKNOWN, which
+	// is the honest rendering, while partial work on a dead stream is billed and
+	// must be recorded.
 	defer func() {
-		var live ai.ProviderUsage
-		hasLive := false
-		if usageUp != nil {
-			if u := usageUp.Usage(); u.Known {
-				live = u
-				hasLive = true
-			} else if lastUsage.Known {
-				live = lastUsage
-				hasLive = true
-			}
-		} else if lastUsage.Known {
-			live = lastUsage
-			hasLive = true
+		failed := err != nil || ctx.Err() != nil
+		var fallback ai.ProviderUsage
+		if failed {
+			fallback = estimateUsage()
 		}
-		if hasLive {
-			if live.PromptTokens != 0 || live.CompletionTokens != 0 {
-				needsFlush := err != nil || ctx.Err() != nil
-				if !needsFlush {
-					if live.PromptTokens != lastUsage.PromptTokens ||
-						live.CompletionTokens != lastUsage.CompletionTokens ||
-						live.ReasoningTokens != lastUsage.ReasoningTokens {
-						needsFlush = true
-					}
+		if !failed {
+			// A clean stream still has whatever the tracker last reported, and
+			// the aggregator is where that lives.
+			if usageUp != nil {
+				if u := usageUp.Usage(); u.Known {
+					streamTokens.OnReading(u)
 				}
-				if needsFlush && g != nil {
-					g.UpdateUsage(model, live.PromptTokens, live.CompletionTokens, live.ReasoningTokens)
-					lastUsage = live
-					if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
-						usage = live
-					}
-				}
-				return
 			}
+		}
+		final := streamTokens.Finalize(fallback)
+		if !final.Known {
 			return
 		}
-		// No live tracker data: only error/timeout paths fall back to the
-		// character estimate; success with unknown usage stays unknown.
-		if err == nil && ctx.Err() == nil {
+		if final.PromptTokens == 0 && final.CompletionTokens == 0 {
 			return
 		}
-		fallback := snapshotUsage()
-		if !fallback.Known {
-			return
-		}
-		if fallback.PromptTokens == 0 && fallback.CompletionTokens == 0 {
-			return
-		}
-		if g != nil {
-			g.UpdateUsage(model, fallback.PromptTokens, fallback.CompletionTokens, fallback.ReasoningTokens)
-			lastUsage = fallback
-			if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
-				usage = fallback
-			}
+		lastUsage = final
+		// The returned account is only overwritten when the caller established
+		// none: an explicit count from the happy path is more specific than the
+		// aggregate and must not be replaced by it.
+		if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+			usage = final
 		}
 	}()
 	firstToken := false
@@ -4040,14 +4063,20 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			emitUsage()
 			// D. Real-time streaming token accounting: emit estimated usage
 			// increments on every chunk so TUI counters update dynamically.
+			// PHASE 15: the published reading is the AGGREGATOR's merged view,
+			// not the raw tracker frame. A provider that seeds an estimated
+			// prompt baseline and then reports the authoritative total would
+			// otherwise make the live counter move backwards on the frame that
+			// actually settles the bill.
 			if usageUp != nil {
-				u := usageUp.Usage()
-				if streamCb != nil {
-					streamCb(StreamEvent{
-						RequestID: requestID,
-						Kind:      "stream_token",
-						Usage:     u,
-					})
+				if u := streamTokens.Live(); u.Known {
+					if streamCb != nil {
+						streamCb(StreamEvent{
+							RequestID: requestID,
+							Kind:      "stream_token",
+							Usage:     u,
+						})
+					}
 				}
 			}
 		}
@@ -4078,11 +4107,28 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		}
 	}
 
-	usage = lastUsage
+	// PHASE 15: the stream reached EOF, which is the ONE termination every
+	// successful run shares. The account is settled here — before any
+	// truncation gate, ingestion repair or artifact parse can return early —
+	// so no downstream decision about the artifact can change what the provider
+	// already billed. The deferred teardown below is then a no-op by design.
+	streamTokens.finished = time.Now()
 	if usageUp != nil {
 		if u := usageUp.Usage(); u.Known {
-			usage = u
+			streamTokens.OnReading(u)
 		}
+	}
+	if metadataUp != nil {
+		if md := metadataUp.ResponseMetadata(); md.Usage.Known {
+			streamTokens.OnReading(md.Usage)
+		}
+	}
+	settled := streamTokens.Finalize(ai.ProviderUsage{})
+	if settled.Known {
+		usage = settled
+		lastUsage = settled
+	} else {
+		usage = lastUsage
 	}
 	if metadataUp != nil {
 		responseMetadata = metadataUp.ResponseMetadata()

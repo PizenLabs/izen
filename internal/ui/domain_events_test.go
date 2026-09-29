@@ -16,55 +16,77 @@ import (
 )
 
 func TestHandleDomainEventProjection(t *testing.T) {
+	// ── PHASE 15 ──────────────────────────────────────────────────────
+	// `divert` marks the cases the Main Narrative / Trace boundary now owns. The
+	// runtime still publishes every one of these events verbatim; the projection
+	// reducer decides which surface each belongs on, and the `[intent]` family is
+	// part of the canonical infrastructure set: the internal intent authority
+	// telling the reader what it is still deciding is the last thing that belongs
+	// in front of them mid-run.
 	tests := []struct {
-		name string
-		ev   events.DomainEvent
-		want string
+		name   string
+		ev     events.DomainEvent
+		want   string
+		divert bool
 	}{
 		{"command received", events.NewCommandReceived("refactor LICENSE", "plan"),
-			"[plan] received command: refactor LICENSE"},
+			"[plan] received command: refactor LICENSE", false},
 		{"intent parsed", events.NewIntentParsed("direct_mutation", "refactor LICENSE", 1.0),
-			"[intent] parsed: direct_mutation (100% confidence)"},
+			"[intent] parsed: direct_mutation (100% confidence)", true},
 		{"plan staged", events.NewPlanStaged(3, []string{"a", "b", "c"}, "plan"),
-			"[plan] staged 3 tasks"},
+			"[plan] staged 3 tasks", false},
 		{"patch attempted", events.NewPatchAttempted("x.go", "ATOMIC_REPLACE", 2),
-			"[build] patch attempt 2: x.go (ATOMIC_REPLACE)"},
+			"[build] patch attempt 2: x.go (ATOMIC_REPLACE)", false},
 		{"patch applied", events.NewPatchApplied("x.go", 12, 4, 350*time.Millisecond),
-			"[build] applied patch to x.go (+12/-4 lines)"},
+			"[build] applied patch to x.go (+12/-4 lines)", false},
 		{"execution failed", events.NewExecutionFailed(events.FailureRecoverable, errors.New("boom"), "build.compilation"),
-			"[error] boom"},
+			"[error] boom", false},
 		{"self-healing attempt", events.NewSelfHealingAttempt(2, "worker.go", "TYPE_MISMATCH"),
-			"[RETRY 2] [TYPE_MISMATCH] worker.go"},
+			"[RETRY 2] [TYPE_MISMATCH] worker.go", false},
 		{"self-healing exhausted", events.NewSelfHealingExhausted(4, "./x.go:5: undefined: foo"),
-			"[EXHAUSTED] self-healing stopped after 4 attempt(s); workspace rolled back clean — ./x.go:5: undefined: foo"},
+			"[EXHAUSTED] self-healing stopped after 4 attempt(s); workspace rolled back clean — ./x.go:5: undefined: foo", false},
 		{"self-healing exhausted (empty output)", events.NewSelfHealingExhausted(3, "  \n\t\n"),
-			"[EXHAUSTED] self-healing stopped after 3 attempt(s); workspace rolled back clean"},
+			"[EXHAUSTED] self-healing stopped after 3 attempt(s); workspace rolled back clean", false},
 		{"stage completed", events.NewStageCompleted("review", 5*time.Millisecond, "ok"),
-			"[stage] review completed (ok)"},
+			"[stage] review completed (ok)", false},
 		{"engine activity", events.NewActivity("[ OK ] search \"query\": 3 results"),
-			"[ OK ] search \"query\": 3 results"},
+			"[ OK ] search \"query\": 3 results", false},
 		{"engine activity (multiline escapes)", events.NewActivity("step 1\\nstep 2\\tvalue"),
-			"step 1\\nstep 2\\tvalue"},
+			"step 1\\nstep 2\\tvalue", false},
 		{"intent classified", events.NewIntentClassified("build", "write a fix", 0.91, "en", "code mutation", false),
-			"[intent] classified: /build (91%, code mutation)"},
+			"[intent] classified: /build (91%, code mutation)", true},
 		{"intent classified (ambiguous)", events.NewIntentClassified("plan", "what should we do", 0.42, "en", "ambiguous request", true),
-			"[intent] ambiguous: /plan (42%, ambiguous request) — asking user"},
+			"[intent] ambiguous: /plan (42%, ambiguous request) — asking user", true},
 		{"patch parsed", events.NewPatchParsed("x.go", "STRUCTURED_DIFF", 1),
-			"[patch] parsed x.go (strategy=STRUCTURED_DIFF, tier=1)"},
+			"[patch] parsed x.go (strategy=STRUCTURED_DIFF, tier=1)", false},
 		{"patch validated", events.NewPatchValidated("x.go", "SEARCH_REPLACE", 2),
-			"[patch] validated x.go (strategy=SEARCH_REPLACE, tier=2)"},
+			"[patch] validated x.go (strategy=SEARCH_REPLACE, tier=2)", false},
 		{"patch rejected", events.NewPatchRejected("x.go", "unsafe full rewrite", 3),
-			"[patch] rejected x.go (tier 3): unsafe full rewrite"},
+			"[patch] rejected x.go (tier 3): unsafe full rewrite", false},
 		{"approval requested (tier 4)", events.NewApprovalRequested("x.go", "full-file rewrite needs approval", ""),
-			"[approval] requested for x.go: full-file rewrite needs approval"},
+			"[approval] requested for x.go: full-file rewrite needs approval", false},
 		{"approval requested (intent disambiguation)", events.NewApprovalRequested("", "unclear intent", ""),
-			"[approval] requested for intent disambiguation: unclear intent"},
+			"[approval] requested for intent disambiguation: unclear intent", false},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			m := &model{}
 			m.handleDomainEvent(tc.ev)
+
+			if tc.divert {
+				if len(m.records) != 0 {
+					t.Fatalf("infrastructure telemetry reached the narrative: %+v", m.records)
+				}
+				steps := m.projection().Trace().Steps()
+				if len(steps) != 1 {
+					t.Fatalf("trace steps = %d, want 1 (the boundary moves information)", len(steps))
+				}
+				if steps[0].Message != tc.want {
+					t.Errorf("trace message = %q, want the verbatim line %q", steps[0].Message, tc.want)
+				}
+				return
+			}
 
 			if len(m.records) != 1 {
 				t.Fatalf("got %d records, want 1", len(m.records))

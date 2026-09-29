@@ -3018,6 +3018,20 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		}
 		return m, m.readStream()
 
+	case hudUsageMsg:
+		// ── PHASE 15: IN-PLACE TELEMETRY REPLACE ──────────────────────
+		// A live provider reading on the gated execution path. It updates the
+		// fixed HUD slot and nothing else: no record, no viewport repaint churn,
+		// no second claim about the execution in the conversation. Dropping it (as
+		// this path previously did) is why the live counter froze for every
+		// mutation execution while the read-only path updated.
+		m.routeContextTokens(msg.promptTokens)
+		// Chain the next read so the telemetry behind this one keeps flowing.
+		if m.execStreaming {
+			return m, m.readExecStream()
+		}
+		return m, m.readStream()
+
 	case streamDoneMsg:
 		// ── AUTHORITATIVE STAGE: provider stream completed ─────────
 		// NO-TOKEN-LEFT-BEHIND: flush every ring-overflow token before the

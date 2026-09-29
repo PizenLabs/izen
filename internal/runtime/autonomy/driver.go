@@ -181,7 +181,49 @@ type Driver struct {
 	// context compiler and the driver all read it, and only a blocking revision
 	// advances it — so no two components can hold conflicting intent states.
 	intents *autonomy.IntentAuthority
+
+	// ── Contract Recovery Circuit Breaker (Phase 15) ─────────────────────
+	// contractRecoveries counts the strict-contract re-prompts this lifecycle has
+	// already spent on a prose-only (zero-artifact) response. It is reset per
+	// Run, incremented only when a re-prompt is actually dispatched, and read by
+	// authorizeContractRecovery to close the loop. See the constant below for
+	// why the bound exists at all.
+	contractRecoveries int
+	// contractRecoveryExhausted latches the terminal breaker condition so the
+	// unsubstantiated verdict is attributable to the contract, not to whatever
+	// the observation happened to say last.
+	contractRecoveryExhausted bool
+
+	// grants answers whether a full workspace capability grant is in force for
+	// this lifecycle (Phase 15). It is the signal that turns a granted workspace
+	// capability into a mandatory, synchronous context re-compilation before the
+	// preflight barrier is lowered. It is created ONCE with the driver, not per
+	// run: a grant issued immediately before the run — which is the common
+	// production order, authorize-then-dispatch — would be invisible to an
+	// observer that subscribed at run entry.
+	grants *grantObserver
+	// grantContextSynced records that the grant-gated re-compilation has already
+	// run for this lifecycle, so a resumed or re-driven loop does not re-invalidate
+	// the context the current attempt is already using.
+	grantContextSynced bool
 }
+
+// MaxContractRecoveryAttempts bounds how many times one execution lifecycle
+// re-prompts a model that answered a structural artifact contract with prose.
+//
+// Phase 14 made ErrZeroArtifactsParsed repromptable, which is correct: a single
+// prose response is a contract miss, not a task failure. An UNBOUNDED version of
+// the same thing is a different bug — a model that has settled on prose keeps
+// settling on prose, and each attempt spends real provider billing to confirm
+// it. Two is the bound because it separates "the model needed to be told" (one
+// re-prompt, after the Phase 15 system-channel contract) from "the model will
+// not speak this contract" (a human decision, not a retry).
+//
+// The bound is deliberately NOT a completion claim and NOT a failure: when it is
+// consumed the lifecycle terminates UNSUBSTANTIATED with
+// execution.ErrContractRecoveryExhausted, because the honest description of
+// that run is "the workspace was not changed and nothing was proven".
+const MaxContractRecoveryAttempts = 2
 
 // Option configures the Driver during construction.
 type Option func(*Driver)
@@ -243,6 +285,31 @@ func WithPreflightBarrier(b *loop.Barrier) Option {
 // WithPreflightState wires the Observation State where StructuralSnapshot is published.
 func WithPreflightState(s *preflight.ObservationState) Option {
 	return func(d *Driver) { d.preflightState = s }
+}
+
+// WithGrantLedger binds the authoritative session capability ledger to the
+// grant-gated context barrier (Phase 15).
+//
+// The ledger is consulted on every gate query, not snapshotted, so a grant issued
+// at any point in the run — including the common authorize-then-dispatch order,
+// where the grant strictly precedes the run — is visible to the gate. Passing nil
+// leaves the gate with the event bus alone, which still catches grants issued
+// while a run is in flight.
+func WithGrantLedger(l *autonomy.GrantLedger) Option {
+	return func(d *Driver) {
+		if d == nil {
+			return
+		}
+		// The observer already exists and already owns a bus subscription.
+		// Rebinding it is deliberate: constructing a replacement would orphan the
+		// first subscription, and a subscription owns a dispatch goroutine, so the
+		// driver would leak one per option application.
+		if d.grants == nil {
+			d.grants = newGrantObserver(d.bus, l)
+			return
+		}
+		d.grants.bindLedger(l)
+	}
 }
 
 // WithSubstrate wires the Substrate execution target. When set, the Driver
@@ -326,6 +393,7 @@ func NewDriver(adapter *ExecutorAdapter, bus *events.Bus, opts ...Option) *Drive
 		// The completion authority is domain code with no UI dependency: the
 		// driver stays fully executable and testable headless.
 		objectiveAuthority: objectiveReducer{},
+		grants:             newGrantObserver(bus, nil),
 	}
 	for _, o := range opts {
 		o(d)
@@ -374,11 +442,20 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.lastObjective = execution.ObjectiveEvaluation{}
 	d.lastContract = execution.TaskContract{}
 	d.preTargets = nil
+	d.contractRecoveries = 0
+	d.contractRecoveryExhausted = false
 	// A fresh run is a fresh LIFECYCLE, and the canonical intent is per
 	// lifecycle. Reusing the previous run's authority would let an elevation
 	// leak into a read-only objective — the exact split-brain this authority
 	// exists to prevent, one run later.
 	d.intents = autonomy.NewIntentAuthority()
+	// ── PHASE 15: GRANT OBSERVATION ──────────────────────────────────
+	// The per-lifecycle observation resets here; the subscription and the ledger
+	// binding live as long as the driver does. A fresh lifecycle observes only
+	// authorizations issued for it, so a grant issued for one objective cannot
+	// gate the context of an entirely different one.
+	d.grants.reset()
+	d.grantContextSynced = false
 	d.runRequestID = fmt.Sprintf("run-%d", d.runID)
 	d.loop.Start("user objective: " + objective)
 	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
@@ -391,7 +468,7 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	if contractErr != nil {
 		_, _ = d.loop.Abort("interaction contract binding failed: "+contractErr.Error(), autonomy.FailurePermanent)
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
-		d.runCtx, d.runCancel = nil, nil
+		d.releaseRunResources()
 		return nil, fmt.Errorf("autonomy: interaction contract: %w", contractErr)
 	}
 	// The strategy gateway is the deterministic authority for whether this
@@ -455,7 +532,7 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	if err := ValidateObjectiveContract(objective, interaction, interactionDescriptor); err != nil {
 		_, _ = d.loop.Abort("interaction contract authority ceiling: "+err.Error(), autonomy.FailurePermanent)
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
-		d.runCtx, d.runCancel = nil, nil
+		d.releaseRunResources()
 		return nil, err
 	}
 	// ── PHASE 14: CANONICAL INTENT AUTHORITY ───────────────────────────
@@ -564,7 +641,7 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 			d.loop.ReleaseHuman(reason)
 			d.publish(ctx)
 			term := d.terminateAbort(ctx, reason, autonomy.FailurePermanent)
-			d.runCtx, d.runCancel = nil, nil
+			d.releaseRunResources()
 			return term, nil
 		}
 		return d.term(), nil
@@ -582,7 +659,7 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 			reason += ": " + err.Error()
 		}
 		term := d.terminateAbort(ctx, reason, autonomy.FailurePermanent)
-		d.runCtx, d.runCancel = nil, nil
+		d.releaseRunResources()
 		return term, nil
 	}
 	d.runID++
@@ -615,7 +692,7 @@ func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.Loo
 			d.loop.ReleaseHuman(r)
 			d.publish(ctx)
 			term := d.terminateAbort(ctx, r, autonomy.FailurePermanent)
-			d.runCtx, d.runCancel = nil, nil
+			d.releaseRunResources()
 			return term, nil
 		}
 		return d.term(), nil
@@ -732,7 +809,7 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 		d.publish(ctx)
 		d.emitAutonomousAborted(ctx, "proposal cancelled: "+string(intent))
 		term := d.terminateAbort(ctx, "proposal cancelled: "+string(intent), autonomy.FailurePermanent)
-		d.runCtx, d.runCancel = nil, nil
+		d.releaseRunResources()
 		return term, nil
 	}
 	// ProposalInspect is a READ-ONLY HOLD: expose the diagnostics and remain
@@ -770,7 +847,7 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 		d.publish(ctx)
 		d.emitAutonomousAborted(ctx, "proposal anti-loop guard: "+string(intent))
 		term := d.terminateAbort(ctx, "proposal anti-loop guard: "+string(intent)+" failed without altering state", autonomy.FailurePermanent)
-		d.runCtx, d.runCancel = nil, nil
+		d.releaseRunResources()
 		return term, nil
 	}
 	// ── RECOVERY CREATES A NEW EXECUTION CONTRACT (invariant 9) ─────────
@@ -1023,6 +1100,67 @@ func (d *Driver) RunRequestID() string {
 	return d.runRequestID
 }
 
+// ContractRecoveryState reports the circuit breaker's accounting for the current
+// lifecycle: how many strict-contract re-prompts have been spent, the bound they
+// are spent against, and whether the terminal condition has latched. It is
+// observable state for telemetry and tests — it is never consulted to decide
+// anything; authorizeContractRecovery reads the counter directly.
+func (d *Driver) ContractRecoveryState() (used, limit int, exhausted bool) {
+	if d == nil {
+		return 0, MaxContractRecoveryAttempts, false
+	}
+	return d.contractRecoveries, MaxContractRecoveryAttempts, d.contractRecoveryExhausted
+}
+
+// authorizeContractRecovery is the CONTRACT RECOVERY CIRCUIT BREAKER. It runs on
+// every proposed decision, beside the completion authority, and closes the one
+// path Phase 14 deliberately left open: an unbounded re-prompt at a model that
+// does not speak the artifact contract.
+//
+// It is a MUTATION of the decision, not a veto, for the same reason the
+// completion authority mutates: the loop history must record the transition that
+// actually happened. A prose-only observation normally earns LoopRepair; once
+// MaxContractRecoveryAttempts re-prompts have been spent on it, the repair is
+// rewritten into LoopUnsubstantiate and the reason names
+// execution.ErrContractRecoveryExhausted, so the terminal state is
+// UNSUBSTANTIATED — the workspace was not changed, the transport was healthy, and
+// nothing was proven. That is neither a success nor a fabricated failure.
+func (d *Driver) authorizeContractRecovery(decision *autonomy.LoopDecision) {
+	if d == nil || decision == nil {
+		return
+	}
+	if RecoverySubtype(d.obs) != SubtypeZeroArtifacts {
+		return
+	}
+	if d.contractRecoveries < MaxContractRecoveryAttempts {
+		return
+	}
+	d.contractRecoveryExhausted = true
+	reason := fmt.Sprintf(
+		"objective UNSUBSTANTIATED (%s): %d strict artifact-contract re-prompt(s) were spent on %s and the provider still returned prose instead of a structural artifact — no file was changed",
+		execution.ErrContractRecoveryExhausted.Error(), d.contractRecoveries, contractRecoveryTarget(d.obs))
+	if d.bus != nil {
+		d.bus.Publish(events.NewActivity("[contract] recovery breaker: " + reason))
+	}
+	decision.Action = autonomy.LoopUnsubstantiate
+	decision.Reason = reason
+	// A contract the model will not speak is not a decision the human can make
+	// from a menu of re-scopes: every option in the proposal vocabulary re-prompts
+	// under some contract, and the contract is not the problem. Clearing the patch
+	// reference keeps the terminal state free of a held artifact nobody asked for.
+	decision.PatchID = ""
+}
+
+// contractRecoveryTarget names the target a prose-only response was attributed
+// to, for the terminal reason. It never carries response bytes (Recovery
+// Isolation): the model is told what it produced was discarded, not what it said.
+func contractRecoveryTarget(o autonomy.Observation) string {
+	if o.Target != "" {
+		return o.Target
+	}
+	return "the requested artifact"
+}
+
 // SetStreamCallback sets a callback for incremental streaming progress during
 // the next provider invocation. It is called by the UI before Run.
 func (d *Driver) SetStreamCallback(cb execution.StreamCallback) {
@@ -1111,6 +1249,21 @@ func (d *Driver) currentInteractionMetadata() (protocol.InteractionContract, *pr
 // gated by PreflightSyncBarrier (10s timeout → PREFLIGHT_TIMEOUT). This is the
 // execution invariant: async discovery never means unverified execution.
 func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.LoopTermination, error) {
+	// ── PHASE 15: GRANT-GATED CONTEXT BARRIER ───────────────────────────
+	// This is the LAST point before the loop can leave `observing`, and
+	// therefore the last point at which a context frozen before capability
+	// authorization could still be used. A granted workspace capability is
+	// turned into a freshly compiled, verified non-empty target context HERE,
+	// synchronously, and a failure parks the run instead of dispatching a model
+	// over a workspace it was never shown.
+	//
+	// It runs before the preflight barrier rather than after it on purpose: the
+	// barrier's whole purpose is to guarantee that no execution happens over
+	// unverified structure, and "unverified structure" includes an unpopulated
+	// prompt.
+	if err := d.syncGrantedWorkspaceContext(ctx); err != nil { //nolint:contextcheck // ctx is the run's own cancellation context
+		return d.parkOnGrantContextFailure(ctx, err), nil
+	}
 	if d.preflightBarrier != nil {
 		if d.bus != nil {
 			d.bus.Publish(events.NewActivity("[loop] observing (waiting preflight barrier)"))
@@ -1180,6 +1333,13 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// that returned, a step that came back nil and a verifier that
 			// merely ran are structurally incapable of producing it.
 			d.authorizeObjectiveCompletion(&decision)
+			// ── PHASE 15: CONTRACT RECOVERY CIRCUIT BREAKER ───────────────
+			// A prose-only response is repromptable, but only a bounded number
+			// of times. Once the bound is spent the proposed repair is rewritten
+			// into the terminal UNSUBSTANTIATED state, so the loop can neither
+			// claim the objective nor burn the remaining budget asking a model
+			// that has already declined to speak the contract twice.
+			d.authorizeContractRecovery(&decision)
 			// ── PHASE 12: CANONICAL CONTINUATION CONSULTATION ────────────
 			// An exhausted invocation is an INVOCATION outcome, not a task
 			// failure. Before the matrix acts on it, the pure continuation
@@ -1367,6 +1527,14 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				reason = fmt.Sprintf("re-scoped [%s] — re-execute", req.RecoveryStrategy)
 			}
 			d.req = req
+			// ── PHASE 15: SPEND THE CONTRACT RECOVERY BUDGET ───────────────
+			// The counter is incremented where the re-prompt is actually
+			// dispatched, not where the decision to re-prompt was proposed, so it
+			// measures real spend. A recovery that the matrix refused (and that
+			// therefore parked the run) never consumed a slot.
+			if RecoverySubtype(d.obs) == SubtypeZeroArtifacts {
+				d.contractRecoveries++
+			}
 			if _, err := d.step(ctx, autonomy.LoopDecision{
 				Action: autonomy.LoopContinue,
 				Reason: reason,

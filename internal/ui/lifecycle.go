@@ -150,6 +150,12 @@ func (m *model) clearExecutionActivity() {
 // execution that was just cleared can never repopulate the viewport.
 func (m *model) resetTransientInteraction() {
 	m.records = nil
+	// PHASE 15: the projection is the render input, so it must be cleared with it.
+	// Leaving a stale active node behind would make the first record of the new
+	// session merge into a step that belongs to the cleared one.
+	if m.narrative != nil {
+		m.narrative.Reset()
+	}
 	m.PreRenderedHistory = ""
 	m.showBanner = true
 	// A cleared document is not an extension of the old one: every per-frame

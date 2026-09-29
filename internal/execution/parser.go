@@ -46,6 +46,130 @@ import (
 // creation contract).
 var ErrZeroArtifactsParsed = errors.New("execution: zero artifacts parsed from a completed provider stream — raw model text is not an artifact")
 
+// ErrContractRecoveryExhausted is the terminal condition of the CONTRACT
+// RECOVERY CIRCUIT BREAKER (Phase 15).
+//
+// ErrZeroArtifactsParsed is a TYPED, REPROMPTABLE outcome, so a single prose
+// response must never end a run — but an UNBOUNDED re-prompt loop is the other
+// failure mode: a model that has decided to answer in prose will keep answering
+// in prose, and each retry spends real provider billing to learn nothing. The
+// breaker therefore bounds the recovery at a fixed number of attempts and, when
+// the bound is consumed, reports the objective as UNSUBSTANTIATED with this
+// reason.
+//
+// It is deliberately NOT a failure: the stream completed, the transport was
+// healthy, and the workspace was not modified. What failed is the model's
+// willingness to speak the artifact contract, and the human — not another retry
+// — is who decides what happens next.
+var ErrContractRecoveryExhausted = errors.New("execution: artifact contract recovery exhausted — the model did not honour the structural artifact contract within the bounded recovery limit")
+
+// ArtifactContractKind names the STRUCTURAL contract a mutation invocation must
+// satisfy. It is the vocabulary the system instruction and the recovery
+// circuit breaker speak, so "what shape must the answer take" is one named fact
+// rather than a shape string re-derived at three call sites.
+type ArtifactContractKind string
+
+const (
+	// ArtifactContractCreate: the target is new or empty; the artifact is the
+	// complete file body inside an explicit FILE_CREATE envelope.
+	ArtifactContractCreate ArtifactContractKind = "CREATE"
+	// ArtifactContractPatch: the target exists; the artifact is a bounded
+	// SEARCH/REPLACE block or a unified diff with @@ hunk headers.
+	ArtifactContractPatch ArtifactContractKind = "PATCH"
+	// ArtifactContractFile: the target exists; the artifact is the complete
+	// replacement body of the whole file.
+	ArtifactContractFile ArtifactContractKind = "FILE"
+	// ArtifactContractUnknown: no contract could be derived. Callers must treat
+	// it as "do not inject a contract instruction" rather than guessing.
+	ArtifactContractUnknown ArtifactContractKind = "UNKNOWN"
+)
+
+// StrictArtifactContractInstruction builds the EXPLICIT, NON-AMBIGUOUS system
+// instruction that forces the provider to emit a recognized structural artifact
+// block for a CREATE / PATCH / FILE contract.
+//
+// Why this exists as a system instruction rather than only a re-prompt
+// directive: a re-prompt arrives AFTER the contract has already been violated
+// once, so the first attempt is always dispatched against whatever the model
+// believes the format is. The most common cause of a prose-only response is
+// simply that the contract was never stated unambiguously — the model was told
+// what to DO and left to guess how to SAY it. Stating the envelope up front
+// makes the first attempt the one most likely to conform, and it is the only
+// placement that can prevent the failure rather than react to it.
+//
+// The instruction names ONE envelope. Offering three acceptable shapes is the
+// ambiguity this function exists to remove: a model that may choose freely
+// chooses prose, because prose is the shape it is most fluent in.
+func StrictArtifactContractInstruction(kind ArtifactContractKind, target string) string {
+	name := strings.TrimSpace(target)
+	if name == "" {
+		name = "the target file"
+	}
+	var envelope string
+	switch kind {
+	case ArtifactContractCreate:
+		envelope = "<<<<<<< FILE_CREATE " + name + "\n" +
+			"<the COMPLETE new file content, every line of it>\n" +
+			">>>>>>> END_FILE"
+	case ArtifactContractPatch:
+		envelope = "<<<<<<< SEARCH\n" +
+			"<consecutive lines copied BYTE-FOR-BYTE from " + name + ">\n" +
+			"=======\n" +
+			"<the replacement lines>\n" +
+			">>>>>>> REPLACE"
+	case ArtifactContractFile:
+		envelope = "```" + name + "\n" +
+			"<the COMPLETE replacement content of " + name + ">\n" +
+			"```"
+	default:
+		// An unknown contract injects nothing rather than guessing: a wrong
+		// envelope is worse than none, because it is authoritative to the model.
+		return ""
+	}
+	return "[ARTIFACT CONTRACT — " + string(kind) + "]\n" +
+		"Your entire response MUST be exactly this one block, with nothing before it, nothing after it, and no prose of any kind:\n\n" +
+		envelope + "\n\n" +
+		"Rules (each one is a hard requirement, not a preference):\n" +
+		"- Emit the block and NOTHING else. No summary, no explanation, no plan, no questions, no apology.\n" +
+		"- Do NOT wrap the block in any other fence, heading, list or blockquote.\n" +
+		"- The bytes inside the block ARE the change to " + name + ".\n" +
+		"- Prose is discarded at the artifact boundary: only the block's bytes reach the workspace.\n" +
+		"- If you believe no change is required, that belief is not a valid response; emit the block anyway."
+}
+
+// ContractKindForShape derives the structural contract an invocation must
+// satisfy from the artifact shape the executor dispatched under, and whether the
+// target already carries content.
+//
+// The two inputs are the whole decision and both are facts the runtime already
+// holds before the request goes out. Guessing the contract from the model's
+// output instead would make the instruction a function of the failure it is
+// meant to prevent.
+func ContractKindForShape(shape string, targetExists bool) ArtifactContractKind {
+	normalized := strings.ToLower(strings.TrimSpace(shape))
+	switch {
+	case creationShape(normalized):
+		return ArtifactContractCreate
+	case normalized == "search_replace", normalized == "replace_block",
+		normalized == "bounded_patch", normalized == "strict_patch",
+		normalized == "syntax_repair", normalized == "force_bounded_patch":
+		return ArtifactContractPatch
+	case normalized == "create_file", normalized == "create":
+		return ArtifactContractCreate
+	case normalized == "full_file", normalized == "full_rewrite",
+		normalized == "replace_file", normalized == "file":
+		if !targetExists {
+			return ArtifactContractCreate
+		}
+		return ArtifactContractFile
+	default:
+		if targetExists {
+			return ArtifactContractFile
+		}
+		return ArtifactContractCreate
+	}
+}
+
 // ArtifactForm names the recognized mutation-artifact representation a payload
 // carried. It is diagnostic metadata: it tells the recovery matrix WHICH
 // contract to re-prompt under, so a creation is never re-asked as a patch.

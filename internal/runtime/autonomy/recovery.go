@@ -124,6 +124,26 @@ func RecoverySubtype(o autonomy.Observation) FailureSubtype {
 	}
 }
 
+// zeroArtifactDecision is the ONE answer to "what does a prose-only response
+// earn". It is extracted so the early return that places it ahead of the generic
+// attempt hard-block and the switch case that keeps the subtype exhaustive cannot
+// drift apart.
+//
+// The recovery-cycle bound still applies, and it applies here: exhausting the
+// run's recovery budget is a lifecycle fact that outranks any subtype-specific
+// allowance. Within that budget the answer is a single structured re-prompt under
+// the SAME artifact contract, and the driver-level breaker
+// (MaxContractRecoveryAttempts) is what ultimately bounds it.
+func zeroArtifactDecision(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
+	cyclesLeft := b.MaxRecoveryCycles <= 0 || o.RecoveryCycle < b.MaxRecoveryCycles
+	if !cyclesLeft {
+		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+			Reason: "prose-only responses exhausted the recovery cycles — the model is not honouring the artifact contract; explicit re-scope required"}
+	}
+	return autonomy.LoopDecision{Action: autonomy.LoopRepair,
+		Reason: "zero artifacts parsed: structured re-prompt under the SAME artifact contract (no relabelling)"}
+}
+
 // transitionAvailable reports whether the I3 typed transition
 // (FULL_REWRITE → BOUNDED_PATCH) is still available for this lineage. The
 // observation's own RecoveryStrategy is the latch: once bounded_patch is set,
@@ -236,6 +256,18 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
 			Reason: "circuit-breaker: NonRetryableArtifactError (ambiguous anchors) — park at DecisionSurface awaiting_human [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization"}
 	}
+	// ── PHASE 15: THE ZERO-ARTIFACT PATH IS BOUNDED BY THE CONTRACT
+	// BREAKER, NOT BY THE GENERIC ATTEMPT COUNTER ─────────────────────
+	// A prose-only response is a CONTRACT miss, and the contract breaker in the
+	// driver (MaxContractRecoveryAttempts) is the authority that bounds it. It has
+	// to be consulted before the generic `AttemptNum >= 2` hard-block below,
+	// because that block exists to stop repeated schema/anchor churn and would
+	// otherwise end every prose-only run after a single re-prompt — reporting a
+	// decision-surface park for a problem the breaker is designed to characterise
+	// honestly.
+	if RecoverySubtype(o) == SubtypeZeroArtifacts {
+		return zeroArtifactDecision(o, b)
+	}
 	// HARD-BLOCK: FormatFailureCount >=2 or Ambiguous == true → park at DecisionSurface awaiting_human
 	// Do NOT issue a re-scoped [bounded_patch] retry. Immediately park.
 	if o.AttemptNum >= 2 || o.RecoveryCycle >= 2 {
@@ -309,18 +341,11 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
 			Reason: "workspace version changed between attempts — aborting stale run"}
 	case SubtypeZeroArtifacts:
-		// ONE structured re-prompt under the SAME artifact contract. The
-		// directive tells the model its prose was discarded; nothing about the
-		// contract changes, so a creation stays a creation. A second prose-only
-		// response exhausts the recovery cycles and escalates to the human
-		// rather than looping.
-		cyclesLeft := b.MaxRecoveryCycles <= 0 || o.RecoveryCycle < b.MaxRecoveryCycles
-		if !cyclesLeft {
-			return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
-				Reason: "prose-only responses exhausted the recovery cycles — the model is not honouring the artifact contract; explicit re-scope required"}
-		}
-		return autonomy.LoopDecision{Action: autonomy.LoopRepair,
-			Reason: "zero artifacts parsed: structured re-prompt under the SAME artifact contract (no relabelling)"}
+		// Reached only if the early return above is ever removed. Delegating to the
+		// same helper rather than inlining a second copy is what makes that removal
+		// safe: there is one answer to "what does a prose-only response earn", and a
+		// reordering cannot leave a divergent branch behind.
+		return zeroArtifactDecision(o, b)
 	case SubtypeNoOpObjectiveUnresolved:
 		cyclesLeft := b.MaxRecoveryCycles <= 0 || o.RecoveryCycle < b.MaxRecoveryCycles
 		if !cyclesLeft {
@@ -395,6 +420,37 @@ func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.Loo
 	if isNonRetryableAmbiguous(o) {
 		return req, fmt.Errorf("%w: circuit-breaker NonRetryableArtifactError ambiguous anchors for %s — park at DecisionSurface awaiting_human [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrRecoveryHalted, o.Target)
 	}
+	target := recoveryTarget(o, req)
+	// ── PHASE 14/15: ZERO-ARTIFACT STRUCTURED RE-PROMPT ────────────────
+	// The stream COMPLETED and carried prose. The recovery re-prompts under the
+	// SAME artifact contract: the artifact shape, the recovery strategy label
+	// and the mutation strategy all travel through UNCHANGED, so a creation is
+	// never relabelled as a bounded patch (which would ask the model for a
+	// SEARCH/REPLACE block against a file that does not yet exist, burning a
+	// whole recovery cycle to prove it). Only the attempt counter and the
+	// evidence ledger change.
+	//
+	// This branch is placed BEFORE the generic `AttemptNum >= 2` hard-block for
+	// the same reason it is early in DecideRecovery: the bound on a contract miss
+	// is MaxContractRecoveryAttempts, owned by the driver's breaker, not the
+	// generic attempt counter that guards schema and anchor churn. Reaching the
+	// hard-block here would park a prose-only run after one re-prompt and report
+	// a re-scope decision the human cannot act on.
+	//
+	// The run's recovery-cycle budget is enforced upstream, in DecideRecovery,
+	// which is the only function that receives the bounds. This function cannot
+	// re-check it, and duplicating the rule without the bounds would make the two
+	// copies disagree.
+	if RecoverySubtype(o) == SubtypeZeroArtifacts {
+		next := req
+		next.RecoveryAttempt = recoveryAttempt(o, req)
+		next.RecoveryReason = "zero_artifacts: the completed stream carried prose, not an artifact — re-issue under the SAME artifact contract"
+		if o.ContractID != "" {
+			next.ParentContractID = o.ContractID
+		}
+		next.Evidence = joinEvidence(req.Evidence, execution.ZeroArtifactRepromptDirective(target, o.ArtifactShape))
+		return next, nil
+	}
 	// HARD-BLOCK: FormatFailureCount >=2 or Ambiguous → no bounded_patch retry
 	if o.AttemptNum >= 2 || o.RecoveryCycle >= 2 {
 		return req, fmt.Errorf("%w: hard-block format failures >=2 for %s — park at DecisionSurface awaiting_human", ErrRecoveryHalted, o.Target)
@@ -403,39 +459,7 @@ func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.Loo
 		return req, fmt.Errorf("%w: hard-block ambiguous for %s — park at DecisionSurface awaiting_human [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization", ErrRecoveryHalted, o.Target)
 	}
 	sub := RecoverySubtype(o)
-	target := o.Target
-	if target == "" {
-		target = firstTarget(req.Targets)
-		if target == "" {
-			target = req.Target
-		}
-	}
-	attempt := o.AttemptNum + 1
-	if attempt < 1 {
-		attempt = req.RecoveryAttempt + 1
-		if attempt < 1 {
-			attempt = 1
-		}
-	}
-
-	// ── PHASE 14: ZERO-ARTIFACT STRUCTURED RE-PROMPT ────────────────────
-	// The stream COMPLETED and carried prose. The recovery re-prompts under the
-	// SAME artifact contract: the artifact shape, the recovery strategy label
-	// and the mutation strategy all travel through UNCHANGED, so a creation is
-	// never relabelled as a bounded patch (which would ask the model for a
-	// SEARCH/REPLACE block against a file that does not yet exist, burning a
-	// whole recovery cycle to prove it). Only the attempt counter and the
-	// evidence ledger change.
-	if sub == SubtypeZeroArtifacts {
-		next := req
-		next.RecoveryAttempt = attempt
-		next.RecoveryReason = "zero_artifacts: the completed stream carried prose, not an artifact — re-issue under the SAME artifact contract"
-		if o.ContractID != "" {
-			next.ParentContractID = o.ContractID
-		}
-		next.Evidence = joinEvidence(req.Evidence, execution.ZeroArtifactRepromptDirective(target, o.ArtifactShape))
-		return next, nil
-	}
+	attempt := recoveryAttempt(o, req)
 
 	next := req
 	next.RequestID = req.RequestID
@@ -523,6 +547,36 @@ func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.Loo
 	default:
 		return req, fmt.Errorf("%w: subtype %q is not automatically recoverable", ErrRecoveryHalted, sub)
 	}
+}
+
+// recoveryTarget names the artifact a recovery is re-scoping. It prefers the
+// observation's own resolved target and falls back to the request's declared
+// set, so a diagnostic never renders an empty target just because the executor
+// reported the failure without echoing one back.
+func recoveryTarget(o autonomy.Observation, req autonomy.LoopRequest) string {
+	if target := strings.TrimSpace(o.Target); target != "" {
+		return target
+	}
+	if target := firstTarget(req.Targets); target != "" {
+		return target
+	}
+	return req.Target
+}
+
+// recoveryAttempt derives the child attempt number for a continuation. The
+// loop's own counter is authoritative when it is set; the request's counter is
+// the fallback for an observation that reached the matrix without one; and 1 is
+// the floor, because attempt 0 would collide with the initial dispatch's
+// identity and silently collapse a recovery into the attempt it is recovering
+// from.
+func recoveryAttempt(o autonomy.Observation, req autonomy.LoopRequest) int {
+	if attempt := o.AttemptNum + 1; attempt >= 1 {
+		return attempt
+	}
+	if attempt := req.RecoveryAttempt + 1; attempt >= 1 {
+		return attempt
+	}
+	return 1
 }
 
 // joinEvidence appends a bounded advisory line to the evidence ledger. Only

@@ -1186,6 +1186,17 @@ type model struct {
 	showTraceOverlay bool
 	// telemetryDemuxer isolates internal execution loop events into a Trace Buffer.
 	telemetryDemuxer *TelemetryDemuxer
+	// narrative is the Projection Reducer that owns the Main Viewport's two-tier
+	// state (sealed history + one active node) and diverts infrastructure
+	// telemetry to Trace. It is the single ingestion authority for records: push
+	// and logActivity both route through it, so the narrative filter, the step
+	// classification and the single-active-node invariant cannot be bypassed by
+	// a call site that forgets a rule. Nil until first use; see projection().
+	narrative *ProjectionReducer
+	// hud is the fixed in-place telemetry surface (context tokens, cost, MCP
+	// status). Telemetry lives here and nowhere else, so a live counter can never
+	// append a line to the conversation. Nil until first use.
+	hud *SidebarHUD
 	// traceVerbose is the model-local verbosity toggle mirrored into the
 	// package-level TraceVerbose flag used by layout/stream renderers.
 	traceVerbose bool
@@ -2921,12 +2932,20 @@ func (m *model) logActivity(format string, args ...interface{}) {
 		return
 	}
 	msg := sanitizeIngressANSI(fmt.Sprintf(format, args...))
-	m.ingestTrace(msg)
-	if !IsUserFacingEvidence(msg) {
+	// ── PHASE 15: ONE INGESTION AUTHORITY ─────────────────────────────
+	// logActivity, push and pushRecords converge on the same reducer, so the
+	// narrative / trace boundary has exactly one enforcement point. The reducer
+	// diverts a machine line to Trace AND refuses it the narrative in the same
+	// step, so this function decides nothing: it asks, and obeys. Keeping a local
+	// pre-check here would be a second copy of the policy, and two copies drift.
+	//
+	// A refused record short-circuits the redraw entirely. There is nothing new on
+	// screen to show, and repainting on a machine line is exactly the jitter the
+	// projection exists to remove.
+	if !m.commitRecord(record{role: roleActivity, text: msg, turnID: m.currentTurnID}) {
 		return
 	}
-	r := record{role: roleActivity, text: msg}
-	m.records = append(m.records, r)
+	r := m.records[len(m.records)-1]
 	if m.width > 0 {
 		rendered := m.renderRecordForViewport(r)
 		if rendered != "" {
@@ -3002,9 +3021,18 @@ func (m *model) logRuntimeDetail(format string, args ...interface{}) {
 // ingestion point so every execution-state source — activity, runtime detail,
 // boundary reasons — lands in Trace exactly once and in the same order it was
 // produced.
+//
+// It creates the demuxer on demand. A nil-buffer early return here would be the
+// one outcome the narrative/trace boundary must never produce: infrastructure
+// telemetry that is correctly refused by the narrative AND silently dropped by
+// Trace is information that ceased to exist. Whichever caller reaches Trace first
+// owns creating the buffer.
 func (m *model) ingestTrace(line string) {
-	if m.telemetryDemuxer == nil || strings.TrimSpace(line) == "" {
+	if m == nil || strings.TrimSpace(line) == "" {
 		return
+	}
+	if m.telemetryDemuxer == nil {
+		m.telemetryDemuxer = NewTelemetryDemuxer()
 	}
 	m.telemetryDemuxer.Ingest(line)
 }
@@ -4230,14 +4258,18 @@ func (m *model) push(r role, text string) {
 	if isBoundedPatchRecovery(text) {
 		text = RenderBoundedPatchRecoveryBadge()
 	}
-	if m.telemetryDemuxer == nil {
-		m.telemetryDemuxer = NewTelemetryDemuxer()
-	}
-	m.telemetryDemuxer.Ingest(text)
-
-	rec := record{role: r, text: text, turnID: m.currentTurnID}
-	m.records = append(m.records, rec)
-	m.cacheRecordToHistory(rec)
+	// ── PHASE 15: PROJECTION REDUCER IS THE INGESTION AUTHORITY ───────
+	// Every record — from a domain event, a stream delta, a slash command or a
+	// handler nobody has written yet — crosses the reducer before it can reach
+	// the Main Viewport. That is where the narrative/trace boundary is enforced,
+	// where a machine line is diverted to Trace, and where the Single Active Node
+	// Invariant collapses a step that restates itself into one node.
+	//
+	// Refusing here is not a filter layered on top of a policy: it is the policy.
+	// There is no second path into m.records, and m.records stays in exact
+	// correspondence with the projection, so what the reducer deduped is what the
+	// viewport, the hit map and selection all see.
+	m.commitRecord(record{role: r, text: text, turnID: m.currentTurnID})
 }
 
 // sanitizeIngressANSI is the ingress filter for external stream ingestion.
@@ -4682,13 +4714,18 @@ func wrapIndentedLine(text string, maxWidth int) []string {
 	return result
 }
 
-// pushRecords appends multiple records.
+// pushRecords appends multiple records through the SAME projection gate as
+// push and logActivity.
+//
+// It used to write `m.records` directly, which made it a second ingestion path
+// that could put a machine line into the narrative regardless of the boundary
+// policy. A bulk path is exactly where such a bypass hides, because the author
+// is copying a loop they have already seen work.
 func (m *model) pushRecords(recs []record) {
 	for _, rec := range recs {
 		rec.text = SanitizeForIngest(rec.text)
 		rec.text = sanitizeIngressANSI(rec.text)
-		m.records = append(m.records, rec)
-		m.cacheRecordToHistory(rec)
+		m.commitRecord(rec)
 	}
 }
 
@@ -5994,6 +6031,18 @@ func (m *model) renderTailPanelLines() []string {
 				b.WriteString("\n")
 			}
 		}
+	}
+
+	// ── Sidebar HUD: fixed in-place telemetry (Phase 15) ───────────
+	// Context tokens, cost and MCP status live HERE and nowhere else. Each slot is
+	// rewritten in place on every update, so the block's geometry never changes and
+	// the conversation above it is never displaced by a counter ticking over.
+	// Rendering it in the tail rather than the document is what makes that true:
+	// the document is append-only history, and a value that appends is not a value
+	// anyone can read.
+	if hud := m.renderSidebarHUD(); hud != "" {
+		b.WriteString(hud)
+		b.WriteString("\n")
 	}
 
 	// ── Inline Loading Dock (shimmer) ──────────────────────────────
