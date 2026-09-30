@@ -86,6 +86,23 @@ func (a *ExecutorAdapter) Root() string {
 	return a.root
 }
 
+// PreflightTarget is the adapter's Phase 16.1 target-resolution seam for the
+// pre-flight admission gate. It delegates to the executor's resolver (pure
+// os.Stat classification plus ISOLATED discovery) so the gate and the executor
+// see the SAME target verdict. The adapter never scans a workspace itself and
+// never grants authority: discovery candidates travel as evidence only (I13).
+func (a *ExecutorAdapter) PreflightTarget(ctx context.Context, prompt string, explicit []string) execution.TargetBindingResult {
+	if a == nil || a.executor == nil {
+		return execution.TargetBindingResult{
+			Status: execution.BindingUnresolved,
+			Phase:  execution.PhaseUnsubstantiated,
+			State:  execution.TargetStateUnboundPath,
+			Reason: "no executor is bound to the adapter; target evidence is impossible",
+		}
+	}
+	return a.executor.ResolveMutationTarget(ctx, prompt, explicit)
+}
+
 // Resolve determines the execution target set for an objective WITHOUT
 // executing. It surfaces HumanClarification as an ambiguous resolution so the
 // driver parks before any model call or mutation.

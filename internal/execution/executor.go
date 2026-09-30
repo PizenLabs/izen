@@ -318,6 +318,15 @@ type ExecutionProof struct {
 	ContextID       string `json:"context_id,omitempty"`
 	ContextDigest   string `json:"context_digest,omitempty"`
 	ContextParentID string `json:"context_parent_id,omitempty"`
+	// TargetBinding is the Phase 16 evidence record for WHERE this execution
+	// was allowed to act. It is present whenever the target resolver ran, and
+	// it is the only thing that authorises a mutation: a dispatch with no
+	// TargetBinding behind it has no proven destination.
+	//
+	// A halted execution keeps its record. "The target was ambiguous, and here
+	// are the three files it could have been" is actionable evidence; a bare
+	// cancellation is not.
+	TargetBinding *TargetBindingResult `json:"target_binding,omitempty"`
 	// Contract identity (Phase 2 P2): WHICH unique execution intent ran and
 	// WHICH invocation attempt of it. The identity is computed at admission
 	// from the sealed context + strategy + targets — retries keep the
@@ -412,6 +421,14 @@ type ExecutionResult struct {
 	// ClarificationRequired is true when the strategy demanded human input
 	// before any model call or mutation. No invocation occurred.
 	ClarificationRequired bool
+	// TargetBinding is the Phase 16 evidence-bound target verdict: the proven
+	// TargetBinding a mutation dispatch was authorised against, or the
+	// deterministic refusal that stopped it. It is nil only for executions that
+	// never needed a mutation target (read-only objectives).
+	//
+	// A UI that renders a mutation objective reads THIS, never the target list:
+	// a target list can be non-empty and still unproven.
+	TargetBinding *TargetBindingResult
 	// Mutations records the applied mutation evidence (populated after Approve).
 	Mutations []MutationEvidence
 	// Verification is the real verifier result (populated after Approve).
@@ -571,6 +588,16 @@ type RuntimeExecutor struct {
 	// prompt (buildManifestPrompt) at bootstrap via SetManifestSystemPrompt; a
 	// direct InvokeManifestPass call without injection keeps the default.
 	manifestSystemPromptOverride string
+	// targetResolver is the Phase 16 evidence-bound target resolver. It sits
+	// between Admission and the ContextCompiler: admission decides whether the
+	// objective may act, the resolver decides WHERE it may act. They are
+	// separate questions, and answering the second with the first is how an
+	// authorized-but-untargeted objective reached the provider.
+	targetResolver *TargetResolver
+	// binder is the Phase 16 strict artifact binder. It sits between the
+	// artifact PARSER and the MUTATION ENGINE, and it is the only component
+	// allowed to answer "is this artifact allowed to be applied here".
+	binder *ArtifactBinder
 
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
@@ -607,6 +634,8 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		artifactValidator: validator,
 		contextCompiler:   &contextcompiler.Compiler{},
 		pending:           make(map[string]*pendingMutation),
+		targetResolver:    NewTargetResolver(root),
+		binder:            NewArtifactBinder(root),
 	}
 	x.admission.SetAuditSink(x.emitAdmissionAudit)
 	// Wire the normalizer to consume the observe snapshot cache, eliminating
@@ -675,6 +704,78 @@ func (x *RuntimeExecutor) resolveSnapshotPath(target string) string {
 		return filepath.Clean(target)
 	}
 	return filepath.Join(x.root, target)
+}
+
+// targetBindingResolver returns the Phase 16 target resolver, constructing it
+// on first use. A nil resolver is repaired rather than tolerated: a mutation
+// objective with no resolver would have no target evidence at all, and silently
+// skipping the step is the exact defect this component was added to remove.
+func (x *RuntimeExecutor) targetBindingResolver() *TargetResolver {
+	if x == nil {
+		return nil
+	}
+	if x.targetResolver == nil {
+		x.targetResolver = NewTargetResolver(x.root)
+	}
+	return x.targetResolver
+}
+
+// SetTargetResolver replaces the Phase 16 target resolver. It is the injection
+// seam that lets a composition root or a test observe exactly which evidence
+// produced (or failed to produce) a dispatchable target.
+func (x *RuntimeExecutor) SetTargetResolver(r *TargetResolver) {
+	if x == nil {
+		return
+	}
+	x.targetResolver = r
+}
+
+// ResolveMutationTarget is the Phase 16.1 target-resolution seam: it classifies
+// the stated target set (I11) and, when nothing is stated, returns a
+// disambiguation request over discovery evidence. It is exported so the
+// autonomy pre-flight admission gate can evaluate admission BEFORE any planning
+// or provider call — the gate must see the same verdict the executor would.
+func (x *RuntimeExecutor) ResolveMutationTarget(ctx context.Context, prompt string, explicit []string) TargetBindingResult {
+	if x == nil {
+		return TargetBindingResult{
+			Status: BindingUnresolved,
+			Phase:  PhaseUnsubstantiated,
+			State:  TargetStateUnboundPath,
+			Reason: "no runtime executor is bound; target evidence is impossible",
+		}
+	}
+	return x.targetBindingResolver().Resolve(ctx, prompt, explicit)
+}
+
+// DiscoverWorkspace is the Phase 16.1 discovery seam. It returns workspace
+// EVIDENCE only (I13): candidates are context, never authority.
+func (x *RuntimeExecutor) DiscoverWorkspace() WorkspaceProfile {
+	if x == nil {
+		return WorkspaceProfile{}
+	}
+	return NewWorkspaceDiscovery(x.root).Discover()
+}
+
+// artifactBinder returns the Phase 16 strict artifact binder, constructing it on
+// first use.
+func (x *RuntimeExecutor) artifactBinder() *ArtifactBinder {
+	if x == nil {
+		return nil
+	}
+	if x.binder == nil {
+		x.binder = NewArtifactBinder(x.root)
+	}
+	return x.binder
+}
+
+// SetArtifactBinder replaces the Phase 16 strict artifact binder. Injecting a
+// binder is how a test proves that NO write happens on a rejection without
+// inspecting the mutation engine's internals.
+func (x *RuntimeExecutor) SetArtifactBinder(b *ArtifactBinder) {
+	if x == nil {
+		return
+	}
+	x.binder = b
 }
 
 // SetAdmittedCapabilities replaces the capability set the runtime's admission
@@ -1464,6 +1565,46 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			}
 		}
 	}
+
+	// ── 2b. EVIDENCE-BOUND TARGET RESOLUTION (Phase 16.1) ──────────────
+	//
+	// Admission has already decided whether this objective MAY act. This step
+	// decides WHERE it may act, and it runs BEFORE the ContextCompiler and
+	// before any provider call, because compiling a mutation prompt for a file
+	// the runtime cannot name produces a model answer about a file the runtime
+	// will then have to guess at.
+	//
+	// I11: a mutation objective ALWAYS classifies its stated target — including
+	// an explicit directory. "." (or any directory) resolves to
+	// UNBOUND_DIRECTORY and HALTS; it is never carried downstream as if it were
+	// a file. Discovery candidates are attached as EVIDENCE only and can never
+	// become the mutation target (I13).
+	if profile.Strategy == strategy.TargetedMutation {
+		binding := x.targetBindingResolver().Resolve(ctx, req.Prompt, targets)
+		res.TargetBinding = &binding
+		res.Proof.TargetBinding = &binding
+		switch binding.State {
+		case TargetStateResolvedFile, TargetStateResolvedSet:
+			proven := provenPaths(binding.Paths)
+			if len(proven) == 0 && binding.Binding != nil {
+				proven = []string{binding.Binding.Path}
+			}
+			targets = proven
+		case TargetStateUnboundDirectory, TargetStateAmbiguous, TargetStateUnboundPath:
+			// I11: a directory, an ambiguous statement, or an unusable path is
+			// NOT a destination. Clear it so nothing downstream mistakes a
+			// statement for a target.
+			targets = nil
+		case TargetStateNotFound:
+			// An explicitly stated file that does not exist yet is a legitimate
+			// CREATION target: the caller named the file. A not-found result
+			// with NO explicit statement is not.
+			if len(provenPaths(targets)) == 0 {
+				targets = nil
+			}
+		}
+	}
+
 	res.Targets = targets
 	res.Proof.Targets = targets
 	for _, t := range targets {
@@ -1531,6 +1672,24 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// A target-bound strategy whose target cannot be resolved stops before any
 	// invocation. Read-only strategies (and zero-context direct response) may
 	// run without a target set.
+	//
+	// PHASE 16: when the target resolver already ran and returned a
+	// non-dispatchable verdict, the halt is reported under THAT verdict rather
+	// than a generic "clarification required". A caller that cannot tell
+	// AWAITING_DISAMBIGUATION from UNRESOLVED cannot help the human: the first
+	// needs a choice between three named files, the second needs a name at all.
+	if len(targets) == 0 && res.TargetBinding != nil {
+		skipTail(g, string(res.TargetBinding.Phase))
+		g.CancelExecution(string(res.TargetBinding.Phase))
+		log.Printf("[execution] request=%s target_binding=%s status=%s candidates=%v reason=%q — halting before any provider call",
+			requestID, res.TargetBinding.Phase, res.TargetBinding.Status,
+			res.TargetBinding.Candidates, res.TargetBinding.Reason)
+		res.ClarificationRequired = true
+		res.Proof.Outcome = OutcomeCancelled
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), nil
+	}
 	if len(targets) == 0 && profile.Strategy != strategy.TargetedReasoning &&
 		profile.Strategy != strategy.DirectResponse &&
 		profile.Strategy != strategy.MultiFilePlanning &&
@@ -2955,6 +3114,51 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 				// rather than to the raw stream.
 				modified = artifact.Content
 			}
+
+			// ── EVIDENCE-BOUND ARTIFACT BINDING (Phase 16) ──────────────
+			//
+			// The parser above produced BYTES. This step decides whether those
+			// bytes may be applied to THIS file — and it is the first place in
+			// the pipeline where that question is asked at all.
+			//
+			// Before this gate, an artifact's destination was whatever the
+			// dispatch happened to be aimed at, which meant a payload that said
+			// nothing about its own location was applied to a file chosen by
+			// circumstance. The gate's inputs are the artifact's own explicit
+			// path attribute (never a content-type inference) and the SHA-256 of
+			// the source buffer the artifact was produced against. A rejection is
+			// TERMINAL: `modified` is never staged, so no patch is created, so
+			// the mutation engine is never handed anything to write.
+			// A creation has no source bytes to anchor to, and claiming a context
+			// digest for a file that does not exist would be describing a buffer
+			// the model never read. The absence of a target is the honest
+			// context evidence for a creation, so the claim is empty — not the
+			// digest of an empty string, which is a different and false fact.
+			targetExists := fileExists(filepath.Join(x.root, target))
+			contextSHA := ""
+			if targetExists {
+				contextSHA = sourceSHA256([]byte(original))
+			}
+			bound, bindErr := x.artifactBinder().Bind(ArtifactEnvelope{
+				Content:       modified,
+				Form:          artifact.Form,
+				Structural:    artifact.Structural,
+				DeclaredPath:  artifact.DeclaredPath,
+				ContractPath:  target,
+				ContextSHA256: contextSHA,
+			}, TargetBinding{
+				Path:         target,
+				SourceSHA256: contextSHA,
+				Explicit:     true,
+				Exists:       targetExists,
+			})
+			if bindErr != nil {
+				log.Printf("[execution] request=%s target=%s artifact_binding=REJECTED reason=%q — no patch staged, no bytes applied",
+					requestID, target, bindErr.Error())
+				return nil, invs, diffs, candidates, trace, fmt.Errorf(
+					"%w: %w: %s", ErrUnboundArtifact, ErrArtifactRejected, bindErr.Error())
+			}
+			modified = bound.Content
 		}
 		if strings.TrimSpace(modified) == "" {
 			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,

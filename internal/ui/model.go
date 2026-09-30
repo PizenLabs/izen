@@ -2146,6 +2146,20 @@ type model struct {
 	// issues the session capability grant internally, re-runs the decision and
 	// continues execution. Nil when no proposal is outstanding.
 	pendingAutonomyProposal *autonomy.Proposal
+	// executionSteps is the Phase 16 evidence ledger of runtime-attested
+	// execution steps. It is the ONLY source of execution-step rendering: an
+	// entry exists here if and only if a runtime StepStarted/StepCompleted
+	// event was consumed. There is no template, no plan projection and no
+	// default list, so the UI cannot show a checkmark for work that has not
+	// been reported as finished.
+	executionSteps *ExecutionStepLedger
+	// backgroundTelemetry is the Phase 16.1 BACKGROUND telemetry domain
+	// (indexer/graph progress). It has no execution spinner and no execution
+	// surface at all (I14).
+	backgroundTelemetry *BackgroundTelemetryState
+	// executionNarrative is the Phase 16.1 EXECUTION narrative domain. It OWNS
+	// the ExecutionSpinner, which only an execution domain event may advance.
+	executionNarrative *ExecutionNarrativeState
 	// autonomyProposalSelect is the highlighted action index in the proposal
 	// menu (Execute / Inspect / Cancel), navigated with ↑/↓.
 	autonomyProposalSelect int
@@ -3120,6 +3134,12 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	if m.activitySurfaceSealed {
 		return
 	}
+	// ── TELEMETRY DOMAIN ROUTING (Phase 16.1, I14) ────────────────
+	// Dispatch the event to exactly one domain BEFORE any rendering: background
+	// events reach only BackgroundTelemetryState, execution events reach only
+	// ExecutionNarrativeState (which owns the ExecutionSpinner). A background
+	// event therefore cannot instantiate or advance the execution spinner.
+	m.routeExecutionDomainEvent(ev)
 	// ── SINGLE EXECUTION-VIEW PROJECTION (Phase 4) ────────────────
 	// Every canonical runtime lifecycle event advances the execution-view
 	// projection. The renderer for the gated path reads ONLY this projection's
@@ -3174,9 +3194,17 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	// ceiling mid-synthesis. Each line surfaces one hop of the
 	// smaller-bounded-step continuation so a free-tier truncation is
 	// visible instead of silently retried blind.
+	//
+	// PHASE 16: these two payloads are the ONLY events that may produce an
+	// execution-step entry. Before this, the authorization surface rendered a
+	// hardcoded checklist of steps the runtime had not taken; now a step line
+	// exists only because the runtime reported one. A "✓" in the viewport is a
+	// claim the runtime made, not one the UI invented.
 	case events.StepStartedPayload:
+		m.routeStepStarted(stepKeyFromOrdinal(p.Step), stepLabelWithModel(p.Model, p.Step))
 		m.logActivity("[plan:step] %d started (budget %d tokens)", p.Step, p.MaxOutputTokens)
 	case events.StepCompletedPayload:
+		m.routeStepCompleted(stepKeyFromOrdinal(p.Step))
 		m.logActivity("[plan:step] %d completed: %d task(s) committed (%s)", p.Step, p.TasksCommitted, p.FinishReason)
 	case events.StepExhaustedPayload:
 		m.logActivity("[plan:step] %d exhausted at %d tokens (salvaged %d task(s))", p.Step, p.OutputTokens, p.SalvagedTasks)

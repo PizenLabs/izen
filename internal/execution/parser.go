@@ -192,6 +192,32 @@ const (
 	ArtifactFormRawBody ArtifactForm = "raw_body"
 )
 
+// IsAddressed reports whether the form SELF-ADDRESSES: whether the envelope
+// names the file it is about, and therefore carries its own target evidence.
+//
+// The distinction matters at the binding gate. An addressed form (FILE_CREATE,
+// a ":::artifact <path>" contract fence, a unified diff) has a path field, and
+// if that field is absent the artifact is unaddressed no matter what the
+// dispatch happened to be aimed at — or, worse, it may name a DIFFERENT file
+// than the one the model was asked to change, which is a silent
+// redirect-and-overwrite.
+//
+// A positional form (a SEARCH/REPLACE block, a bare full-file body) has no path
+// field by construction. Its location is the dispatch, and its content is
+// byte-anchored to the observed source buffer. Requiring a header there would be
+// requiring a field the format does not have.
+//
+// The classification is per-FORM, not per-payload: it is a property of the
+// artifact contract, and a contract's shape is exactly what a gate may rely on.
+func (f ArtifactForm) IsAddressed() bool {
+	switch f {
+	case ArtifactFormFileCreate, ArtifactFormContractFence, ArtifactFormUnifiedDiff:
+		return true
+	default:
+		return false
+	}
+}
+
 // MutationArtifact is the parsed outcome of one mutation payload.
 type MutationArtifact struct {
 	// Content is the artifact body the parser resolved. Empty only when the
@@ -203,6 +229,19 @@ type MutationArtifact struct {
 	// delimiter. A structural artifact is authoritative: it is never
 	// prose-tested and never rejected here.
 	Structural bool
+	// DeclaredPath is the target path the ENVELOPE explicitly named, and "" when
+	// it named none.
+	//
+	// PHASE 16 / I7: this is the parser's ONLY path output and it is read from
+	// an explicit path attribute ("```lang:path", ":::artifact <path>",
+	// "FILE_CREATE <path>", "+++ b/<path>") — never inferred from the payload's
+	// content. A bare "```html" fence names a LANGUAGE; treating it as
+	// "index.html" is a content-type heuristic, and a content-type heuristic is
+	// how a redesign request ends up overwriting a file nobody asked about. An
+	// empty DeclaredPath is therefore a NORMAL, expected outcome that the
+	// ArtifactBinder refuses downstream (ErrUnboundArtifact) — it is not a
+	// parse failure to be back-filled here.
+	DeclaredPath string
 }
 
 // ParseMutationArtifacts resolves a mutation payload into an artifact.
@@ -227,7 +266,11 @@ func ParseMutationArtifacts(raw string) (MutationArtifact, error) {
 			fmt.Errorf("%w: the provider stream completed with an empty payload", ErrZeroArtifactsParsed)
 	}
 	if form, ok := RecognizeArtifactForm(trimmed); ok {
-		return MutationArtifact{Form: form, Structural: true}, nil
+		return MutationArtifact{
+			Form:         form,
+			Structural:   true,
+			DeclaredPath: DeclaredTargetPath(trimmed),
+		}, nil
 	}
 	body := stripOuterFence(trimmed)
 	if strings.TrimSpace(body) == "" {
@@ -237,14 +280,21 @@ func ParseMutationArtifacts(raw string) (MutationArtifact, error) {
 	// The fence strip may have revealed a contract (a fence whose info string
 	// only became visible once the outer wrapper was removed).
 	if form, ok := RecognizeArtifactForm(body); ok {
-		return MutationArtifact{Form: form, Structural: true}, nil
+		return MutationArtifact{
+			Form:         form,
+			Structural:   true,
+			DeclaredPath: DeclaredTargetPath(body),
+		}, nil
 	}
 	if LooksLikeProse(body) {
 		return MutationArtifact{Form: ArtifactFormNone}, fmt.Errorf(
 			"%w: the provider stream completed with %d line(s) of natural-language text and no artifact contract",
 			ErrZeroArtifactsParsed, len(nonEmptyLines(body)))
 	}
-	return MutationArtifact{Content: body, Form: ArtifactFormRawBody}, nil
+	// A bare, unstructured body declares NO path. The returned artifact is
+	// therefore unbound until the ArtifactBinder (or a dispatch contract) proves
+	// a target for it — the parser never fills the gap itself.
+	return MutationArtifact{Content: body, Form: ArtifactFormRawBody, DeclaredPath: DeclaredTargetPath(body)}, nil
 }
 
 // RecognizeArtifactForm reports the explicit artifact representation a payload

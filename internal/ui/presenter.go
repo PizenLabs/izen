@@ -180,6 +180,48 @@ func (m *model) routeContextTokens(tokens int) {
 	m.HUD().SetTokens(tokens)
 }
 
+// executionStepLedger returns the model's Phase 16 evidence ledger of
+// runtime-attested execution steps, creating it on first use.
+//
+// Lazy construction for the same reason the projection reducer is lazy: a
+// headless model that never renders costs nothing, and a model built directly
+// as a struct literal (every test harness) still gets a real ledger rather than
+// a nil one that would silently suppress all step rendering.
+func (m *model) executionStepLedger() *ExecutionStepLedger {
+	if m == nil {
+		return nil
+	}
+	if m.executionSteps == nil {
+		m.executionSteps = NewExecutionStepLedger()
+	}
+	return m.executionSteps
+}
+
+// routeStepStarted records a runtime StepStarted event. This is one of the two
+// — and only two — ways an execution step can ever reach the screen.
+//
+// key is the step's runtime identity (the bounded-step ordinal) and name is
+// optional display context. They are separate parameters because the start
+// event carries a model id and the completion event does not: deriving the
+// identity from the richer string would make the two events describe two
+// different steps.
+func (m *model) routeStepStarted(key, name string) {
+	m.executionStepLedger().RecordStepStarted(key, name)
+}
+
+// routeStepCompleted records a runtime StepCompleted event under the same key
+// the start event used.
+func (m *model) routeStepCompleted(key string) {
+	m.executionStepLedger().RecordStepCompleted(key)
+}
+
+// attestedExecutionSteps exposes the ledger for assertions and diagnostics. A
+// test that wants to know whether the UI is showing invented progress asks this
+// rather than counting glyphs in a rendered string.
+func (m *model) attestedExecutionSteps() []ExecutionStep {
+	return m.executionStepLedger().Steps()
+}
+
 // routeCost writes the cost metric. Formatting is the caller's, because cost
 // formatting depends on the pricing registry the caller owns.
 func (m *model) routeCost(amount string) {

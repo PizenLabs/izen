@@ -1248,6 +1248,74 @@ func (d *Driver) currentInteractionMetadata() (protocol.InteractionContract, *pr
 // Preflight barrier: when wired, the transition from observing to deciding is
 // gated by PreflightSyncBarrier (10s timeout → PREFLIGHT_TIMEOUT). This is the
 // execution invariant: async discovery never means unverified execution.
+// preflightExecutionSpec builds the admission-time view of the run for the
+// Phase 16.1 pre-flight gate. Assembling it invokes NO provider and mutates
+// nothing: it resolves the target through the executor's resolver (pure
+// classification + isolated discovery) and records the boundary the run holds.
+//
+// ctx is the run's own cancellation context, threaded so resolution is
+// interruptible: a cancelled run resolves to an unsubstantiated verdict and
+// stops, rather than completing a bounded scan nobody is waiting for.
+func (d *Driver) preflightExecutionSpec(ctx context.Context) ExecutionSpec {
+	spec := ExecutionSpec{Intent: intentClassForStrategy(d.resolved.Profile.Strategy)}
+	if !spec.Intent.IsMutation() {
+		return spec
+	}
+	binding := d.adapter.PreflightTarget(ctx, d.prompt, d.resolved.Targets)
+	spec.TargetBinding = &binding
+	if binding.Profile != nil {
+		spec.WorkspaceEvidence = binding.Profile
+	}
+	spec.ExplicitTargets = append([]string(nil), d.resolved.Targets...)
+	// A proven target binds the boundary directly; an explicitly named creation
+	// target binds it by statement. Anything else is UNBOUND.
+	explicit := provenExplicit(spec.ExplicitTargets)
+	if binding.Dispatchable() || (binding.State == execution.TargetStateNotFound && len(explicit) > 0) {
+		spec.MutationBoundary = MutationBoundaryBound
+	} else {
+		spec.MutationBoundary = MutationBoundaryUnbound
+	}
+	// A resolved, existing target is an authoritative context channel: it is
+	// runtime-observed evidence the prompt can be compiled from. An explicitly
+	// named creation target is a channel by statement. A directory or an
+	// ambiguous statement is NOT a channel — it is a question. Zero channels on
+	// a mutation objective is the empty-context condition I12 forbids.
+	channels := provenExplicit(binding.Paths)
+	if len(channels) == 0 && binding.State == execution.TargetStateNotFound {
+		channels = explicit
+	}
+	for _, target := range channels {
+		spec.ContextChannels = append(spec.ContextChannels, ContextChannel{
+			Kind:          "target",
+			Source:        target,
+			Authoritative: true,
+		})
+	}
+	if len(spec.ContextChannels) > 0 {
+		spec.Evidence = EvidenceProduced
+	}
+	return spec
+}
+
+// intentClassForStrategy maps the deterministic execution strategy onto the
+// coarse admission intent. It is a pure projection: the strategy is already
+// the authority, this only names the mutation/read-only distinction the gate
+// reasons over.
+func intentClassForStrategy(s strategy.ExecutionStrategy) IntentClass {
+	switch s {
+	case strategy.TargetedMutation, strategy.DirectDeterministic:
+		return IntentMutate
+	case strategy.MultiFilePlanning:
+		return IntentPlan
+	case strategy.RepositoryInvestigation:
+		return IntentInvestigate
+	default:
+		return IntentAsk
+	}
+}
+
+// observeAndRun runs the bounded observe → decide → execute loop. It is reached
+// only after the run's context has been synchronized.
 func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.LoopTermination, error) {
 	// ── PHASE 15: GRANT-GATED CONTEXT BARRIER ───────────────────────────
 	// This is the LAST point before the loop can leave `observing`, and
@@ -1300,6 +1368,32 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 		d.bus.Publish(events.NewActivity("[loop] observing -> deciding"))
 	}
 	d.publish(ctx)
+
+	// ── PHASE 16.1: PRE-FLIGHT ADMISSION GATE ──────────────────────────
+	// "No Evidence, No Provider" (I12) is enforced HERE, at the last point
+	// before the loop can plan or dispatch a provider. A mutation objective
+	// without a proven target, an admissible mutation boundary and
+	// authoritative evidence parks at a human boundary or aborts — no provider
+	// token is billed. A directory target (I11) can never be promoted to a file
+	// on the way through.
+	if outcome := EvaluatePreflightAdmission(d.preflightExecutionSpec(ctx)); outcome.Blocked() {
+		if outcome.Verdict == AdmissionDisambiguate {
+			if d.bus != nil {
+				d.bus.Publish(events.NewActivity("[preflight] target unresolved — awaiting disambiguation: " + outcome.Reason))
+			}
+			d.loop.AwaitHuman(autonomy.HumanBoundary{
+				Reason:  outcome.Reason,
+				Options: outcome.Candidates,
+			})
+			d.enrichBoundary()
+			d.publish(ctx)
+			return d.term(), nil
+		}
+		if d.bus != nil {
+			d.bus.Publish(events.NewActivity("[preflight] inadmissible target: " + outcome.Reason))
+		}
+		return d.terminateAbort(ctx, "preflight inadmissible target: "+outcome.Reason, autonomy.FailurePermanent), nil
+	}
 	for !d.loop.State().IsTerminal() {
 		// Late-result guard: if the run was aborted/superseded, exit immediately.
 		if d.runID != runID {

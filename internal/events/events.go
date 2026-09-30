@@ -182,6 +182,21 @@ const (
 	// provenance, including failed/cancelled calls.
 	EventProviderExecution = "execution.provider.execution"
 
+	// ── TELEMETRY DOMAIN ISOLATION (Phase 16.1, I14) ─────────────────────
+	// Background telemetry and execution narrative are SEPARATE domains. These
+	// two events make the boundary observable: an indexer progress report is
+	// background work and MUST NOT touch execution rendering, while a model
+	// streaming report is execution work and is the ONLY thing that may drive
+	// the execution spinner.
+	//
+	// EventIndexerProgress is a workspace-indexing progress report. It is
+	// background telemetry by construction: no consumer may derive execution
+	// status from it.
+	EventIndexerProgress = "workspace.indexer.progress"
+	// EventModelStreaming is a live model-streaming report. It belongs to the
+	// execution narrative domain.
+	EventModelStreaming = "execution.model.streaming"
+
 	// ── PREFLIGHT / RECOVERY / DECISION-SURFACE / AUTONOMY TELEMETRY ──────
 	// These are the STRUCTURED lifecycle events of the preflight-failure
 	// recovery path. Every event carries the stable run identity and the
@@ -695,6 +710,32 @@ type ProviderResponsePayload struct {
 	OutputChars       int
 	PromptFingerprint string
 	ProtocolTelemetry
+}
+
+// IndexerProgressPayload is a workspace-indexing progress report. It is
+// BACKGROUND telemetry: it describes work that is not execution work and must
+// never drive execution rendering (Phase 16.1, I14).
+type IndexerProgressPayload struct {
+	// Stage names the indexing stage (scan, parse, embed, graph…).
+	Stage string
+	// FilesIndexed is how many files the indexer has processed.
+	FilesIndexed int
+	// TotalFiles is the indexer's total when known, 0 otherwise.
+	TotalFiles int
+}
+
+// ModelStreamingPayload is a live model-streaming report. It belongs to the
+// EXECUTION narrative domain and is the only class of event that may drive the
+// execution spinner (Phase 16.1, I14).
+type ModelStreamingPayload struct {
+	// RequestID binds the stream to one execution.
+	RequestID string
+	// Model is the provider model emitting the stream.
+	Model string
+	// Delta is the incremental content chunk (may be empty on a status tick).
+	Delta string
+	// Streaming is false once the stream has settled.
+	Streaming bool
 }
 
 // ArtifactProducedPayload records a parsed artifact (e.g. a patch) produced by
@@ -1307,6 +1348,29 @@ func NewContextCompilation(payload ContextCompilationPayload) DomainEvent {
 	binding := payload.ProtocolTelemetry
 	payload.ProtocolTelemetry = binding.Normalize()
 	return newEvent(EventContextCompilation, payload)
+}
+
+// NewIndexerProgress publishes a background workspace-indexing progress report.
+// It carries no execution semantics: no consumer may derive execution status
+// from it (Phase 16.1, I14).
+func NewIndexerProgress(stage string, filesIndexed, totalFiles int) DomainEvent {
+	return newEvent(EventIndexerProgress, IndexerProgressPayload{
+		Stage:        stage,
+		FilesIndexed: filesIndexed,
+		TotalFiles:   totalFiles,
+	})
+}
+
+// NewModelStreaming publishes a live model-streaming report. It is execution
+// narrative evidence and the only class of event permitted to drive the
+// execution spinner (Phase 16.1, I14).
+func NewModelStreaming(requestID, model, delta string, streaming bool) DomainEvent {
+	return newEvent(EventModelStreaming, ModelStreamingPayload{
+		RequestID: requestID,
+		Model:     model,
+		Delta:     delta,
+		Streaming: streaming,
+	})
 }
 
 // NewAdmissionDecision publishes the structured admission verdict. The

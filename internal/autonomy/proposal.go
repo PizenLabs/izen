@@ -53,6 +53,17 @@ type Proposal struct {
 	// Reason is the controller's justification.
 	Reason string
 	// Actions is the planned high-level execution chain.
+	//
+	// PHASE 16 — THIS IS NOT PROGRESS AND MUST NEVER BE RENDERED AS PROGRESS.
+	// It is a static description of the loop contract, valid the moment the
+	// proposal is raised and unchanging until the run ends. A UI that renders
+	// it as "✓ inspect target / ✓ apply mutation" is asserting that work
+	// happened, and the assertion is false from the first frame.
+	//
+	// The rendering rule is: permissions are static declarations, execution is
+	// event-derived. This field feeds execution PLANNING and diagnostics; the
+	// user-facing surface reads runtime events (see internal/ui/authorization.go
+	// — an ExecutionStepLedger with no other source).
 	Actions []string
 	// Decision is the original verdict (always ask_user when a proposal is
 	// produced; carried for provenance).
@@ -69,7 +80,10 @@ func (p *Proposal) CapabilityLabel() string {
 
 // PlannedActions projects the high-level execution chain the runtime will
 // follow inside the granted boundary. It is a pure description of the loop
-// contract — it executes nothing.
+// contract — it executes nothing, and it is NOT a report of anything that has
+// happened (PHASE 16). Callers must never render these strings with a completed
+// or in-flight marker; an execution step reaches the UI only from a runtime
+// event.
 func PlannedActions(i Intent) []string {
 	switch i {
 	case IntentModification, IntentRefactoring:

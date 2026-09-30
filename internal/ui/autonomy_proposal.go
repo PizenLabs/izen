@@ -188,17 +188,20 @@ func (m *model) requestAutonomyProposal(trace autonomy.Trace) tea.Cmd {
 	m.ensureSyntheticMicroPlanForProposal(prop)
 	// ── Low-risk auto-approval: bypass awaiting_human ───────────────────
 	if m.isLowRiskAutoApprovable(prop) {
-		// Non-blocking diff preview: stream the planned diff/actions to the
-		// Activity Log so the user immediately sees what is changing, without
-		// blocking on Alt+A/Enter.
-		if len(prop.Actions) > 0 {
-			m.logActivity("[diff preview] auto-approved low-risk mutation for %s — streaming diff", prop.Target)
-			for _, a := range prop.Actions {
-				m.logActivity("  %s %s", Icon.Diff, a)
-			}
-		} else {
-			m.logActivity("[diff preview] auto-approved low-risk mutation for %s", prop.Target)
-		}
+		// PHASE 16: this used to stream a hardcoded checklist of planned steps
+		// ("✓ inspect target", "✓ apply mutation") the moment the low-risk
+		// auto-approval fired. Every one of those checkmarks was a lie: the
+		// runtime had approved and not yet executed, and rendering an
+		// intended action in the same visual language as a completed one is how
+		// a user ends up believing their files were touched when they were not.
+		//
+		// What replaces it is a PERMISSION DECLARATION — a static statement of
+		// the boundary that was released. It is not progress, it has no
+		// execution glyphs, and it appears at the moment of the grant. From
+		// here on, step lines come from runtime events and nowhere else.
+		m.logActivity("[authorized] auto-approved low-risk mutation for %s — capability boundary released, execution not yet started",
+			prop.Target)
+		m.logActivity("  %s", renderAuthorizedPermission())
 		m.pendingAutonomyProposal = prop
 		m.autonomyProposalSelect = 0
 		// Bypass modal: transition directly to executing.
@@ -263,9 +266,10 @@ func (m *model) executeAutonomyProposal() tea.Cmd {
 	if len(prop.Missing) > 0 {
 		g := m.autonomy.GrantDefault(prop.Missing...)
 		m.push(roleStatus, fmt.Sprintf(
-			"%s Capability granted: %s\n  scope: %s\n%s",
+			"%s Capability granted: %s\n  scope: %s\n  %s\n%s",
 			greenStyle.Render("✓"), strings.Join(capNames(g.Capabilities), " + "), g.Scope,
-			mutedStyle.Render("The runtime may now inspect, plan, patch and verify inside this boundary without asking again."),
+			renderAuthorizedPermission(),
+			mutedStyle.Render("These are the operations the runtime may now perform inside this boundary. No operation has been performed yet."),
 		))
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -397,6 +401,11 @@ func (m *model) clearAutonomyProposal() {
 	m.autonomyHotfix = false
 	m.pendingHotfixObjective = ""
 	m.clearAutonomyTargetSelector()
+	// PHASE 16: the step ledger is cleared HERE, on the same unwind seam as the
+	// pending proposal. Leaving it alive would let a previous run's completed
+	// steps render as this run's progress — the exact failure the hardcoded
+	// checklist caused, reintroduced through a different mechanism.
+	m.executionStepLedger().Reset()
 }
 
 // renderAutonomyProposalBlock renders the compact authorization card
@@ -483,6 +492,15 @@ func (m *model) renderAutonomyProposalBlock(width int) string {
 
 	// Line 4: the DERIVED action set.
 	b.WriteString(m.renderAuthorizationActionLine())
+
+	// Line 5: runtime-attested execution steps. This block exists ONLY to the
+	// extent a runtime StepStarted/StepCompleted event was consumed. When
+	// nothing has been attested it renders nothing — not a planned list, not an
+	// empty section, not a hint at what is coming. The permission declaration
+	// above is what describes intent; this is what describes fact.
+	if steps := m.executionStepLedger().renderExecutionSteps(); steps != "" {
+		b.WriteString(steps)
+	}
 
 	// Inspect expansion: reachable only when a candidate/diff exists (the
 	// action that reveals it is state-derived), so this line cannot appear
