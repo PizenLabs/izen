@@ -268,12 +268,15 @@ func (d *WorkspaceDiscovery) WithMaxDepth(depth int) *WorkspaceDiscovery {
 // It reads directory entries and, for candidates, file bytes (for the digest);
 // it writes nothing, mutates nothing, and grants nothing.
 func (d *WorkspaceDiscovery) Discover() WorkspaceProfile {
+	if d == nil {
+		return WorkspaceProfile{}
+	}
 	profile := WorkspaceProfile{
 		Root:        d.root,
 		MaxDepth:    d.maxDepth,
 		IgnoreRules: ignoreRuleNames(d.ignoreRules),
 	}
-	if d == nil || strings.TrimSpace(d.root) == "" {
+	if strings.TrimSpace(d.root) == "" {
 		return profile
 	}
 	root := filepath.Clean(d.root)
