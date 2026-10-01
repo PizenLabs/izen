@@ -13,6 +13,21 @@ func SetActivityLogger(fn ActivityLogFunc) {
 	globalActivityLog = fn
 }
 
+// DetailLogFunc is a hook for the TRACE/DEBUG channel: raw runtime telemetry
+// (workspace-context facts, provider forensics, per-stage internals). It is
+// wired separately from ActivityLogFunc so the presentation layer can decide
+// what reaches the human execution narrative and what stays in Trace. PHASE 12.
+var globalDetailLog DetailLogFunc
+
+// SetDetailLogger installs the trace/debug telemetry sink. Passing nil disables
+// emission.
+func SetDetailLogger(fn DetailLogFunc) {
+	globalDetailLog = fn
+}
+
+// DetailLogFunc is the signature of the trace/debug telemetry sink.
+type DetailLogFunc func(format string, args ...interface{})
+
 // EventFunc is a typed event sink for EngineEvent payloads carrying real
 // I/O metrics (bytes read, lines patched, exit codes, elapsed time).
 // The UI model sets this at startup and dispatches directly to the

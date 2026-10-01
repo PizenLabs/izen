@@ -522,6 +522,16 @@ func (m *model) renderProposalBlock() string {
 		// the runtime is ACTUALLY doing (apply/patch/model), never the generic
 		// "Processing file mutations..." claim. When no authoritative stage
 		// exists, nothing is rendered — empty is better than fake.
+		//
+		// PHASE 12 — NO DUPLICATE EXECUTION STATE: when the viewport's
+		// canonical in-flight execution line is already rendered by the
+		// loading dock, this dock must not restate the same stage. Two
+		// surfaces rendering the same `renderStageStatus` output in one frame
+		// is a duplicate claim about one execution, and the two can disagree
+		// when only one of them has refreshed.
+		if m.loadingDockActive() {
+			return b.String()
+		}
 		sp := spinnerGlyph(m.spinnerFrame)
 		stageLine := m.renderStageLine()
 		if stageLine == "" {

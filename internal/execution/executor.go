@@ -276,6 +276,14 @@ type ExecutionProof struct {
 	Verification     VerificationReport           `json:"verification"`
 	// AffectedFiles is the set of files a mutation execution actually mutated.
 	AffectedFiles []string `json:"affected_files,omitempty"`
+	// WorkspaceObservations counts the declared targets whose bytes this
+	// execution actually READ and projected into the provider request.
+	//
+	// PHASE 14: this is PROVENANCE, not telemetry. A read/review objective is
+	// only proven when the runtime can show the model looked at the workspace;
+	// a response-content heuristic can never establish that. Token counts are
+	// budget arithmetic and are deliberately NOT a substitute for this field.
+	WorkspaceObservations int `json:"workspace_observations"`
 	// DiffSummary is the compact per-file diff accounting of the mutation
 	// (e.g. "index.html +12/-4").
 	DiffSummary []string `json:"diff_summary,omitempty"`
@@ -310,6 +318,15 @@ type ExecutionProof struct {
 	ContextID       string `json:"context_id,omitempty"`
 	ContextDigest   string `json:"context_digest,omitempty"`
 	ContextParentID string `json:"context_parent_id,omitempty"`
+	// TargetBinding is the Phase 16 evidence record for WHERE this execution
+	// was allowed to act. It is present whenever the target resolver ran, and
+	// it is the only thing that authorises a mutation: a dispatch with no
+	// TargetBinding behind it has no proven destination.
+	//
+	// A halted execution keeps its record. "The target was ambiguous, and here
+	// are the three files it could have been" is actionable evidence; a bare
+	// cancellation is not.
+	TargetBinding *TargetBindingResult `json:"target_binding,omitempty"`
 	// Contract identity (Phase 2 P2): WHICH unique execution intent ran and
 	// WHICH invocation attempt of it. The identity is computed at admission
 	// from the sealed context + strategy + targets — retries keep the
@@ -404,6 +421,14 @@ type ExecutionResult struct {
 	// ClarificationRequired is true when the strategy demanded human input
 	// before any model call or mutation. No invocation occurred.
 	ClarificationRequired bool
+	// TargetBinding is the Phase 16 evidence-bound target verdict: the proven
+	// TargetBinding a mutation dispatch was authorised against, or the
+	// deterministic refusal that stopped it. It is nil only for executions that
+	// never needed a mutation target (read-only objectives).
+	//
+	// A UI that renders a mutation objective reads THIS, never the target list:
+	// a target list can be non-empty and still unproven.
+	TargetBinding *TargetBindingResult
 	// Mutations records the applied mutation evidence (populated after Approve).
 	Mutations []MutationEvidence
 	// Verification is the real verifier result (populated after Approve).
@@ -421,6 +446,23 @@ type ExecutionResult struct {
 	// exact unmutated model output and every transport transformation, and is
 	// attached to the sealed ExecutionEvidence for post-mortem traceability.
 	IngestionTrace *ingestion.IngestionTrace
+	// ArtifactShape names the artifact contract the attempt was actually
+	// dispatched under ("create_file", "replace_block", "search_replace", ...).
+	//
+	// PHASE 12: the recovery matrix needs this to stay truthful. A CREATION
+	// contract can never be re-expressed as a bounded SEARCH/REPLACE patch —
+	// there is no existing content to anchor against — so an exhausted creation
+	// must escalate to an explicit budget decision instead of silently
+	// relabelling its contract. The value is the profile's own
+	// Artifact.Kind, copied verbatim by the composition-boundary adapter.
+	ArtifactShape string
+	// ArtifactCandidates records the truthful, non-authoritative artifact state
+	// of every target that reached a full-artifact generation (PHASE 12). A
+	// CandidatePartial entry proves how much the provider actually delivered
+	// before the output ceiling — it is evidence, never state: no byte of a
+	// partial candidate reaches the workspace, and a partial candidate is never
+	// admitted, authorized, or applied.
+	ArtifactCandidates []ArtifactCandidate
 	// Completed is the authoritative terminal usage account computed by the
 	// runtime from the provider-reported usage. The renderer reads it for the
 	// footer / EXPANDED token numbers and never re-derives them.
@@ -546,6 +588,16 @@ type RuntimeExecutor struct {
 	// prompt (buildManifestPrompt) at bootstrap via SetManifestSystemPrompt; a
 	// direct InvokeManifestPass call without injection keeps the default.
 	manifestSystemPromptOverride string
+	// targetResolver is the Phase 16 evidence-bound target resolver. It sits
+	// between Admission and the ContextCompiler: admission decides whether the
+	// objective may act, the resolver decides WHERE it may act. They are
+	// separate questions, and answering the second with the first is how an
+	// authorized-but-untargeted objective reached the provider.
+	targetResolver *TargetResolver
+	// binder is the Phase 16 strict artifact binder. It sits between the
+	// artifact PARSER and the MUTATION ENGINE, and it is the only component
+	// allowed to answer "is this artifact allowed to be applied here".
+	binder *ArtifactBinder
 
 	mu      sync.Mutex
 	pending map[string]*pendingMutation
@@ -582,6 +634,8 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 		artifactValidator: validator,
 		contextCompiler:   &contextcompiler.Compiler{},
 		pending:           make(map[string]*pendingMutation),
+		targetResolver:    NewTargetResolver(root),
+		binder:            NewArtifactBinder(root),
 	}
 	x.admission.SetAuditSink(x.emitAdmissionAudit)
 	// Wire the normalizer to consume the observe snapshot cache, eliminating
@@ -650,6 +704,78 @@ func (x *RuntimeExecutor) resolveSnapshotPath(target string) string {
 		return filepath.Clean(target)
 	}
 	return filepath.Join(x.root, target)
+}
+
+// targetBindingResolver returns the Phase 16 target resolver, constructing it
+// on first use. A nil resolver is repaired rather than tolerated: a mutation
+// objective with no resolver would have no target evidence at all, and silently
+// skipping the step is the exact defect this component was added to remove.
+func (x *RuntimeExecutor) targetBindingResolver() *TargetResolver {
+	if x == nil {
+		return nil
+	}
+	if x.targetResolver == nil {
+		x.targetResolver = NewTargetResolver(x.root)
+	}
+	return x.targetResolver
+}
+
+// SetTargetResolver replaces the Phase 16 target resolver. It is the injection
+// seam that lets a composition root or a test observe exactly which evidence
+// produced (or failed to produce) a dispatchable target.
+func (x *RuntimeExecutor) SetTargetResolver(r *TargetResolver) {
+	if x == nil {
+		return
+	}
+	x.targetResolver = r
+}
+
+// ResolveMutationTarget is the Phase 16.1 target-resolution seam: it classifies
+// the stated target set (I11) and, when nothing is stated, returns a
+// disambiguation request over discovery evidence. It is exported so the
+// autonomy pre-flight admission gate can evaluate admission BEFORE any planning
+// or provider call — the gate must see the same verdict the executor would.
+func (x *RuntimeExecutor) ResolveMutationTarget(ctx context.Context, prompt string, explicit []string) TargetBindingResult {
+	if x == nil {
+		return TargetBindingResult{
+			Status: BindingUnresolved,
+			Phase:  PhaseUnsubstantiated,
+			State:  TargetStateUnboundPath,
+			Reason: "no runtime executor is bound; target evidence is impossible",
+		}
+	}
+	return x.targetBindingResolver().Resolve(ctx, prompt, explicit)
+}
+
+// DiscoverWorkspace is the Phase 16.1 discovery seam. It returns workspace
+// EVIDENCE only (I13): candidates are context, never authority.
+func (x *RuntimeExecutor) DiscoverWorkspace() WorkspaceProfile {
+	if x == nil {
+		return WorkspaceProfile{}
+	}
+	return NewWorkspaceDiscovery(x.root).Discover()
+}
+
+// artifactBinder returns the Phase 16 strict artifact binder, constructing it on
+// first use.
+func (x *RuntimeExecutor) artifactBinder() *ArtifactBinder {
+	if x == nil {
+		return nil
+	}
+	if x.binder == nil {
+		x.binder = NewArtifactBinder(x.root)
+	}
+	return x.binder
+}
+
+// SetArtifactBinder replaces the Phase 16 strict artifact binder. Injecting a
+// binder is how a test proves that NO write happens on a rejection without
+// inspecting the mutation engine's internals.
+func (x *RuntimeExecutor) SetArtifactBinder(b *ArtifactBinder) {
+	if x == nil {
+		return
+	}
+	x.binder = b
 }
 
 // SetAdmittedCapabilities replaces the capability set the runtime's admission
@@ -892,6 +1018,27 @@ func admissionAuditReason(reason string, err error) string {
 
 func (x *RuntimeExecutor) nextID() string {
 	return fmt.Sprintf("exec-%d", x.counter.Add(1))
+}
+
+// countWorkspaceObservations reports how many of the declared targets this
+// execution actually read. It is the durable provenance evidence for a read or
+// review objective: the runtime can point at the bytes the model was given, not
+// at a token estimate. Token counts are budget arithmetic and are deliberately
+// NOT treated as a substitute for this fact.
+func (x *RuntimeExecutor) countWorkspaceObservations(targets []string) int {
+	if x == nil {
+		return 0
+	}
+	n := 0
+	for _, t := range targets {
+		if t == "" {
+			continue
+		}
+		if _, ok := x.getSnapshotContent(t); ok {
+			n++
+		}
+	}
+	return n
 }
 
 // ErrProviderModelMismatch is the deterministic error returned when the model
@@ -1418,6 +1565,46 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			}
 		}
 	}
+
+	// ── 2b. EVIDENCE-BOUND TARGET RESOLUTION (Phase 16.1) ──────────────
+	//
+	// Admission has already decided whether this objective MAY act. This step
+	// decides WHERE it may act, and it runs BEFORE the ContextCompiler and
+	// before any provider call, because compiling a mutation prompt for a file
+	// the runtime cannot name produces a model answer about a file the runtime
+	// will then have to guess at.
+	//
+	// I11: a mutation objective ALWAYS classifies its stated target — including
+	// an explicit directory. "." (or any directory) resolves to
+	// UNBOUND_DIRECTORY and HALTS; it is never carried downstream as if it were
+	// a file. Discovery candidates are attached as EVIDENCE only and can never
+	// become the mutation target (I13).
+	if profile.Strategy == strategy.TargetedMutation {
+		binding := x.targetBindingResolver().Resolve(ctx, req.Prompt, targets)
+		res.TargetBinding = &binding
+		res.Proof.TargetBinding = &binding
+		switch binding.State {
+		case TargetStateResolvedFile, TargetStateResolvedSet:
+			proven := provenPaths(binding.Paths)
+			if len(proven) == 0 && binding.Binding != nil {
+				proven = []string{binding.Binding.Path}
+			}
+			targets = proven
+		case TargetStateUnboundDirectory, TargetStateAmbiguous, TargetStateUnboundPath:
+			// I11: a directory, an ambiguous statement, or an unusable path is
+			// NOT a destination. Clear it so nothing downstream mistakes a
+			// statement for a target.
+			targets = nil
+		case TargetStateNotFound:
+			// An explicitly stated file that does not exist yet is a legitimate
+			// CREATION target: the caller named the file. A not-found result
+			// with NO explicit statement is not.
+			if len(provenPaths(targets)) == 0 {
+				targets = nil
+			}
+		}
+	}
+
 	res.Targets = targets
 	res.Proof.Targets = targets
 	for _, t := range targets {
@@ -1475,9 +1662,8 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// ── 4. Deterministic strategies (zero model) ───────────────────────
 	if profile.Deterministic {
 		skipTail(g, "deterministic execution")
-		g.CompleteExecution("deterministic")
 		res.Proof.Outcome = OutcomeNoArtifact
-		res.Proof.FinishedAt = time.Now()
+		x.completeExecution(res, g, "deterministic")
 		setProofGraph(res, g)
 		return x.finalizeResult(res), nil
 	}
@@ -1486,6 +1672,24 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// A target-bound strategy whose target cannot be resolved stops before any
 	// invocation. Read-only strategies (and zero-context direct response) may
 	// run without a target set.
+	//
+	// PHASE 16: when the target resolver already ran and returned a
+	// non-dispatchable verdict, the halt is reported under THAT verdict rather
+	// than a generic "clarification required". A caller that cannot tell
+	// AWAITING_DISAMBIGUATION from UNRESOLVED cannot help the human: the first
+	// needs a choice between three named files, the second needs a name at all.
+	if len(targets) == 0 && res.TargetBinding != nil {
+		skipTail(g, string(res.TargetBinding.Phase))
+		g.CancelExecution(string(res.TargetBinding.Phase))
+		log.Printf("[execution] request=%s target_binding=%s status=%s candidates=%v reason=%q — halting before any provider call",
+			requestID, res.TargetBinding.Phase, res.TargetBinding.Status,
+			res.TargetBinding.Candidates, res.TargetBinding.Reason)
+		res.ClarificationRequired = true
+		res.Proof.Outcome = OutcomeCancelled
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), nil
+	}
 	if len(targets) == 0 && profile.Strategy != strategy.TargetedReasoning &&
 		profile.Strategy != strategy.DirectResponse &&
 		profile.Strategy != strategy.MultiFilePlanning &&
@@ -1525,6 +1729,11 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// model.invoked, NO provider.response and NO artifact.produced — a failed
 	// execution must never emit a misleading success artifact.
 	if profile.Strategy != strategy.TargetedMutation {
+		// PHASE 14: record the workspace OBSERVATION provenance before the
+		// read-only dispatch. It is the only durable evidence that a read or
+		// review objective actually looked at the workspace instead of
+		// answering from priors.
+		res.Proof.WorkspaceObservations = x.countWorkspaceObservations(targets)
 		content, invs, ingTrace, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
 		if ingTrace != nil {
 			res.IngestionTrace = ingTrace
@@ -1566,9 +1775,8 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		g.Skip(runtimegraph.StageApprovalGate, "read-only execution")
 		g.Skip(runtimegraph.StageMutationTransaction, "read-only execution")
 		g.Skip(runtimegraph.StageVerification, "read-only execution")
-		g.CompleteExecution(string(OutcomeCompleted))
 		res.Proof.Outcome = OutcomeCompleted
-		res.Proof.FinishedAt = time.Now()
+		x.completeExecution(res, g, string(OutcomeCompleted))
 		setProofGraph(res, g)
 		return x.finalizeResult(res), nil
 	}
@@ -1630,7 +1838,11 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 
 	// ── 7. Targeted mutation: per-target model invocation ──────────────
-	patches, invs, diffs, ingTrace, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
+	// Record the contract the attempt is actually dispatched under so the
+	// recovery matrix never has to guess it (see ArtifactShape).
+	res.ArtifactShape = profile.Artifact.Kind
+	res.Proof.WorkspaceObservations = x.countWorkspaceObservations(targets)
+	patches, invs, diffs, artCandidates, ingTrace, err := x.invokeMutation(ctx, req, requestID, profile, targets, g)
 	if err != nil && IsHallucinatedAnchorError(err) && req.RecoveryAttempt < 1 {
 		// A zero-match SEARCH is an engine-recoverable anchor hallucination.
 		// Re-prompt exactly once under the strict line-anchor contract; this
@@ -1642,8 +1854,9 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		retryProfile.Artifact.Kind = "search_replace"
 		retryProfile.Artifact.Bounded = true
 		retryProfile.StrategyReason += "; strict line-anchor recovery"
-		retryPatches, retryInvs, retryDiffs, retryTrace, retryErr := x.invokeMutation(ctx, retryReq, requestID, retryProfile, targets, g)
+		retryPatches, retryInvs, retryDiffs, retryCandidates, retryTrace, retryErr := x.invokeMutation(ctx, retryReq, requestID, retryProfile, targets, g)
 		invs = append(invs, retryInvs...)
+		artCandidates = append(artCandidates, retryCandidates...)
 		if retryTrace != nil {
 			ingTrace = retryTrace
 		}
@@ -1659,6 +1872,9 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	}
 	if ingTrace != nil {
 		res.IngestionTrace = ingTrace
+	}
+	if len(artCandidates) > 0 {
+		res.ArtifactCandidates = append(res.ArtifactCandidates, artCandidates...)
 	}
 	if err != nil {
 		// Retain the invocation evidence on EVERY error return: the provider
@@ -1715,7 +1931,6 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 				return x.finalizeResult(res), unresolvedErr
 			case NoOpNoSafeMutation:
 				g.Skip(runtimegraph.StageVerification, "requires review")
-				g.CompleteExecution(string(OutcomeNoOpNoSafeMutation))
 				res.ArtifactKind = ""
 				res.Content = ""
 				res.Err = nil
@@ -1725,17 +1940,20 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 					"human review required before any further mutation", false,
 				))
 				res.Proof.Outcome = OutcomeNoOpNoSafeMutation
-				res.Proof.FinishedAt = time.Now()
+				// A no-op that produced no candidate and applied nothing seals
+				// REQUIRES_REVIEW evidence, which BLOCKS authoritative success.
+				// Sealing before the completion event means a consumer can never
+				// read "completed" for an attempt the evidence refuses.
+				x.completeExecution(res, g, string(OutcomeNoOpNoSafeMutation))
 				setProofGraph(res, g)
 				return x.finalizeResult(res), nil
 			default: // NoOpObjectiveSatisfied
 				g.Skip(runtimegraph.StageVerification, "no-op objective satisfied")
-				g.CompleteExecution(string(OutcomeNoOpObjectiveSatisfied))
 				res.ArtifactKind = ""
 				res.Content = ""
 				res.Err = nil
 				res.Proof.Outcome = OutcomeNoOpObjectiveSatisfied
-				res.Proof.FinishedAt = time.Now()
+				x.completeExecution(res, g, string(OutcomeNoOpObjectiveSatisfied))
 				setProofGraph(res, g)
 				return x.finalizeResult(res), nil
 			}
@@ -1807,6 +2025,30 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			res.Err = err
 			res.Diagnostics = append(res.Diagnostics, artifactDiagnostic(firstTarget(targets), err, true))
 			res.Proof.Outcome = OutcomeArtifactRetryableRejected
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), err
+		}
+		if llmstep.IsOutputExhausted(err) {
+			// PHASE 12 — BOUNDED-STEP EXHAUSTION (Task != Invocation).
+			// The full-artifact branch already continued the SAME artifact
+			// contract across every affordable invocation; this terminal state
+			// means the shared request budget is consumed. It is a TYPED,
+			// RECOVERABLE exhaustion — never a failed task, never an admitted
+			// artifact — and the delivered prefix survives on
+			// res.ArtifactCandidates as evidence so no useful work is lost.
+			g.FailExecution(events.FailureRecoverable, err, "executor.bounded-step")
+			res.ArtifactKind = ""
+			res.Content = ""
+			res.Err = err
+			res.Diagnostics = append(res.Diagnostics, diagnosticSignal(
+				SignalOutputExhausted, partialCandidateTarget(res.ArtifactCandidates),
+				fmt.Sprintf("finish_reason=%q output_tokens=%d delivered_bytes=%d invocations=%d",
+					lastFinishReason(invs), lastOutputTokens(invs), partialCandidateBytes(res.ArtifactCandidates), len(invs)),
+				"the bounded-step continuation budget is consumed; the delivered prefix is preserved as a candidate and a successor attempt must re-scope or raise the per-invocation budget",
+				true,
+			))
+			res.Proof.Outcome = OutcomeTruncated
 			res.Proof.FinishedAt = time.Now()
 			setProofGraph(res, g)
 			return x.finalizeResult(res), err
@@ -2007,6 +2249,13 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	// The runtime owns a fresh mutation boundary for this apply.
 	ms := NewMutationSet()
 	x.patches.SetMutationSet(ms)
+	// DIFF IS EVIDENCE: hand the boundary the runtime's OWN compiled unified
+	// diffs so the per-target diff evidence it records is measured from the
+	// same object the approval surface showed the human. Without this the
+	// boundary would have to measure the raw artifact, which for a bounded
+	// SEARCH/REPLACE contract carries no hunk header and would under-report a
+	// change that demonstrably happened.
+	x.patches.SetCompiledDiffs(compiledDiffsByTarget(pm.diffs, pm.patches))
 	x.patches.SetAuthorization(x.auth)
 	if x.verifier != nil {
 		// Phase 1 safety rule: the verifier is the APPLY GATE, not an
@@ -2092,7 +2341,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 			if o == OutcomeNoArtifact {
 				o = OutcomeApplyFailed
 			}
-			g.CompleteMutation(p.File, string(o))
+			publishMutationOutcome(g, ms, p.File, o)
 		}
 		if ms.Verification != nil {
 			if ms.Verification.Skipped {
@@ -2125,7 +2374,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		if o == OutcomeNoArtifact {
 			o = OutcomeNoChange
 		}
-		g.CompleteMutation(p.File, string(o))
+		publishMutationOutcome(g, ms, p.File, o)
 	}
 	if ms.Verification != nil {
 		if ms.Verification.Skipped {
@@ -2137,8 +2386,13 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		g.Skip(runtimegraph.StageVerification, "no verifier gate ran during apply")
 	}
 
-	g.CompleteExecution(string(outcome))
+	// ── EVIDENCE BEFORE COMPLETION ───────────────────────────────────
+	// The sealed evidence is published BEFORE execution.finished so every
+	// consumer that observes the completion event has already observed the
+	// authoritative terminal record that justifies it. A completion claim is
+	// therefore never broadcast ahead of the evidence that substantiates it.
 	res.Proof.FinishedAt = time.Now()
+	x.completeExecution(res, g, string(outcome))
 	setProofGraph(res, g)
 	return x.finalizeResult(res), nil
 }
@@ -2370,17 +2624,17 @@ func effectiveMaxOutput(req int, profile *strategy.ExecutionStrategyProfile) int
 // the error and emits neither response nor artifact. The returned patches carry
 // the full resolved content of each target; the diffs are the authoritative
 // unified diffs for rendering.
-func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, *ingestion.IngestionTrace, error) {
+func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest, requestID string, profile strategy.ExecutionStrategyProfile, targets []string, g *runtimegraph.Graph) ([]*Patch, []ModelInvocation, []string, []ArtifactCandidate, *ingestion.IngestionTrace, error) {
 	if len(targets) == 0 {
-		return nil, nil, nil, nil, fmt.Errorf("executor: no mutation target resolved")
+		return nil, nil, nil, nil, nil, fmt.Errorf("executor: no mutation target resolved")
 	}
 	if x.provider == nil {
-		return nil, nil, nil, nil, fmt.Errorf("executor: no provider configured for model invocation")
+		return nil, nil, nil, nil, nil, fmt.Errorf("executor: no provider configured for model invocation")
 	}
 
 	model, modelErr := x.resolveModel(req)
 	if modelErr != nil {
-		return nil, nil, nil, nil, modelErr
+		return nil, nil, nil, nil, nil, modelErr
 	}
 	sources := make(map[string]string, len(targets))
 	for _, target := range targets {
@@ -2390,12 +2644,16 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	}
 	symbolBaseline, symbolErr := runtimeexecutor.NewSymbolBaseline(sources)
 	if symbolErr != nil {
-		return nil, nil, nil, nil, fmt.Errorf("executor: scope symbol baseline: %w", symbolErr)
+		return nil, nil, nil, nil, nil, fmt.Errorf("executor: scope symbol baseline: %w", symbolErr)
 	}
 
 	patches := make([]*Patch, 0, len(targets))
 	invs := make([]ModelInvocation, 0, len(targets))
 	diffs := make([]string, 0, len(targets))
+	// candidates records the truthful, non-authoritative artifact candidate of
+	// every target that reached a full-artifact generation. A partial candidate
+	// is evidence — it never becomes state and never mutates the workspace.
+	candidates := make([]ArtifactCandidate, 0, len(targets))
 	contextReported := false
 	// trace carries the forensic transport-normalization record of the most
 	// recent model invocation (nil until the first stream returns). It is
@@ -2497,17 +2755,26 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 				if errors.Is(guardErr, ErrOutputBudgetExceeded) {
 					log.Printf("[execution] request=%s target=%s guardrail=BUDGET_EXCEEDED estimated_tokens=%d max_output=%d shape=%s — refusing FULL_REWRITE dispatch",
 						requestID, target, EstimateTargetTokens(original), maxOut, shape)
-					return nil, nil, nil, trace, guardErr
+					return nil, nil, nil, candidates, trace, guardErr
 				}
 				if errors.Is(guardErr, ErrTargetEmpty) {
-					return nil, nil, nil, trace, guardErr
+					return nil, nil, nil, candidates, trace, guardErr
 				}
-				return nil, nil, nil, trace, guardErr
+				return nil, nil, nil, candidates, trace, guardErr
 			}
 		}
 
 		system := boundedMutationSystemPrompt() + "\nSystem: You are strictly modifying ONE file: " + target + ". Do NOT output code or patches for any other files in this response."
 		outputContract := "full_file_or_patch"
+		// ── PHASE 15: EXPLICIT ARTIFACT CONTRACT ON THE SYSTEM CHANNEL ────
+		// The structural envelope is stated BEFORE the request goes out, not
+		// only re-stated after a prose-only response. The old prompts listed
+		// three acceptable shapes and left the choice to the model, which is
+		// precisely the ambiguity a fluent prose model resolves by answering
+		// in prose — and that prose then reached the artifact boundary as a
+		// non-artifact. One named envelope, stated once, removes the choice.
+		system += "\n\n" + StrictArtifactContractInstruction(
+			ContractKindForShape(profile.Artifact.Kind, original != ""), target)
 		// The target bytes are supplied as an explicit workspace file to the
 		// Context Compiler. Do not embed them a second time in the hand-built
 		// prompt: one authority owns projection, truncation and accounting.
@@ -2528,6 +2795,11 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		if patchOnly {
 			system = boundedPatchSystemPrompt() + "\nSystem: You are strictly modifying ONE file: " + target + ". Do NOT output code or patches for any other files in this response."
 			outputContract = "search_replace"
+			// PHASE 15: the bounded lane names the ONE envelope it will accept.
+			// Its recovery path (RMAH) already tolerates fenced code as a
+			// fallback, but the primary contract is unambiguous, so the model
+			// is told exactly which of them is the contract.
+			system += "\n\n" + StrictArtifactContractInstruction(ArtifactContractPatch, target)
 			// Bounded INPUT contract: the runtime — not the model — decides
 			// what crosses. Only one small line-aligned window of the target
 			// is shown as the copyable source; rotating it by attempt gives
@@ -2583,7 +2855,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			ctx, req, profile, model, system, user, contextFiles, maxOut,
 		)
 		if compileErr != nil {
-			return nil, nil, nil, trace, fmt.Errorf("executor: context compilation: %w", compileErr)
+			return nil, nil, nil, candidates, trace, fmt.Errorf("executor: context compilation: %w", compileErr)
 		}
 		if compiledUser, ok := lastUserMessage(compiledReq); ok {
 			user = compiledUser
@@ -2621,46 +2893,85 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		if disableReasoning {
 			aiReq.Reasoning = &ai.ReasoningConfig{Disabled: true}
 		}
-		// model.invoked is emitted when the invocation BEGINS — before the
-		// provider call — so the event stream truthfully records the start.
-		g.BeginModel(model)
-		var providerMetadata ai.ResponseMetadata
-		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, &providerMetadata)
-		trace = itrace
-		// The invocation evidence is built from the stream outcome REGARDLESS
-		// of the artifact result: the provider billed these tokens whether the
-		// stream succeeded, was cancelled mid-flight, or produced a malformed
-		// artifact. Dropping the invocation on any error return erased real
-		// billing from Completed.OutputTokens (the 5,883-token repro: the
-		// artifact was rejected as "unterminated <script> element" and the
-		// provider's authoritative usage vanished from Izen's account).
-		inv := ModelInvocation{
-			Model:               model,
-			InteractionContract: req.InteractionContract,
-			ContractDescriptor:  cloneExecutionDescriptor(req.Contract),
-		}
-		populateInvocationTelemetry(&inv, aiReq, usage, providerMetadata)
-		log.Printf("[execution] result request=%s target=%s input=%d output=%d finish_reason=%s",
-			requestID, target, inv.TokenInput, inv.TokenOutput, inv.FinishReason)
-		if callErr != nil {
-			// The invocation evidence (real billing when usage arrived)
-			// survives even a hard transport failure.
-			return nil, append(invs, inv), nil, trace, fmt.Errorf("executor: model invocation: %w", callErr)
-		}
-		// provider.response is emitted ONLY on a successful response — the
-		// authoritative usage travels here. No artifact may precede it.
-		g.CompleteModelWithMetadata(providerResponseEvent(x.providerName(), aiReq, usage, providerMetadata, len(raw)))
-		invs = append(invs, inv)
+		// Truthful wire-contract trace: this line describes what the executor
+		// ACTUALLY sends/expects for this invocation — not what a recovery
+		// field claims.
+		log.Printf("[execution] request=%s attempt=%d target=%s strategy=%s artifact_kind=%s output_contract=%s context_bytes=%d prompt_bytes=%d max_output=%d reasoning=%s recovery=%s",
+			requestID, attempt, target, profile.Strategy, profile.Artifact.Kind, outputContract, contextBytes, len(user), maxOut, reasoningMode, recoveryLabel)
 
-		// ── BOUNDARY 3 — OUTPUT GATE (I1) ───────────────────────────
-		// Normalize the provider terminal reason into a CanonicalOutcome and
-		// enforce it BEFORE anything is parsed. An incomplete generation is
-		// circuit-broken here: its bytes are DISCARDED (never handed to hunk
-		// extraction or full-file resolution), no approval surface opens, and
-		// no recovery loop starts inside the executor. Only a COMPLETE stream
-		// may proceed to Boundary 4.
-		if gate := gateFor(target, inv.FinishReason); gate != nil {
-			return nil, invs, nil, trace, gate
+		var raw string
+		if !patchOnly {
+			// ── PHASE 12: FULL-ARTIFACT BOUNDED STEP (Task != Invocation) ──
+			// A full-artifact generation is a LOGICAL task that may legitimately
+			// need several bounded MODEL INVOCATIONS. finish_reason=length is an
+			// INVOCATION outcome, never a task failure: the executor preserves
+			// the delivered prefix as a bounded artifact CANDIDATE, advances the
+			// shared llmstep state, and re-invokes under the SAME artifact
+			// contract, the SAME authority and the SAME workspace lineage. The
+			// bounded-patch branch below is deliberately unchanged: that contract
+			// already fits any budget, so exhaustion there is a genuine re-scope,
+			// never a step to continue.
+			outcome, stepErr := x.invokeArtifactBoundedStep(
+				ctx, requestID, model, target, g, compiledReq,
+				func(userTurn string, stepMaxTokens int) (ai.Request, error) {
+					stepReq, _, compileErr := x.compileRequest(ctx, req, profile, model, system, userTurn, contextFiles, stepMaxTokens)
+					if compileErr != nil {
+						return ai.Request{}, compileErr
+					}
+					return stepReq, nil
+				},
+				req.StreamCallback, maxOut, llmConstrained, disableReasoning, &invs, &trace,
+			)
+			candidates = append(candidates, outcome.Candidate)
+			if stepErr != nil {
+				return nil, invs, diffs, candidates, trace, stepErr
+			}
+			raw = outcome.Raw
+		} else {
+			// model.invoked is emitted when the invocation BEGINS — before the
+			// provider call — so the event stream truthfully records the start.
+			g.BeginModel(model)
+			var providerMetadata ai.ResponseMetadata
+			var callErr error
+			var itrace *ingestion.IngestionTrace
+			var usage ai.ProviderUsage
+			raw, usage, itrace, callErr = x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, &providerMetadata)
+			trace = itrace
+			// The invocation evidence is built from the stream outcome REGARDLESS
+			// of the artifact result: the provider billed these tokens whether the
+			// stream succeeded, was cancelled mid-flight, or produced a malformed
+			// artifact. Dropping the invocation on any error return erased real
+			// billing from Completed.OutputTokens (the 5,883-token repro: the
+			// artifact was rejected as "unterminated <script> element" and the
+			// provider's authoritative usage vanished from Izen's account).
+			inv := ModelInvocation{
+				Model:               model,
+				InteractionContract: req.InteractionContract,
+				ContractDescriptor:  cloneExecutionDescriptor(req.Contract),
+			}
+			populateInvocationTelemetry(&inv, aiReq, usage, providerMetadata)
+			log.Printf("[execution] result request=%s target=%s input=%d output=%d finish_reason=%s",
+				requestID, target, inv.TokenInput, inv.TokenOutput, inv.FinishReason)
+			if callErr != nil {
+				// The invocation evidence (real billing when usage arrived)
+				// survives even a hard transport failure.
+				return nil, append(invs, inv), diffs, candidates, trace, fmt.Errorf("executor: model invocation: %w", callErr)
+			}
+			// provider.response is emitted ONLY on a successful response — the
+			// authoritative usage travels here. No artifact may precede it.
+			g.CompleteModelWithMetadata(providerResponseEvent(x.providerName(), aiReq, usage, providerMetadata, len(raw)))
+			invs = append(invs, inv)
+
+			// ── BOUNDARY 3 — OUTPUT GATE (I1) ───────────────────────────
+			// Normalize the provider terminal reason into a CanonicalOutcome and
+			// enforce it BEFORE anything is parsed. An incomplete generation is
+			// circuit-broken here: its bytes are DISCARDED (never handed to hunk
+			// extraction or full-file resolution), no approval surface opens, and
+			// no recovery loop starts inside the executor. Only a COMPLETE stream
+			// may proceed to Boundary 4.
+			if gate := gateFor(target, inv.FinishReason); gate != nil {
+				return nil, invs, diffs, candidates, trace, gate
+			}
 		}
 
 		// TRANSPORT-VERBATIM VIEW: ingestion may lift the fenced document (or a
@@ -2675,31 +2986,35 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		if offsetRecovery || strings.Contains(verbatim, "<<<<<<< SEARCH line-offset=") {
 			materialized, ok := materializeOffsetPatch(original, verbatim, windowStart, windowEnd)
 			if !ok {
-				return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: invalid or missing exact line-offset bounds", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
+				return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w: %s: invalid or missing exact line-offset bounds", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
 			}
 			verbatim = materialized
 		}
+		// ── NO-OP SENTINEL (pre-validation, EVERY artifact contract) ─────
+		// A model that answers NO_CHANGES_REQUIRED has satisfied the OUTPUT
+		// CONTRACT — but the claim itself is NOT yet a verdict. The raw claim is
+		// propagated verbatim and classified by deterministic structural
+		// analysis against the exact content the model judged; the terminal
+		// sub-state (satisfied / requires review / unresolved) is selected at
+		// the convergence site. Burning the retry budget on prose-free
+		// compliant output is never the right outcome.
+		//
+		// The check is hoisted ABOVE the contract split because the sentinel is
+		// not a bounded-patch concept: under a full-artifact contract the token
+		// would otherwise be parsed as document CONTENT and written to the
+		// user's file. A claim is never an artifact, under any contract.
+		if claim, claimed := ExtractNoOpClaim(raw); claimed {
+			assessment := ClassifyNoOpClaim(req.Prompt, judgedContent)
+			log.Printf("[execution] request=%s target=%s artifact=no_op (%s) verdict=%s reason=%q",
+				requestID, target, claim.Sentinel, assessment.Verdict, assessment.Reason)
+			return nil, invs, diffs, candidates, trace, &NoOpClaimError{
+				Claim:      claim,
+				Assessment: assessment,
+				Target:     target,
+			}
+		}
 		var modified string
 		if patchOnly {
-			// NO-OP SENTINEL (pre-validation): a model that answers
-			// NO_CHANGES_REQUIRED has satisfied the OUTPUT CONTRACT of the
-			// bounded patch — but the claim itself is NOT yet a verdict. The
-			// raw claim is propagated verbatim and classified by deterministic
-			// structural analysis against the exact window the model judged;
-			// the terminal sub-state (satisfied / requires review /
-			// unresolved) is selected at the convergence site. Burning the
-			// retry budget on prose-free compliant output is never the right
-			// outcome.
-			if claim, claimed := ExtractNoOpClaim(raw); claimed {
-				assessment := ClassifyNoOpClaim(req.Prompt, judgedContent)
-				log.Printf("[execution] request=%s target=%s artifact=no_op (%s) verdict=%s reason=%q",
-					requestID, target, claim.Sentinel, assessment.Verdict, assessment.Reason)
-				return nil, invs, nil, trace, &NoOpClaimError{
-					Claim:      claim,
-					Assessment: assessment,
-					Target:     target,
-				}
-			}
 			// Bounded-patch artifact boundary: extract ONLY structured patch
 			// representations. A full-file (or otherwise unstructured)
 			// response can NEVER satisfy this contract — rejecting it here is
@@ -2713,14 +3028,14 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 				for _, b := range ParseSearchReplaceBlocks(verbatim) {
 					cnt := strings.Count(original, b.search)
 					if b.search == "" || cnt == 0 {
-						return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: SEARCH matches zero regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
+						return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w: %s: SEARCH matches zero regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
 					}
 					ambiguous = ambiguous || cnt > 1
 				}
 				if ambiguous {
 					candidate, recovered := recoverSmallFileAmbiguousAnchor(original, verbatim, target, x.artifactGate)
 					if !recovered {
-						return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
+						return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
 					}
 					// Materialize the validated complete document as an exact
 					// full-span SEARCH/REPLACE envelope so the ordinary
@@ -2760,29 +3075,97 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					if rmahResult.Rejected && rmahResult.RejectReason != "" {
 						lower := strings.ToLower(rmahResult.RejectReason)
 						if strings.Contains(lower, "zero match") || strings.Contains(lower, "hallucinated anchor") {
-							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s: %s", ErrHallucinatedAnchorError, ErrArtifactRejected, target, detail)
+							return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w: %s: %s", ErrHallucinatedAnchorError, ErrArtifactRejected, target, detail)
 						}
 						if strings.Contains(lower, "ambiguous anchor") {
-							return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
+							return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
 						}
 					}
-					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, detail)
+					return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, detail)
 				}
 			}
 		} else {
+			// ── PHASE 14: RAW MODEL TEXT IS NOT AN ARTIFACT ─────────────
+			// The full-artifact contract asks for the replacement content of
+			// THIS file. A provider that completed its stream with a paragraph
+			// of prose satisfied the transport boundary and NOTHING else: there
+			// is no artifact, so there is nothing to write. The legacy path
+			// treated any unresolvable payload as the replacement body, which
+			// wrote the model's essay into the user's file and let the run
+			// report the objective satisfied — the canonical false completion.
+			//
+			// The parser is called ONLY on a COMPLETE stream: a truncated
+			// generation was already circuit-broken at Boundary 3 and its
+			// delivered prefix survives as a preserved candidate on
+			// res.ArtifactCandidates for the continuation path.
+			artifact, parseErr := ParseMutationArtifacts(verbatim)
+			if parseErr != nil {
+				// TYPED + REPROMPTABLE under the SAME artifact contract. The
+				// directive names the contract so the successor attempt is not
+				// silently relabelled — a creation stays a creation.
+				return nil, invs, diffs, candidates, trace, fmt.Errorf(
+					"%w: %w: %s: %w", ErrZeroArtifactsParsed, ErrArtifactRetryableRejected,
+					target, parseErr)
+			}
 			modified = ResolveModifiedContent(original, raw)
 			if modified == "" {
-				// The model returned only prose or a fence without content — treat
-				// the full response as the replacement attempt (best-effort).
-				modified = raw
+				// The payload carried a recognizable artifact but the content
+				// resolver produced nothing: fall back to the parsed body
+				// rather than to the raw stream.
+				modified = artifact.Content
 			}
+
+			// ── EVIDENCE-BOUND ARTIFACT BINDING (Phase 16) ──────────────
+			//
+			// The parser above produced BYTES. This step decides whether those
+			// bytes may be applied to THIS file — and it is the first place in
+			// the pipeline where that question is asked at all.
+			//
+			// Before this gate, an artifact's destination was whatever the
+			// dispatch happened to be aimed at, which meant a payload that said
+			// nothing about its own location was applied to a file chosen by
+			// circumstance. The gate's inputs are the artifact's own explicit
+			// path attribute (never a content-type inference) and the SHA-256 of
+			// the source buffer the artifact was produced against. A rejection is
+			// TERMINAL: `modified` is never staged, so no patch is created, so
+			// the mutation engine is never handed anything to write.
+			// A creation has no source bytes to anchor to, and claiming a context
+			// digest for a file that does not exist would be describing a buffer
+			// the model never read. The absence of a target is the honest
+			// context evidence for a creation, so the claim is empty — not the
+			// digest of an empty string, which is a different and false fact.
+			targetExists := fileExists(filepath.Join(x.root, target))
+			contextSHA := ""
+			if targetExists {
+				contextSHA = sourceSHA256([]byte(original))
+			}
+			bound, bindErr := x.artifactBinder().Bind(ArtifactEnvelope{
+				Content:       modified,
+				Form:          artifact.Form,
+				Structural:    artifact.Structural,
+				DeclaredPath:  artifact.DeclaredPath,
+				ContractPath:  target,
+				ContextSHA256: contextSHA,
+			}, TargetBinding{
+				Path:         target,
+				SourceSHA256: contextSHA,
+				Explicit:     true,
+				Exists:       targetExists,
+			})
+			if bindErr != nil {
+				log.Printf("[execution] request=%s target=%s artifact_binding=REJECTED reason=%q — no patch staged, no bytes applied",
+					requestID, target, bindErr.Error())
+				return nil, invs, diffs, candidates, trace, fmt.Errorf(
+					"%w: %w: %s", ErrUnboundArtifact, ErrArtifactRejected, bindErr.Error())
+			}
+			modified = bound.Content
 		}
 		if strings.TrimSpace(modified) == "" {
 			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
 			// never a proposal staged for approval. The model produced no
 			// usable mutation artifact — abort before any approval surface.
 			// The billed invocation is still returned so usage is preserved.
-			return nil, invs, nil, trace, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
+			return nil, invs, diffs, candidates, trace, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
 		}
 		// ── ARTIFACT BOUNDARY (Phase 2) ─────────────────────────────
 		// A model response is NOT an artifact until it passes the artifact
@@ -2800,10 +3183,10 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		if patchOnly && x != nil && x.artifactValidator != nil {
 			if _, err := x.artifactValidator.ValidateArtifact([]byte(raw), target); err != nil {
 				if errors.Is(err, ErrAmbiguousAnchor) {
-					return nil, invs, nil, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
+					return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w: %s", ErrAmbiguousAnchorContinuation, ErrArtifactRetryableRejected, target)
 				}
 				if errors.Is(err, ErrScopeViolation) {
-					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+					return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
 				}
 				if errors.Is(err, ErrFormatRejected) {
 					gate := v3Artifact.ValidateContent(target, []byte(modified), 0) //nolint:contextcheck // artifact validation is pure content checking, no context needed
@@ -2813,11 +3196,11 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 						// directive so the successor anchors its correction at the
 						// precise defect instead of resending raw code.
 						audit := StructuralAuditDirective(gate.Error.Error())
-						return nil, invs, nil, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, audit)
+						return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %s: %s", ErrArtifactRetryableRejected, target, audit)
 					}
-					return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+					return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
 				}
-				return nil, invs, nil, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
+				return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %s: %w", ErrArtifactRejected, target, err)
 			}
 		}
 		//nolint:contextcheck // artifact validation is pure content checking, no context needed
@@ -2826,11 +3209,11 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// The artifact was rejected, but the invocation evidence (and the
 			// real provider billing it carries) must survive: the token count
 			// is provider truth, not a function of artifact validity.
-			return nil, invs, nil, trace, gateErr
+			return nil, invs, diffs, candidates, trace, gateErr
 		}
 		modified = normalized
 		if redundant := symbolBaseline.Check(target, modified); redundant != nil {
-			return nil, invs, nil, trace, fmt.Errorf("%w: %w", ErrArtifactRetryableRejected, redundant)
+			return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w", ErrArtifactRetryableRejected, redundant)
 		}
 		patches = append(patches, &Patch{
 			ID:       fmt.Sprintf("%s-patch-%d", requestID, len(patches)+1),
@@ -2840,7 +3223,42 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		})
 		diffs = append(diffs, x.compileDiff(raw, target, original))
 	}
-	return patches, invs, diffs, trace, nil
+	return patches, invs, diffs, candidates, trace, nil
+}
+
+// lastFinishReason returns the provider finish_reason of the most recent
+// invocation ("" when unknown).
+func lastFinishReason(invs []ModelInvocation) string {
+	if len(invs) == 0 {
+		return ""
+	}
+	return invs[len(invs)-1].FinishReason
+}
+
+// partialCandidateTarget names the target whose artifact candidate is the most
+// advanced partial, for the exhaustion diagnostic. It reports the TARGET only —
+// never candidate content (Recovery Isolation, I2).
+func partialCandidateTarget(candidates []ArtifactCandidate) string {
+	best := ""
+	bestBytes := -1
+	for _, c := range candidates {
+		if c.DeliveredBytes > bestBytes {
+			best, bestBytes = c.Target, c.DeliveredBytes
+		}
+	}
+	return best
+}
+
+// partialCandidateBytes reports how many output bytes the most advanced partial
+// candidate actually delivered.
+func partialCandidateBytes(candidates []ArtifactCandidate) int {
+	best := 0
+	for _, c := range candidates {
+		if c.DeliveredBytes > best {
+			best = c.DeliveredBytes
+		}
+	}
+	return best
 }
 
 // artifactDiagnostic builds the Boundary-4 advisory signal for a rejected
@@ -3576,7 +3994,16 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 				finishReason = "length"
 			}
 			gate := &OutputGateError{Outcome: CanonicalOutputExhausted, Target: "", FinishReason: finishReason}
-			return "", usage, nil, errors.Join(gate, ErrPayloadTruncated)
+			// PHASE 12 (Task != Invocation): the delivered prefix is RETURNED
+			// alongside the typed gate error instead of being dropped. The
+			// runtime may not ADMIT it — only a COMPLETE provider outcome may
+			// reach the artifact boundary — but the executor's bounded-step
+			// continuation needs the real bytes to advance the SAME artifact
+			// contract. Every other caller ignores `raw` whenever the error is
+			// an exhaustion, so this is strictly more truthful: the bytes stop
+			// being silently destroyed and become available to the one caller
+			// that is allowed to continue under the same authority.
+			return resp.Content, usage, nil, errors.Join(gate, ErrPayloadTruncated)
 		}
 		// Transport normalization: preserve the raw response and record every
 		// transformation in an IngestionTrace before the payload reaches the
@@ -3632,11 +4059,25 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		metadataUp = metadata
 	}
 	var lastUsage ai.ProviderUsage
+	// ── PHASE 15: STREAM TOKEN AGGREGATION ────────────────────────────
+	// The aggregator owns this stream's token account from the first live
+	// reading to the final flush. `lastUsage` remains the SNAPSHOT the executor
+	// reads on the happy path, and the aggregator is the authority that keeps the
+	// two from diverging: every reading is merged into both, and the deferred
+	// teardown below finalizes the aggregator, so a stream that terminates at the
+	// artifact boundary still commits the counts the provider already billed.
+	streamTokens := NewStreamTokenAggregator(model, began)
+	streamTokens.SetFlushRequest(func(prompt, completion, reasoning int) {
+		if g != nil {
+			g.UpdateUsage(model, prompt, completion, reasoning)
+		}
+	})
 	emitUsage := func() {
 		if usageUp == nil {
 			return
 		}
 		u := usageUp.Usage()
+		streamTokens.OnReading(u)
 		if !u.Known || u.Estimated {
 			return
 		}
@@ -3655,15 +4096,11 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	// character-count estimate of what crossed the boundary (prompt request
 	// bytes + accumulated content), explicitly marked Estimated. Either way
 	// the caller records real counts instead of a silent zero.
-	snapshotUsage := func() ai.ProviderUsage {
-		if usageUp != nil {
-			if u := usageUp.Usage(); u.Known {
-				return u
-			}
-		}
-		if lastUsage.Known {
-			return lastUsage
-		}
+	//
+	// PHASE 15: the aggregator is consulted FIRST, so a reading that arrived
+	// outside the chunk loop's emit path still counts. Estimating while a real
+	// reading is in hand is how an aggregate starts drifting from the invoice.
+	estimateUsage := func() ai.ProviderUsage {
 		out := ai.ProviderUsage{Known: true, Estimated: true}
 		promptChars := len(req.System)
 		for _, m := range req.Messages {
@@ -3677,6 +4114,20 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		}
 		out.TotalTokens = out.PromptTokens + out.CompletionTokens
 		return out
+	}
+	snapshotUsage := func() ai.ProviderUsage {
+		if live := streamTokens.Live(); live.Known {
+			return live
+		}
+		if usageUp != nil {
+			if u := usageUp.Usage(); u.Known {
+				return u
+			}
+		}
+		if lastUsage.Known {
+			return lastUsage
+		}
+		return estimateUsage()
 	}
 	// ── Phase 6.4.4 Always-Flush Telemetry & Live Token Accounting ────
 	// Optimistic Prompt Token Invariant: commit estimated prompt tokens to
@@ -3698,6 +4149,7 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		// 2181/0 prefix on a size-1 bus channel.
 		if u := usageUp.Usage(); u.Known && u.Estimated && u.PromptTokens > 0 && g != nil {
 			g.UpdateUsage(model, u.PromptTokens, 0, 0)
+			streamTokens.OnReading(u)
 			if !lastUsage.Known {
 				lastUsage = ai.ProviderUsage{Known: true, Estimated: true, PromptTokens: u.PromptTokens}
 			} else if lastUsage.PromptTokens == 0 {
@@ -3705,68 +4157,52 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			}
 		}
 	}
-	// Always-Flush: every exit path (success, failure, timeout, cancel)
-	// commits whatever the live accumulator observed. The deferred read
-	// happens AFTER the return values are set, so it observes the final
-	// partial content even when the SSE loop bailed on ctx deadline before
-	// any usage chunk. On success with genuinely unknown usage (no tracker,
-	// no counts) nothing is flushed — "unknown" stays unknown, never a
-	// fabricated zero. On error/timeout the character fallback applies so
-	// billed partial work is never silently zeroed.
+	// ── PHASE 15: ONE FINALIZATION, EVERY TERMINATION ─────────────────
+	// Always-Flush Invariant, restated as a single unconditional step: this
+	// deferred teardown runs on EVERY exit — success, artifact-boundary
+	// rejection, transport failure, timeout, cancellation — because it is a
+	// defer, not a branch someone has to remember to add.
+	//
+	// What it commits is the aggregator's settled account, which is a merge of
+	// every reading the provider made. Before this phase each exit path
+	// re-derived its own telemetry and a path that terminated on a contract
+	// error could return before the counts the provider had already billed were
+	// folded into the result; the aggregate then diverged from the invoice. Now
+	// the numbers are settled in exactly one place, and `Finalize` is idempotent
+	// so a terminator that finalized eagerly cannot double-count.
+	//
+	// The estimate fallback is admitted ONLY when the stream failed or was
+	// cancelled: a clean completion with no reported usage stays UNKNOWN, which
+	// is the honest rendering, while partial work on a dead stream is billed and
+	// must be recorded.
 	defer func() {
-		var live ai.ProviderUsage
-		hasLive := false
-		if usageUp != nil {
-			if u := usageUp.Usage(); u.Known {
-				live = u
-				hasLive = true
-			} else if lastUsage.Known {
-				live = lastUsage
-				hasLive = true
-			}
-		} else if lastUsage.Known {
-			live = lastUsage
-			hasLive = true
+		failed := err != nil || ctx.Err() != nil
+		var fallback ai.ProviderUsage
+		if failed {
+			fallback = estimateUsage()
 		}
-		if hasLive {
-			if live.PromptTokens != 0 || live.CompletionTokens != 0 {
-				needsFlush := err != nil || ctx.Err() != nil
-				if !needsFlush {
-					if live.PromptTokens != lastUsage.PromptTokens ||
-						live.CompletionTokens != lastUsage.CompletionTokens ||
-						live.ReasoningTokens != lastUsage.ReasoningTokens {
-						needsFlush = true
-					}
+		if !failed {
+			// A clean stream still has whatever the tracker last reported, and
+			// the aggregator is where that lives.
+			if usageUp != nil {
+				if u := usageUp.Usage(); u.Known {
+					streamTokens.OnReading(u)
 				}
-				if needsFlush && g != nil {
-					g.UpdateUsage(model, live.PromptTokens, live.CompletionTokens, live.ReasoningTokens)
-					lastUsage = live
-					if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
-						usage = live
-					}
-				}
-				return
 			}
+		}
+		final := streamTokens.Finalize(fallback)
+		if !final.Known {
 			return
 		}
-		// No live tracker data: only error/timeout paths fall back to the
-		// character estimate; success with unknown usage stays unknown.
-		if err == nil && ctx.Err() == nil {
+		if final.PromptTokens == 0 && final.CompletionTokens == 0 {
 			return
 		}
-		fallback := snapshotUsage()
-		if !fallback.Known {
-			return
-		}
-		if fallback.PromptTokens == 0 && fallback.CompletionTokens == 0 {
-			return
-		}
-		if g != nil {
-			g.UpdateUsage(model, fallback.PromptTokens, fallback.CompletionTokens, fallback.ReasoningTokens)
-			lastUsage = fallback
-			if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
-				usage = fallback
-			}
+		lastUsage = final
+		// The returned account is only overwritten when the caller established
+		// none: an explicit count from the happy path is more specific than the
+		// aggregate and must not be replaced by it.
+		if usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+			usage = final
 		}
 	}()
 	firstToken := false
@@ -3831,14 +4267,20 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 			emitUsage()
 			// D. Real-time streaming token accounting: emit estimated usage
 			// increments on every chunk so TUI counters update dynamically.
+			// PHASE 15: the published reading is the AGGREGATOR's merged view,
+			// not the raw tracker frame. A provider that seeds an estimated
+			// prompt baseline and then reports the authoritative total would
+			// otherwise make the live counter move backwards on the frame that
+			// actually settles the bill.
 			if usageUp != nil {
-				u := usageUp.Usage()
-				if streamCb != nil {
-					streamCb(StreamEvent{
-						RequestID: requestID,
-						Kind:      "stream_token",
-						Usage:     u,
-					})
+				if u := streamTokens.Live(); u.Known {
+					if streamCb != nil {
+						streamCb(StreamEvent{
+							RequestID: requestID,
+							Kind:      "stream_token",
+							Usage:     u,
+						})
+					}
 				}
 			}
 		}
@@ -3869,11 +4311,28 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		}
 	}
 
-	usage = lastUsage
+	// PHASE 15: the stream reached EOF, which is the ONE termination every
+	// successful run shares. The account is settled here — before any
+	// truncation gate, ingestion repair or artifact parse can return early —
+	// so no downstream decision about the artifact can change what the provider
+	// already billed. The deferred teardown below is then a no-op by design.
+	streamTokens.finished = time.Now()
 	if usageUp != nil {
 		if u := usageUp.Usage(); u.Known {
-			usage = u
+			streamTokens.OnReading(u)
 		}
+	}
+	if metadataUp != nil {
+		if md := metadataUp.ResponseMetadata(); md.Usage.Known {
+			streamTokens.OnReading(md.Usage)
+		}
+	}
+	settled := streamTokens.Finalize(ai.ProviderUsage{})
+	if settled.Known {
+		usage = settled
+		lastUsage = settled
+	} else {
+		usage = lastUsage
 	}
 	if metadataUp != nil {
 		responseMetadata = metadataUp.ResponseMetadata()
@@ -3968,15 +4427,26 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	return visible, usage, trace, nil
 }
 
-// emitSnapshotActivity surfaces whether snapshot content came from physical
-// disk or the in-memory observation cache through the existing activity/event
-// loggers (wired by the UI at startup).
+// emitSnapshotActivity records whether snapshot content came from physical disk
+// or the in-memory observation cache.
+//
+// PHASE 12 — WORKSPACE CONTEXT, NOT MODEL CONTEXT. A snapshot-cache hit is a
+// WORKSPACE-context fact: the raw bytes were already in the executor's memory
+// map. It says nothing about the MODEL context, which is re-projected and
+// re-billed on every attempt, and reporting it next to model-context
+// telemetry presented a filesystem fact as if it were model-context reuse.
+//
+// The line therefore names its own layer explicitly and is routed to the
+// DETAIL channel, never the default activity channel: raw telemetry belongs in
+// Trace, not in the human execution narrative. The typed
+// retrieval.FileReadEvent still fires for genuine disk reads and feeds the
+// structured ActivityTree, which is the canonical file-I/O surface.
 func (x *RuntimeExecutor) emitSnapshotActivity(target string, bytes int, disk bool) {
-	if globalActivityLog != nil {
+	if globalDetailLog != nil {
 		if disk {
-			globalActivityLog("[runtime] reading disk %s (%d bytes)", target, bytes)
+			globalDetailLog("[runtime:workspace] read from disk %s (%d bytes)", target, bytes)
 		} else {
-			globalActivityLog("[runtime] snapshot cache hit %s (%d bytes)", target, bytes)
+			globalDetailLog("[runtime:workspace] snapshot cache hit %s (%d bytes)", target, bytes)
 		}
 	}
 	if disk && globalEventLog != nil {
@@ -4177,6 +4647,102 @@ func (x *RuntimeExecutor) emitEvidenceEvent(res *ExecutionResult, ev *ExecutionE
 			string(ai.SchemaModeAuto),
 		),
 	}))
+}
+
+// compiledDiffsByTarget maps the runtime's compiled unified diffs onto their
+// targets.
+//
+// pm.diffs is index-aligned with the target list, but a target can carry an
+// empty diff (the runtime compiled nothing for it). Mapping by target rather
+// than by position keeps an empty entry from being silently attributed to a
+// neighbour — which would publish another file's diff metrics on this target.
+func compiledDiffsByTarget(diffs []string, patches []*Patch) map[string]string {
+	out := make(map[string]string, len(patches))
+	for i, p := range patches {
+		if p == nil || i >= len(diffs) {
+			continue
+		}
+		if diffs[i] == "" {
+			// No compiled diff for this target: recorded as absent, not
+			// borrowed from a sibling.
+			continue
+		}
+		out[p.File] = diffs[i]
+	}
+	return out
+}
+
+// publishMutationOutcome closes one target of a mutation on the runtime graph,
+// transporting the apply boundary's REAL evidence for it.
+//
+// The diff metrics are read from the boundary's own MutationEvidence record
+// (measured from the unified diff the boundary compiled, by
+// PatchManager.recordMutationEvidence). Nothing is recomputed here, and a
+// target whose evidence carries no compiled diff publishes DiffPresent=false —
+// so a projector that renders diff statistics from this event can never print
+// fabricated counts, and "0 bytes written" stays truthful.
+//
+// fallback carries the reconciled outcome the executor assigned when the
+// boundary recorded none (a target that produced no artifact is reported as
+// no-change on success and apply-failed on rollback).
+func publishMutationOutcome(g *runtimegraph.Graph, ms *MutationSet, file string, fallback MutationOutcome) {
+	ev, ok := ms.EvidenceFor(file)
+	if !ok {
+		ev = MutationEvidence{File: file, Outcome: fallback}
+	}
+	// The executor's reconciled outcome is authoritative for the transport: a
+	// boundary record without a typed outcome adopts the reconciliation, while a
+	// recorded outcome is passed through unchanged.
+	if ev.Outcome == "" || ev.Outcome == OutcomeNoArtifact {
+		ev.Outcome = fallback
+	}
+	// A diff is evidence of a change; a target the boundary proved unchanged can
+	// never publish diff metrics, even if a diff was compiled for it.
+	if ev.Outcome != OutcomeChanged && ev.Outcome != OutcomeCreated {
+		ev.DiffPresent = false
+		ev.DiffAdds = 0
+		ev.DiffRemoves = 0
+	}
+	g.CompleteMutationWithEvidence(events.MutationEvidence{
+		Target:            file,
+		Outcome:           string(ev.Outcome),
+		ArtifactPresent:   ev.ArtifactPresent,
+		DiffPresent:       ev.DiffPresent,
+		DiffAdds:          ev.DiffAdds,
+		DiffRemoves:       ev.DiffRemoves,
+		ApplyExecuted:     ev.ApplyExecuted,
+		FilesystemChanged: ev.FilesystemChanged,
+	})
+}
+
+// completeExecution is the ONE terminal-success choke point of the executor.
+//
+// It enforces the ordering invariant the whole evidence pipeline depends on:
+//
+//	seal evidence  →  publish evidence  →  publish execution.finished(success)
+//
+// A completion claim is never broadcast ahead of the record that substantiates
+// it. A projector that observes execution.finished therefore always has the
+// sealed evidence in hand and can gate the completion verdict on it; it never
+// has to trust the success flag, and it never has to guess whether a record is
+// still in flight.
+//
+// Every terminal success in Execute / Approve routes through here, so there is
+// no path that emits a success without first sealing. finalizeResult remains the
+// idempotent backstop (sealTerminalEvidence refuses to re-seal), which keeps
+// the failure, cancellation and rejection paths covered by the same single seal.
+//
+// res, res.Proof and g are guaranteed non-nil by every call site: each passes
+// the proof it just populated and the graph of the request it is executing. The
+// single linear body is deliberate — an extra conditional call site would create
+// a second path to a success event, and the ordering invariant this function
+// exists to guarantee must be structural, not conventional.
+func (x *RuntimeExecutor) completeExecution(res *ExecutionResult, g *runtimegraph.Graph, outcome string) {
+	if res.Proof.FinishedAt.IsZero() {
+		res.Proof.FinishedAt = time.Now()
+	}
+	x.sealTerminalEvidence(res)
+	g.CompleteExecution(outcome)
 }
 
 // finalizeResult stamps the authoritative terminal usage account (provider,

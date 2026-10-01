@@ -154,13 +154,20 @@ func TestConformanceB_DriverOutputExhaustionSingleTypedTransitionThenHalt(t *tes
 	root := t.TempDir()
 	writeTarget(t, root, "index.html", compactIndexHTML()) // feasible at B2
 
-	truncated := func() *ai.Response {
-		return &ai.Response{
-			Content: "<<<<<<< SEARCH\nfoo\n=======\nqux\n>>>>>>>", // parseable-looking poison
-			Usage:   ai.ProviderUsage{PromptTokens: 2180, CompletionTokens: 1024, Known: true, FinishReason: "length"},
-		}
-	}
-	mock := &mockProvider{responses: []*ai.Response{truncated(), truncated(), truncated()}}
+	// PHASE 12 (Task != Invocation): the initial full-artifact ATTEMPT is one
+	// bounded step of 1 + llmstep.DefaultMaxContinuationSteps invocations, all
+	// under the SAME contract. The I1 invariant under test is about CONTRACT
+	// TRANSITIONS, not raw provider calls: exactly ONE typed
+	// FULL_REWRITE -> BOUNDED_PATCH transition may ever happen, and then the
+	// lineage HALTS.
+	poison := "<<<<<<< SEARCH\nfoo\n=======\nqux\n>>>>>>>" // parseable-looking poison
+	mock := &mockProvider{responses: exhaustedFullArtifactStep(poison, 2180, 1024)}
+	// A second exhausted bounded step for the typed recovery attempt, which
+	// must then HALT rather than transition a second time (I1).
+	mock.responses = append(mock.responses, &ai.Response{
+		Content: poison,
+		Usage:   ai.ProviderUsage{PromptTokens: 2180, CompletionTokens: 1024, Known: true, FinishReason: "length"},
+	})
 	bus := events.NewBus(events.DefaultBufferSize)
 	x := testExecutor(t, root, mock, bus)
 
@@ -183,10 +190,13 @@ func TestConformanceB_DriverOutputExhaustionSingleTypedTransitionThenHalt(t *tes
 		t.Fatalf("Run: %v", err)
 	}
 
-	// Exactly TWO invocations: the initial full-artifact attempt and the ONE
-	// typed bounded-patch continuation. No third attempt exists (I1).
-	if got := mock.calls(); got != 2 {
-		t.Fatalf("provider invocations = %d, want exactly 2 (one attempt + one typed transition)", got)
+	// Exactly TWO attempts: the initial full-artifact bounded step (1 +
+	// DefaultMaxContinuationSteps invocations of its own) and the ONE typed
+	// bounded-patch continuation. No third attempt exists (I1) — and the
+	// bounded-patch contract is deliberately NOT continued, because it already
+	// fits any budget, so its exhaustion is a genuine halt.
+	if got, want := mock.calls(), exhaustedFullArtifactStepCount+1; got != want {
+		t.Fatalf("provider invocations = %d, want %d (one full-artifact bounded step + one typed transition)", got, want)
 	}
 
 	// The typed transition was materially correct (I3).
@@ -222,10 +232,19 @@ func TestConformanceB_DriverOutputExhaustionSingleTypedTransitionThenHalt(t *tes
 		t.Fatal("workspace corrupted by an exhausted recovery")
 	}
 
-	// The wire proves the second attempt used the strict bounded protocol.
+	// The wire proves the second ATTEMPT used the strict bounded protocol. Its
+	// first request is the one after the initial attempt's bounded continuations.
 	reqs := mock.recordedRequests()
-	if strings.Contains(strings.ToLower(reqs[1].System), "full modified file") {
+	if len(reqs) <= exhaustedFullArtifactStepCount {
+		t.Fatalf("expected a second-attempt request after %d bounded continuations, got %d",
+			exhaustedFullArtifactStepCount, len(reqs))
+	}
+	second := reqs[exhaustedFullArtifactStepCount]
+	if strings.Contains(strings.ToLower(second.System), "full modified file") {
 		t.Fatal("attempt 2 did not switch to the strict bounded-patch protocol")
+	}
+	if !strings.Contains(second.System, "<<<<<<< SEARCH") {
+		t.Fatal("attempt 2 did not adopt the strict bounded-patch protocol")
 	}
 }
 

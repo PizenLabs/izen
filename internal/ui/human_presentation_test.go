@@ -73,7 +73,13 @@ func TestHumanViewDoesNotContainProviderNames(t *testing.T) {
 }
 
 // TestExpandedViewContainsRuntimeMetadata pins requirement 6b: EXPANDED (Ctrl+O)
-// reveals strategy, context policy, model, token usage, duration, and artifacts.
+// reveals strategy, context channels, the layer-labelled token figures, model,
+// provider invocation state, duration, and artifacts.
+//
+// PHASE 13: every token figure is layer-labelled. "compiled context (est.)" is
+// the ~4-chars/token estimate of the assembled prompt; "provider tokens" is the
+// provider's own report. Rendering them under a single ambiguous "tokens:" label
+// forced the user to infer which measurement they were looking at.
 func TestExpandedViewContainsRuntimeMetadata(t *testing.T) {
 	m := gatedDispatchModel(t, &mockProvider{}, map[string]string{"index.html": "<p>hi</p>"})
 	m.execView = presentation.NewExecutionProjection()
@@ -85,9 +91,11 @@ func TestExpandedViewContainsRuntimeMetadata(t *testing.T) {
 	panel := stripANSITest(m.renderExecutionLayered())
 	for _, want := range []string{
 		"strategy:", "targeted_mutation",
-		"context policy:", "user_intent",
+		"context channels:", "user_intent",
+		"compiled context (est.):",
 		"model:", "mock-provider",
-		"tokens:", "12 in",
+		"provider calls:",
+		"provider tokens:", "12 prompt", "6 completion",
 		"duration:",
 		"artifact:",
 	} {

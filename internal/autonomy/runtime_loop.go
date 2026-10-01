@@ -41,16 +41,33 @@ const (
 	// RuntimeAwaitingHuman parks the loop: the human must respond before the
 	// loop advances. This is a runtime state; the UI only renders it.
 	RuntimeAwaitingHuman RuntimeState = "awaiting_human"
-	// RuntimeCompleted is the terminal success position.
+	// RuntimeCompleted is the terminal success position. It is reachable ONLY
+	// from a LoopComplete decision that the ObjectiveCompletionAuthority ruled
+	// PROVEN — i.e. only when the execution evidence satisfied the Task
+	// Contract. A provider that returned, a step that came back nil and a
+	// verifier that merely ran are structurally incapable of producing it.
 	RuntimeCompleted RuntimeState = "completed"
+	// RuntimeUnsubstantiated is the terminal position for an execution whose
+	// evidence did NOT satisfy the Task Contract. The run stopped without
+	// claiming success and without fabricating a failure verdict: the honest
+	// terminal truth is "not proven". It is deliberately distinct from
+	// RuntimeAborted (a failure) and from RuntimeCompleted (a proof) so no
+	// projection can round-trip an unproven objective into either.
+	//
+	// PhaseUnsubstantiated is the design-document spelling of the same state,
+	// retained so callers written against the Phase 14 vocabulary compile.
+	RuntimeUnsubstantiated RuntimeState = "unsubstantiated"
+	// PhaseUnsubstantiated is an alias of RuntimeUnsubstantiated.
+	PhaseUnsubstantiated = RuntimeUnsubstantiated
 	// RuntimeAborted is the terminal position: loop bounds, cancellation, or a
 	// permanent runtime failure.
 	RuntimeAborted RuntimeState = "aborted"
 )
 
-// IsTerminal reports whether the state is terminal (Completed/Aborted).
+// IsTerminal reports whether the state is terminal (Completed/Unsubstantiated/
+// Aborted).
 func (s RuntimeState) IsTerminal() bool {
-	return s == RuntimeCompleted || s == RuntimeAborted
+	return s == RuntimeCompleted || s == RuntimeAborted || s == RuntimeUnsubstantiated
 }
 
 // String returns the canonical runtime-state label.
@@ -233,6 +250,17 @@ type Observation struct {
 	ClarificationRequired bool
 	// Verification is the verification outcome (populated post-execution).
 	Verification VerificationOutcome
+	// Objective carries the TASK-SPECIFIC execution evidence the composition
+	// boundary sealed for this observation: the four independent lifecycle
+	// states (provider / artifact / mutation / verification) plus the runtime's
+	// immutable terminal record.
+	//
+	// The loop never derives these facts itself and never authorizes completion
+	// from a provider outcome: it hands this bundle to the
+	// ObjectiveCompletionAuthority, which is the only thing allowed to say the
+	// objective was PROVEN. A zero-value bundle is an UNOBSERVED execution and
+	// can therefore never prove anything.
+	Objective execution.ObjectiveEvidence
 	// TokenUsage is the provider usage accounted by the loop for bounds.
 	TokenUsage int
 	// InputTokens / OutputTokens are the authoritative provider-reported
@@ -252,6 +280,13 @@ type Observation struct {
 	// state: the matrix refuses a second OUTPUT_EXHAUSTED transition when it
 	// is already set.
 	RecoveryStrategy string
+	// ArtifactShape names the artifact contract this attempt was dispatched
+	// under ("create_file", "replace_block", "search_replace", ...). It is
+	// authoritative for the recovery matrix: a CREATION contract has no
+	// existing content to anchor a bounded SEARCH/REPLACE patch against, so
+	// relabelling it is structurally impossible rather than merely wasteful.
+	// Such an attempt escalates to an explicit budget decision instead.
+	ArtifactShape string
 	// AttemptNum is the attempt counter for the current objective.
 	AttemptNum int
 	// RecoveryCycle is the recovery-cycle counter for the current objective.
@@ -280,6 +315,12 @@ const (
 	LoopRepair LoopAction = "repair"
 	// LoopAskHuman parks the loop in AwaitingHuman (runtime state).
 	LoopAskHuman LoopAction = "ask_human"
+	// LoopUnsubstantiate terminates the loop at RuntimeUnsubstantiated. It is
+	// the ONLY alternative to LoopComplete the authority permits: a proposed
+	// completion whose evidence failed the Task Contract is downgraded here
+	// instead of being honoured. It is a terminal truth ("not proven"), not a
+	// failure verdict and not a success.
+	LoopUnsubstantiate LoopAction = "unsubstantiate"
 	// LoopAbort terminates the loop with a failure classification.
 	LoopAbort LoopAction = "abort"
 )
@@ -287,7 +328,8 @@ const (
 // Valid reports whether the action is in the closed vocabulary.
 func (a LoopAction) Valid() bool {
 	switch a {
-	case LoopContinue, LoopComplete, LoopRetry, LoopRepair, LoopAskHuman, LoopAbort:
+	case LoopContinue, LoopComplete, LoopRetry, LoopRepair, LoopAskHuman,
+		LoopUnsubstantiate, LoopAbort:
 		return true
 	default:
 		return false
@@ -506,13 +548,71 @@ type LoopBounds struct {
 }
 
 // DefaultLoopBounds returns the standard runtime-owned termination bounds.
+//
+// PHASE 12 — the run-level token bound is now a FLOOR, not the whole budget.
+// `MaxTotalTokens` used to be a fixed 8 000, which is smaller than a single
+// legitimate multi-invocation task: one 4 096-token full-artifact generation
+// plus its bounded continuations already crosses it, so the token bound — not
+// the structural bounds — was the first thing to terminate a run that was
+// making progress. The authoritative run ceiling is
+// `RunTokenBudget(perInvocationOutputTokens, …)`, derived at Run time from the
+// budget the invocations are actually bound to. This floor only guarantees the
+// run-level bound is never the tightest constraint; it never authorizes
+// anything.
+const (
+	// MinRunTokenBudget is the floor for the derived run-level token bound.
+	MinRunTokenBudget = 64_000
+	// MaxRunTokenBudget is the hard ceiling for the derived run-level token
+	// bound. A pathological loop is still terminated by the structural bounds
+	// (MaxAttempts, MaxIdenticalDecisions, MaxExecutionSteps); this is only a
+	// spend guard.
+	MaxRunTokenBudget = 400_000
+	// runInputAllowancePerAttempt is the deterministic per-attempt input
+	// allowance: the strategy-owned repository context budget
+	// (ContextPolicyRepository = 16 000 tokens) plus the objective/evidence
+	// ledger and the contract envelope.
+	runInputAllowancePerAttempt = 24_000
+)
+
+// RunTokenBudget derives the run-level provider-token ceiling for one loop run.
+//
+// A budget bounds MODEL INVOCATIONS; it must not arbitrarily truncate a logical
+// task. The derivation is a pure function of facts the runtime already owns:
+//
+//	perInvocationOutput × (attempts × (1 + continuationSteps))
+//	  + attempts × inputAllowancePerAttempt
+//
+// clamped to [MinRunTokenBudget, MaxRunTokenBudget]. It is deterministic,
+// inspectable and unit-testable, and it never lowers a bound the caller set.
+func RunTokenBudget(perInvocationOutputTokens, attempts, continuationSteps int) int {
+	if perInvocationOutputTokens <= 0 {
+		perInvocationOutputTokens = 4096
+	}
+	if attempts <= 0 {
+		attempts = DefaultLoopBounds().MaxAttempts
+	}
+	if continuationSteps < 0 {
+		continuationSteps = 0
+	}
+	invocations := attempts * (1 + continuationSteps)
+	total := perInvocationOutputTokens*invocations + attempts*runInputAllowancePerAttempt
+	if total < MinRunTokenBudget {
+		return MinRunTokenBudget
+	}
+	if total > MaxRunTokenBudget {
+		return MaxRunTokenBudget
+	}
+	return total
+}
+
+// DefaultLoopBounds returns the standard runtime-owned termination bounds.
 func DefaultLoopBounds() LoopBounds {
 	return LoopBounds{
 		MaxAttempts:           3,
 		MaxRecoveryCycles:     2,
 		MaxExecutionSteps:     10,
 		MaxIdenticalDecisions: 2,
-		MaxTotalTokens:        8000,
+		MaxTotalTokens:        MinRunTokenBudget,
 	}
 }
 
@@ -762,8 +862,8 @@ func (l *RuntimeLoop) Observe(o Observation) RuntimeState {
 // Step advances the loop by one bounded decision step.
 //
 //   - From Deciding, the decision is validated and applied: Continue/Retry/
-//     Repair → Executing, Complete → Completed, AskHuman → AwaitingHuman,
-//     Abort → Aborted.
+//     Repair → Executing, Complete → Completed, Unsubstantiate →
+//     Unsubstantiated, AskHuman → AwaitingHuman, Abort → Aborted.
 //   - From Interpreting, the same vocabulary applies (recovery decisions are
 //     legal here).
 //   - From Recovering, Continue/Retry/Repair → Executing, AskHuman →
@@ -869,6 +969,11 @@ func (l *RuntimeLoop) applyDecision(d LoopDecision) RuntimeState {
 		l.push(d.Action, RuntimeRecovering, d.Reason)
 	case LoopComplete:
 		l.terminate(LoopComplete, RuntimeCompleted, d.Reason, "")
+	case LoopUnsubstantiate:
+		// The authority refused the completion claim. The reason carries the
+		// specific unsatisfied clause so the terminal record states WHICH
+		// obligation went unmet, never a bare "did not work".
+		l.terminate(LoopUnsubstantiate, RuntimeUnsubstantiated, d.Reason, "")
 	case LoopAskHuman:
 		l.push(d.Action, RuntimeAwaitingHuman, d.Reason)
 		b := &HumanBoundary{Reason: d.Reason, PatchID: d.PatchID, Options: d.Options}
@@ -909,6 +1014,22 @@ func (l *RuntimeLoop) Complete(reason string) (RuntimeState, *LoopTermination) {
 	}
 	term := &LoopTermination{State: RuntimeCompleted, Reason: reason}
 	l.terminate(LoopComplete, term.State, term.Reason, term.Class)
+	return l.state, term
+}
+
+// Unsubstantiate terminates the loop at the terminal UNSUBSTANTIATED position:
+// the run stopped because its evidence did not satisfy the Task Contract.
+//
+// It is the truthful counterpart of Complete. Neither claims failure (the
+// attempt may have been perfectly legal) nor success (nothing was proven), and
+// the reason string states the specific unmet obligation. A fresh Run may
+// start afterwards — like every other terminal state, the loop is frozen.
+func (l *RuntimeLoop) Unsubstantiate(reason string) (RuntimeState, *LoopTermination) {
+	if l == nil {
+		return RuntimeIdle, nil
+	}
+	term := &LoopTermination{State: RuntimeUnsubstantiated, Reason: reason}
+	l.terminate(LoopUnsubstantiate, term.State, term.Reason, term.Class)
 	return l.state, term
 }
 
@@ -977,6 +1098,9 @@ func (l *RuntimeLoop) legalFrom(s RuntimeState, a LoopAction) bool {
 	switch s {
 	case RuntimeDeciding, RuntimeInterpreting:
 		return a.Valid()
+	case RuntimeUnsubstantiated:
+		// Terminal like Completed/Aborted — Step rejects it above.
+		return false
 	case RuntimeRecovering:
 		return a == LoopContinue || a == LoopRetry || a == LoopRepair ||
 			a == LoopAskHuman || a == LoopAbort

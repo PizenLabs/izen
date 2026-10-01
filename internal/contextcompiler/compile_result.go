@@ -55,6 +55,7 @@ func (c *CompiledContext) Metrics() CompileResult {
 	rendered := c.Assemble()
 	result.PromptChars = len(rendered)
 	result.PromptFingerprint = protocol.Fingerprint(rendered)
+	result.CacheHit = c.CacheHit
 	return result
 }
 

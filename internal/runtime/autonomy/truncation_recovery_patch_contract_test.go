@@ -10,6 +10,7 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/llmstep"
 )
 
 // ── fixtures ────────────────────────────────────────────────────────────────
@@ -376,18 +377,27 @@ func TestMisbehavingModelDoesNotCorruptFile(t *testing.T) {
 			Usage:   ai.ProviderUsage{PromptTokens: in, CompletionTokens: 300, Known: true, FinishReason: "stop"},
 		}
 	}
-	mock, _, driver := newCompactDriver(t, root, truncated, fullFile(2277), fullFile(2353))
+	responses := exhaustedFullArtifactStep(truncated.Content, 2182, 1022)
+	responses = append(responses, fullFile(2277), fullFile(2353))
+	mock, _, driver := newCompactDriver(t, root, responses...)
 	runObjectiveCompact(t, driver)
 
 	reqs := mock.recordedRequests()
-	for i, r := range reqs[1:] {
+	// The bounded continuations of the FIRST attempt keep the full-artifact
+	// contract on purpose (PHASE 12: the contract is what stays stable). The
+	// Driver-driven RECOVERY attempts after them must be bounded patches.
+	recovery := reqs[exhaustedFullArtifactStepCount:]
+	if len(recovery) == 0 {
+		t.Fatalf("no driver-driven recovery request was issued (%d total requests)", len(reqs))
+	}
+	for i, r := range recovery {
 		norm := strings.Join(strings.Fields(strings.ToLower(r.System)), " ")
 		if strings.Contains(norm, "full modified file") ||
 			!strings.Contains(r.System, "<<<<<<< SEARCH") {
-			t.Fatalf("recovery request #%d regressed to the full-artifact contract: %q", i+2, r.System)
+			t.Fatalf("recovery request #%d regressed to the full-artifact contract: %q", i+1, r.System)
 		}
 		if r.MaxTokens != 1024 {
-			t.Fatalf("recovery request #%d raised the budget to %d", i+2, r.MaxTokens)
+			t.Fatalf("recovery request #%d raised the budget to %d", i+1, r.MaxTokens)
 		}
 	}
 	if got := readTarget(t, root, "index.html"); got != before {
@@ -416,15 +426,25 @@ func TestRecoveryDoesNotDuplicateProviderInvocation(t *testing.T) {
 		Content: patchForLine(8, "<p class=\"line-8\">deduped line 8</p>"),
 		Usage:   ai.ProviderUsage{PromptTokens: 1100, CompletionTokens: 90, Known: true, FinishReason: "stop", HTTPAttempts: 2, RateLimitedRetries: 1},
 	}
-	mock, x, driver := newCompactDriver(t, root, truncated, bounded)
+	responses := exhaustedFullArtifactStep(truncated.Content, truncated.Usage.PromptTokens, truncated.Usage.CompletionTokens)
+	responses = append(responses, bounded)
+	mock, x, driver := newCompactDriver(t, root, responses...)
 	runObjectiveCompact(t, driver)
 
-	if mock.calls() != 2 {
-		t.Fatalf("provider invocations = %d, want exactly one per loop attempt (2)", mock.calls())
+	// One exhausted full-artifact bounded step, then exactly ONE loop attempt
+	// that staged the patch.
+	if got := mock.calls(); got != exhaustedFullArtifactStepCount+1 {
+		t.Fatalf("provider invocations = %d, want %d", got, exhaustedFullArtifactStepCount+1)
 	}
+	// The driver accounts EVERY billed invocation it observed: the exhausted
+	// full-artifact bounded step AND the single recovery attempt that staged
+	// the patch. Nothing is hidden, and nothing is double counted.
 	in, out, known := driver.AggregatedUsage()
-	if !known || in != 2100 || out != 590 {
-		t.Fatalf("aggregate = %d/%d known=%v, want 2100/590 true (one count per logical invocation)", in, out, known)
+	wantIn := exhaustedFullArtifactStepCount*truncated.Usage.PromptTokens + bounded.Usage.PromptTokens
+	wantOut := exhaustedFullArtifactStepCount*truncated.Usage.CompletionTokens + bounded.Usage.CompletionTokens
+	if !known || in != wantIn || out != wantOut {
+		t.Fatalf("aggregate = %d/%d known=%v, want %d/%d true (one count per logical invocation)",
+			in, out, known, wantIn, wantOut)
 	}
 	b := driver.Boundary()
 	if b == nil || b.PatchID == "" {
@@ -462,7 +482,10 @@ func TestUsageAggregationAcrossRecovery(t *testing.T) {
 		Content: patchForLine(9, "<p class=\"line-9\">counted line 9</p>"),
 		Usage:   ai.ProviderUsage{PromptTokens: 2303, CompletionTokens: 140, Known: true, FinishReason: "stop"},
 	}
-	mock, _, adapter, _ := harnessWithAdapter(t, root, truncated, bounded)
+	responses := exhaustedFullArtifactStep(truncated.Content, 2182, 1022)
+	responses = append(responses, exhaustedFullArtifactStep(truncated.Content, 2182, 1022)...)
+	responses = append(responses, bounded)
+	mock, _, adapter, _ := harnessWithAdapter(t, root, responses...)
 
 	// Direct first attempt through the adapter: the observation must preserve
 	// the authoritative finish_reason and usage verbatim.
@@ -473,8 +496,11 @@ func TestUsageAggregationAcrossRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first attempt: %v", err)
 	}
-	if obs.FinishReason != "length" || obs.OutputTokens != 1022 {
-		t.Fatalf("observation = %d toks finish=%q, want 1022/length", obs.OutputTokens, obs.FinishReason)
+	// The observation accounts the WHOLE exhausted bounded step, not just its
+	// first invocation: those tokens were really spent on this logical task.
+	wantOut := int64(exhaustedFullArtifactStepCount) * 1022
+	if obs.FinishReason != "length" || obs.OutputTokens != int(wantOut) {
+		t.Fatalf("observation = %d toks finish=%q, want %d/length", obs.OutputTokens, obs.FinishReason, wantOut)
 	}
 	if obs.RecoveryStrategy != autonomy.StrategyFullArtifact {
 		t.Fatalf("first attempt strategy = %q, want full_artifact", obs.RecoveryStrategy)
@@ -486,18 +512,47 @@ func TestUsageAggregationAcrossRecovery(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	// Run started a fresh aggregation: it covers exactly the invocations IT
-	// made (the recovery attempt that staged the patch).
+	// made — its own exhausted full-artifact bounded step plus the single
+	// recovery attempt that staged the patch.
 	in, out, known := driver.AggregatedUsage()
 	if !known {
 		t.Fatal("usage unknown")
 	}
-	if in != 2303 || out != 140 {
-		t.Fatalf("aggregate = %d/%d, want 2303/140", in, out)
+	aggIn := exhaustedFullArtifactStepCount*2182 + bounded.Usage.PromptTokens
+	aggOut := exhaustedFullArtifactStepCount*1022 + bounded.Usage.CompletionTokens
+	if in != aggIn || out != aggOut {
+		t.Fatalf("aggregate = %d/%d, want %d/%d", in, out, aggIn, aggOut)
 	}
-	if mock.calls() != 2 { // 1 explicit + 1 via Run
-		t.Fatalf("calls = %d, want 2 (one count per logical invocation)", mock.calls())
+	// 1 explicit exhausted bounded step + 1 via Run (its own exhausted step
+	// plus the single recovery attempt that staged the patch).
+	if want := 2*exhaustedFullArtifactStepCount + 1; mock.calls() != want {
+		t.Fatalf("calls = %d, want %d (one count per logical invocation)", mock.calls(), want)
 	}
 }
+
+// exhaustedFullArtifactStep builds the provider responses ONE full-artifact
+// attempt costs when the model never stops: the initial bounded invocation plus
+// every affordable bounded continuation (llmstep.DefaultMaxContinuationSteps).
+//
+// PHASE 12 (Task != Invocation): a full-artifact generation is a LOGICAL task
+// that continues the SAME artifact contract across bounded MODEL INVOCATIONS
+// before the Driver ever sees an exhaustion. Tests that exercise the
+// Driver-driven contract transition must therefore supply a whole exhausted
+// step before their typed-transition response.
+func exhaustedFullArtifactStep(content string, promptTokens, completionTokens int) []*ai.Response {
+	out := make([]*ai.Response, 0, 1+llmstep.DefaultMaxContinuationSteps)
+	for i := 0; i <= llmstep.DefaultMaxContinuationSteps; i++ {
+		out = append(out, &ai.Response{
+			Content: content,
+			Usage:   ai.ProviderUsage{PromptTokens: promptTokens, CompletionTokens: completionTokens, Known: true, FinishReason: "length"},
+		})
+	}
+	return out
+}
+
+// exhaustedFullArtifactStepCount is the number of provider invocations one
+// never-completing full-artifact attempt costs under the bounded-step contract.
+const exhaustedFullArtifactStepCount = 1 + llmstep.DefaultMaxContinuationSteps
 
 // ── shared helpers ──────────────────────────────────────────────────────────
 

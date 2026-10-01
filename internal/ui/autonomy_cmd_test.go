@@ -11,33 +11,51 @@ import (
 
 // ── Event projection ─────────────────────────────────────────────────────────
 
+// TestHandleAutonomyEventProjection pins where each autonomy event is PROJECTED.
+//
+// PHASE 15 moved the capability grant: a grant is an authorization-layer fact, and
+// the Main Narrative shows evidence of work rather than the granting of
+// permission. The event is still published verbatim and still reaches Trace —
+// the boundary moves information, it never discards it. The `divert` column
+// records which surface each event now belongs on.
 func TestHandleAutonomyEventProjection(t *testing.T) {
 	tests := []struct {
-		name string
-		ev   events.DomainEvent
-		want string
+		name   string
+		ev     events.DomainEvent
+		want   string
+		divert bool
 	}{
 		{"autonomy decision auto_continue", events.NewAutonomyDecision("auto_continue", "modification", 0.9, "build", "low", nil, "mutation granted"),
-			"[autonomy] ▶ auto_continue → workspace build (risk low, 90%): mutation granted"},
+			"[autonomy] ▶ auto_continue → workspace build (risk low, 90%): mutation granted", false},
 		{"autonomy decision ask_user with missing caps", events.NewAutonomyDecision("ask_user", "modification", 0.9, "build", "low", []string{"mutate"}, "capability not granted"),
-			"[autonomy] ◈ ask_user → workspace build (risk low, 90%): capability not granted\n[autonomy] requesting capability: mutate"}, {"autonomy decision block", events.NewAutonomyDecision("block", "modification", 0.9, "build", "critical", nil, "no rollback"),
-			"[autonomy] ■ block → workspace build (risk critical, 90%): no rollback"},
+			"[autonomy] ◈ ask_user → workspace build (risk low, 90%): capability not granted\n[autonomy] requesting capability: mutate", false},
+		{"autonomy decision block", events.NewAutonomyDecision("block", "modification", 0.9, "build", "critical", nil, "no rollback"),
+			"[autonomy] ■ block → workspace build (risk critical, 90%): no rollback", false},
 		{"autonomy decision direct response", events.NewAutonomyDecision("direct_response", "conversation", 0.95, "", "low", nil, "conversation intent"),
-			"[autonomy] ◇ direct response — no workspace"},
+			"[autonomy] ◇ direct response — no workspace", false},
 		{"capability granted", events.NewCapabilityGranted("grant-1", "repository", []string{"read", "mutate"}, ""),
-			"[grant] grant-1: read+mutate granted for repository (expires never)"},
-		{"loop transition", events.NewLoopTransition("plan", "build", "capability_granted", "build authorized"),
-			"[loop] plan → build (capability_granted): build authorized"},
-		{"loop transition diagnose", events.NewLoopTransition("verify", "diagnose", "verify_failed", "verification failed"),
-			"[loop] verify → diagnose (verify_failed): verification failed"},
-		{"context compiled", events.NewContextCompiled("index.html", "html", 3),
-			"[context] compiled index.html (html): 3 finding(s)"},
+			"[grant] grant-1: read+mutate granted for repository (expires never)", true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			m := &model{}
 			m.handleDomainEvent(tc.ev)
+
+			if tc.divert {
+				if len(m.records) != 0 {
+					t.Fatalf("capability authorization reached the narrative: %+v", m.records)
+				}
+				steps := m.projection().Trace().Steps()
+				if len(steps) != 1 {
+					t.Fatalf("trace steps = %d, want 1", len(steps))
+				}
+				if steps[0].Message != tc.want {
+					t.Errorf("trace message = %q, want %q", steps[0].Message, tc.want)
+				}
+				return
+			}
+
 			if len(m.records) == 0 {
 				t.Fatal("no records produced")
 			}
@@ -51,6 +69,72 @@ func TestHandleAutonomyEventProjection(t *testing.T) {
 			got := strings.Join(parts, "\n")
 			if got != tc.want {
 				t.Errorf("record = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleAutonomyInfrastructureTelemetryStaysOutOfTheMainNarrative pins the
+// PHASE 14 MAIN UI / TRACE boundary for the loop-transition, context-compilation
+// and preflight families.
+//
+// Those events are facts about the runtime talking to itself. The Main
+// Narrative carries user-facing execution evidence; a user reading
+// "[loop] interpreting → completed" is reading the runtime's own state machine
+// at the exact moment they are deciding whether to trust the result.
+//
+// The runtime source is UNCHANGED — the events are still published and still
+// carry their full payload. The boundary is enforced at the TUI subscriber, and
+// the information is moved to the Trace Overlay (Alt+T), not discarded.
+func TestHandleAutonomyInfrastructureTelemetryStaysOutOfTheMainNarrative(t *testing.T) {
+	cases := []struct {
+		name      string
+		ev        events.DomainEvent
+		traceWant string
+	}{
+		{
+			name:      "loop transition",
+			ev:        events.NewLoopTransition("plan", "build", "capability_granted", "build authorized"),
+			traceWant: "[loop] plan → build (capability_granted): build authorized",
+		},
+		{
+			name:      "loop transition diagnose",
+			ev:        events.NewLoopTransition("verify", "diagnose", "verify_failed", "verification failed"),
+			traceWant: "[loop] verify → diagnose (verify_failed): verification failed",
+		},
+		{
+			name:      "context compiled",
+			ev:        events.NewContextCompiled("index.html", "html", 3),
+			traceWant: "[context] compiled index.html (html): 3 finding(s)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := readyChatModel(newTestModel())
+			m.telemetryDemuxer = NewTelemetryDemuxer()
+			m.handleDomainEvent(tc.ev)
+			if len(m.records) != 0 {
+				t.Fatalf("infrastructure telemetry leaked into the main narrative: %+v", m.records)
+			}
+			// The Trace Overlay is the EXCLUSIVE destination. The buffered step
+			// carries the verbatim line (the rendered overlay width-caps it, so
+			// the buffer is the authoritative content to assert on).
+			steps := m.telemetryDemuxer.Steps()
+			if len(steps) == 0 {
+				t.Fatalf("infrastructure telemetry was discarded instead of routed to Trace")
+			}
+			found := false
+			for _, s := range steps {
+				if strings.Contains(s.Message, tc.traceWant) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("Trace buffer missing %q, got %+v", tc.traceWant, steps)
+			}
+			if m.telemetryDemuxer.StepCount() == 0 {
+				t.Fatal("Trace buffer must count the step")
 			}
 		})
 	}

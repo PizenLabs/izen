@@ -45,6 +45,12 @@ const (
 	// retrieval/execution packages' activity sinks. Routing it through the bus
 	// keeps the UI a pure projection: engines never call UI routines directly.
 	EventActivity = "engine.activity"
+	// EventRuntimeDetail is the TRACE/DEBUG channel (PHASE 12). It carries raw
+	// runtime telemetry — workspace-context cache facts, provider forensics,
+	// per-stage internals — that must never reach the human execution narrative
+	// at the default visibility. The presentation layer projects it through the
+	// debug gate only.
+	EventRuntimeDetail = "engine.runtime_detail"
 	// EventEngineTelemetry is a typed engine I/O event (file read, search,
 	// resolve, mutate metrics) wrapped for bus transport. The UI projects it
 	// into its structured activity tree.
@@ -175,6 +181,21 @@ const (
 	// carries duration, usage, schema serialization choice and truncation
 	// provenance, including failed/cancelled calls.
 	EventProviderExecution = "execution.provider.execution"
+
+	// ── TELEMETRY DOMAIN ISOLATION (Phase 16.1, I14) ─────────────────────
+	// Background telemetry and execution narrative are SEPARATE domains. These
+	// two events make the boundary observable: an indexer progress report is
+	// background work and MUST NOT touch execution rendering, while a model
+	// streaming report is execution work and is the ONLY thing that may drive
+	// the execution spinner.
+	//
+	// EventIndexerProgress is a workspace-indexing progress report. It is
+	// background telemetry by construction: no consumer may derive execution
+	// status from it.
+	EventIndexerProgress = "workspace.indexer.progress"
+	// EventModelStreaming is a live model-streaming report. It belongs to the
+	// execution narrative domain.
+	EventModelStreaming = "execution.model.streaming"
 
 	// ── PREFLIGHT / RECOVERY / DECISION-SURFACE / AUTONOMY TELEMETRY ──────
 	// These are the STRUCTURED lifecycle events of the preflight-failure
@@ -394,6 +415,13 @@ type ActivityPayload struct {
 	Line string
 }
 
+// RuntimeDetailPayload is the trace/debug telemetry envelope. Like
+// ActivityPayload it is content-free metadata: a formatted detail line, never a
+// provider body and never artifact content.
+type RuntimeDetailPayload struct {
+	Line string
+}
+
 // EngineTelemetryPayload is the transport envelope for a typed engine I/O
 // event (retrieval.FileReadEvent, retrieval.SearchEvent, etc.). The payload
 // stays interface{} here because the concrete types live in their source
@@ -545,6 +573,11 @@ type ContextCompilationPayload struct {
 	PromptChars        int      `json:"prompt_chars,omitempty"`
 	PromptFingerprint  string   `json:"prompt_fingerprint,omitempty"`
 	ProtocolTelemetry
+	// CacheHit reports that this MODEL CONTEXT was reused from the context
+	// compiler's fingerprint cache instead of being re-derived (PHASE 12). It
+	// is a different fact from a workspace snapshot-cache hit and is never
+	// conflated with one.
+	CacheHit bool `json:"cache_hit,omitempty"`
 }
 
 // ProviderExecutionPayload is the terminal, structured provider telemetry
@@ -638,6 +671,11 @@ type ContextPreparedPayload struct {
 	PromptChars        int
 	PromptFingerprint  string
 	ProtocolTelemetry
+	// CacheHit reports that this MODEL CONTEXT was reused from the context
+	// compiler's fingerprint cache instead of being re-derived (PHASE 12). It
+	// is a different fact from a workspace snapshot-cache hit and is never
+	// conflated with one.
+	CacheHit bool `json:"cache_hit,omitempty"`
 }
 
 // ModelInvokedPayload records a single provider invocation. TokenInput/Output
@@ -674,6 +712,32 @@ type ProviderResponsePayload struct {
 	ProtocolTelemetry
 }
 
+// IndexerProgressPayload is a workspace-indexing progress report. It is
+// BACKGROUND telemetry: it describes work that is not execution work and must
+// never drive execution rendering (Phase 16.1, I14).
+type IndexerProgressPayload struct {
+	// Stage names the indexing stage (scan, parse, embed, graph…).
+	Stage string
+	// FilesIndexed is how many files the indexer has processed.
+	FilesIndexed int
+	// TotalFiles is the indexer's total when known, 0 otherwise.
+	TotalFiles int
+}
+
+// ModelStreamingPayload is a live model-streaming report. It belongs to the
+// EXECUTION narrative domain and is the only class of event that may drive the
+// execution spinner (Phase 16.1, I14).
+type ModelStreamingPayload struct {
+	// RequestID binds the stream to one execution.
+	RequestID string
+	// Model is the provider model emitting the stream.
+	Model string
+	// Delta is the incremental content chunk (may be empty on a status tick).
+	Delta string
+	// Streaming is false once the stream has settled.
+	Streaming bool
+}
+
 // ArtifactProducedPayload records a parsed artifact (e.g. a patch) produced by
 // a model invocation.
 type ArtifactProducedPayload struct {
@@ -693,10 +757,31 @@ type MutationStartedPayload struct {
 // MutationCompletedPayload records a mutation outcome. Outcome uses the
 // execution.MutationOutcome vocabulary (committed, rolled_back, apply_failed,
 // cancelled, ...).
+//
+// The evidence fields are the ACTUAL apply-boundary facts recorded by the
+// mutation boundary, transported so every downstream projector consumes the
+// same evidence object instead of re-deriving or estimating one for display:
+//
+//   - ArtifactPresent: the model produced a concrete mutation artifact.
+//   - DiffPresent / DiffAdds / DiffRemoves: the compiled unified-diff line
+//     metrics, measured from the diff the boundary actually compiled. When
+//     DiffPresent is false the counts are meaningless and MUST be rendered as
+//     absent — never as "+0 -0".
+//   - ApplyExecuted / FilesystemChanged: whether the apply step ran and whether
+//     the post-apply content actually differs from the pre-apply content.
+//
+// No field here is computed for presentation. A projector that has no diff
+// evidence has no diff statistics to show.
 type MutationCompletedPayload struct {
-	RequestID string
-	Target    string
-	Outcome   string
+	RequestID         string
+	Target            string
+	Outcome           string
+	ArtifactPresent   bool
+	DiffPresent       bool
+	DiffAdds          int
+	DiffRemoves       int
+	ApplyExecuted     bool
+	FilesystemChanged bool
 	ProtocolTelemetry
 }
 
@@ -1073,6 +1158,14 @@ func NewSelfHealingExhausted(attempts int, output string) DomainEvent {
 // NewActivity publishes a single free-form engine telemetry line. It is the
 // bus transport for the retrieval/execution activity sinks, decoupling the
 // engine packages from any direct UI callback.
+// NewRuntimeDetail publishes one raw runtime telemetry line onto the
+// trace/debug channel. It is deliberately a DIFFERENT event type from
+// NewActivity so no projection can route it to the user-facing activity log by
+// accident.
+func NewRuntimeDetail(line string) DomainEvent {
+	return newEvent(EventRuntimeDetail, RuntimeDetailPayload{Line: line})
+}
+
 func NewActivity(line string) DomainEvent {
 	return newEvent(EventActivity, ActivityPayload{Line: line})
 }
@@ -1257,6 +1350,29 @@ func NewContextCompilation(payload ContextCompilationPayload) DomainEvent {
 	return newEvent(EventContextCompilation, payload)
 }
 
+// NewIndexerProgress publishes a background workspace-indexing progress report.
+// It carries no execution semantics: no consumer may derive execution status
+// from it (Phase 16.1, I14).
+func NewIndexerProgress(stage string, filesIndexed, totalFiles int) DomainEvent {
+	return newEvent(EventIndexerProgress, IndexerProgressPayload{
+		Stage:        stage,
+		FilesIndexed: filesIndexed,
+		TotalFiles:   totalFiles,
+	})
+}
+
+// NewModelStreaming publishes a live model-streaming report. It is execution
+// narrative evidence and the only class of event permitted to drive the
+// execution spinner (Phase 16.1, I14).
+func NewModelStreaming(requestID, model, delta string, streaming bool) DomainEvent {
+	return newEvent(EventModelStreaming, ModelStreamingPayload{
+		RequestID: requestID,
+		Model:     model,
+		Delta:     delta,
+		Streaming: streaming,
+	})
+}
+
 // NewAdmissionDecision publishes the structured admission verdict. The
 // constructor defensively normalizes protocol metadata and never accepts a raw
 // prompt or command payload.
@@ -1330,6 +1446,56 @@ func NewMutationCompleted(requestID, target, outcome string, bindings ...protoco
 		payload.ProtocolTelemetry = bindings[0].Normalize()
 	}
 	return newEvent(EventMutationCompleted, payload)
+}
+
+// NewMutationCompletedWithEvidence publishes a mutation outcome together with
+// the apply-boundary evidence that substantiates it. The evidence is supplied
+// by the mutation boundary itself (it measured the compiled diff and observed
+// the filesystem before/after the apply), so the event carries a verifiable
+// claim rather than a display estimate. The diff metrics are ignored when no
+// diff was actually compiled.
+func NewMutationCompletedWithEvidence(requestID string, ev MutationEvidence, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := MutationCompletedPayload{
+		RequestID:         requestID,
+		Target:            ev.Target,
+		Outcome:           ev.Outcome,
+		ArtifactPresent:   ev.ArtifactPresent,
+		DiffPresent:       ev.DiffPresent,
+		ApplyExecuted:     ev.ApplyExecuted,
+		FilesystemChanged: ev.FilesystemChanged,
+	}
+	if ev.DiffPresent {
+		payload.DiffAdds = ev.DiffAdds
+		payload.DiffRemoves = ev.DiffRemoves
+	}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventMutationCompleted, payload)
+}
+
+// MutationEvidence is the transport projection of one target's real
+// apply-boundary evidence. It is deliberately a scalar record: the bus carries
+// facts, never live objects. The executor fills it from the mutation boundary's
+// own evidence; the events package never computes a value here.
+type MutationEvidence struct {
+	// Target is the mutation target path.
+	Target string
+	// Outcome is the execution.MutationOutcome vocabulary value.
+	Outcome string
+	// ArtifactPresent reports whether a concrete mutation artifact existed.
+	ArtifactPresent bool
+	// DiffPresent reports whether a compiled, non-empty diff existed. The
+	// add/remove counts are only meaningful when it is true.
+	DiffPresent bool
+	// DiffAdds / DiffRemoves are the measured compiled-diff line metrics.
+	DiffAdds    int
+	DiffRemoves int
+	// ApplyExecuted reports whether the apply step ran against the filesystem.
+	ApplyExecuted bool
+	// FilesystemChanged reports whether the post-apply content actually differs
+	// from the pre-apply content.
+	FilesystemChanged bool
 }
 
 // NewVerificationCompleted publishes the verifier's real result.

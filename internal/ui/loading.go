@@ -240,11 +240,25 @@ func (m *model) renderLoadingDock() string {
 
 // composeDockTextWithFlake builds the dynamic status text using the given
 // snowflake character. It is derived from AUTHORITATIVE execution signals only:
-// the execution-view projection (event-derived human step), the runtime stage
-// record (stage.go), or — on the legacy agent/stream paths — the shimmer text
-// set by startShimmer. When no authoritative signal exists it returns "" so the
-// dock renders nothing: a static "Working..." placeholder would be a fake
-// progress claim.
+// the runtime stage record (stage.go), or — on the legacy agent/stream paths —
+// the shimmer text set by startShimmer. When no authoritative signal exists it
+// returns "" so the dock renders nothing: a static "Working..." placeholder
+// would be a fake progress claim.
+//
+// ── ONE owner for the current execution step ──────────────────────────────
+// When the execution narrative panel is mounted it is the single canonical
+// main-UI representation of what the execution is doing right now: it is
+// derived from the same event projection, it carries the full milestone list,
+// and it is rendered immediately below this dock. Restating its current step
+// here — or restating the runtime stage under a second wording, e.g. "Model ●
+// streaming" beside the panel's "Model responding" — would put two claims
+// about ONE execution state in a single frame. Two surfaces that can disagree
+// are two sources of truth, and neither is authoritative.
+//
+// So while the panel is mounted the dock keeps only what it uniquely owns: the
+// animated glyph and the contextual tip. The stage line returns once no panel
+// is mounted (the legacy agent/stream paths), which is exactly when it is the
+// only surface with a claim to make.
 //
 // The returned text is ALWAYS plain (ANSI-free): the shimmer sweep re-colours
 // every rune independently, so embedding a lipgloss-styled segment here would
@@ -252,15 +266,9 @@ func (m *model) renderLoadingDock() string {
 // renderLoadingDock). The hint is therefore plain text carried on the same
 // swept line.
 func (m *model) composeDockTextWithFlake(flake string) string {
-	// The gated RuntimeExecutor path renders its status EXCLUSIVELY from the
-	// single execution-view projection (Part 5): the human step the runtime
-	// events produced — "Reading index.html", "Analyzing", "Applying changes".
-	// The UI never invents execution truth. Gated on the in-flight marker so a
-	// later legacy operation can never inherit a stale execution step.
-	if m.execView != nil && m.executionResolving && m.execView.Active() {
-		if step := m.execView.HumanStep(); step != "" {
-			return flake + " " + step
-		}
+	// The execution narrative panel owns the current step while it is mounted.
+	if m.loadingDockActive() {
+		return ""
 	}
 	if st := m.stageSnapshot(); st.active() {
 		if line := renderStageStatus(st); line != "" {
@@ -271,6 +279,15 @@ func (m *model) composeDockTextWithFlake(flake string) string {
 		return flake + " " + m.shimmerText
 	}
 	return ""
+}
+
+// loadingDockActive reports whether the canonical in-flight execution line is
+// currently rendered somewhere in the viewport. The execution narrative panel is
+// that surface: it is derived from real runtime events, so an empty HumanStep
+// means there is no authoritative in-flight state to restate — and the dock
+// must not invent one.
+func (m *model) loadingDockActive() bool {
+	return m.execView != nil && m.executionResolving && m.execView.Active() && m.execView.HumanStep() != ""
 }
 
 // composeDockText builds the dynamic status text using the default snowflake.
@@ -311,13 +328,16 @@ func (m *model) renderExecutionLayered() string {
 // contains no interpretation: it renders exactly what the presentation layer
 // put into the frame.
 //
-// NORMAL: human narrative milestones + the live current step.
-// EXPANDED: NORMAL + runtime metadata (strategy, context, model, tokens,
-// duration, artifacts).
+// NORMAL: human narrative milestones + the live current step + the artifact
+// ledger (which targets exist, which are being worked on, what actually
+// changed).
+// EXPANDED: NORMAL + runtime metadata (strategy, context layers, model,
+// provider invocation state, tokens, duration).
 // DEBUG: EXPANDED + the full machine event stream.
 func renderExecutionFrame(f presentation.ExecutionFrame) string {
 	steps := f.Steps
-	if len(steps) == 0 {
+	ledger := renderArtifactLedger(f.State.Details)
+	if len(steps) == 0 && ledger == "" {
 		return ""
 	}
 	var b strings.Builder
@@ -340,6 +360,7 @@ func renderExecutionFrame(f presentation.ExecutionFrame) string {
 			break
 		}
 	}
+	b.WriteString(ledger)
 	if f.Visibility >= presentation.VisibilityExpanded {
 		if detail := renderExecutionDetails(f.Details); detail != "" {
 			b.WriteString(detail)
@@ -351,8 +372,83 @@ func renderExecutionFrame(f presentation.ExecutionFrame) string {
 	return b.String()
 }
 
+// renderArtifactLedger renders the artifact-centric execution view: which
+// targets the execution is working on, which are still pending, and what the
+// mutation boundary actually changed.
+//
+// It is the ANSWER to "what is Izen doing, on what artifact, and what
+// changed" — the questions a mutation execution is actually asked. It replaces
+// a stream of generic model-activity lines with a per-artifact ledger.
+//
+// Truthfulness rules enforced here:
+//
+//   - A target is listed only because a canonical runtime event announced it
+//     (mutation.started / artifact.produced). Nothing is pre-listed.
+//   - "mutated" is rendered only for boundary evidence that proves the apply
+//     ran AND the content actually changed.
+//   - Diff statistics are rendered ONLY for a target the boundary compiled a
+//     real diff for. A target without a diff gets no numbers at all — never
+//     "+0 -0", which would read as a measured empty diff.
+func renderArtifactLedger(d presentation.ExecutionDetails) string {
+	if len(d.Targets) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	// Header names the phase the ledger is in, derived from the observed state.
+	switch {
+	case d.MutatedFiles > 0:
+		b.WriteString(dimmedStyle.Render("  ── mutation ──") + "\n")
+	case d.CandidateCount > 0:
+		b.WriteString(dimmedStyle.Render("  ── generating ──") + "\n")
+	}
+	for _, t := range d.Targets {
+		b.WriteString("  " + renderTargetLedgerRow(t) + "\n")
+	}
+	if d.MutatedFiles > 0 {
+		b.WriteString("  " + greenStyle.Render(Icon.Success) + " " +
+			mutedStyle.Render(fmt.Sprintf("%d file(s) updated", d.MutatedFiles)) + "\n")
+	}
+	return b.String()
+}
+
+// renderTargetLedgerRow renders one target of the ledger.
+func renderTargetLedgerRow(t presentation.TargetEvidence) string {
+	name := mutedStyle.Render(t.Target)
+	switch {
+	case t.Mutated():
+		// A real filesystem change. The diff numbers, when present, are the
+		// measured compiled-diff line counts from the apply boundary.
+		row := greenStyle.Render(Icon.Success) + " " + name
+		if t.DiffPresent {
+			row += " " + greenStyle.Render(fmt.Sprintf("+%d", t.DiffAdds)) +
+				" " + redStyle.Render(fmt.Sprintf("-%d", t.DiffRemoves))
+		}
+		return row
+	case t.Outcome != "":
+		// A terminal outcome that is not a filesystem change. The outcome is the
+		// runtime's own vocabulary — never restated as a success.
+		return mutedStyle.Render(Icon.Pending) + " " + name + " " + mutedStyle.Render("("+t.Outcome+")")
+	case t.Candidate:
+		// A candidate exists for this target and the mutation has not landed.
+		return orangeStyle.Render("●") + " " + name
+	default:
+		// Announced by the mutation boundary, no candidate and no outcome yet.
+		return mutedStyle.Render("○") + " " + name
+	}
+}
+
 // renderExecutionDetails renders the EXPANDED-layer runtime metadata. It is
 // visual formatting of the accumulated details only.
+//
+// Every token number is LAYER-LABELLED. The four token quantities in an
+// execution are different measurements of different things, and conflating
+// them is how a user ends up inferring that a context estimate is a billing
+// figure:
+//
+//	compiled context  ~chars/4 of the assembled prompt the compiler sent
+//	provider prompt   tokens the provider reported reading
+//	provider output   tokens the provider reported writing
+//	reasoning         tokens the provider attributed to reasoning
 func renderExecutionDetails(d presentation.ExecutionDetails) string {
 	if d.Empty() && d.Duration() == 0 {
 		return ""
@@ -365,26 +461,54 @@ func renderExecutionDetails(d presentation.ExecutionDetails) string {
 	}
 	if len(d.ContextChannels) > 0 {
 		policy := strings.Join(d.ContextChannels, ", ")
-		b.WriteString("  " + dimmedStyle.Render("context policy:") + " " + textStyle.Render(policy))
-		if d.ContextTokens > 0 {
-			b.WriteString(" " + mutedStyle.Render(fmt.Sprintf("(~%d tok)", d.ContextTokens)))
+		b.WriteString("  " + dimmedStyle.Render("context channels:") + " " + textStyle.Render(policy) + "\n")
+	}
+	if d.ContextTokens > 0 {
+		reuse := ""
+		if d.ContextCacheHit {
+			reuse = " " + mutedStyle.Render("(reused from cache)")
 		}
-		b.WriteString("\n")
+		b.WriteString("  " + dimmedStyle.Render("compiled context (est.):") + " " +
+			mutedStyle.Render(fmt.Sprintf("~%d tok", d.ContextTokens)) + reuse + "\n")
 	}
 	if d.Model != "" {
 		b.WriteString("  " + dimmedStyle.Render("model:") + " " + textStyle.Render(d.Model))
 		if d.ProviderState != "" {
-			b.WriteString(" " + mutedStyle.Render("("+d.ProviderState+")"))
+			b.WriteString(" " + mutedStyle.Render("(invocation "+d.ProviderState+")"))
 		}
 		b.WriteString("\n")
 	}
+	if d.ProviderCalls > 0 {
+		b.WriteString("  " + dimmedStyle.Render("provider calls:") + " " + mutedStyle.Render(fmt.Sprintf("%d", d.ProviderCalls)) + "\n")
+	}
 	if d.TokenInput > 0 || d.TokenOutput > 0 {
-		b.WriteString("  " + dimmedStyle.Render("tokens:") + " " + mutedStyle.Render(
-			fmt.Sprintf("%d in / %d out", d.TokenInput, d.TokenOutput)) + "\n")
+		b.WriteString("  " + dimmedStyle.Render("provider tokens:") + " " + mutedStyle.Render(
+			fmt.Sprintf("%d prompt / %d completion", d.TokenInput, d.TokenOutput)) + "\n")
+	}
+	if d.FinishReason != "" {
+		b.WriteString("  " + dimmedStyle.Render("finish reason:") + " " + mutedStyle.Render(d.FinishReason) + "\n")
 	}
 	if d.ReasoningDuration > 0 || d.ReasoningTokens > 0 {
-		b.WriteString("  " + dimmedStyle.Render("reasoning:") + " " + mutedStyle.Render(
+		b.WriteString("  " + dimmedStyle.Render("reasoning (telemetry):") + " " + mutedStyle.Render(
 			fmt.Sprintf("%s (%d tok)", d.ReasoningDuration.Round(time.Millisecond), d.ReasoningTokens)) + "\n")
+	}
+	if d.VerificationRan {
+		verdict := greenStyle.Render("passed")
+		if !d.VerificationPassed {
+			verdict = redStyle.Render("failed")
+		}
+		steps := ""
+		if len(d.VerificationSteps) > 0 {
+			steps = " " + mutedStyle.Render("["+strings.Join(d.VerificationSteps, ", ")+"]")
+		}
+		b.WriteString("  " + dimmedStyle.Render("verification:") + " " + verdict + steps + "\n")
+	}
+	if d.EvidenceObserved {
+		verdict := greenStyle.Render(d.EvidenceOutcome)
+		if d.EvidenceTainted {
+			verdict = redStyle.Render(d.EvidenceOutcome + " (tainted)")
+		}
+		b.WriteString("  " + dimmedStyle.Render("sealed evidence:") + " " + verdict + "\n")
 	}
 	if dur := d.Duration(); dur > 0 {
 		b.WriteString("  " + dimmedStyle.Render("duration:") + " " + mutedStyle.Render(dur.Round(time.Millisecond).String()) + "\n")

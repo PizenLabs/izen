@@ -92,6 +92,15 @@ func (m *model) ingestStreamUsage(input, output, reasoning int) {
 	if m.thinkingBuffer != nil && reasoning > 0 {
 		m.thinkingBuffer.SetReasoningTokens(reasoning)
 	}
+	// ── PHASE 15: TELEMETRY IS AN IN-PLACE REPLACE, NOT A RECORD ─────
+	// The provider-reported prompt count is the context the model actually
+	// received, measured by the authority that knows best. It belongs on the fixed
+	// HUD, where the previous value is still on screen to be compared against.
+	// Appending it to the conversation would push the value it supersedes out of
+	// view, which is the opposite of what a live counter is for.
+	if input > 0 {
+		m.routeContextTokens(input)
+	}
 }
 
 // ── Overflow Ring Drain (frame-flush pass) ────────────────────────────────

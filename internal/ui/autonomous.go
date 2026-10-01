@@ -569,10 +569,22 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 
 	// A terminal outcome.
 	m.autonomousBoundary = nil
-	if msg.term.State == autonomy.RuntimeCompleted {
+	switch msg.term.State {
+	case autonomy.RuntimeCompleted:
 		m.finalizeOperation(OpOutcomeSuccess, nil)
 		m.push(roleSystem, infoStyle.Render("[autonomous] "+greenStyle.Render("completed")+" — "+msg.term.Reason))
-	} else {
+	case autonomy.RuntimeUnsubstantiated:
+		// ── PHASE 14: THE OBJECTIVE WAS NOT PROVEN ─────────────────────
+		// Neither success nor failure. The run was legal, the workspace was not
+		// corrupted, and nothing was proven. Reporting it as "aborted" would
+		// claim a failure that did not happen and invite a retry that would
+		// hit the same wall; reporting it as "completed" would be the false
+		// completion this phase exists to prevent.
+		m.finalizeOperation(OpOutcomeAmbiguous, nil)
+		m.unwindBuildFailure()
+		m.push(roleSystem, infoStyle.Render("[autonomous] "+orangeStyle.Render("objective was not proven")+" — "+msg.term.Reason))
+		m.push(roleSystem, infoStyle.Render(ObjectiveUnprovenMessage("")))
+	default:
 		m.finalizeOperation(OpOutcomeFailure, nil)
 		// An aborted autonomous run is terminal: release the workflow phase
 		// so the BUILDING header status cannot survive the abort.

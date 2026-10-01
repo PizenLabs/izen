@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/continuation"
@@ -14,6 +15,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
+	"github.com/PizenLabs/izen/internal/llmstep"
 	"github.com/PizenLabs/izen/internal/loop"
 	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
@@ -157,7 +159,71 @@ type Driver struct {
 	// substrate is the execution target — the single authority that executes
 	// Proposals. The Driver never mutates the filesystem directly.
 	substrate substrate.ProposalExecutor
+
+	// ── Objective Completion Authority (Phase 14) ────────────────────────
+	// objectiveAuthority is the ONLY authority permitted to say an objective was
+	// PROVEN. The Driver owns the loop, the executor owns execution, and the
+	// authority owns the transition into `completed` — the three roles are
+	// deliberately distinct so no single component can both do the work and
+	// declare it finished.
+	objectiveAuthority ObjectiveAuthority
+	// preTargets is the durable target state captured BEFORE the lifecycle's
+	// first dispatch. It is the only admissible evidence for an idempotent
+	// ("already satisfied") claim.
+	preTargets map[string]bool
+	// lastObjective caches the most recent authorization verdict for tests and
+	// structured telemetry. It is never consulted to decide anything.
+	lastObjective execution.ObjectiveEvaluation
+	// lastContract is the canonical TaskContract the last verdict was judged
+	// against. Keeping it adjacent to the verdict makes the pairing auditable.
+	lastContract execution.TaskContract
+	// intents is the lifecycle's ONE canonical intent authority. Preflight, the
+	// context compiler and the driver all read it, and only a blocking revision
+	// advances it — so no two components can hold conflicting intent states.
+	intents *autonomy.IntentAuthority
+
+	// ── Contract Recovery Circuit Breaker (Phase 15) ─────────────────────
+	// contractRecoveries counts the strict-contract re-prompts this lifecycle has
+	// already spent on a prose-only (zero-artifact) response. It is reset per
+	// Run, incremented only when a re-prompt is actually dispatched, and read by
+	// authorizeContractRecovery to close the loop. See the constant below for
+	// why the bound exists at all.
+	contractRecoveries int
+	// contractRecoveryExhausted latches the terminal breaker condition so the
+	// unsubstantiated verdict is attributable to the contract, not to whatever
+	// the observation happened to say last.
+	contractRecoveryExhausted bool
+
+	// grants answers whether a full workspace capability grant is in force for
+	// this lifecycle (Phase 15). It is the signal that turns a granted workspace
+	// capability into a mandatory, synchronous context re-compilation before the
+	// preflight barrier is lowered. It is created ONCE with the driver, not per
+	// run: a grant issued immediately before the run — which is the common
+	// production order, authorize-then-dispatch — would be invisible to an
+	// observer that subscribed at run entry.
+	grants *grantObserver
+	// grantContextSynced records that the grant-gated re-compilation has already
+	// run for this lifecycle, so a resumed or re-driven loop does not re-invalidate
+	// the context the current attempt is already using.
+	grantContextSynced bool
 }
+
+// MaxContractRecoveryAttempts bounds how many times one execution lifecycle
+// re-prompts a model that answered a structural artifact contract with prose.
+//
+// Phase 14 made ErrZeroArtifactsParsed repromptable, which is correct: a single
+// prose response is a contract miss, not a task failure. An UNBOUNDED version of
+// the same thing is a different bug — a model that has settled on prose keeps
+// settling on prose, and each attempt spends real provider billing to confirm
+// it. Two is the bound because it separates "the model needed to be told" (one
+// re-prompt, after the Phase 15 system-channel contract) from "the model will
+// not speak this contract" (a human decision, not a retry).
+//
+// The bound is deliberately NOT a completion claim and NOT a failure: when it is
+// consumed the lifecycle terminates UNSUBSTANTIATED with
+// execution.ErrContractRecoveryExhausted, because the honest description of
+// that run is "the workspace was not changed and nothing was proven".
+const MaxContractRecoveryAttempts = 2
 
 // Option configures the Driver during construction.
 type Option func(*Driver)
@@ -219,6 +285,31 @@ func WithPreflightBarrier(b *loop.Barrier) Option {
 // WithPreflightState wires the Observation State where StructuralSnapshot is published.
 func WithPreflightState(s *preflight.ObservationState) Option {
 	return func(d *Driver) { d.preflightState = s }
+}
+
+// WithGrantLedger binds the authoritative session capability ledger to the
+// grant-gated context barrier (Phase 15).
+//
+// The ledger is consulted on every gate query, not snapshotted, so a grant issued
+// at any point in the run — including the common authorize-then-dispatch order,
+// where the grant strictly precedes the run — is visible to the gate. Passing nil
+// leaves the gate with the event bus alone, which still catches grants issued
+// while a run is in flight.
+func WithGrantLedger(l *autonomy.GrantLedger) Option {
+	return func(d *Driver) {
+		if d == nil {
+			return
+		}
+		// The observer already exists and already owns a bus subscription.
+		// Rebinding it is deliberate: constructing a replacement would orphan the
+		// first subscription, and a subscription owns a dispatch goroutine, so the
+		// driver would leak one per option application.
+		if d.grants == nil {
+			d.grants = newGrantObserver(d.bus, l)
+			return
+		}
+		d.grants.bindLedger(l)
+	}
 }
 
 // WithSubstrate wires the Substrate execution target. When set, the Driver
@@ -299,6 +390,10 @@ func NewDriver(adapter *ExecutorAdapter, bus *events.Bus, opts ...Option) *Drive
 		repair:       typedRepair,
 		decompose:    defaultDecompose,
 		globalVerify: defaultGlobalVerify,
+		// The completion authority is domain code with no UI dependency: the
+		// driver stays fully executable and testable headless.
+		objectiveAuthority: objectiveReducer{},
+		grants:             newGrantObserver(bus, nil),
 	}
 	for _, o := range opts {
 		o(d)
@@ -344,6 +439,23 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.allowASTBypass = false
 	d.explicitOutputBudget = 0
 	d.syntheticSubGoal = ""
+	d.lastObjective = execution.ObjectiveEvaluation{}
+	d.lastContract = execution.TaskContract{}
+	d.preTargets = nil
+	d.contractRecoveries = 0
+	d.contractRecoveryExhausted = false
+	// A fresh run is a fresh LIFECYCLE, and the canonical intent is per
+	// lifecycle. Reusing the previous run's authority would let an elevation
+	// leak into a read-only objective — the exact split-brain this authority
+	// exists to prevent, one run later.
+	d.intents = autonomy.NewIntentAuthority()
+	// ── PHASE 15: GRANT OBSERVATION ──────────────────────────────────
+	// The per-lifecycle observation resets here; the subscription and the ledger
+	// binding live as long as the driver does. A fresh lifecycle observes only
+	// authorizations issued for it, so a grant issued for one objective cannot
+	// gate the context of an entirely different one.
+	d.grants.reset()
+	d.grantContextSynced = false
 	d.runRequestID = fmt.Sprintf("run-%d", d.runID)
 	d.loop.Start("user objective: " + objective)
 	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
@@ -356,7 +468,7 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	if contractErr != nil {
 		_, _ = d.loop.Abort("interaction contract binding failed: "+contractErr.Error(), autonomy.FailurePermanent)
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
-		d.runCtx, d.runCancel = nil, nil
+		d.releaseRunResources()
 		return nil, fmt.Errorf("autonomy: interaction contract: %w", contractErr)
 	}
 	// The strategy gateway is the deterministic authority for whether this
@@ -379,6 +491,17 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		InteractionContract: interaction,
 		Contract:            interactionDescriptor,
 	}
+	// ── PHASE 12: DERIVE THE RUN-LEVEL TOKEN BOUND ──────────────────────
+	// The run-level budget is derived from the per-invocation budget this run
+	// is actually bound to, so a legitimate multi-invocation task is not
+	// truncated by a fixed constant. `WidenBounds` only ever RAISES a floor, so
+	// an explicit `WithLoopBounds` from an operator is never reduced. Authority
+	// is untouched: the bound terminates a run, it never admits work.
+	d.loop.WidenBounds(0, 0,
+		autonomy.RunTokenBudget(d.resolved.Profile.MaxOutputTokens,
+			d.loop.Bounds().MaxAttempts,
+			llmstep.DefaultMaxContinuationSteps), 0)
+
 	// Adaptive heuristic (Task 1): bypass FULL_REWRITE for large targets
 	// or small model budgets; force BOUNDED_PATCH as initial strategy.
 	if len(d.resolved.Targets) > 0 && d.resolved.Targets[0] != "" {
@@ -388,6 +511,13 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 			d.mutationStrategy = StrategyBoundedPatch
 		}
 	}
+	// ── PHASE 14: PRE-EXECUTION TARGET PROVENANCE ─────────────────────
+	// Capture the durable target state BEFORE any dispatch. This is the only
+	// admissible evidence for an idempotent ("already satisfied") claim: a
+	// post-hoc reading cannot distinguish "already done" from "done by this
+	// run", and a completion authority that trusted one would rubber-stamp
+	// execution inertia.
+	d.capturePreExecutionTargets()
 	// Clear the callback after capturing it for this run.
 	d.streamCb = nil
 	if d.resolved.Ambiguous {
@@ -402,8 +532,31 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	if err := ValidateObjectiveContract(objective, interaction, interactionDescriptor); err != nil {
 		_, _ = d.loop.Abort("interaction contract authority ceiling: "+err.Error(), autonomy.FailurePermanent)
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
-		d.runCtx, d.runCancel = nil, nil
+		d.releaseRunResources()
 		return nil, err
+	}
+	// ── PHASE 14: CANONICAL INTENT AUTHORITY ───────────────────────────
+	// Synchronize the lifecycle's ONE canonical intent before the loop
+	// observes anything. When the strategy gateway elevates a read-only
+	// classification to a mutation contract, this performs the blocking
+	// revision: the previous intent and every artefact derived from it are
+	// invalidated, the canonical intent is synchronized, and the workspace
+	// context is re-compiled under the modification contract. A re-compilation
+	// that cannot satisfy the contract parks the run instead of dispatching a
+	// mutation over a read-only context.
+	if err := d.syncCanonicalIntent(d.runCtx, objective); err != nil { //nolint:contextcheck // runCtx is the run's own cancellation context
+		canonical, _ := d.intentAuthority().Current()
+		d.loop.AwaitHuman(autonomy.HumanBoundary{
+			Reason: "canonical intent revision incomplete: " + err.Error() +
+				fmt.Sprintf(" — the run holds intent %q with no valid workspace context for it; re-scope the objective or grant an explicit mutation contract", canonical),
+			Targets: d.objectiveTargets(),
+		})
+		d.enrichBoundary()
+		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
+		// A parked run terminates nothing, exactly like the preflight-infeasible
+		// and NO-OP-escalation paths: the reason travels on the boundary, not
+		// as a raw error, so the human gets a decision instead of a stack.
+		return d.term(), nil //nolint:nilerr // the incomplete revision is a park, not a run failure
 	}
 	d.obs = d.contextObservation()
 	term, err := d.observeAndRun(d.runCtx, runID) //nolint:contextcheck // runCtx is the run's own cancellation context
@@ -488,7 +641,7 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 			d.loop.ReleaseHuman(reason)
 			d.publish(ctx)
 			term := d.terminateAbort(ctx, reason, autonomy.FailurePermanent)
-			d.runCtx, d.runCancel = nil, nil
+			d.releaseRunResources()
 			return term, nil
 		}
 		return d.term(), nil
@@ -506,7 +659,7 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 			reason += ": " + err.Error()
 		}
 		term := d.terminateAbort(ctx, reason, autonomy.FailurePermanent)
-		d.runCtx, d.runCancel = nil, nil
+		d.releaseRunResources()
 		return term, nil
 	}
 	d.runID++
@@ -539,7 +692,7 @@ func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.Loo
 			d.loop.ReleaseHuman(r)
 			d.publish(ctx)
 			term := d.terminateAbort(ctx, r, autonomy.FailurePermanent)
-			d.runCtx, d.runCancel = nil, nil
+			d.releaseRunResources()
 			return term, nil
 		}
 		return d.term(), nil
@@ -581,6 +734,10 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	d.req.ParentContractID = ""
 	d.req.StagedPlan = nil
 	d.req.FocusStartLine, d.req.FocusEndLine = 0, 0
+	// A human-specified target replaces the declared set, so the pre-execution
+	// provenance is re-captured against the NEW target before dispatch. It is a
+	// first observation of a changed scope, not a refresh of an existing claim.
+	d.capturePreExecutionTargets()
 	d.obs = d.contextObservation()
 	d.loop.ReleaseHuman("target specified: " + target)
 	d.publish(ctx)
@@ -652,7 +809,7 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 		d.publish(ctx)
 		d.emitAutonomousAborted(ctx, "proposal cancelled: "+string(intent))
 		term := d.terminateAbort(ctx, "proposal cancelled: "+string(intent), autonomy.FailurePermanent)
-		d.runCtx, d.runCancel = nil, nil
+		d.releaseRunResources()
 		return term, nil
 	}
 	// ProposalInspect is a READ-ONLY HOLD: expose the diagnostics and remain
@@ -690,7 +847,7 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 		d.publish(ctx)
 		d.emitAutonomousAborted(ctx, "proposal anti-loop guard: "+string(intent))
 		term := d.terminateAbort(ctx, "proposal anti-loop guard: "+string(intent)+" failed without altering state", autonomy.FailurePermanent)
-		d.runCtx, d.runCancel = nil, nil
+		d.releaseRunResources()
 		return term, nil
 	}
 	// ── RECOVERY CREATES A NEW EXECUTION CONTRACT (invariant 9) ─────────
@@ -943,6 +1100,67 @@ func (d *Driver) RunRequestID() string {
 	return d.runRequestID
 }
 
+// ContractRecoveryState reports the circuit breaker's accounting for the current
+// lifecycle: how many strict-contract re-prompts have been spent, the bound they
+// are spent against, and whether the terminal condition has latched. It is
+// observable state for telemetry and tests — it is never consulted to decide
+// anything; authorizeContractRecovery reads the counter directly.
+func (d *Driver) ContractRecoveryState() (used, limit int, exhausted bool) {
+	if d == nil {
+		return 0, MaxContractRecoveryAttempts, false
+	}
+	return d.contractRecoveries, MaxContractRecoveryAttempts, d.contractRecoveryExhausted
+}
+
+// authorizeContractRecovery is the CONTRACT RECOVERY CIRCUIT BREAKER. It runs on
+// every proposed decision, beside the completion authority, and closes the one
+// path Phase 14 deliberately left open: an unbounded re-prompt at a model that
+// does not speak the artifact contract.
+//
+// It is a MUTATION of the decision, not a veto, for the same reason the
+// completion authority mutates: the loop history must record the transition that
+// actually happened. A prose-only observation normally earns LoopRepair; once
+// MaxContractRecoveryAttempts re-prompts have been spent on it, the repair is
+// rewritten into LoopUnsubstantiate and the reason names
+// execution.ErrContractRecoveryExhausted, so the terminal state is
+// UNSUBSTANTIATED — the workspace was not changed, the transport was healthy, and
+// nothing was proven. That is neither a success nor a fabricated failure.
+func (d *Driver) authorizeContractRecovery(decision *autonomy.LoopDecision) {
+	if d == nil || decision == nil {
+		return
+	}
+	if RecoverySubtype(d.obs) != SubtypeZeroArtifacts {
+		return
+	}
+	if d.contractRecoveries < MaxContractRecoveryAttempts {
+		return
+	}
+	d.contractRecoveryExhausted = true
+	reason := fmt.Sprintf(
+		"objective UNSUBSTANTIATED (%s): %d strict artifact-contract re-prompt(s) were spent on %s and the provider still returned prose instead of a structural artifact — no file was changed",
+		execution.ErrContractRecoveryExhausted.Error(), d.contractRecoveries, contractRecoveryTarget(d.obs))
+	if d.bus != nil {
+		d.bus.Publish(events.NewActivity("[contract] recovery breaker: " + reason))
+	}
+	decision.Action = autonomy.LoopUnsubstantiate
+	decision.Reason = reason
+	// A contract the model will not speak is not a decision the human can make
+	// from a menu of re-scopes: every option in the proposal vocabulary re-prompts
+	// under some contract, and the contract is not the problem. Clearing the patch
+	// reference keeps the terminal state free of a held artifact nobody asked for.
+	decision.PatchID = ""
+}
+
+// contractRecoveryTarget names the target a prose-only response was attributed
+// to, for the terminal reason. It never carries response bytes (Recovery
+// Isolation): the model is told what it produced was discarded, not what it said.
+func contractRecoveryTarget(o autonomy.Observation) string {
+	if o.Target != "" {
+		return o.Target
+	}
+	return "the requested artifact"
+}
+
 // SetStreamCallback sets a callback for incremental streaming progress during
 // the next provider invocation. It is called by the UI before Run.
 func (d *Driver) SetStreamCallback(cb execution.StreamCallback) {
@@ -1030,7 +1248,90 @@ func (d *Driver) currentInteractionMetadata() (protocol.InteractionContract, *pr
 // Preflight barrier: when wired, the transition from observing to deciding is
 // gated by PreflightSyncBarrier (10s timeout → PREFLIGHT_TIMEOUT). This is the
 // execution invariant: async discovery never means unverified execution.
+// preflightExecutionSpec builds the admission-time view of the run for the
+// Phase 16.1 pre-flight gate. Assembling it invokes NO provider and mutates
+// nothing: it resolves the target through the executor's resolver (pure
+// classification + isolated discovery) and records the boundary the run holds.
+//
+// ctx is the run's own cancellation context, threaded so resolution is
+// interruptible: a cancelled run resolves to an unsubstantiated verdict and
+// stops, rather than completing a bounded scan nobody is waiting for.
+func (d *Driver) preflightExecutionSpec(ctx context.Context) ExecutionSpec {
+	spec := ExecutionSpec{Intent: intentClassForStrategy(d.resolved.Profile.Strategy)}
+	if !spec.Intent.IsMutation() {
+		return spec
+	}
+	binding := d.adapter.PreflightTarget(ctx, d.prompt, d.resolved.Targets)
+	spec.TargetBinding = &binding
+	if binding.Profile != nil {
+		spec.WorkspaceEvidence = binding.Profile
+	}
+	spec.ExplicitTargets = append([]string(nil), d.resolved.Targets...)
+	// A proven target binds the boundary directly; an explicitly named creation
+	// target binds it by statement. Anything else is UNBOUND.
+	explicit := provenExplicit(spec.ExplicitTargets)
+	if binding.Dispatchable() || (binding.State == execution.TargetStateNotFound && len(explicit) > 0) {
+		spec.MutationBoundary = MutationBoundaryBound
+	} else {
+		spec.MutationBoundary = MutationBoundaryUnbound
+	}
+	// A resolved, existing target is an authoritative context channel: it is
+	// runtime-observed evidence the prompt can be compiled from. An explicitly
+	// named creation target is a channel by statement. A directory or an
+	// ambiguous statement is NOT a channel — it is a question. Zero channels on
+	// a mutation objective is the empty-context condition I12 forbids.
+	channels := provenExplicit(binding.Paths)
+	if len(channels) == 0 && binding.State == execution.TargetStateNotFound {
+		channels = explicit
+	}
+	for _, target := range channels {
+		spec.ContextChannels = append(spec.ContextChannels, ContextChannel{
+			Kind:          "target",
+			Source:        target,
+			Authoritative: true,
+		})
+	}
+	if len(spec.ContextChannels) > 0 {
+		spec.Evidence = EvidenceProduced
+	}
+	return spec
+}
+
+// intentClassForStrategy maps the deterministic execution strategy onto the
+// coarse admission intent. It is a pure projection: the strategy is already
+// the authority, this only names the mutation/read-only distinction the gate
+// reasons over.
+func intentClassForStrategy(s strategy.ExecutionStrategy) IntentClass {
+	switch s {
+	case strategy.TargetedMutation, strategy.DirectDeterministic:
+		return IntentMutate
+	case strategy.MultiFilePlanning:
+		return IntentPlan
+	case strategy.RepositoryInvestigation:
+		return IntentInvestigate
+	default:
+		return IntentAsk
+	}
+}
+
+// observeAndRun runs the bounded observe → decide → execute loop. It is reached
+// only after the run's context has been synchronized.
 func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.LoopTermination, error) {
+	// ── PHASE 15: GRANT-GATED CONTEXT BARRIER ───────────────────────────
+	// This is the LAST point before the loop can leave `observing`, and
+	// therefore the last point at which a context frozen before capability
+	// authorization could still be used. A granted workspace capability is
+	// turned into a freshly compiled, verified non-empty target context HERE,
+	// synchronously, and a failure parks the run instead of dispatching a model
+	// over a workspace it was never shown.
+	//
+	// It runs before the preflight barrier rather than after it on purpose: the
+	// barrier's whole purpose is to guarantee that no execution happens over
+	// unverified structure, and "unverified structure" includes an unpopulated
+	// prompt.
+	if err := d.syncGrantedWorkspaceContext(ctx); err != nil { //nolint:contextcheck // ctx is the run's own cancellation context
+		return d.parkOnGrantContextFailure(ctx, err), nil
+	}
 	if d.preflightBarrier != nil {
 		if d.bus != nil {
 			d.bus.Publish(events.NewActivity("[loop] observing (waiting preflight barrier)"))
@@ -1067,6 +1368,32 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 		d.bus.Publish(events.NewActivity("[loop] observing -> deciding"))
 	}
 	d.publish(ctx)
+
+	// ── PHASE 16.1: PRE-FLIGHT ADMISSION GATE ──────────────────────────
+	// "No Evidence, No Provider" (I12) is enforced HERE, at the last point
+	// before the loop can plan or dispatch a provider. A mutation objective
+	// without a proven target, an admissible mutation boundary and
+	// authoritative evidence parks at a human boundary or aborts — no provider
+	// token is billed. A directory target (I11) can never be promoted to a file
+	// on the way through.
+	if outcome := EvaluatePreflightAdmission(d.preflightExecutionSpec(ctx)); outcome.Blocked() {
+		if outcome.Verdict == AdmissionDisambiguate {
+			if d.bus != nil {
+				d.bus.Publish(events.NewActivity("[preflight] target unresolved — awaiting disambiguation: " + outcome.Reason))
+			}
+			d.loop.AwaitHuman(autonomy.HumanBoundary{
+				Reason:  outcome.Reason,
+				Options: outcome.Candidates,
+			})
+			d.enrichBoundary()
+			d.publish(ctx)
+			return d.term(), nil
+		}
+		if d.bus != nil {
+			d.bus.Publish(events.NewActivity("[preflight] inadmissible target: " + outcome.Reason))
+		}
+		return d.terminateAbort(ctx, "preflight inadmissible target: "+outcome.Reason, autonomy.FailurePermanent), nil
+	}
 	for !d.loop.State().IsTerminal() {
 		// Late-result guard: if the run was aborted/superseded, exit immediately.
 		if d.runID != runID {
@@ -1092,6 +1419,35 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			d.obs.AttemptNum = d.loop.Attempts()
 			d.obs.RecoveryCycle = d.loop.RecoveryCycles()
 			decision := d.decide(d.obs, d.loop.Bounds())
+			// ── PHASE 14: OBJECTIVE COMPLETION AUTHORITY ────────────────
+			// The decision matrix proposes; the authority disposes. A proposed
+			// completion is rewritten into the terminal state that matches WHY
+			// the evidence failed, so `interpreting -> completed` is reachable
+			// only when the Task Contract was actually satisfied. A provider
+			// that returned, a step that came back nil and a verifier that
+			// merely ran are structurally incapable of producing it.
+			d.authorizeObjectiveCompletion(&decision)
+			// ── PHASE 15: CONTRACT RECOVERY CIRCUIT BREAKER ───────────────
+			// A prose-only response is repromptable, but only a bounded number
+			// of times. Once the bound is spent the proposed repair is rewritten
+			// into the terminal UNSUBSTANTIATED state, so the loop can neither
+			// claim the objective nor burn the remaining budget asking a model
+			// that has already declined to speak the contract twice.
+			d.authorizeContractRecovery(&decision)
+			// ── PHASE 12: CANONICAL CONTINUATION CONSULTATION ────────────
+			// An exhausted invocation is an INVOCATION outcome, not a task
+			// failure. Before the matrix acts on it, the pure continuation
+			// library classifies the durable task state — it already
+			// distinguishes "partial but still advanceable" from "nothing
+			// evidence-backed remains". A verdict that is NOT "continue"
+			// escalates to the human instead of spending another attempt; the
+			// library never re-enters execution by itself.
+			if decision.Action == autonomy.LoopRepair &&
+				RecoverySubtype(d.obs) == SubtypeOutputExhausted {
+				if escalated := d.consultContinuationOnExhaustion(); escalated {
+					return d.term(), nil
+				}
+			}
 			// ── ZERO-TOKEN PREFLIGHT GATE (invariant I5) ────────────────
 			// On the INITIAL attempt (no human proposal selected, no recovery
 			// strategy in flight) the driver runs the local structural
@@ -1265,6 +1621,14 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				reason = fmt.Sprintf("re-scoped [%s] — re-execute", req.RecoveryStrategy)
 			}
 			d.req = req
+			// ── PHASE 15: SPEND THE CONTRACT RECOVERY BUDGET ───────────────
+			// The counter is incremented where the re-prompt is actually
+			// dispatched, not where the decision to re-prompt was proposed, so it
+			// measures real spend. A recovery that the matrix refused (and that
+			// therefore parked the run) never consumed a slot.
+			if RecoverySubtype(d.obs) == SubtypeZeroArtifacts {
+				d.contractRecoveries++
+			}
 			if _, err := d.step(ctx, autonomy.LoopDecision{
 				Action: autonomy.LoopContinue,
 				Reason: reason,
@@ -1319,6 +1683,85 @@ func (d *Driver) handlePreflightInfeasible(ctx context.Context, runID uint64) bo
 	d.loop.AwaitHuman(*b)
 	d.enrichBoundary()
 	d.publish(ctx)
+	return true
+}
+
+// consultContinuationOnExhaustion asks the pure continuation library to
+// classify the durable task state after an exhausted invocation and maps a
+// non-CONTINUE verdict onto an explicit human decision.
+//
+// It returns true when the run was parked (the caller must stop), false when
+// the library agrees the task can continue under the matrix's own decision.
+//
+// The library is a PROPOSAL function: it never schedules, never authorizes and
+// never re-enters execution. Only a non-continue verdict is acted on, and it
+// is acted on by parking the loop — the most conservative possible outcome.
+func (d *Driver) consultContinuationOnExhaustion() bool {
+	allowed := append([]string(nil), d.req.Targets...)
+	if len(allowed) == 0 {
+		allowed = append(allowed, d.resolved.Targets...)
+	}
+	// Durable, transcript-free task state: the plan's own unit bookkeeping when
+	// a decomposition is staged, otherwise the current attempt itself. A
+	// monolithic (non-decomposed) attempt is always pending work until the
+	// executor reports otherwise.
+	var completed, pending []string
+	if plan := d.Plan(); plan != nil && len(plan.SubTasks) > 0 {
+		for i, st := range plan.SubTasks {
+			// Units before the current cursor have been dispatched; the DAG
+			// reports how many were satisfied without a mutation.
+			if i < plan.NoOpSatisfiedSubTasks {
+				completed = append(completed, st.ID)
+				continue
+			}
+			pending = append(pending, st.ID)
+		}
+	}
+	if len(pending) == 0 && d.req.Target != "" {
+		pending = append(pending, d.req.Target)
+	}
+	if len(pending) == 0 && len(allowed) > 0 {
+		pending = append(pending, allowed...)
+	}
+	cont := DeriveDriverContinuation(DriverContinuationInput{
+		Objective:        d.prompt,
+		Targets:          d.resolved.Targets,
+		StateFingerprint: d.req.WorkspaceDigest,
+		IsPartialOutput:  true,
+		PreviousOutcome:  "partial",
+		PreviousReason:   "OUTPUT_CEILING",
+		Verified:         d.obs.Verification.Passed,
+		AllowedScope:     allowed,
+		ProviderCeiling:  d.obs.MaxOutputTokens,
+		CompletedSteps:   completed,
+		PendingSteps:     pending,
+		Observations: []continuation.Observation{{
+			Kind:             continuation.KindExecutionResult,
+			Subject:          d.obs.Target,
+			Detail:           "model invocation exhausted its output ceiling",
+			StateFingerprint: d.req.WorkspaceDigest,
+			Timestamp:        time.Now(),
+		}},
+	})
+	if cont.Action == continuation.ActionContinue {
+		// The pure function agrees the task is still advanceable: the matrix's
+		// own decision stands and the run re-enters the SAME executor.
+		return false
+	}
+	// Any other verdict is an explicit human decision, never a silent retry and
+	// never a fabricated completion.
+	reason := "continuation blocked after output exhaustion: " + cont.Reason
+	if cont.Action == continuation.ActionAwaitingApproval {
+		reason = "continuation would exceed the authorized scope: " + cont.Reason
+	}
+	b := &autonomy.HumanBoundary{
+		Reason:  reason,
+		Targets: append([]string(nil), d.req.Targets...),
+	}
+	autonomy.DeriveBoundaryAction(b)
+	d.loop.AwaitHuman(*b)
+	d.enrichBoundary()
+	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 	return true
 }
 
@@ -1562,6 +2005,40 @@ func (d *Driver) emitAutonomousAborted(ctx context.Context, reason string) {
 	}
 	runID, contractID, target, workspace := d.driverFacts()
 	d.bus.Publish(events.NewAutonomousAborted(runID, contractID, target, workspace, reason))
+}
+
+// emitObjectiveUnsubstantiated publishes the objective-authority verdict as
+// INFRASTRUCTURE telemetry. It deliberately carries no user-facing evidence, so
+// the TUI subscriber boundary routes it to the Trace Overlay (Alt+T) and never
+// into the Main Narrative. The runtime source is unchanged; only the projection
+// filters.
+//
+// The line names the run, the contract kind, the contract identity, the target
+// and the exact clause that went unmet: a refusal a human cannot reconstruct
+// from the trace overlay is a refusal they have to take on faith.
+func (d *Driver) emitObjectiveUnsubstantiated(contract execution.TaskContract, evaluation execution.ObjectiveEvaluation) {
+	if d == nil || d.bus == nil {
+		return
+	}
+	runID, contractID, target, _ := d.driverFacts()
+	d.bus.Publish(events.NewActivity(fmt.Sprintf(
+		"[objective] run=%s contract_id=%s kind=%s target=%s outcome=%s clause=%s — %s",
+		orUnknownField(runID), orUnknownField(contractID), contract.Kind, orUnknownField(target),
+		evaluation.Outcome, orClause(evaluation.Clause), evaluation.Reason)))
+}
+
+func orUnknownField(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "unknown"
+	}
+	return value
+}
+
+func orClause(clause string) string {
+	if strings.TrimSpace(clause) == "" {
+		return "unspecified"
+	}
+	return clause
 }
 
 func (d *Driver) term() *autonomy.LoopTermination {

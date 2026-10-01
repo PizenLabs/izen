@@ -233,14 +233,22 @@ func TestNarrativeMachineSeparated(t *testing.T) {
 	}
 }
 
-// TestNarrativeTerminalSentences pins the deterministic terminal sentences.
+// TestNarrativeTerminalSentences pins the deterministic terminal sentences the
+// narrative derives from the transition ALONE.
+//
+// A success flag never produces "Completed" here: whether the task completed is
+// an evidence-gated verdict owned by ExecutionProjection (see
+// completion_gate.go), and the projection rewrites this sentence the moment it
+// reduces the event. The narrative's own contribution is the conservative
+// provisional reading plus the two facts a transition alone does settle — a
+// cancellation is cancelled, a failure is failed.
 func TestNarrativeTerminalSentences(t *testing.T) {
 	cases := []struct {
 		success bool
 		outcome string
 		want    string
 	}{
-		{true, "completed", "Completed"},
+		{true, "completed", "Execution finished"},
 		{false, "cancelled", "Cancelled"},
 		{false, "patch_failed", "Failed"},
 	}

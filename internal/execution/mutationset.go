@@ -245,3 +245,28 @@ func (ms *MutationSet) OutcomeFor(path string) MutationOutcome {
 	}
 	return OutcomeNoArtifact
 }
+
+// EvidenceFor returns the FULL per-target evidence record recorded by the apply
+// boundary for a target, and whether the set holds one. It is the only accessor
+// for the compiled-diff metrics, the apply-execution flag and the observed
+// filesystem result — so a caller that needs to publish or render diff evidence
+// reads the same record the boundary measured, never a re-derivation.
+func (ms *MutationSet) EvidenceFor(path string) (MutationEvidence, bool) {
+	if ms == nil {
+		return MutationEvidence{}, false
+	}
+	for _, ev := range ms.Outcomes {
+		if ev.File == path {
+			return ev, true
+		}
+	}
+	return MutationEvidence{}, false
+}
+
+// Count returns the number of recorded per-target outcomes.
+func (ms *MutationSet) Count() int {
+	if ms == nil {
+		return 0
+	}
+	return len(ms.Outcomes)
+}

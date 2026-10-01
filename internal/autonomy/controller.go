@@ -1,7 +1,9 @@
 package autonomy
 
 import (
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -235,6 +237,292 @@ func missingCaps(required, granted CapabilitySet) CapabilitySet {
 		}
 	}
 	return missing
+}
+
+// ── Canonical Intent Authority (Phase 14) ────────────────────────────────────
+//
+// A single execution lifecycle has EXACTLY ONE canonical resolved intent. The
+// failure this type exists to prevent is a lifecycle in which three components
+// concurrently believe different things:
+//
+//	Preflight/Parser  → "ask"        (read-only, no workspace mutation)
+//	Context Compiler   → "ask"        (read-only context policy compiled)
+//	Autonomy           → "modification" (mutation authority requested)
+//
+// Under that split the compiler is fitting a read-only context for a request
+// that then mutates the workspace, and no component can say which contract the
+// run is really under. The fix is a BLOCKING REVISION: elevating the intent is
+// a transaction that invalidates the previous intent AND every artefact derived
+// from it (the cached context descriptor, the compiled payload, the contract
+// descriptor), synchronizes the canonical intent, and refuses to hand the run
+// back to the driver until the context has been re-compiled under the new one.
+//
+// The transaction is deliberately fail-closed: a revision that cannot complete
+// leaves the authority in the REVISING state, and `Ready()` reports false. No
+// caller can proceed on a half-revised intent.
+
+// IntentPhase is the lifecycle position of the canonical intent authority.
+type IntentPhase string
+
+const (
+	// IntentUnresolved: no intent has been resolved yet.
+	IntentUnresolved IntentPhase = "UNRESOLVED"
+	// IntentResolved: one intent is canonical and its context is valid for it.
+	IntentResolved IntentPhase = "RESOLVED"
+	// IntentRevising: a blocking revision is in flight. The previous intent and
+	// its derived artefacts are INVALID until the revision completes.
+	IntentRevising IntentPhase = "REVISING"
+)
+
+// IntentRevision is the record of ONE blocking intent revision. It is the audit
+// trail that explains why a compiled context was discarded.
+type IntentRevision struct {
+	// From is the invalidated intent.
+	From Intent
+	// To is the canonical intent after the revision.
+	To Intent
+	// Reason is the human/machine-readable justification.
+	Reason string
+	// Revision is the 1-indexed revision counter of the lifecycle.
+	Revision int
+	// At is the wall-clock instant of the revision.
+	At time.Time
+	// ContextInvalidated names the derived artefacts the revision dropped. A
+	// revision that invalidated nothing was not a revision.
+	ContextInvalidated bool
+}
+
+// ErrIntentRevisionIncomplete is returned when a caller asks for the canonical
+// intent while a blocking revision is still in flight. It exists so a stale
+// caller fails loudly instead of proceeding on the previous intent.
+var ErrIntentRevisionIncomplete = errors.New("autonomy: intent revision in flight — the canonical intent is not yet usable")
+
+// ErrIntentDowngradeRejected is returned when a caller attempts to LOWER the
+// canonical intent (e.g. modification → ask) through the revision path. A
+// mutation authority, once granted inside a lifecycle, cannot be silently
+// withdrawn by a later classifier reading; only a fresh lifecycle can.
+var ErrIntentDowngradeRejected = errors.New("autonomy: intent downgrade rejected — a new lifecycle is required to lower authority")
+
+// IntentAuthority is the single canonical intent holder for one execution
+// lifecycle. It is safe for concurrent use: preflight, the context compiler and
+// the driver all read it, and only the authority advances it.
+type IntentAuthority struct {
+	mu       sync.RWMutex
+	phase    IntentPhase
+	intent   Intent
+	revision int
+	// contextRevision binds the compiled context to the intent revision that
+	// produced it. A context compiled under an older revision is invalid.
+	contextRevision int
+	// contextValid records whether the currently compiled context satisfies the
+	// ACTIVE intent's semantic contract (see ValidateContextProvenance).
+	contextValid bool
+	// contextIntent is the intent the currently compiled context was built for.
+	contextIntent Intent
+	last          IntentRevision
+}
+
+// NewIntentAuthority returns an authority with no resolved intent.
+func NewIntentAuthority() *IntentAuthority {
+	return &IntentAuthority{phase: IntentUnresolved}
+}
+
+// Phase returns the authority's lifecycle position.
+func (a *IntentAuthority) Phase() IntentPhase {
+	if a == nil {
+		return IntentUnresolved
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.phase
+}
+
+// Resolve installs the FIRST canonical intent of the lifecycle. It is a no-op
+// when an intent is already resolved, because the first resolution is the
+// preflight/parser's classification and a second, un-revised call must never
+// silently overwrite it.
+func (a *IntentAuthority) Resolve(classified Intent) Intent {
+	if a == nil {
+		return IntentUnknown
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.phase == IntentUnresolved {
+		a.intent = classified
+		a.phase = IntentResolved
+	}
+	return a.intent
+}
+
+// Current returns the canonical intent. It fails CLOSED while a revision is in
+// flight: the caller must wait for the transaction instead of reading the
+// invalidated value.
+func (a *IntentAuthority) Current() (Intent, error) {
+	if a == nil {
+		return IntentUnknown, nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.phase == IntentRevising {
+		return IntentUnknown, ErrIntentRevisionIncomplete
+	}
+	return a.intent, nil
+}
+
+// Revision returns the current revision counter (0 before the first revision).
+func (a *IntentAuthority) Revision() int {
+	if a == nil {
+		return 0
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.revision
+}
+
+// LastRevision returns the most recent revision record.
+func (a *IntentAuthority) LastRevision() IntentRevision {
+	if a == nil {
+		return IntentRevision{}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.last
+}
+
+// Elevate performs the BLOCKING INTENT REVISION: it elevates the canonical
+// intent to `to`, invalidates the previous intent together with every artefact
+// derived from it, and synchronizes the canonical intent in one transaction.
+//
+// The consequences, all of them mandatory:
+//
+//   - the previous intent is INVALID — Current() no longer returns it;
+//   - the cached context descriptor and the compiled payload are DROPPED, so no
+//     read-only context compiled for the old intent can be reused;
+//   - the context is marked INVALID for the new intent, so `Ready()` is false
+//     until it is re-compiled under the new contract;
+//   - the caller MUST re-compile before invoking the driver, and the returned
+//     record is the proof that it did so.
+//
+// Elevating to the intent that is already canonical is a no-op: a revision that
+// changes nothing would otherwise invalidate a perfectly valid context for no
+// reason. Lowering the intent is rejected outright (ErrIntentDowngradeRejected)
+// — authority, once held, is not withdrawn inside a lifecycle.
+func (a *IntentAuthority) Elevate(to Intent, reason string) (IntentRevision, error) {
+	if a == nil {
+		return IntentRevision{}, errors.New("autonomy: nil intent authority")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.phase == IntentRevising {
+		return IntentRevision{}, ErrIntentRevisionIncomplete
+	}
+	from := a.intent
+	if to == from {
+		return IntentRevision{From: from, To: to, Reason: reason, Revision: a.revision}, nil
+	}
+	if from.RequiresMutation() && !to.RequiresMutation() {
+		return IntentRevision{}, fmt.Errorf("%w: %s -> %s", ErrIntentDowngradeRejected, from, to)
+	}
+	a.revision++
+	a.phase = IntentRevising
+	// SYNCHRONIZE: the canonical intent becomes the elevated one. This is the
+	// single point where the lifecycle's intent changes, so a concurrent reader
+	// can never observe a half-revised value.
+	a.intent = to
+	// Invalidate EVERY artefact derived from the previous intent. The context is
+	// marked invalid for the NEW intent as well, because nothing has been
+	// compiled under it yet.
+	a.contextValid = false
+	a.contextIntent = IntentUnknown
+	a.contextRevision = 0
+	rev := IntentRevision{
+		From:               from,
+		To:                 to,
+		Reason:             reason,
+		Revision:           a.revision,
+		At:                 time.Now().UTC(),
+		ContextInvalidated: true,
+	}
+	a.last = rev
+	return rev, nil
+}
+
+// CommitContext records that the workspace context was (re-)compiled under the
+// ACTIVE canonical intent and satisfies its semantic provenance contract. It is
+// the second half of the blocking revision transaction: the lifecycle leaves
+// REVISING only here, and only with an intent the compiler actually named.
+func (a *IntentAuthority) CommitContext(under Intent, provenanceValid bool) error {
+	if a == nil {
+		return errors.New("autonomy: nil intent authority")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.phase != IntentRevising {
+		// A commit outside a revision simply re-asserts the binding.
+		a.contextIntent = under
+		a.contextValid = provenanceValid
+		a.contextRevision = a.revision
+		if a.phase == IntentUnresolved && under != IntentUnknown {
+			a.intent = under
+			a.phase = IntentResolved
+		}
+		return nil
+	}
+	if under != a.intent {
+		return fmt.Errorf("%w: context compiled under %q but the canonical intent is %q",
+			ErrIntentRevisionIncomplete, under, a.intent)
+	}
+	a.contextIntent = under
+	a.contextValid = provenanceValid
+	a.contextRevision = a.revision
+	if provenanceValid {
+		a.phase = IntentResolved
+	} else {
+		// Fail closed: the revision stays open until a context that actually
+		// satisfies the contract is committed.
+		a.phase = IntentRevising
+		return fmt.Errorf("%w: compiled context for %q does not satisfy its provenance contract", ErrIntentRevisionIncomplete, under)
+	}
+	return nil
+}
+
+// InvalidateContext drops the compiled context without changing the canonical
+// intent. It is used when the workspace moved underneath a still-valid intent.
+func (a *IntentAuthority) InvalidateContext() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.contextValid = false
+	a.contextIntent = IntentUnknown
+	a.contextRevision = 0
+	if a.phase == IntentResolved {
+		a.phase = IntentRevising
+	}
+}
+
+// Ready reports whether the run may proceed: one canonical intent is resolved
+// and the compiled context is valid FOR THAT INTENT. It is the gate the driver
+// consults before dispatching.
+func (a *IntentAuthority) Ready() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.phase == IntentResolved && a.contextValid && a.contextIntent == a.intent
+}
+
+// ContextValid reports whether the compiled context currently satisfies the
+// active intent's semantic provenance contract.
+func (a *IntentAuthority) ContextValid() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.contextValid && a.contextIntent == a.intent
 }
 
 // GrantRequest is a structured capability authorization request surfaced to the

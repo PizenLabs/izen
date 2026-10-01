@@ -42,6 +42,15 @@ type CompileResult struct {
 
 	PromptChars       int    `json:"prompt_chars,omitempty"`
 	PromptFingerprint string `json:"prompt_fingerprint,omitempty"`
+
+	// CacheHit reports that this MODEL CONTEXT was reused from the compiler's
+	// fingerprint cache instead of being re-derived. PHASE 12: model-context
+	// reuse was implemented but completely unobservable, which made it
+	// impossible to tell "the workspace cache avoided a file read" (a
+	// workspace-context fact) from "the model context was not rebuilt" (a
+	// different fact about a different layer). The two are now separately
+	// reportable.
+	CacheHit bool `json:"cache_hit,omitempty"`
 }
 
 // Phase and Source aliases keep the projection source-compatible with the

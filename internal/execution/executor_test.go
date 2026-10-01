@@ -17,6 +17,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
+	"github.com/PizenLabs/izen/internal/llmstep"
 )
 
 // mockProvider implements ai.Provider for executor tests.
@@ -624,18 +625,31 @@ func TestRuntimeExecutor_ReadOnlyStrategyBudgetSurvivesRequestOmission(t *testin
 	}
 }
 
+// TestRuntimeExecutor_FinishReasonLengthBecomesTruncatedOutcome pins the
+// truthful outcome of a full-artifact generation whose bounded-step
+// continuation budget is consumed by exhaustion.
+//
+// PHASE 12: a full-artifact generation continues the SAME contract across
+// bounded invocations, so this case now costs
+// 1 + llmstep.DefaultMaxContinuationSteps invocations rather than exactly one.
+// The terminal classification is unchanged — OutcomeTruncated, recoverable,
+// never an admitted artifact — and every billed invocation is still recorded.
 func TestRuntimeExecutor_FinishReasonLengthBecomesTruncatedOutcome(t *testing.T) {
 	root := t.TempDir()
 	writeTarget(t, root, "note.txt", sampleOriginal)
-	mock := &mockProvider{responses: []*ai.Response{{
-		Content: sampleReplace,
-		Usage: ai.ProviderUsage{
-			Known:            true,
-			PromptTokens:     10,
-			CompletionTokens: 20,
-			FinishReason:     "length",
-		},
-	}}}
+	responses := make([]*ai.Response, 0, 1+llmstep.DefaultMaxContinuationSteps)
+	for i := 0; i <= llmstep.DefaultMaxContinuationSteps; i++ {
+		responses = append(responses, &ai.Response{
+			Content: sampleReplace,
+			Usage: ai.ProviderUsage{
+				Known:            true,
+				PromptTokens:     10,
+				CompletionTokens: 20,
+				FinishReason:     "length",
+			},
+		})
+	}
+	mock := &mockProvider{responses: responses}
 	x := testExecutor(t, root, mock, events.NewBus(events.DefaultBufferSize))
 
 	res, err := x.Execute(context.Background(), ExecuteRequest{
@@ -644,8 +658,8 @@ func TestRuntimeExecutor_FinishReasonLengthBecomesTruncatedOutcome(t *testing.T)
 		Prompt:    "change bar to qux",
 		Target:    "note.txt",
 	})
-	if !errors.Is(err, ErrOutputTruncated) {
-		t.Fatalf("err = %v, want ErrOutputTruncated", err)
+	if !llmstep.IsOutputExhausted(err) {
+		t.Fatalf("err = %v, want the recoverable bounded-step exhaustion", err)
 	}
 	if res == nil || res.Proof == nil {
 		t.Fatal("expected result proof")
@@ -653,8 +667,21 @@ func TestRuntimeExecutor_FinishReasonLengthBecomesTruncatedOutcome(t *testing.T)
 	if res.Proof.Outcome != OutcomeTruncated {
 		t.Fatalf("outcome = %q, want %q", res.Proof.Outcome, OutcomeTruncated)
 	}
-	if len(res.Proof.ModelInvocations) != 1 || res.Proof.ModelInvocations[0].FinishReason != "length" {
-		t.Fatalf("finish reason evidence = %+v, want length", res.Proof.ModelInvocations)
+	want := 1 + llmstep.DefaultMaxContinuationSteps
+	if len(res.Proof.ModelInvocations) != want {
+		t.Fatalf("model invocations = %d, want %d", len(res.Proof.ModelInvocations), want)
+	}
+	for i, inv := range res.Proof.ModelInvocations {
+		if inv.FinishReason != "length" {
+			t.Fatalf("invocation %d finish reason = %q, want length", i, inv.FinishReason)
+		}
+	}
+	// EXHAUSTION != AN ADMITTED ARTIFACT: the partial prefix is evidence only.
+	if res.PendingPatchID != "" || res.Content != "" {
+		t.Fatal("an exhausted full-artifact generation must not produce an admitted artifact")
+	}
+	if len(res.ArtifactCandidates) != 1 || res.ArtifactCandidates[0].Committed {
+		t.Fatalf("candidates = %+v, want exactly one non-committed partial candidate", res.ArtifactCandidates)
 	}
 }
 

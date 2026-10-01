@@ -111,6 +111,18 @@ func (c *phase4Collector) timestampOf(typ string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// firstPayload returns the payload of the first event of typ (nil when absent).
+func (c *phase4Collector) firstPayload(typ string) interface{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, ev := range c.events {
+		if ev.Type() == typ {
+			return ev.Payload()
+		}
+	}
+	return nil
+}
+
 // failingProvider fails on the first call (model failure path).
 type failingProvider struct {
 	mu     sync.Mutex

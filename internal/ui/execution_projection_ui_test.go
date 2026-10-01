@@ -76,8 +76,15 @@ func TestGatedProjectionFollowsRuntimeEvents(t *testing.T) {
 	if m.execView.HumanStep() != "Reading index.html" {
 		t.Fatalf("step after target.resolved = %q, want Reading index.html", m.execView.HumanStep())
 	}
-	if dock := m.composeDockText(); !strings.Contains(dock, "Reading index.html") {
-		t.Fatalf("dock %q missing the projected target step", dock)
+	// PHASE 13 — ONE owner for the current step. The execution narrative panel
+	// is the canonical main-UI rendering; the loading dock must NOT restate the
+	// same sentence, and must not substitute the runtime stage under a second
+	// wording. The dock keeps only its animated glyph.
+	if dock := m.composeDockText(); dock != "" {
+		t.Fatalf("dock text = %q, want none: the narrative panel owns the current step", dock)
+	}
+	if panel := m.renderExecutionLayered(); !strings.Contains(panel, "Reading index.html") {
+		t.Fatalf("narrative panel %q missing the projected target step", panel)
 	}
 
 	m.handleDomainEvent(events.NewModelInvoked("g1", "mock", 0, 0))

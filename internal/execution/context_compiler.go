@@ -2,6 +2,8 @@ package execution
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/ai"
@@ -195,6 +197,7 @@ func contextTelemetry(req ExecuteRequest, agent *contextcompiler.AgentContext) (
 		DropCount:          result.DropCount,
 		PromptChars:        result.PromptChars,
 		PromptFingerprint:  result.PromptFingerprint,
+		CacheHit:           result.CacheHit,
 		ProtocolTelemetry:  binding,
 	}
 	metrics := events.ContextCompilationPayload{
@@ -220,6 +223,7 @@ func contextTelemetry(req ExecuteRequest, agent *contextcompiler.AgentContext) (
 		Sources:            make([]string, 0, len(result.Sources)),
 		PromptChars:        result.PromptChars,
 		PromptFingerprint:  result.PromptFingerprint,
+		CacheHit:           result.CacheHit,
 		ProtocolTelemetry:  binding,
 	}
 	for _, source := range result.Sources {
@@ -251,6 +255,170 @@ func contextLineage(req ExecuteRequest) string {
 		return ""
 	}
 	return req.Context.ID
+}
+
+// ErrIntentContextProvenance is returned when a re-compiled workspace context
+// does not satisfy the ACTIVE canonical intent's provenance contract: a
+// requested target is missing, the payload carries no workspace material, or
+// the compilation was bound to a different intent.
+//
+// It fails CLOSED. A mutation intent dispatched over a read-only context is
+// exactly the split-brain state the intent revision exists to prevent, and
+// running it would mean the model judged a workspace it was never shown.
+var ErrIntentContextProvenance = errors.New("execution: compiled context does not satisfy the active intent's provenance contract")
+
+// ErrIntentContextStarvation is returned when a re-compilation is semantically
+// VALID but carries no usable workspace material for the declared targets: the
+// payload admits every requested scope entry and yet the prompt crosses the
+// provider boundary carrying effectively nothing to judge.
+//
+// It is a separate sentinel from ErrIntentContextProvenance because the two
+// demand different responses. Provenance failure means the contract was not
+// satisfied and the run must park. Starvation means the contract WAS satisfied
+// on paper while the workspace was still invisible — the exact state produced by
+// freezing the compiled context before capability authorization completed. The
+// acceptance criterion is deliberately the strongest one available: a granted
+// workspace capability must be backed by non-zero target context bytes before
+// any model is asked to judge the workspace.
+var ErrIntentContextStarvation = errors.New("execution: granted workspace capabilities produced an empty target context")
+
+// RecompileIntentContext re-compiles the workspace context for the given
+// targets under an intent's contract and returns the SEMANTIC provenance
+// verdict.
+//
+// It is the second half of the blocking intent revision: the payload compiled
+// for the previous intent is never reused, because a read-only projection is
+// not a valid mutation context no matter how completely it filled its budget.
+// The verdict is a scope + provenance + intent check — never a token threshold.
+// `required` is one of the contextcompiler.IntentContext* vocabularies.
+func (x *RuntimeExecutor) RecompileIntentContext(ctx context.Context, targets []string, intentLabel, required string) (contextcompiler.ContextProvenance, error) {
+	return x.recompileIntentContext(ctx, targets, intentLabel, required)
+}
+
+// RecompileGrantedIntentContext is the GRANT-GATED half of the intent revision
+// (Phase 15): the re-compilation that must happen once a workspace capability
+// grant is in force, and before the execution driver lowers its preflight
+// barrier.
+//
+// It is `RecompileIntentContext` plus one additional, stronger acceptance
+// condition: the compiled payload must be a NON-EMPTY projection of the workspace.
+// The semantic provenance gate already refuses a payload that carries no
+// workspace material, so this is not a second copy of that check — it is the
+// condition provenance cannot express, namely that a payload which satisfies
+// every clause must still have content to show. A compiler that reports a valid,
+// scope-matched, workspace-bound context of zero tokens is not a valid context;
+// it is an empty one wearing a valid label, and it is precisely the state the
+// pre-grant freeze produced.
+//
+// WHAT THE PAYLOAD IS AND IS NOT FOR. This call does not hand a prompt to the
+// model and is not a substitute for the dispatch-time compilation. Its two
+// effects are (a) it drops the previous intent's cached projection, so the
+// compilation the executor performs when it builds the dispatched request cannot
+// be a cache hit on a read-only payload, and (b) it proves — before a single
+// provider request is admitted — that a context satisfying the active intent
+// actually exists and carries bytes. Both effects must happen before the barrier
+// lowers; neither replaces the other.
+//
+// The refusal is ErrIntentContextStarvation so a caller can tell "the contract
+// was refused" (ErrIntentContextProvenance) from "the contract was met by
+// nothing" — a compiler defect rather than a legitimate refusal.
+func (x *RuntimeExecutor) RecompileGrantedIntentContext(ctx context.Context, targets []string, intentLabel, required string) (contextcompiler.ContextProvenance, error) {
+	provenance, err := x.recompileIntentContext(ctx, targets, intentLabel, required)
+	if err != nil {
+		return provenance, err
+	}
+	return provenance, GrantedContextStarvation(provenance, targets, required)
+}
+
+// GrantedContextStarvation is the pure acceptance check a grant-gated
+// re-compilation must pass, separated from the executor so it can be reasoned
+// about — and tested — without a workspace, a compiler or a provider.
+//
+// It returns nil for every contract that does not demand workspace material. That
+// exclusion is load-bearing: a zero-workspace or self-contained turn is CORRECT
+// with an empty payload, and refusing it would reintroduce the token-threshold
+// rule this gate was written alongside, just with a different threshold.
+func GrantedContextStarvation(provenance contextcompiler.ContextProvenance, targets []string, required string) error {
+	if required != contextcompiler.IntentContextWorkspace {
+		return nil
+	}
+	// `Valid` is checked first so this never re-diagnoses a refusal: the
+	// provenance gate's reason is the better answer and the caller must not have
+	// two competing explanations for one failure.
+	if !provenance.Valid {
+		return nil
+	}
+	if !provenance.WorkspaceMaterialPresent || provenance.ObservedTokens <= 0 {
+		return fmt.Errorf("%w: %d target(s) compiled to a valid but empty context (%d token(s), workspace_material=%t)",
+			ErrIntentContextStarvation, len(uniqueTargets(targets)), provenance.ObservedTokens,
+			provenance.WorkspaceMaterialPresent)
+	}
+	return nil
+}
+
+// uniqueTargets de-duplicates non-empty targets, preserving first-appearance
+// order. It exists so a diagnostic counts declared targets rather than
+// re-listing the same path twice.
+func uniqueTargets(targets []string) []string {
+	if len(targets) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(targets))
+	out := make([]string, 0, len(targets))
+	for _, t := range targets {
+		trimmed := strings.TrimSpace(t)
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+// recompileIntentContext is the shared body of the two revision entry points.
+// The invalidation step, the compile call and the provenance evaluation live
+// here exactly once so the blocking revision and the grant-gated one can never
+// drift apart in what they consider a valid re-compilation.
+func (x *RuntimeExecutor) recompileIntentContext(ctx context.Context, targets []string, intentLabel, required string) (contextcompiler.ContextProvenance, error) {
+	if x == nil {
+		return contextcompiler.ContextProvenance{}, fmt.Errorf("execution: nil executor")
+	}
+	if ctx == nil {
+		// Fail closed rather than substituting a fresh context: the caller's
+		// cancellation authority is the run's, and silently detaching from it
+		// would let a re-compilation outlive an aborted run.
+		return contextcompiler.ContextProvenance{}, errors.New("execution: intent context re-compilation requires a context")
+	}
+	// The MUTATION context contract always projects the declared targets as
+	// required (critical) file context: a read-only projection of them is not a
+	// mutation context.
+	critical := required == contextcompiler.IntentContextWorkspace
+	compiler := x.contextCompilerInstance()
+	// PHASE 14 — step 1 of the blocking intent revision: drop every payload
+	// compiled under the PREVIOUS intent before compiling under this one. The
+	// read-only projection of the previous intent is not a mutation context, and
+	// a cache hit on it would be indistinguishable from a correct compilation.
+	compiler.InvalidateCache()
+	compiled, err := compiler.Compile(ctx, contextcompiler.Input{
+		UserRequest:   intentLabel,
+		WorkflowState: string(strategy.TargetedMutation),
+		Phase:         contextcompiler.PhaseExecute,
+		Files:         x.workspaceFiles(targets, critical),
+		ContextPolicy: "target_file_only",
+		Scope:         strings.Join(targets, ","),
+	})
+	if err != nil {
+		return contextcompiler.ContextProvenance{}, err
+	}
+	provenance := compiled.ValidateContextProvenance(contextcompiler.IntentBinding{
+		Active:   intentLabel,
+		Required: required,
+	}, targets)
+	if !provenance.Valid {
+		return provenance, fmt.Errorf("%w: %s", ErrIntentContextProvenance, provenance.Reason)
+	}
+	return provenance, nil
 }
 
 func (x *RuntimeExecutor) workspaceFiles(targets []string, critical bool) []contextcompiler.FileContext {

@@ -1186,6 +1186,17 @@ type model struct {
 	showTraceOverlay bool
 	// telemetryDemuxer isolates internal execution loop events into a Trace Buffer.
 	telemetryDemuxer *TelemetryDemuxer
+	// narrative is the Projection Reducer that owns the Main Viewport's two-tier
+	// state (sealed history + one active node) and diverts infrastructure
+	// telemetry to Trace. It is the single ingestion authority for records: push
+	// and logActivity both route through it, so the narrative filter, the step
+	// classification and the single-active-node invariant cannot be bypassed by
+	// a call site that forgets a rule. Nil until first use; see projection().
+	narrative *ProjectionReducer
+	// hud is the fixed in-place telemetry surface (context tokens, cost, MCP
+	// status). Telemetry lives here and nowhere else, so a live counter can never
+	// append a line to the conversation. Nil until first use.
+	hud *SidebarHUD
 	// traceVerbose is the model-local verbosity toggle mirrored into the
 	// package-level TraceVerbose flag used by layout/stream renderers.
 	traceVerbose bool
@@ -2135,6 +2146,20 @@ type model struct {
 	// issues the session capability grant internally, re-runs the decision and
 	// continues execution. Nil when no proposal is outstanding.
 	pendingAutonomyProposal *autonomy.Proposal
+	// executionSteps is the Phase 16 evidence ledger of runtime-attested
+	// execution steps. It is the ONLY source of execution-step rendering: an
+	// entry exists here if and only if a runtime StepStarted/StepCompleted
+	// event was consumed. There is no template, no plan projection and no
+	// default list, so the UI cannot show a checkmark for work that has not
+	// been reported as finished.
+	executionSteps *ExecutionStepLedger
+	// backgroundTelemetry is the Phase 16.1 BACKGROUND telemetry domain
+	// (indexer/graph progress). It has no execution spinner and no execution
+	// surface at all (I14).
+	backgroundTelemetry *BackgroundTelemetryState
+	// executionNarrative is the Phase 16.1 EXECUTION narrative domain. It OWNS
+	// the ExecutionSpinner, which only an execution domain event may advance.
+	executionNarrative *ExecutionNarrativeState
 	// autonomyProposalSelect is the highlighted action index in the proposal
 	// menu (Execute / Inspect / Cancel), navigated with ↑/↓.
 	autonomyProposalSelect int
@@ -2904,6 +2929,14 @@ func (m *model) setApplyError(text string) {
 // streaming freeze). ActivityTree entries are NOT populated here —
 // they are fed directly from the engine via handleEngineEvent for
 // typed events with real I/O metrics.
+//
+// ── PHASE 14: MAIN NARRATIVE / TRACE BOUNDARY ────────────────────────────
+// This is the single TUI subscriber choke point, and it enforces the evidence
+// boundary structurally: an infrastructure-telemetry line is routed to the Trace
+// Overlay (Alt+T) and NEVER appended to the Main Narrative, whatever handler
+// produced it and whatever visibility layer is active. The runtime still
+// generates every one of those events — the boundary moves information, it does
+// not discard it.
 func (m *model) logActivity(format string, args ...interface{}) {
 	// ── ACTIVITY-SURFACE SEAL ─────────────────────────────────────
 	// After /clear the surface is sealed until the next operation or user
@@ -2913,8 +2946,20 @@ func (m *model) logActivity(format string, args ...interface{}) {
 		return
 	}
 	msg := sanitizeIngressANSI(fmt.Sprintf(format, args...))
-	r := record{role: roleActivity, text: msg}
-	m.records = append(m.records, r)
+	// ── PHASE 15: ONE INGESTION AUTHORITY ─────────────────────────────
+	// logActivity, push and pushRecords converge on the same reducer, so the
+	// narrative / trace boundary has exactly one enforcement point. The reducer
+	// diverts a machine line to Trace AND refuses it the narrative in the same
+	// step, so this function decides nothing: it asks, and obeys. Keeping a local
+	// pre-check here would be a second copy of the policy, and two copies drift.
+	//
+	// A refused record short-circuits the redraw entirely. There is nothing new on
+	// screen to show, and repainting on a machine line is exactly the jitter the
+	// projection exists to remove.
+	if !m.commitRecord(record{role: roleActivity, text: msg, turnID: m.currentTurnID}) {
+		return
+	}
+	r := m.records[len(m.records)-1]
 	if m.width > 0 {
 		rendered := m.renderRecordForViewport(r)
 		if rendered != "" {
@@ -2931,11 +2976,79 @@ func (m *model) logActivity(format string, args ...interface{}) {
 // token usage, event names) ONLY when the gated execution is in the DEBUG
 // layer. In NORMAL and EXPANDED the human narrative panel is the only execution
 // surface — internal runtime states are never rendered directly by default.
+// contextReuseSuffix renders the MODEL-CONTEXT identity fact. Reuse is decided by
+// the context compiler's fingerprint cache; an empty fingerprint (no compile
+// happened) is reported as nothing rather than as reuse.
+func contextReuseSuffix(fingerprint string, reused bool) string {
+	if fingerprint == "" {
+		return ""
+	}
+	if reused {
+		return ", model context reused (" + shortFingerprint(fingerprint) + ")"
+	}
+	return ", compiled " + shortFingerprint(fingerprint)
+}
+
+// contextTruncationSuffix renders what the compiler had to leave out of the
+// model context. Truncation is always reported: silently dropping material is
+// exactly the kind of implementation noise the human must not have to discover
+// from a failure.
+func contextTruncationSuffix(truncated bool, truncatedFiles, drops int) string {
+	switch {
+	case truncated:
+		return fmt.Sprintf(", %d file(s) truncated, %d section(s) dropped", truncatedFiles, drops)
+	case drops > 0:
+		return fmt.Sprintf(", %d section(s) dropped", drops)
+	default:
+		return ""
+	}
+}
+
+// shortFingerprint renders the leading edge of a hex digest for a compact,
+// user-facing context line.
+func shortFingerprint(digest string) string {
+	if len(digest) > 8 {
+		return digest[:8]
+	}
+	return digest
+}
+
+// logRuntimeDetail writes a runtime lifecycle detail line (strategy, provider,
+// token usage, event names) ONLY when the gated execution is in the DEBUG
+// layer. In NORMAL and EXPANDED the human narrative panel is the only execution
+// surface — internal runtime states are never rendered directly by default.
+//
+// PHASE 12: the line is ALSO ingested into the Trace buffer unconditionally, so
+// Alt+T is actually populated. Previously only `m.push` fed the demuxer and
+// every runtime detail line bypassed it, leaving Trace empty precisely when a
+// human was debugging.
 func (m *model) logRuntimeDetail(format string, args ...interface{}) {
+	line := sanitizeIngressANSI(fmt.Sprintf(format, args...))
+	m.ingestTrace(line)
 	if m.execVisibility != presentation.VisibilityDebug {
 		return
 	}
-	m.logActivity(format, args...)
+	m.logActivity("%s", line)
+}
+
+// ingestTrace feeds one line into the Trace overlay buffer. It is the single
+// ingestion point so every execution-state source — activity, runtime detail,
+// boundary reasons — lands in Trace exactly once and in the same order it was
+// produced.
+//
+// It creates the demuxer on demand. A nil-buffer early return here would be the
+// one outcome the narrative/trace boundary must never produce: infrastructure
+// telemetry that is correctly refused by the narrative AND silently dropped by
+// Trace is information that ceased to exist. Whichever caller reaches Trace first
+// owns creating the buffer.
+func (m *model) ingestTrace(line string) {
+	if m == nil || strings.TrimSpace(line) == "" {
+		return
+	}
+	if m.telemetryDemuxer == nil {
+		m.telemetryDemuxer = NewTelemetryDemuxer()
+	}
+	m.telemetryDemuxer.Ingest(line)
 }
 
 // handleEngineEvent receives typed event payloads from the execution
@@ -3021,6 +3134,12 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	if m.activitySurfaceSealed {
 		return
 	}
+	// ── TELEMETRY DOMAIN ROUTING (Phase 16.1, I14) ────────────────
+	// Dispatch the event to exactly one domain BEFORE any rendering: background
+	// events reach only BackgroundTelemetryState, execution events reach only
+	// ExecutionNarrativeState (which owns the ExecutionSpinner). A background
+	// event therefore cannot instantiate or advance the execution spinner.
+	m.routeExecutionDomainEvent(ev)
 	// ── SINGLE EXECUTION-VIEW PROJECTION (Phase 4) ────────────────
 	// Every canonical runtime lifecycle event advances the execution-view
 	// projection. The renderer for the gated path reads ONLY this projection's
@@ -3075,9 +3194,17 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 	// ceiling mid-synthesis. Each line surfaces one hop of the
 	// smaller-bounded-step continuation so a free-tier truncation is
 	// visible instead of silently retried blind.
+	//
+	// PHASE 16: these two payloads are the ONLY events that may produce an
+	// execution-step entry. Before this, the authorization surface rendered a
+	// hardcoded checklist of steps the runtime had not taken; now a step line
+	// exists only because the runtime reported one. A "✓" in the viewport is a
+	// claim the runtime made, not one the UI invented.
 	case events.StepStartedPayload:
+		m.routeStepStarted(stepKeyFromOrdinal(p.Step), stepLabelWithModel(p.Model, p.Step))
 		m.logActivity("[plan:step] %d started (budget %d tokens)", p.Step, p.MaxOutputTokens)
 	case events.StepCompletedPayload:
+		m.routeStepCompleted(stepKeyFromOrdinal(p.Step))
 		m.logActivity("[plan:step] %d completed: %d task(s) committed (%s)", p.Step, p.TasksCommitted, p.FinishReason)
 	case events.StepExhaustedPayload:
 		m.logActivity("[plan:step] %d exhausted at %d tokens (salvaged %d task(s))", p.Step, p.OutputTokens, p.SalvagedTasks)
@@ -3110,13 +3237,48 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// indicator's row is released and the compiled context — which the
 		// context/mutation surfaces below render — takes its place.
 		m.finalizeSkeleton(states.StateAstIndexing, "")
-		m.logRuntimeDetail("[runtime] context prepared: %d channel(s), ~%d tokens", len(p.Channels), p.Tokens)
+		// PHASE 12: this is the ONE user-facing MODEL-CONTEXT line. It reports
+		// what is actually SENT to the model (compiled tokens, channel count,
+		// whether anything was truncated or dropped, and whether the compiled
+		// context was reused from the fingerprint cache) — never a workspace
+		// cache hit, which is a different fact about a different layer.
+		//
+		// PHASE 13 — LAYER LABELS. The number is the COMPILED CONTEXT estimate
+		// (the ~4-chars/token accounting of the assembled prompt), NOT the
+		// provider's prompt-token count and NOT a workspace size. Those are
+		// separate quantities reported separately. A bare "model tokens" label
+		// forced the user to infer which layer a number belonged to, so the
+		// label now names the layer and the units say "estimate".
+		if m.execVisibility == presentation.VisibilityExpanded ||
+			m.execVisibility == presentation.VisibilityDebug {
+			m.logActivity("Context compiled: %d channel(s), ~%d tok (estimate; budget %d, available %d)%s%s",
+				len(p.Channels), p.Tokens, p.BudgetTokens, p.AvailableTokens,
+				contextReuseSuffix(p.PromptFingerprint, p.CacheHit),
+				contextTruncationSuffix(p.Truncated, p.TruncatedFileCount, p.DropCount))
+		} else {
+			m.logActivity("Context compiled: %d channel(s), ~%d tok (estimate)",
+				len(p.Channels), p.Tokens)
+		}
+		m.logRuntimeDetail("[runtime] context prepared: %d channel(s), ~%d tokens scope=%s policy=%s truncated=%t drops=%d fingerprint=%s",
+			len(p.Channels), p.Tokens, p.Scope, p.Policy, p.Truncated, p.DropCount, p.PromptFingerprint)
 	case events.ContextCompilationPayload:
 		// PRE-EXECUTION INDICATOR: the context compiler is running. Nothing has
 		// been read or sent yet, and a context scan on a large workspace is a
 		// real, non-instant pause with nothing else to show for it. The payload is
 		// content-free by construction, so the indicator names no file.
 		m.mountSkeleton(states.StateAstIndexing, "")
+		// PHASE 12: the raw compilation metrics are TRACE telemetry. They were
+		// previously received and discarded entirely; they now reach the debug
+		// layer instead of vanishing, and the user-facing line above stays the
+		// single canonical model-context statement.
+		m.logRuntimeDetail("[runtime] context compiled: phase=%s policy=%s budget=%d reserved=%d available=%d used=%d context=%d system=%d schema=%d tool=%d truncated=%t dropped=%d sections=%d reused=%t fingerprint=%s",
+			p.Phase, p.Policy, p.BudgetTokens, p.ReservedTokens, p.AvailableTokens,
+			p.UsedTokens, p.ContextTokens, p.SystemTokens, p.SchemaTokens, p.ToolTokens,
+			p.Truncated, p.DropCount, p.SectionCount, p.CacheHit, p.PromptFingerprint)
+	case events.RuntimeDetailPayload:
+		// PHASE 12: the trace/debug channel. Raw runtime telemetry reaches
+		// Trace and only Trace — never the human execution narrative.
+		m.logRuntimeDetail("%s", p.Line)
 	case events.ToolBatchStartedPayload:
 		// PRE-EXECUTION INDICATOR: the tool set is committed and about to be
 		// dispatched. Nothing has been handed to a subprocess yet, so the
@@ -3229,7 +3391,12 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			m.logActivity("[intent] classified: /%s (%.0f%%, %s)", p.Intent, p.Confidence*100, p.Explanation)
 		}
 	case events.PhaseChangedPayload:
-		m.logActivity("[phase] %s → %s", p.From, p.To)
+		// PHASE 13 — MAIN UI / TRACE BOUNDARY. The workflow phase is already
+		// projected onto the state machine and rendered by the top bar badge
+		// and the EXECUTING header. A second "[phase] a → b" line in the main
+		// narrative restates a state the chrome already shows, so the
+		// transition record goes to Trace only.
+		m.logRuntimeDetail("[phase] %s → %s", p.From, p.To)
 		// The presentation state is a pure projection of the canonical
 		// workflow phase: derive, never hand-set.
 		if m.viewState != nil {
@@ -3296,7 +3463,12 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		if p.InputTokens > 0 || p.OutputTokens > 0 {
 			m.markUsageKnown()
 		}
-		m.logActivity("[stream] %s: %s tok input + %s tok output (%s)", statusWord,
+		// PHASE 13 — MAIN UI / TRACE BOUNDARY. Provider token accounting is
+		// diagnostic telemetry: the footer already binds the same live
+		// ↑prompt/↓completion counters, and the execution details panel reports
+		// them layer-labelled. Printing a third copy into the main narrative
+		// added no information a user could act on, so it belongs in Trace.
+		m.logRuntimeDetail("[stream] %s: %s tok prompt + %s tok completion (%s)", statusWord,
 			status.FormatTokens(p.InputTokens), status.FormatTokens(p.OutputTokens), truncateForActivity(p.Reason))
 	case events.EngineTelemetryPayload:
 		// Typed engine I/O event wrapped for bus transport — projected into
@@ -3342,14 +3514,19 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		m.logActivity("[grant] %s: %s granted for %s (expires %s)",
 			p.GrantID, strings.Join(p.Capabilities, "+"), p.Scope, orNever(p.ExpiresAt))
 	case events.LoopTransitionPayload:
-		// One step of the autonomous loop. Failure transitions are shown like
-		// any other: the loop produces diagnosis, never termination.
-		m.logActivity("[loop] %s → %s (%s): %s",
+		// One step of the autonomous loop. It is INFRASTRUCTURE telemetry about
+		// the runtime's own state machine — the same fact the execution
+		// narrative panel already projects for the user — so it is written to
+		// the Trace Overlay only. logRuntimeDetail is the Trace-bound writer;
+		// logActivity's evidence guard is the backstop that makes the routing
+		// structural rather than a convention.
+		m.logRuntimeDetail("[loop] %s → %s (%s): %s",
 			p.From, p.To, p.Event, truncateForActivity(p.Reason))
 	case events.ContextCompiledPayload:
 		// The context intelligence layer compiled a structural understanding
-		// of an artifact: findings, not raw bytes.
-		m.logActivity("[context] compiled %s (%s): %d finding(s)",
+		// of an artifact: findings, not raw bytes. This is compiler telemetry;
+		// the user-facing context line is the execution details panel.
+		m.logRuntimeDetail("[context] compiled %s (%s): %d finding(s)",
 			p.Path, p.Kind, p.FindingCount)
 	case events.DecisionSurfacePayload:
 		// The TYPED proposal payload of a Zero-Token DecisionSurface. The
@@ -3357,13 +3534,15 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		// structured line (never inferred from a log string). The interactive
 		// recovery surface itself renders from the authoritative boundary the
 		// driver parks with — this projection is observability + the guarantee
-		// that awaiting_human always has a published decision surface.
-		m.logActivity("[preflight] decision surface: %s — %s (%d option(s))",
+		// that awaiting_human always has a published decision surface. It is
+		// preflight TELEMETRY, so it is Trace-bound; the renderable decision
+		// surface is a separate, user-facing surface.
+		m.logRuntimeDetail("[preflight] decision surface: %s — %s (%d option(s))",
 			p.Target, truncateForActivity(p.Reason), len(p.Options))
 	case events.DecisionSurfaceLifecyclePayload:
-		m.logActivity("[preflight] decision_surface.%s: %s", p.State, truncateForActivity(p.Reason))
+		m.logRuntimeDetail("[preflight] decision_surface.%s: %s", p.State, truncateForActivity(p.Reason))
 	case events.PreflightEventPayload:
-		m.logActivity("[preflight] %s: %s (target=%s est=%d max=%d)",
+		m.logRuntimeDetail("[preflight] %s: %s (target=%s est=%d max=%d)",
 			p.State, truncateForActivity(p.Reason), p.Target, p.EstimatedTokens, p.MaxOutputTokens)
 		// ── PREFLIGHT COMPLETE: MANDATORY SYNCHRONOUS LAYOUT SYNC ──
 		// A completed preflight collapses its multi-line trace to a single
@@ -3376,6 +3555,15 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			m.refreshViewportContentImmediate()
 		}
 	case events.AutonomousLifecyclePayload:
+		// PHASE 14: the objective-authority verdict is infrastructure
+		// telemetry. It is Trace-bound by construction; the user-facing
+		// statement of an unproven objective arrives through the runtime's own
+		// user-facing failure message, which says what stopped and why.
+		if IsInfrastructureTelemetry(p.Reason) || strings.Contains(strings.ToLower(p.Reason), "unproven") ||
+			strings.Contains(strings.ToLower(p.Reason), "unsubstantiated") {
+			m.logRuntimeDetail("[autonomy] %s: %s", strings.TrimPrefix(ev.Type(), "autonomous."), truncateForActivity(p.Reason))
+			return
+		}
 		m.logActivity("[autonomy] %s: %s", strings.TrimPrefix(ev.Type(), "autonomous."), truncateForActivity(p.Reason))
 	}
 }
@@ -4098,14 +4286,18 @@ func (m *model) push(r role, text string) {
 	if isBoundedPatchRecovery(text) {
 		text = RenderBoundedPatchRecoveryBadge()
 	}
-	if m.telemetryDemuxer == nil {
-		m.telemetryDemuxer = NewTelemetryDemuxer()
-	}
-	m.telemetryDemuxer.Ingest(text)
-
-	rec := record{role: r, text: text, turnID: m.currentTurnID}
-	m.records = append(m.records, rec)
-	m.cacheRecordToHistory(rec)
+	// ── PHASE 15: PROJECTION REDUCER IS THE INGESTION AUTHORITY ───────
+	// Every record — from a domain event, a stream delta, a slash command or a
+	// handler nobody has written yet — crosses the reducer before it can reach
+	// the Main Viewport. That is where the narrative/trace boundary is enforced,
+	// where a machine line is diverted to Trace, and where the Single Active Node
+	// Invariant collapses a step that restates itself into one node.
+	//
+	// Refusing here is not a filter layered on top of a policy: it is the policy.
+	// There is no second path into m.records, and m.records stays in exact
+	// correspondence with the projection, so what the reducer deduped is what the
+	// viewport, the hit map and selection all see.
+	m.commitRecord(record{role: r, text: text, turnID: m.currentTurnID})
 }
 
 // sanitizeIngressANSI is the ingress filter for external stream ingestion.
@@ -4550,13 +4742,18 @@ func wrapIndentedLine(text string, maxWidth int) []string {
 	return result
 }
 
-// pushRecords appends multiple records.
+// pushRecords appends multiple records through the SAME projection gate as
+// push and logActivity.
+//
+// It used to write `m.records` directly, which made it a second ingestion path
+// that could put a machine line into the narrative regardless of the boundary
+// policy. A bulk path is exactly where such a bypass hides, because the author
+// is copying a loop they have already seen work.
 func (m *model) pushRecords(recs []record) {
 	for _, rec := range recs {
 		rec.text = SanitizeForIngest(rec.text)
 		rec.text = sanitizeIngressANSI(rec.text)
-		m.records = append(m.records, rec)
-		m.cacheRecordToHistory(rec)
+		m.commitRecord(rec)
 	}
 }
 
@@ -5862,6 +6059,18 @@ func (m *model) renderTailPanelLines() []string {
 				b.WriteString("\n")
 			}
 		}
+	}
+
+	// ── Sidebar HUD: fixed in-place telemetry (Phase 15) ───────────
+	// Context tokens, cost and MCP status live HERE and nowhere else. Each slot is
+	// rewritten in place on every update, so the block's geometry never changes and
+	// the conversation above it is never displaced by a counter ticking over.
+	// Rendering it in the tail rather than the document is what makes that true:
+	// the document is append-only history, and a value that appends is not a value
+	// anyone can read.
+	if hud := m.renderSidebarHUD(); hud != "" {
+		b.WriteString(hud)
+		b.WriteString("\n")
 	}
 
 	// ── Inline Loading Dock (shimmer) ──────────────────────────────

@@ -61,7 +61,13 @@ var _ = ansiRegex
 // telemetry, it parses and buffers the step in the Trace Buffer and returns
 // isTelemetry = true along with the single-line summary anchor.
 func (d *TelemetryDemuxer) Ingest(text string) (bool, string) {
-	if !isEngineTraceLine(text) && !isExecutionLoopTrace(text) {
+	// ── PHASE 14: ONE CANONICAL CLASSIFIER ────────────────────────────
+	// The demuxer and the Main Narrative filter must agree on what counts as
+	// infrastructure telemetry. Two hand-maintained lists is how a line ends up
+	// in neither surface (filtered from the narrative, unrecognized by the
+	// demuxer, therefore discarded) — which is the one outcome the boundary
+	// must never produce. IsInfrastructureTelemetry is the single source.
+	if !isEngineTraceLine(text) && !isExecutionLoopTrace(text) && !IsInfrastructureTelemetry(text) {
 		return false, ""
 	}
 

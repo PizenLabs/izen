@@ -243,8 +243,70 @@ func TestPhase2EvidenceSealedOnlyAtFinalizeResultChokePoint(t *testing.T) {
 	if sealCallsFinalize != 1 {
 		t.Fatalf("architecture: finalizeResult must be the single sealTerminalEvidence call site, got %d", sealCallsFinalize)
 	}
-	if sealCallsHeld != 0 {
-		t.Fatalf("architecture: sealTerminalEvidence called from %d non-finalizeResult site(s) — evidence is born ONLY at the terminal choke point", sealCallsHeld)
+
+	// ── PHASE 13: evidence is born inside the runtime, and ALWAYS BEFORE the
+	// completion event that claims success. There are exactly TWO seal sites —
+	// finalizeResult (the idempotent terminal backstop) and completeExecution
+	// (the ordered choke point) — and completeExecution must seal BEFORE it
+	// calls Graph.CompleteExecution. A projector that observes execution.finished
+	// therefore always holds the evidence that justifies it.
+	if sealCallsHeld != 1 {
+		t.Fatalf("architecture: sealTerminalEvidence must have exactly 2 in-runtime call sites (completeExecution + finalizeResult backstop), got %d extra site(s)", sealCallsHeld)
+	}
+	completeFn := findFuncDecl(f, "completeExecution")
+	if completeFn == nil {
+		t.Fatal("architecture: RuntimeExecutor.completeExecution must exist as the ordered terminal-success choke point")
+	}
+	sealAt, doneAt := -1, -1
+	ast.Inspect(completeFn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch sel.Sel.Name {
+		case "sealTerminalEvidence":
+			if sealAt < 0 {
+				sealAt = int(call.Pos())
+			}
+		case "CompleteExecution":
+			if doneAt < 0 {
+				doneAt = int(call.Pos())
+			}
+		}
+		return true
+	})
+	if sealAt < 0 || doneAt < 0 {
+		t.Fatal("architecture: completeExecution must both seal the evidence and emit the completion event")
+	}
+	if sealAt > doneAt {
+		t.Fatal("architecture: evidence must be sealed BEFORE the completion event is published — a success claim may never be broadcast ahead of its evidence")
+	}
+
+	// No OTHER function in the runtime may emit a successful completion: a
+	// terminal success must be unreachable without sealing first.
+	rawComplete := 0
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || fn.Name.Name == "completeExecution" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "CompleteExecution" {
+				rawComplete++
+			}
+			return true
+		})
+	}
+	if rawComplete != 0 {
+		t.Fatalf("architecture: Graph.CompleteExecution reachable from %d site(s) outside completeExecution — every terminal success must seal evidence first", rawComplete)
 	}
 
 	// The runtime constructor is unexported: no caller can fabricate evidence.

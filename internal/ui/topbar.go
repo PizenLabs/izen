@@ -80,11 +80,23 @@ func (m *model) topBarToast() string {
 // driven by m.spinnerFrame which advances on the capped 90–100ms tick.
 func (m *model) renderTopBar(width int) string {
 	if m != nil && m.isExecuting() {
-		title := "EXECUTING"
-		if m.shimmerText != "" {
+		// ONE owner for the current execution step: while the execution
+		// narrative panel is mounted, the header titles from the SAME
+		// event-derived step. Falling back to m.shimmerText here would let the
+		// header and the panel disagree about what the execution is doing —
+		// "Waiting for model..." in the chrome beside "Applying changes" in the
+		// body is two claims, and neither would be authoritative.
+		title := ""
+		if m.loadingDockActive() {
+			title = m.execView.HumanStep()
+		} else if m.shimmerText != "" {
 			title = m.shimmerText
-		} else if m.workflowSM != nil {
+		}
+		if title == "" && m.workflowSM != nil {
 			title = m.workflowSM.State().String()
+		}
+		if title == "" {
+			title = "EXECUTING"
 		}
 		if h := RenderExecutingHeader(title, m.spinnerFrame, width); h != "" {
 			return h

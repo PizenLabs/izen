@@ -22,6 +22,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/contextcompiler"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
@@ -83,6 +84,23 @@ func (a *ExecutorAdapter) Root() string {
 		return ""
 	}
 	return a.root
+}
+
+// PreflightTarget is the adapter's Phase 16.1 target-resolution seam for the
+// pre-flight admission gate. It delegates to the executor's resolver (pure
+// os.Stat classification plus ISOLATED discovery) so the gate and the executor
+// see the SAME target verdict. The adapter never scans a workspace itself and
+// never grants authority: discovery candidates travel as evidence only (I13).
+func (a *ExecutorAdapter) PreflightTarget(ctx context.Context, prompt string, explicit []string) execution.TargetBindingResult {
+	if a == nil || a.executor == nil {
+		return execution.TargetBindingResult{
+			Status: execution.BindingUnresolved,
+			Phase:  execution.PhaseUnsubstantiated,
+			State:  execution.TargetStateUnboundPath,
+			Reason: "no executor is bound to the adapter; target evidence is impossible",
+		}
+	}
+	return a.executor.ResolveMutationTarget(ctx, prompt, explicit)
 }
 
 // Resolve determines the execution target set for an objective WITHOUT
@@ -520,6 +538,7 @@ func (a *ExecutorAdapter) observe(req autonomy.LoopRequest, res *execution.Execu
 		PatchID:               res.PendingPatchID,
 		ClarificationRequired: res.ClarificationRequired,
 		Verification:          autonomy.VerificationOutcome{Passed: res.Verification.Passed},
+		Objective:             a.objectiveEvidence(res),
 		TokenUsage:            res.Completed.InputTokens + res.Completed.OutputTokens,
 		InputTokens:           res.Completed.InputTokens,
 		OutputTokens:          res.Completed.OutputTokens,
@@ -527,7 +546,85 @@ func (a *ExecutorAdapter) observe(req autonomy.LoopRequest, res *execution.Execu
 		FinishReason:          finishReason,
 		MaxOutputTokens:       maxOut,
 		RecoveryStrategy:      req.RecoveryStrategy,
+		ArtifactShape:         res.ArtifactShape,
 	}
+}
+
+// objectiveEvidence seals the task-specific evidence bundle of one terminal
+// execution result and then OVERWRITES its target-existence map with a live
+// filesystem observation.
+//
+// The overwrite is deliberate. The executor's own view of "which targets exist"
+// is an admission-time fact; a CREATE contract must be judged on the target
+// being present AFTER the apply, and a DELETE contract on it being absent. The
+// adapter is the composition boundary that owns the workspace root, so it — and
+// only it — can read the disk and report the durable truth. An unobservable
+// target stays unobserved; it is never optimistically assumed to exist.
+func (a *ExecutorAdapter) objectiveEvidence(res *execution.ExecutionResult) execution.ObjectiveEvidence {
+	ev := execution.ObjectiveEvidenceFromResult(res, execution.TargetPreState{})
+	if a == nil || a.root == "" {
+		return ev
+	}
+	targets := res.Targets
+	if res.Proof != nil && len(res.Proof.Targets) > 0 {
+		targets = res.Proof.Targets
+	}
+	ev.TargetExists = make(map[string]bool, len(targets))
+	ev.TargetAbsent = make(map[string]bool, len(targets))
+	for _, t := range targets {
+		if t == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(a.root, filepath.FromSlash(t))); err == nil {
+			ev.TargetExists[t] = true
+		} else {
+			ev.TargetAbsent[t] = true
+		}
+	}
+	return ev
+}
+
+// TargetExistence observes, per target, whether it is present on disk right
+// now. The driver captures it BEFORE dispatch: it is the only admissible
+// evidence for the IDEMPOTENT contract ("the objective was already satisfied"),
+// and a post-hoc reading could never distinguish "already done" from "done by
+// this run".
+func (a *ExecutorAdapter) TargetExistence(targets []string) map[string]bool {
+	out := make(map[string]bool, len(targets))
+	if a == nil || a.root == "" {
+		return out
+	}
+	for _, t := range targets {
+		if t == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(a.root, filepath.FromSlash(t))); err == nil {
+			out[t] = true
+		}
+	}
+	return out
+}
+
+// RecompileIntentContext re-compiles the workspace context for targets under an
+// intent's contract and returns the semantic provenance verdict. It is the
+// second half of the blocking intent revision; see the executor method for the
+// contract semantics.
+func (a *ExecutorAdapter) RecompileIntentContext(ctx context.Context, targets []string, intentLabel, required string) (contextcompiler.ContextProvenance, error) {
+	if a == nil || a.executor == nil {
+		return contextcompiler.ContextProvenance{}, errors.New("autonomy: intent context re-compilation requires an executor")
+	}
+	return a.executor.RecompileIntentContext(ctx, targets, intentLabel, required)
+}
+
+// RecompileGrantedIntentContext is the GRANT-GATED re-compilation: the same
+// revision, plus the non-empty-target-context acceptance condition a granted
+// workspace capability must satisfy. See the executor method for why the two
+// entry points are not interchangeable.
+func (a *ExecutorAdapter) RecompileGrantedIntentContext(ctx context.Context, targets []string, intentLabel, required string) (contextcompiler.ContextProvenance, error) {
+	if a == nil || a.executor == nil {
+		return contextcompiler.ContextProvenance{}, errors.New("autonomy: granted-context re-compilation requires an executor")
+	}
+	return a.executor.RecompileGrantedIntentContext(ctx, targets, intentLabel, required)
 }
 
 func firstTarget(targets []string) string {

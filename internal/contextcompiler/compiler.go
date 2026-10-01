@@ -137,6 +137,11 @@ type CompiledContext struct {
 	// TruncatedFiles records only source-side file provenance. It contains
 	// paths, never file contents, and is safe to project into audit telemetry.
 	TruncatedFiles []string
+	// AdmittedPaths records the workspace file paths this compilation actually
+	// carried into the payload. It is the SCOPE provenance the semantic
+	// provenance gate reads: a requested target absent from this set was
+	// dropped, and no token arithmetic can substitute for it.
+	AdmittedPaths []string
 	// Policy is the caller-selected context policy that produced this result.
 	Policy string
 
@@ -322,6 +327,10 @@ type Compiler struct {
 	initOnce sync.Once
 	mu       sync.Mutex
 	cache    map[string]*CompiledContext
+	// cacheOrder records the insertion sequence of each cached fingerprint so
+	// eviction can be FIFO instead of a wholesale flush (see putCacheLocked).
+	cacheOrder map[string]uint64
+	cacheSeq   uint64
 }
 
 // Option configures a Compiler.
@@ -390,6 +399,9 @@ func (c *Compiler) ensureInitialized() {
 		}
 		if c.cache == nil {
 			c.cache = make(map[string]*CompiledContext)
+		}
+		if c.cacheOrder == nil {
+			c.cacheOrder = make(map[string]uint64)
 		}
 	})
 }
@@ -476,6 +488,13 @@ func (c *Compiler) Compile(ctx context.Context, in Input) (*CompiledContext, err
 		Exclusions: append([]string(nil), normalized.Exclusions...),
 	}
 	for _, file := range normalized.Artifacts {
+		if strings.TrimSpace(file.Path) != "" {
+			// PHASE 14: scope provenance is recorded from the artifacts that
+			// SURVIVED exclusion — the exact set the payload can be asked
+			// about. Token counts stay telemetry; this set is the semantic
+			// truth the provenance gate reads.
+			out.AdmittedPaths = appendUniqueStrings(out.AdmittedPaths, file.Path)
+		}
 		if file.Truncated && strings.TrimSpace(file.Path) != "" {
 			out.TruncatedFiles = append(out.TruncatedFiles, file.Path)
 		}
@@ -629,12 +648,89 @@ func (c *Compiler) Compile(ctx context.Context, in Input) (*CompiledContext, err
 		return nil, err
 	}
 	c.mu.Lock()
-	if len(c.cache) >= c.cacheLimit {
-		c.cache = make(map[string]*CompiledContext)
-	}
-	c.cache[fp] = cloneCompiled(out)
+	c.putCacheLocked(fp, out)
 	c.mu.Unlock()
 	return out, nil
+}
+
+// putCacheLocked stores one compiled context, evicting the OLDEST inserted
+// entry when the cache is at its limit.
+//
+// PHASE 12: the previous store flushed the WHOLE map on overflow, discarding
+// every warm entry at once — including the one a live recovery sequence was
+// about to reuse. FIFO eviction is bounded exactly like the flush was, so the
+// memory bound is unchanged, but a working set survives a burst of unrelated
+// compilations. The caller must hold c.mu.
+func (c *Compiler) putCacheLocked(fp string, out *CompiledContext) {
+	if c.cache == nil {
+		c.cache = make(map[string]*CompiledContext)
+	}
+	if c.cacheOrder == nil {
+		c.cacheOrder = make(map[string]uint64)
+	}
+	if _, exists := c.cache[fp]; !exists {
+		for c.cacheLimit > 0 && len(c.cache) >= c.cacheLimit {
+			c.evictOldestLocked()
+		}
+	}
+	c.cacheSeq++
+	c.cacheOrder[fp] = c.cacheSeq
+	c.cache[fp] = cloneCompiled(out)
+}
+
+// evictOldestLocked drops the single least-recently-inserted entry. The caller
+// must hold c.mu.
+func (c *Compiler) evictOldestLocked() {
+	oldestKey := ""
+	var oldestSeq uint64
+	for key, seq := range c.cacheOrder {
+		if oldestKey == "" || seq < oldestSeq {
+			oldestKey, oldestSeq = key, seq
+		}
+	}
+	if oldestKey == "" {
+		// No insertion order recorded (defensive): fall back to a full reset
+		// rather than growing without bound.
+		c.cache = make(map[string]*CompiledContext)
+		c.cacheOrder = make(map[string]uint64)
+		return
+	}
+	delete(c.cache, oldestKey)
+	delete(c.cacheOrder, oldestKey)
+}
+
+// InvalidateCache drops every compiled projection.
+//
+// PHASE 14 — BLOCKING INTENT REVISION. When the canonical intent is elevated
+// (a read-only classification becomes a mutation contract), every payload
+// compiled under the PREVIOUS intent is invalid by definition: a read-only
+// projection is not a mutation context, and reusing it would let a model judge
+// a workspace it was never shown. Flushing the cache makes that structurally
+// impossible instead of relying on the fingerprint happening to differ.
+//
+// The caller MUST re-compile under the new contract afterwards; the compiler
+// never guesses which contract is now active.
+func (c *Compiler) InvalidateCache() {
+	if c == nil {
+		return
+	}
+	c.ensureInitialized()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache = make(map[string]*CompiledContext)
+	c.cacheOrder = make(map[string]uint64)
+}
+
+// CacheSize reports the number of cached projections. It is telemetry for
+// observing the revision's effect, never an input to any decision.
+func (c *Compiler) CacheSize() int {
+	if c == nil {
+		return 0
+	}
+	c.ensureInitialized()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.cache)
 }
 
 func (c *Compiler) resolveTotal(in Input) (int, TokenBudget, error) {
