@@ -14,6 +14,34 @@ import (
 // patches with a nil verifier gate (patch.go:850 was unreachable). These tests
 // pin the corrected composition and the no-change mutation-truth rule.
 
+// chdirForTest moves the process into dir for the duration of ONE test and
+// restores the previous working directory before returning.
+//
+// Chdir without restore is process-global state that outlives the test. Because
+// the target here is a t.TempDir() — removed when the test ends — the leaked CWD
+// points at a deleted directory, and every later test that shells out inherits
+// it: `getcwd` fails and the shell prepends its own error to the captured
+// output. That surfaced as TestRunnerStderr failing with
+//
+//	expected stderr 'error', got "shell-init: error retrieving current directory: …\nerror"
+//
+// in a completely unrelated test, and only under repeated runs.
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("resolve current working directory: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir to %s: %v", dir, err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previous); err != nil {
+			t.Fatalf("restore working directory to %s: %v", previous, err)
+		}
+	})
+}
+
 // TestNewEngineWiresVerifierIntoPatchManager asserts the production
 // construction path (execution.NewEngine) attaches its verifier to the
 // PatchManager it owns. A nil Patches.Verifier() means a production mutation
@@ -56,9 +84,7 @@ func TestNewEngineVerifierCanBeOverridden(t *testing.T) {
 // change.
 func TestApplyIdenticalContentReportsNoChange(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.Chdir(dir); err != nil {
-		t.Fatal(err)
-	}
+	chdirForTest(t, dir)
 	const content = "line one\nline two\n"
 	if err := os.WriteFile("file.txt", []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -99,9 +125,7 @@ func TestApplyIdenticalContentReportsNoChange(t *testing.T) {
 // change records CHANGED with filesystem-changed evidence.
 func TestApplyRealChangeReportsChanged(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.Chdir(dir); err != nil {
-		t.Fatal(err)
-	}
+	chdirForTest(t, dir)
 	const orig = "line one\nline two\n"
 	const modified = "line one updated\nline two\n"
 	if err := os.WriteFile("file.txt", []byte(orig), 0o644); err != nil {

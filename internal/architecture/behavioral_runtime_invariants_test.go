@@ -289,9 +289,11 @@ func TestBehaviorCapabilityVocabularyIsClosed(t *testing.T) {
 	_ = fset
 }
 
-// TestBehaviorFailureTaxonomyIsComplete pins the eleven required failure classes.
-// A blocked objective must be attributable, and an unlisted class is
-// indistinguishable from "it broke".
+// TestBehaviorFailureTaxonomyIsComplete pins the thirteen required failure
+// classes. A blocked objective must be attributable, and an unlisted class is
+// indistinguishable from "it broke". The taxonomy covers the control plane's
+// own terminal outcomes too, so NO_PROGRESS and HUMAN_REQUIRED are nameable
+// without opening the vocabulary at runtime.
 func TestBehaviorFailureTaxonomyIsComplete(t *testing.T) {
 	root := repoRoot(t)
 	f, fset := parseFile(t, filepath.Join(root, "internal", "execution", "capability", "capability.go"))
@@ -327,6 +329,7 @@ func TestBehaviorFailureTaxonomyIsComplete(t *testing.T) {
 		"TARGET_UNCERTAIN", "CONTEXT_INSUFFICIENT", "EXECUTION_FAILED",
 		"OBSERVATION_FAILED", "DIAGNOSIS_UNCERTAIN", "REPAIR_FAILED",
 		"VERIFICATION_FAILED", "OBJECTIVE_UNPROVEN",
+		"NO_PROGRESS", "HUMAN_REQUIRED",
 	}
 	for _, class := range required {
 		if !found[class] {

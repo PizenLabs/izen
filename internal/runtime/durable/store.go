@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +39,35 @@ type TaskStore struct {
 	contextTiers map[string]int
 	pressures    map[string][]LedgerEvent
 	negatives    map[string][]NegativeKnowledgeRecord
+
+	// seq is the highest sequence number durably appended. It is assigned
+	// and advanced under s.mu inside appendLocked, so two concurrent
+	// callers can never mint the same position, and it is reconstructed
+	// from the journal on Open rather than trusted across restarts.
+	seq uint64
+	// gaps and faults hold the sequence defects observed by the last
+	// replayLocked. They are data, not errors: a torn or hand-corrupted
+	// journal still reconstructs the state it can, but the caller is told
+	// exactly what could not be verified.
+	gaps   []uint64
+	faults []SequenceFault
+	// touch records, per task, how many replayed events touched it. It is
+	// the reconstruction ORDER of the fold (file order stays authoritative
+	// even for a legacy journal), so the most recently worked task can be
+	// recovered without trusting sequence numbers.
+	touch    map[string]uint64
+	touchSeq uint64
+	// closed marks a torn-down store: after Close every append is refused,
+	// so a shut-down runtime can never keep writing execution truth.
+	closed bool
 }
+
+// maxReportedSequenceGaps bounds how many missing sequence positions a single
+// replay enumerates. A journal whose sequence was hand-edited can claim an
+// arbitrarily large position; the audit must stay bounded, and the truncation
+// is itself recorded as a fault so the caller still sees that the enumeration
+// was incomplete.
+const maxReportedSequenceGaps = 4096
 
 // SnapshotFile is the on-disk shape of snapshot.json: purely derived,
 // fully reconstructible from ledger.ndjson.
@@ -60,6 +90,7 @@ func NewTaskStore(workDir string) *TaskStore {
 		contextTiers: make(map[string]int),
 		pressures:    make(map[string][]LedgerEvent),
 		negatives:    make(map[string][]NegativeKnowledgeRecord),
+		touch:        make(map[string]uint64),
 	}
 }
 
@@ -210,6 +241,37 @@ func (s *TaskStore) RecordVerification(taskID, operationID string, ok bool, deta
 		"ok":          ok,
 		"detail":      detail,
 	})
+	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
+		return err
+	}
+	s.apply(ev)
+	return nil
+}
+
+// RecordTerminalResult appends VERIFICATION_RESULT carrying the terminal
+// flag: it is the ONE transition that retires a task (COMPLETED when ok, FAILED
+// when not).
+//
+// It deliberately reuses the existing VERIFICATION_RESULT event rather than
+// introducing a terminal event type: the journal's vocabulary stays closed,
+// and a replay written before this method existed is unaffected. Without a
+// terminal transition there is no way to record "this objective is finished",
+// and a finished objective would then replay as unfinished work on every
+// restart — exactly the silent re-prompt the state-reconstruction contract
+// forbids.
+func (s *TaskStore) RecordTerminalResult(taskID, operationID string, ok bool, detail string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	payload := map[string]any{
+		"operationId": operationID,
+		"ok":          ok,
+		"detail":      detail,
+		"terminal":    true,
+	}
+	if !ok {
+		payload["failed"] = true
+	}
+	ev := newEvent(taskID, EventVerificationResult, payload)
 	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
 		return err
 	}
@@ -543,6 +605,96 @@ func (s *TaskStore) CurrentID() string {
 	return s.currentID
 }
 
+// NextSequence reports the sequence the next appended event will carry. It is
+// the value reconstructed by the last Open/replay, so a fresh store reports 1
+// and a store reopened over a journal whose highest sequence is N reports
+// N+1. Callers never assign it: appendLocked owns the position.
+func (s *TaskStore) NextSequence() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.seq + 1
+}
+
+// SequenceGaps returns the sequence positions the last replay found missing
+// from the journal. A non-empty result means the journal is incomplete: the
+// events recorded there are absent, and any conclusion drawn across the gap
+// rests on a hole in the execution truth.
+func (s *TaskStore) SequenceGaps() []uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]uint64(nil), s.gaps...)
+}
+
+// SequenceFaults returns every sequence defect the last replay observed —
+// both the missing positions (SequenceFaultGap) and the positions that
+// arrived out of order (SequenceFaultNonMonotonic). Replay never fails on
+// either: it is the caller's job to decide what a corrupt journal means.
+func (s *TaskStore) SequenceFaults() []SequenceFault {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]SequenceFault(nil), s.faults...)
+}
+
+// RecoverableTasks returns every replayed task whose lifecycle is still open,
+// most recently worked first. This is the §9 state reconstruction surface: a
+// restart reads it to learn what was in flight when the process died instead
+// of inferring that nothing happened.
+func (s *TaskStore) RecoverableTasks() []TaskState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]TaskState, 0, len(s.tasks))
+	for _, t := range s.tasks {
+		if t == nil || t.Status.Terminal() {
+			continue
+		}
+		out = append(out, *t)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if s.touch[out[i].ID] != s.touch[out[j].ID] {
+			return s.touch[out[i].ID] > s.touch[out[j].ID]
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// MostRecentRecoverable returns the most recently replayed task that never
+// reached a terminal state. ok is false when every task completed or failed —
+// the ordinary end of a run, and never an error.
+func (s *TaskStore) MostRecentRecoverable() (TaskState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	best := TaskState{}
+	bestSeq := uint64(0)
+	found := false
+	for id, t := range s.tasks {
+		if t == nil || t.Status.Terminal() {
+			continue
+		}
+		touch := s.touch[id]
+		// A task with no recorded touch (an empty id, an audit-only event)
+		// must never outrank one the fold actually worked on.
+		if !found || touch > bestSeq || (touch == bestSeq && id < best.ID) {
+			best, bestSeq, found = *t, touch, true
+		}
+	}
+	return best, found
+}
+
+// Close tears the store down: it releases the runtime file lock and refuses
+// every later append. It is idempotent. A shut-down runtime that could still
+// write execution truth would make the journal's last writer unknowable.
+func (s *TaskStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	s.lock.Release()
+	return nil
+}
+
 // RebuildSnapshot replays the ledger from disk and atomically rewrites
 // snapshot.json. It proves the canonical lineage invariant: deleting or
 // corrupting snapshot.json loses nothing.
@@ -648,9 +800,20 @@ func (s *TaskStore) withLock(fn func() error) error {
 }
 
 // appendLocked serializes one event as a single JSON line, fsyncing at
-// truth boundaries. Callers must hold s.mu (and the file lock via
-// withLock or Open).
+// truth boundaries, and assigns the event's monotonic sequence. Callers must
+// hold s.mu (and the file lock via withLock or Open).
+//
+// The sequence is minted HERE, not by the caller: every append path in this
+// package funnels through here, so a caller-supplied position could only ever
+// duplicate or skip one. It is written in the same JSON line as the event and
+// reaches the same fsync, which makes the position durable exactly when the
+// event is. The counter advances only after the bytes are on disk: a failed
+// write leaves the next append on the same position rather than burning it.
 func (s *TaskStore) appendLocked(ev LedgerEvent) error {
+	if s.closed {
+		return fmt.Errorf("durable: store closed")
+	}
+	ev.Sequence = s.seq + 1
 	data, err := json.Marshal(ev)
 	if err != nil {
 		return fmt.Errorf("durable: marshal event: %w", err)
@@ -676,18 +839,42 @@ func (s *TaskStore) appendLocked(ev LedgerEvent) error {
 			_ = d.Close()
 		}
 	}
+	s.seq = ev.Sequence
 	return nil
 }
 
 // replayLocked rebuilds in-memory state from ledger.ndjson, tolerating a
 // torn tail: undecodable lines (a SIGKILL mid-write) are skipped so the
 // runtime recovers to the last coherent prefix.
+//
+// It also reconstructs the next sequence from the journal — never from a
+// side file — and audits the sequence it found:
+//
+//   - a sequence of 0 is a legacy event written before the field existed. It
+//     replays normally and is deliberately NOT a gap or a fault: it neither
+//     advances nor rewinds the counter, which is the max of the non-zero
+//     values observed. A journal of nothing but legacy events therefore
+//     reconstructs to "next = 1".
+//   - a non-zero sequence higher than expected means events are missing from
+//     the journal; each missing position is recorded as a gap.
+//   - a non-zero sequence that does not exceed the highest value already seen
+//     is non-monotonic: the journal's order can no longer be trusted to match
+//     its claimed order, so the offending position is recorded as a fault.
+//
+// Neither a gap nor a non-monotonic value stops the fold: the events that ARE
+// present still reconstruct, because a partially corrupt journal is still
+// evidence. What it must never do is accept the journal silently.
 func (s *TaskStore) replayLocked() error {
 	s.tasks = make(map[string]*TaskState)
 	s.contextTiers = make(map[string]int)
 	s.pressures = make(map[string][]LedgerEvent)
 	s.negatives = make(map[string][]NegativeKnowledgeRecord)
+	s.touch = make(map[string]uint64)
+	s.touchSeq = 0
 	s.currentID = ""
+	s.seq = 0
+	s.gaps = nil
+	s.faults = nil
 	f, err := os.Open(s.ledgerPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -712,16 +899,63 @@ func (s *TaskStore) replayLocked() error {
 		if ev.EventType == "" {
 			continue
 		}
+		if ev.Sequence != 0 {
+			switch {
+			case ev.Sequence > s.seq+1:
+				for missing := s.seq + 1; missing < ev.Sequence; missing++ {
+					s.gaps = append(s.gaps, missing)
+					s.faults = append(s.faults, SequenceFault{
+						Kind:     SequenceFaultGap,
+						Observed: ev.Sequence,
+						Expected: missing,
+					})
+					// Bounded audit: a hand-edited journal may claim a
+					// position millions of events past the end. Stop
+					// enumerating and record that the enumeration was
+					// truncated rather than exhausting memory.
+					if len(s.gaps) >= maxReportedSequenceGaps {
+						s.faults = append(s.faults, SequenceFault{
+							Kind:     SequenceFaultGap,
+							Observed: ev.Sequence,
+							Expected: 0,
+						})
+						break
+					}
+				}
+			case ev.Sequence <= s.seq:
+				s.faults = append(s.faults, SequenceFault{
+					Kind:     SequenceFaultNonMonotonic,
+					Observed: ev.Sequence,
+					Expected: s.seq + 1,
+				})
+			}
+			if ev.Sequence > s.seq {
+				s.seq = ev.Sequence
+			}
+		}
 		s.apply(ev)
 	}
 	if err := sc.Err(); err != nil {
 		return fmt.Errorf("durable: scan ledger: %w", err)
+	}
+	if len(s.faults) > 0 {
+		log.Printf("[durable] ledger %s: %d sequence fault(s), %d gap(s); state reconstructed from the events present",
+			s.ledgerPath, len(s.faults), len(s.gaps))
 	}
 	return nil
 }
 
 // apply folds one event into the materialized view.
 func (s *TaskStore) apply(ev LedgerEvent) {
+	// Every folded event advances the per-task touch counter. It is what
+	// makes "which task was being worked when the process died" answerable
+	// after a restart without depending on the sequence numbers at all —
+	// a legacy journal and a sequenced one are reconstructed the same way.
+	if s.touch == nil {
+		s.touch = make(map[string]uint64)
+	}
+	s.touchSeq++
+	s.touch[ev.TaskID] = s.touchSeq
 	switch ev.EventType {
 	case EventTaskCreated:
 		if _, exists := s.tasks[ev.TaskID]; !exists {
@@ -732,7 +966,14 @@ func (s *TaskStore) apply(ev LedgerEvent) {
 			if v, ok := ev.Payload["intent"].(string); ok {
 				t.Intent = v
 			}
-			if pv, ok := ev.Payload["provenance"].(float64); ok {
+			// The live path hands apply an `int`; replay hands it a JSON
+			// `float64`. Accepting only one of them made a freshly created
+			// task read as read-only until the process restarted — the grant
+			// was in the journal the whole time, just not in memory.
+			switch pv := ev.Payload["provenance"].(type) {
+			case float64:
+				t.ScopeProvenance = domain.ScopeProvenance(uint8(pv))
+			case int:
 				t.ScopeProvenance = domain.ScopeProvenance(uint8(pv))
 			}
 			t.ActiveTargetScope = payloadStrings(ev.Payload["scope"])
@@ -773,12 +1014,22 @@ func (s *TaskStore) apply(ev LedgerEvent) {
 		s.currentID = ev.TaskID
 	case EventVerificationResult:
 		t := ensureTask(s.tasks, ev.TaskID)
-		if ok, _ := ev.Payload["ok"].(bool); ok {
+		ok, _ := ev.Payload["ok"].(bool)
+		if ok {
 			t.Cursor = nil
 		} else if t.Cursor != nil {
 			t.Cursor.Phase = PhaseVerificationPending
 		}
-		if _, failed := ev.Payload["failed"]; failed {
+		// A terminal result is the only transition that retires the task:
+		// anything else leaves it recoverable, which is the honest answer
+		// for a run that ended without a verdict.
+		if terminal, _ := ev.Payload["terminal"].(bool); terminal {
+			if ok {
+				t.Status = TaskCompleted
+			} else {
+				t.Status = TaskFailed
+			}
+		} else if _, failed := ev.Payload["failed"]; failed {
 			t.Status = TaskFailed
 		}
 		s.currentID = ev.TaskID

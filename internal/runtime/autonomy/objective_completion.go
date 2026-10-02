@@ -198,6 +198,10 @@ func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
 	d.lastContract = contract
 
 	if evaluation.Outcome.Proves() {
+		// The authority proved the objective: the workspace work it
+		// authorized is committed, and that is a truth boundary the journal
+		// must hold before the loop is allowed to move on.
+		d.ledgerExecutionCommitted()
 		decision.Reason = strings.TrimSpace(decision.Reason + "; objective PROVEN by evidence")
 		return
 	}

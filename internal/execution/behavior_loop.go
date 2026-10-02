@@ -2,6 +2,8 @@ package execution
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/PizenLabs/izen/internal/execution/capability"
+	"github.com/PizenLabs/izen/internal/progress"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
@@ -191,6 +194,11 @@ type BehaviorResult struct {
 	// Proven records whether the loop PROVED the objective's requirements rather
 	// than merely reporting that nothing was observed wrong.
 	Proven bool
+	// NoProgress carries the detector's verdict when the loop stopped or
+	// finished because the runtime stopped changing anything. It is nil when
+	// the loop never got far enough to classify progress, so a caller can
+	// never read "no progress" out of an absent field by accident.
+	NoProgress *progress.Detection
 }
 
 // EvidenceLine renders the bounded evidence log of the final observation.
@@ -267,9 +275,25 @@ func NewBehaviorLoop(cfg BehaviorLoopConfig) (*BehaviorLoop, error) {
 //	OBSERVE → DIAGNOSE → REPAIR → RE-EXECUTE (re-observe) → VERIFY
 //
 // and it repeats while the workspace still observes defects. Termination is
-// truthful in both directions: VERIFIED only when a real re-observation observed
-// every requirement holding, and OBJECTIVE_UNPROVEN when the bound ran out with
-// the workspace still defective.
+// truthful in both directions: VERIFIED only when a real re-observation
+// observed every requirement holding, and a named block when it did not.
+//
+// Two bounds protect liveness, and they are different bounds:
+//
+//   - RoundTimeout bounds ONE round. A round that outlives its deadline is
+//     abandoned where it stands. The workspace was NOT observed clean, so the
+//     result says EXECUTION_FAILED and never claims a partial round as a pass.
+//   - the no-progress detector bounds the LOOP ITSELF. MaxRounds is how long
+//     the runtime is allowed to keep moving; it is not a licence to keep
+//     re-running identical repairs against a workspace that never changes.
+//     When rounds stop changing anything — same satisfied/unmet counts, same
+//     defect fingerprints, same evidence, no mutation — the loop stops with
+//     NO_PROGRESS, which names WHY no proof was produced (spec §36). Reporting
+//     that as OBJECTIVE_UNPROVEN would claim the workspace merely ran out of
+//     attempts, which is not what happened.
+//
+// The detector is a LOCAL: two Runs of the same loop must classify identically,
+// so no stagnation counter may survive a Run.
 func (l *BehaviorLoop) Run(ctx context.Context) BehaviorResult {
 	result := BehaviorResult{}
 	current := l.runtime.Observe(ctx, l.grant)
@@ -277,6 +301,9 @@ func (l *BehaviorLoop) Run(ctx context.Context) BehaviorResult {
 		result.Final, result.Block = current, current.Block
 		return result
 	}
+
+	detector := progress.NewDetector(noProgressThreshold)
+	mutations := 0
 
 	for round := 1; round <= l.bounds.MaxRounds; round++ {
 		record := RoundRecord{Index: round, Before: current}
@@ -287,18 +314,40 @@ func (l *BehaviorLoop) Run(ctx context.Context) BehaviorResult {
 			return result
 		}
 
+		// One round gets one deadline. The repair phase AND the re-observation
+		// share it, because a round that cannot finish its work cannot be
+		// judged by the work of a later one.
+		roundCtx, cancel := context.WithTimeout(ctx, l.bounds.RoundTimeout)
+
 		defects := current.Defects()
 		if len(defects) > l.bounds.MaxDefectsPerRound {
 			defects = defects[:l.bounds.MaxDefectsPerRound]
 		}
-		attempts := l.repairRound(ctx, defects, current)
+		attempts := l.repairRound(roundCtx, defects, current)
 		record.Attempts = attempts
 		result.Repairs = append(result.Repairs, attempts...)
+		mutations += mutatedCount(attempts)
 
 		// RE-EXECUTE + VERIFY: the workspace is observed AGAIN after the
 		// repairs, and it is that fresh observation — never the pre-repair one —
 		// that decides whether this round succeeded.
-		next := l.runtime.Observe(ctx, l.grant)
+		next := l.runtime.Observe(roundCtx, l.grant)
+		expired := roundCtx.Err()
+		cancel()
+		if expired != nil {
+			// The round's deadline is a real observation about the runtime's
+			// behaviour, and it is checked BEFORE the observation is read: a
+			// re-observation cut short by the deadline proves nothing about
+			// the workspace, so it must not be laundered into a verdict.
+			block := &capability.Block{
+				Class:  capability.FailureExecutionFailed,
+				Reason: fmt.Sprintf("round %d exceeded the runtime round bound of %s", round, l.bounds.RoundTimeout),
+			}
+			record.After, record.Verified, record.Blocked = next, false, block
+			result.Rounds = append(result.Rounds, record)
+			result.Final, result.Block = current, block
+			return result
+		}
 		if next.Block != nil {
 			record.After, record.Blocked = next, next.Block
 			result.Rounds = append(result.Rounds, record)
@@ -312,17 +361,99 @@ func (l *BehaviorLoop) Run(ctx context.Context) BehaviorResult {
 			result.Final, result.Verified, result.Proven = current, true, true
 			return result
 		}
+
+		// The round closed without proving anything. Ask whether it CHANGED
+		// anything before spending another one on it.
+		if detector.Observe(progressSnapshot(round, current, mutations)) == progress.VerdictNoProgress {
+			detection := detector.Detection()
+			result.NoProgress = &detection
+			result.Final = current
+			result.Block = &capability.Block{Class: capability.FailureNoProgress, Reason: detection.Reason}
+			return result
+		}
 	}
 
 	// The bound ran out with the workspace still observable and still defective.
-	// That is OBJECTIVE_UNPROVEN, never a pass and never a fabricated failure.
+	// The CLASS depends on whether the runtime was still moving when it ran out:
+	// a frozen runtime is NO_PROGRESS, because "we ran out of rounds" would be a
+	// false explanation for a loop that had stopped learning rounds earlier.
 	result.Final = current
+	detection := detector.Detection()
+	if detection.Verdict == progress.VerdictNoProgress {
+		result.NoProgress = &detection
+		result.Block = &capability.Block{Class: capability.FailureNoProgress, Reason: detection.Reason}
+		return result
+	}
 	result.Block = &capability.Block{
 		Class: capability.FailureObjectiveUnproven,
 		Reason: fmt.Sprintf("after %d round(s) the workspace still observes %d unmet requirement(s): %s",
 			l.bounds.MaxRounds, len(current.Defects()), boundedText(current.DefectLine(), 400)),
 	}
 	return result
+}
+
+// ── Progress accounting ───────────────────────────────────────────────────
+
+// noProgressThreshold is how many consecutive identical runtime states the
+// loop tolerates before calling it stuck. Two, not one: a single quiet round
+// right after a mutation is ordinary, and stopping there would stop the loop
+// before it could ever react.
+const noProgressThreshold = 2
+
+// mutatedCount reports how many attempts in the slice actually changed the
+// workspace. An applied-but-identical write is NOT progress, which is exactly
+// why this counts Mutated() rather than the APPLIED outcome.
+func mutatedCount(attempts []RepairAttempt) int {
+	n := 0
+	for _, a := range attempts {
+		if a.Mutated() {
+			n++
+		}
+	}
+	return n
+}
+
+// progressSnapshot derives one comparable progress point from an observation.
+//
+// Everything in it is an OBSERVATION of the workspace, never a claim about the
+// model: satisfied/unmet counts come from the probes and defects the pass
+// actually produced, the fingerprints come from the defects themselves, and the
+// evidence digest is a digest over evidence IDENTITIES. A loop that re-observes
+// identically therefore produces an identical snapshot, which is the property
+// the detector needs to recognize a stuck loop.
+func progressSnapshot(round int, obs Observation, mutations int) progress.Snapshot {
+	keys := make([]string, 0, len(obs.Defects()))
+	for _, fp := range progress.Fingerprints(obs.Defects()) {
+		keys = append(keys, fp.Key())
+	}
+	unmet := obs.DefectCount()
+	// Each unmet requirement corresponds to one failing subresource probe, so
+	// the probes that did not produce a defect are the ones holding.
+	satisfied := len(obs.Result.Resources) - unmet
+	if satisfied < 0 {
+		satisfied = 0
+	}
+	return progress.Snapshot{
+		Round:           round,
+		Satisfied:       satisfied,
+		Unmet:           unmet,
+		FingerprintKeys: keys,
+		EvidenceDigest:  evidenceDigest(obs),
+		Mutations:       mutations,
+	}
+}
+
+// evidenceDigest digests the observation's evidence identities. It deliberately
+// digests IDs rather than field values: the IDs are what the observation
+// produced, while field values include per-serve details (ports, byte counts)
+// that change on every pass and would make every round look like progress.
+func evidenceDigest(obs Observation) string {
+	ids := make([]string, 0, len(obs.Proof))
+	for _, ev := range obs.Proof {
+		ids = append(ids, ev.ID)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(ids, "\x00")))
+	return hex.EncodeToString(sum[:])
 }
 
 // repairRound attempts one repair per defect and returns the attempt records.

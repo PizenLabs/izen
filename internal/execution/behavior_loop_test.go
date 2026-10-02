@@ -13,6 +13,7 @@ import (
 	domaincap "github.com/PizenLabs/izen/internal/domain/capability"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/capability"
+	"github.com/PizenLabs/izen/internal/progress"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
@@ -281,6 +282,11 @@ func TestLoopRepairsVerifiesAndProves(t *testing.T) {
 	if !last.Verified {
 		t.Fatalf("final round did not verify: %s", last.After.DefectLine())
 	}
+	// A successful loop has no stagnation to report; leaving the field nil is
+	// what keeps "no progress" from being read out of an absent verdict.
+	if result.NoProgress != nil {
+		t.Fatalf("a proven loop reported progress detection: %+v", result.NoProgress)
+	}
 }
 
 func blockText(r execution.BehaviorResult) string {
@@ -324,8 +330,10 @@ func TestLoopRefusesWithoutAuthorization(t *testing.T) {
 	if !sawDenial {
 		t.Fatalf("repairs = %+v, want a NOT_AUTHORIZED outcome", result.Repairs)
 	}
-	if result.Block == nil || result.Block.Class != capability.FailureObjectiveUnproven {
-		t.Fatalf("block = %v, want OBJECTIVE_UNPROVEN after exhausting the bound", result.Block)
+	// A denying gate changes nothing, so the loop never made progress: naming
+	// the reason NO_PROGRESS is more truthful than blaming the round bound.
+	if result.Block == nil || result.Block.Class != capability.FailureNoProgress {
+		t.Fatalf("block = %v, want NO_PROGRESS: a denied mutation leaves the workspace frozen", result.Block)
 	}
 }
 
@@ -428,8 +436,12 @@ func TestLoopNeverInventsATarget(t *testing.T) {
 }
 
 // TestLoopReportsDeclinedRepairTruthfully: a backend that consistently cannot
-// propose is a DECLINED outcome for every attempt, and the objective terminates
-// UNPROVEN. It must never be reported as a pass.
+// propose is a DECLINED outcome for every attempt, and the objective
+// terminates unproven. It must never be reported as a pass.
+//
+// The terminal class is NO_PROGRESS because that is what the run observed: a
+// backend that declines every proposal leaves the workspace and the evidence
+// bit-for-bit unchanged, so the loop was never making progress (spec §36).
 func TestLoopReportsDeclinedRepairTruthfully(t *testing.T) {
 	root := goldenFixture(t)
 	alwaysDeclines := execution.RepairProposerFunc(func(context.Context, capability.Defect, execution.Observation) (execution.RepairProposal, error) {
@@ -449,8 +461,8 @@ func TestLoopReportsDeclinedRepairTruthfully(t *testing.T) {
 			t.Fatalf("repair %d outcome = %s, want %s", i, a.Outcome, execution.RepairDeclined)
 		}
 	}
-	if result.Block == nil || result.Block.Class != capability.FailureObjectiveUnproven {
-		t.Fatalf("block = %v, want OBJECTIVE_UNPROVEN", result.Block)
+	if result.Block == nil || result.Block.Class != capability.FailureNoProgress {
+		t.Fatalf("block = %v, want NO_PROGRESS: every attempt declined, so nothing ever changed", result.Block)
 	}
 }
 
@@ -470,9 +482,13 @@ const persistentlyBrokenHTML = `<!DOCTYPE html>
 </html>`
 
 // TestLoopBoundsTerminate: a workspace that never becomes correct must terminate
-// as OBJECTIVE_UNPROVEN within the bound. This is the anti-liveness property:
+// within the bound and never as a pass. This is the anti-liveness property:
 // without it a repair loop over a stubborn workspace runs forever, which is the
 // failure mode a bounded runtime exists to prevent.
+//
+// The class is NO_PROGRESS, not OBJECTIVE_UNPROVEN: the loop's runtime state
+// was frozen — identical defects, identical evidence, zero mutations — so
+// "we ran out of rounds" would misdescribe what actually happened (spec §36).
 func TestLoopBoundsTerminate(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "index.html"), []byte(persistentlyBrokenHTML), 0o644); err != nil {
@@ -503,11 +519,14 @@ func TestLoopBoundsTerminate(t *testing.T) {
 	if result.Proven {
 		t.Fatal("a no-op repair must not prove the objective")
 	}
-	if result.Block == nil || result.Block.Class != capability.FailureObjectiveUnproven {
-		t.Fatalf("block = %v, want OBJECTIVE_UNPROVEN", result.Block)
+	if result.Block == nil || result.Block.Class != capability.FailureNoProgress {
+		t.Fatalf("block = %v, want NO_PROGRESS: a byte-identical proposal proves the loop never moved", result.Block)
 	}
-	if len(result.Rounds) != 3 {
-		t.Fatalf("rounds = %d, want exactly the bound (3)", len(result.Rounds))
+	if len(result.Rounds) >= 3 {
+		t.Fatalf("rounds = %d, want fewer than the bound (3): a frozen runtime must stop before the bound is spent", len(result.Rounds))
+	}
+	if result.NoProgress == nil || result.NoProgress.Reason == "" {
+		t.Fatalf("NO_PROGRESS block carried no detection: %+v", result.NoProgress)
 	}
 	if result.RepairCount() != 0 {
 		t.Fatalf("repairs that changed the workspace = %d, want 0: a byte-identical proposal changes nothing",
@@ -517,6 +536,169 @@ func TestLoopBoundsTerminate(t *testing.T) {
 		if a.Outcome != execution.RepairNotNeeded {
 			t.Fatalf("repair %d outcome = %s, want %s", i, a.Outcome, execution.RepairNotNeeded)
 		}
+	}
+}
+
+// TestLoopStopsWhenNothingChanges: with a generous bound, a workspace whose
+// repair never changes the observation must still stop as NO_PROGRESS in
+// bound-proportional time. Without the detector the loop would spend all
+// MaxRounds re-proposing the same no-op, which is precisely the wasted work
+// no-progress protection exists to prevent.
+func TestLoopStopsWhenNothingChanges(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "index.html"), []byte(persistentlyBrokenHTML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	noop := execution.RepairProposerFunc(func(_ context.Context, _ capability.Defect, _ execution.Observation) (execution.RepairProposal, error) {
+		return execution.RepairProposal{Content: persistentlyBrokenHTML}, nil
+	})
+	const maxRounds = 9
+	rt := execution.NewBehavioralRuntime(execution.BehavioralConfig{Root: root})
+	defer func() { _ = rt.Close() }()
+	loop, err := execution.NewBehaviorLoop(execution.BehaviorLoopConfig{
+		Runtime:   rt,
+		Grant:     behavioralGrant(),
+		Proposer:  noop,
+		Mutate:    substrate.NewConcreteSubstrate(root),
+		Authorize: func(string) error { return nil },
+		Bounds:    execution.LoopBounds{MaxRounds: maxRounds, MaxDefectsPerRound: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewBehaviorLoop: %v", err)
+	}
+
+	result := loop.Run(context.Background())
+	if result.Proven || result.Verified {
+		t.Fatal("an unchanging workspace must never be reported as proven or verified")
+	}
+	if result.Block == nil || result.Block.Class != capability.FailureNoProgress {
+		t.Fatalf("block = %v, want NO_PROGRESS", result.Block)
+	}
+	if len(result.Rounds) >= maxRounds {
+		t.Fatalf("rounds = %d, want fewer than MaxRounds (%d): stagnation must cut the loop short", len(result.Rounds), maxRounds)
+	}
+	detection := result.NoProgress
+	if detection == nil {
+		t.Fatal("a NO_PROGRESS result must carry the detector's detection")
+	}
+	if detection.Verdict != progress.VerdictNoProgress {
+		t.Fatalf("detection verdict = %q, want %q", detection.Verdict, progress.VerdictNoProgress)
+	}
+	if detection.StagnantRounds < 2 {
+		t.Fatalf("stagnant rounds = %d, want at least 2: one quiet round is normal, two in a row is a loop", detection.StagnantRounds)
+	}
+	if detection.Reason == "" {
+		t.Fatal("a NO_PROGRESS detection must explain itself")
+	}
+	// The terminal result must remain truthful: the workspace still observes
+	// the original defect.
+	if result.Final.Block != nil || result.Final.DefectCount() == 0 {
+		t.Fatalf("final observation = %s, want the defect still observed", result.Final.DefectLine())
+	}
+}
+
+// blockingProposer never returns until its context is done, which is how a
+// reasoning backend behaves when it hangs. The loop must not wait for it.
+func blockingProposer() execution.RepairProposer {
+	return execution.RepairProposerFunc(func(ctx context.Context, _ capability.Defect, _ execution.Observation) (execution.RepairProposal, error) {
+		<-ctx.Done()
+		return execution.RepairProposal{}, ctx.Err()
+	})
+}
+
+// TestLoopEnforcesRoundTimeout: RoundTimeout is a real bound, not a comment.
+// A backend that hangs must not be able to hold the loop past its deadline, and
+// the workspace was NOT observed clean, so the result must not claim a pass.
+func TestLoopEnforcesRoundTimeout(t *testing.T) {
+	root := goldenFixture(t)
+	rt := execution.NewBehavioralRuntime(execution.BehavioralConfig{Root: root})
+	defer func() { _ = rt.Close() }()
+	loop, err := execution.NewBehaviorLoop(execution.BehaviorLoopConfig{
+		Runtime:   rt,
+		Grant:     behavioralGrant(),
+		Proposer:  blockingProposer(),
+		Mutate:    substrate.NewConcreteSubstrate(root),
+		Authorize: func(string) error { return nil },
+		Bounds: execution.LoopBounds{
+			MaxRounds:          5,
+			MaxDefectsPerRound: 1,
+			RoundTimeout:       150 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewBehaviorLoop: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	start := time.Now()
+	result := loop.Run(ctx)
+	elapsed := time.Since(start)
+
+	// The bound is per ROUND, so five rounds may legitimately take five
+	// deadlines; what must never happen is the loop running away from them.
+	if limit := 5*150*time.Millisecond + 30*time.Second; elapsed > limit {
+		t.Fatalf("loop ran for %s, want it bounded by the round deadline (%s)", elapsed, limit)
+	}
+	if elapsed >= 5*time.Second {
+		t.Fatalf("loop ran for %s: a hanging proposer was not cut off at the round deadline", elapsed)
+	}
+	if result.Proven || result.Verified {
+		t.Fatal("an abandoned round observed nothing clean, so it must never report a pass")
+	}
+	if result.Block == nil {
+		t.Fatal("a round that hit its deadline must stop with a named block")
+	}
+	if result.Block.Class != capability.FailureExecutionFailed {
+		t.Fatalf("block class = %s, want %s", result.Block.Class, capability.FailureExecutionFailed)
+	}
+	if !strings.Contains(result.Block.Reason, "exceeded the runtime round bound") {
+		t.Fatalf("reason = %q, want it to name the round bound", result.Block.Reason)
+	}
+	if len(result.Rounds) == 0 {
+		t.Fatal("the abandoned round must still be recorded for audit")
+	}
+	last := result.Rounds[len(result.Rounds)-1]
+	if last.Verified {
+		t.Fatal("the abandoned round must not be recorded as verified")
+	}
+	if last.Blocked == nil || last.Blocked.Class != capability.FailureExecutionFailed {
+		t.Fatalf("round block = %+v, want the round-bound stop", last.Blocked)
+	}
+}
+
+// TestFailureTaxonomyCoversTerminalOutcomes: the taxonomy must name the
+// control-plane terminal outcomes, not only capability failures, and it must
+// stay closed — every listed class is valid and no member is duplicated.
+func TestFailureTaxonomyCoversTerminalOutcomes(t *testing.T) {
+	for _, class := range []capability.FailureClass{capability.FailureNoProgress, capability.FailureHumanRequired} {
+		if !class.Valid() {
+			t.Errorf("%s is not a member of the closed taxonomy", class)
+		}
+		seen := false
+		for _, known := range capability.AllFailureClasses {
+			if known == class {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			t.Errorf("%s is missing from AllFailureClasses", class)
+		}
+	}
+
+	seen := make(map[capability.FailureClass]bool, len(capability.AllFailureClasses))
+	for _, class := range capability.AllFailureClasses {
+		if seen[class] {
+			t.Errorf("%s is listed twice in AllFailureClasses", class)
+		}
+		seen[class] = true
+		if !class.Valid() {
+			t.Errorf("AllFailureClasses lists the invalid class %q", class)
+		}
+	}
+	if capability.FailureClass("SOMETHING_ELSE").Valid() {
+		t.Error("an undeclared class must not validate: the taxonomy is closed")
 	}
 }
 

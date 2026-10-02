@@ -18,6 +18,7 @@ import (
 	"github.com/PizenLabs/izen/internal/llmstep"
 	"github.com/PizenLabs/izen/internal/loop"
 	"github.com/PizenLabs/izen/internal/protocol"
+	"github.com/PizenLabs/izen/internal/runtime/durable"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
@@ -171,6 +172,12 @@ type Driver struct {
 	// first dispatch. It is the only admissible evidence for an idempotent
 	// ("already satisfied") claim.
 	preTargets map[string]bool
+	// derivationNote records what evidence-bound scope derivation concluded for
+	// this run — either the evidence that bound a target set, or the reason no
+	// target could be bound. It is per-run evidence rather than a log line,
+	// because a driver that reports "no target" without ever saying it looked is
+	// indistinguishable from one that never looked.
+	derivationNote string
 	// lastObjective caches the most recent authorization verdict for tests and
 	// structured telemetry. It is never consulted to decide anything.
 	lastObjective execution.ObjectiveEvaluation
@@ -217,6 +224,25 @@ type Driver struct {
 	// lastBehavior is the most recent behavioral stage result, retained so a
 	// terminal reason can name the evidence behind it.
 	lastBehavior BehaviorResult
+
+	// ── Durable execution ledger ───────────────────────────────────────
+	// ledger is the append-only execution record the run is witnessed into
+	// (see ledger.go). It is nil unless a store was bound, and every write
+	// through it is best-effort with respect to the LOOP: the loop's
+	// decisions never depend on whether the journal accepted a line.
+	ledger *durable.TaskStore
+	// ledgerSession scopes the durable task key so two sessions running the
+	// same objective stay two separate records.
+	ledgerSession string
+	// ledgerTask is the current run's durable task id, empty when no ledger
+	// is bound.
+	ledgerTask string
+	// ledgerLastState is the last loop state written to the journal. Every
+	// return path funnels through term(), so this is what keeps a single
+	// transition from being appended twice while still recording every
+	// genuine state change. The zero value means "nothing written yet" — it
+	// is not a valid autonomy.RuntimeState.
+	ledgerLastState autonomy.RuntimeState
 }
 
 // MaxContractRecoveryAttempts bounds how many times one execution lifecycle
@@ -455,6 +481,7 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.preTargets = nil
 	d.contractRecoveries = 0
 	d.contractRecoveryExhausted = false
+	d.derivationNote = ""
 	// A fresh run is a fresh LIFECYCLE, and the canonical intent is per
 	// lifecycle. Reusing the previous run's authority would let an elevation
 	// leak into a read-only objective — the exact split-brain this authority
@@ -480,6 +507,23 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// never guesses a target. A clarification boundary parks BEFORE any
 	// execution — no model call, no mutation.
 	d.resolved = d.adapter.Resolve(objective)
+	// ── EVIDENCE-BOUND SCOPE DERIVATION ─────────────────────────────────
+	// A broad objective ("redesign the portfolio page using HTML, CSS and JS")
+	// names no file, so the gateway classifies it read-only and the driver would
+	// spend a provider call on an empty workspace before noticing there is
+	// nothing to read. That is the exact shape of the reported failure:
+	//
+	//	authorization → context compiled: 0 channels → provider called
+	//	→ target=unknown → artifact_missing → objective unproven
+	//
+	// The fix is not to trust the prompt's word "HTML" as a filename. It is to
+	// OBSERVE the workspace and bind the files that satisfy the artifact kinds
+	// the objective itself declared. When that yields a target set, the run
+	// becomes an evidence-backed mutation and the whole existing machinery —
+	// canonical resolution, OCC baseline, MutationSet, approval, verification —
+	// applies unchanged. When it yields nothing, the run stays read-only and the
+	// emptiness is reported truthfully rather than papered over.
+	d.deriveEvidenceScope()
 	interaction, interactionDescriptor, contractErr := d.selectInteractionContract(objective)
 	if contractErr != nil {
 		_, _ = d.loop.Abort("interaction contract binding failed: "+contractErr.Error(), autonomy.FailurePermanent)
@@ -507,6 +551,10 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		InteractionContract: interaction,
 		Contract:            interactionDescriptor,
 	}
+	// The durable execution record opens HERE: once the objective and its
+	// resolved targets are known, and before anything can be dispatched, so
+	// an interruption from here on is reconstructable.
+	d.ledgerBeginRun(objective)
 	// ── PHASE 12: DERIVE THE RUN-LEVEL TOKEN BOUND ──────────────────────
 	// The run-level budget is derived from the per-invocation budget this run
 	// is actually bound to, so a legitimate multi-invocation task is not
@@ -1261,6 +1309,108 @@ func (d *Driver) currentInteractionMetadata() (protocol.InteractionContract, *pr
 // runID is the identity of the run that started this observation loop;
 // late results from a different runID are discarded.
 //
+// deriveEvidenceScope observes the workspace and binds an evidence-backed target
+// set for an objective that names no file but DOES declare artifact kinds.
+//
+// It runs ONCE, before admission, and it is the only place a run acquires a
+// target it was not given. Three properties make it safe to run here:
+//
+//   - It is a no-op when the gateway already resolved a target. A stated or
+//     canonical target outranks anything discovery could suggest.
+//   - It requires the objective to DECLARE a kind. "Make this better" declares
+//     nothing and therefore derives nothing; only "…using HTML, CSS and JS"
+//     names file extensions, and only extension-matching observed files qualify.
+//   - It mutates nothing and bills nothing. Discovery is a bounded read; the
+//     decision is a pure projection of it.
+//
+// A successful derivation rewrites the run's strategy to the canonical mutation
+// contract over the derived targets, because that is now what the run IS: a
+// bounded mutation of proven, observed files. Everything downstream — canonical
+// re-resolution, OCC baseline, MutationSet, the approval gate, verification —
+// then runs on its existing, unchanged path.
+//
+// A failed derivation is NOT an error and NOT a fabrication. The run keeps its
+// read-only classification and the refusal is recorded on the run so a later
+// report can say exactly why no target was bound.
+func (d *Driver) deriveEvidenceScope() {
+	if d.adapter == nil {
+		return
+	}
+	// A resolved target set is already authoritative. Deriving over it would be
+	// second-guessing the gateway with a scan.
+	if len(d.resolved.Targets) > 0 {
+		return
+	}
+	derivation := d.adapter.DeriveScope(d.prompt, nil)
+	if !derivation.Derivable || len(derivation.Targets) == 0 {
+		if derivation.Reason != "" {
+			d.derivationNote = derivation.Reason
+			diagnosticf("[scope] no evidence-bound target derived: %s", derivation.Reason)
+			if d.bus != nil {
+				d.bus.Publish(events.NewActivity("[scope] " + derivation.Reason))
+			}
+		}
+		return
+	}
+
+	// Re-resolve the strategy over the DERIVED objective. This is what keeps
+	// strategy selection in its existing authority: the gateway still decides
+	// the contract, it simply now sees the scope the objective is actually
+	// about instead of an empty one. No second strategy selector is introduced
+	// and no strategy is hand-assembled here.
+	boundPrompt := d.prompt + " " + joinTargets(derivation.Targets)
+	profile := d.adapter.SelectStrategy(boundPrompt)
+	if profile.Strategy != strategy.TargetedMutation {
+		// The gateway still declines to treat the derived scope as a mutation
+		// target. That is a real disagreement between the observed evidence and
+		// the classifier, and resolving it by force would be exactly the
+		// invention this step exists to avoid. Record it and stay read-only.
+		d.derivationNote = "observed files " + strings.Join(derivation.Targets, ",") +
+			" satisfy the declared artifact kinds, but the strategy gateway still classifies the objective read-only (" +
+			string(profile.Strategy) + "); no mutation was dispatched"
+		diagnosticf("[scope] derivation produced %v but gateway selected %s — no dispatch",
+			derivation.Targets, profile.Strategy)
+		if d.bus != nil {
+			d.bus.Publish(events.NewActivity("[scope] " + d.derivationNote))
+		}
+		return
+	}
+
+	var proven []string
+	for _, t := range profile.Targets {
+		if t.Resolved != "" {
+			proven = append(proven, t.Resolved)
+		}
+	}
+	if len(proven) == 0 {
+		d.derivationNote = "derived candidates did not resolve to existing workspace files: " + derivation.Reason
+		diagnosticf("[scope] %s", d.derivationNote)
+		return
+	}
+
+	d.resolved.Profile = profile
+	d.resolved.Targets = proven
+	d.derivationNote = derivation.Reason
+	diagnosticf("[scope] evidence-bound derivation: %v (kinds=%v) — %s",
+		proven, derivation.Kinds, derivation.Reason)
+	if d.bus != nil {
+		d.bus.Publish(events.NewActivity(fmt.Sprintf(
+			"[scope] observed workspace evidence bound %d target(s) %v — %s",
+			len(proven), proven, derivation.Reason)))
+	}
+}
+
+// joinTargets renders derived targets as @scope tokens so the canonical gateway
+// parses them through its EXISTING @scope path — the same path a human-typed
+// target takes. Nothing about the gateway's target semantics is bypassed.
+func joinTargets(targets []string) string {
+	parts := make([]string, 0, len(targets))
+	for _, t := range targets {
+		parts = append(parts, "@"+t)
+	}
+	return strings.Join(parts, " ")
+}
+
 // Preflight barrier: when wired, the transition from observing to deciding is
 // gated by PreflightSyncBarrier (10s timeout → PREFLIGHT_TIMEOUT). This is the
 // execution invariant: async discovery never means unverified execution.
@@ -1411,6 +1561,9 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 		return d.terminateAbort(ctx, "preflight inadmissible target: "+outcome.Reason, autonomy.FailurePermanent), nil
 	}
 	for !d.loop.State().IsTerminal() {
+		// Loop boundary: snapshot the durable view so "where was this run
+		// when the process stopped" is readable without a full replay.
+		d.ledgerCheckpoint(d.loop.State())
 		// Late-result guard: if the run was aborted/superseded, exit immediately.
 		if d.runID != runID {
 			return d.term(), nil
@@ -1576,6 +1729,10 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			}
 			d.loop.ConsumeExecution(obs)
 			d.loop.ConsumeVerification(obs)
+			// The step's observation is the only thing that happened to the
+			// workspace; it goes into the journal before the loop can decide
+			// anything about it.
+			d.ledgerObserved(obs)
 			d.publish(ctx)
 			if isPhysicalOutputBudgetBreach(obs) {
 				return d.terminateAbort(ctx, "Physical Output Budget Breach", autonomy.FailurePermanent), nil
@@ -2074,7 +2231,11 @@ func (d *Driver) term() *autonomy.LoopTermination {
 	if d.loop == nil {
 		return nil
 	}
-	return d.loop.Termination()
+	term := d.loop.Termination()
+	// Every return path funnels through here, so this is the single point at
+	// which "how did the run end" is written to the journal — exactly once.
+	d.ledgerTerminal(term)
+	return term
 }
 
 func (d *Driver) terminateAbort(ctx context.Context, reason string, class autonomy.FailureClass) *autonomy.LoopTermination {

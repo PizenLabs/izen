@@ -164,11 +164,53 @@ func (a *ExecutorAdapter) PreflightTarget(ctx context.Context, prompt string, ex
 	return a.executor.ResolveMutationTarget(ctx, prompt, explicit)
 }
 
+// DeriveScope is the adapter's EVIDENCE-BOUND SCOPE DERIVATION seam.
+//
+// It answers the one question the target resolver deliberately refuses to
+// answer: when the objective names no file but DOES name artifact kinds, which
+// OBSERVED files satisfy them? The resolver refuses to choose from a scan
+// because choosing from a scan is how a broad objective silently becomes a write
+// to an arbitrary file (I13). This seam does not relax that: it filters the
+// scan by extension against a kind the objective itself declared, and hands the
+// result to the SAME canonical resolver, so a derived target is bound, digested
+// and admission-checked exactly like a stated one.
+//
+// The adapter owns this because it is the composition boundary that already owns
+// both halves of the question — the gateway (what kind of work this is) and the
+// executor (what the workspace actually contains). Putting it here keeps
+// strategy.Select a pure text classifier and keeps the executor free of
+// objective-language parsing.
+func (a *ExecutorAdapter) DeriveScope(prompt string, stated []string) execution.Derivation {
+	if a == nil || a.executor == nil {
+		return execution.Derivation{Reason: "no executor is bound to the adapter; scope derivation is impossible"}
+	}
+	resolver := a.executor.TargetResolver()
+	return execution.DeriveScope(execution.DerivationRequest{
+		Prompt:        prompt,
+		Profile:       resolver.DiscoverProfile(),
+		StatedTargets: stated,
+	})
+}
+
 // Resolve determines the execution target set for an objective WITHOUT
 // executing. It surfaces HumanClarification as an ambiguous resolution so the
 // driver parks before any model call or mutation.
 func (a *ExecutorAdapter) Resolve(prompt string) Resolved {
-	profile := a.gateway.SelectStrategy(prompt)
+	return a.resolveWith(prompt, a.SelectStrategy(prompt))
+}
+
+// SelectStrategy exposes the canonical gateway's strategy decision so the
+// driver can re-resolve an objective against an evidence-bound scope without
+// introducing a second strategy selector. The gateway remains the sole
+// authority for which execution contract a request runs under.
+func (a *ExecutorAdapter) SelectStrategy(prompt string) strategy.ExecutionStrategyProfile {
+	if a == nil || a.gateway == nil {
+		return strategy.ExecutionStrategyProfile{Intent: prompt}
+	}
+	return a.gateway.SelectStrategy(prompt)
+}
+
+func (a *ExecutorAdapter) resolveWith(prompt string, profile strategy.ExecutionStrategyProfile) Resolved {
 	res := Resolved{Prompt: prompt, Profile: profile}
 	if profile.Strategy == strategy.HumanClarification {
 		// A clarification NEVER leaks a target set: the loop must park, not
@@ -275,7 +317,21 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 			return a.driftObservation(req, targets), nil
 		}
 	}
-	profile := a.gateway.SelectStrategy(req.Prompt)
+	// ── STRATEGY SELECTION OVER THE BOUND SCOPE ─────────────────────────
+	// The strategy MUST be decided against the scope the run actually holds,
+	// not against the raw objective text. The driver may have bound an
+	// evidence-derived target set (see ExecutorAdapter.DeriveScope) after the
+	// initial resolve; re-selecting on the bare prompt would silently discard
+	// that work and dispatch the read-only contract the text alone implies.
+	//
+	// This is the SAME gateway on the SAME objective — only the scope it is
+	// asked about differs — so the adapter remains a translation layer and the
+	// gateway remains the sole strategy authority.
+	scopePrompt := req.Prompt
+	if len(targets) > 0 {
+		scopePrompt = req.Prompt + " " + joinTargets(targets)
+	}
+	profile := a.gateway.SelectStrategy(scopePrompt)
 	strategyPtr := &profile
 	if (len(req.Targets) > 0 || req.Target != "") && profile.Strategy == strategy.HumanClarification {
 		// The loop carries a resolved target set the raw prompt could not

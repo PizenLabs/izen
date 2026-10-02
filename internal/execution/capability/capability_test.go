@@ -106,14 +106,17 @@ func TestUnknownCapabilityIsNeverPermitted(t *testing.T) {
 	}
 }
 
-// TestFailureTaxonomyIsTotalAndClosed: the 11 required classes exist and
-// nothing else does.
+// TestFailureTaxonomyIsTotalAndClosed: the 13 required classes exist and
+// nothing else does. The last two are CONTROL-PLANE terminal outcomes rather
+// than capability failures, and the vocabulary still covers them: a loop that
+// stops without making progress must be able to say so.
 func TestFailureTaxonomyIsTotalAndClosed(t *testing.T) {
 	required := []FailureClass{
 		FailureAuthorizationBlocked, FailureCapabilityMissing, FailureCapabilityFailed,
 		FailureTargetUncertain, FailureContextInsufficient, FailureExecutionFailed,
 		FailureObservationFailed, FailureDiagnosisUncertain, FailureRepairFailed,
 		FailureVerificationFailed, FailureObjectiveUnproven,
+		FailureNoProgress, FailureHumanRequired,
 	}
 	for _, c := range required {
 		if !c.Valid() {

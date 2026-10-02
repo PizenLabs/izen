@@ -114,7 +114,7 @@ func (e *semanticExtractorAdapter) Extract(ctx context.Context, system, prompt s
 // shares the canonical execution authority, substrate confinement, and
 // guards with every other entry point; only the loop cardinality differs
 // from the TUI Driver path, by explicit contract rather than by accident.
-func runRuntimeCommand(args []string) error {
+func runRuntimeCommand(args []string) (err error) {
 	dir := "."
 	var targets []string
 	var prompt string
@@ -149,6 +149,29 @@ func runRuntimeCommand(args []string) error {
 		return errors.New("izen run: a prompt argument is required")
 	}
 
+	// ── DURABLE EXECUTION LEDGER (§10/§15) ────────────────────────────
+	// The journal of record for what this cycle actually does, opened and
+	// replayed BEFORE the pipeline can dispatch anything. `izen run` builds
+	// its own pipeline rather than going through compose.Wire, so without
+	// this the headless path left no reconstructable execution state: the
+	// audit log it writes has no reader and no fold, and an interrupted run
+	// left no memory of itself anywhere.
+	//
+	// Fail closed here, exactly as compose.Wire does: a ledger that cannot be
+	// opened or replayed is not an execution truth, and the cycle has not
+	// mutated anything yet, so aborting costs nothing.
+	ledger, err := newRunLedger(dir, prompt, targets)
+	if err != nil {
+		return fmt.Errorf("izen run: %w", err)
+	}
+	defer func() {
+		// Close releases the runtime file lock. Its error is surfaced on the
+		// run's own outcome, never dropped: a shut-down runtime still holding
+		// the journal's writer lock would make the next process's lineage
+		// unknowable.
+		err = errRunLedgerClosed(err, ledger.Close())
+	}()
+
 	cfg, err := config.Load()
 	if err != nil {
 		cfg = config.Default()
@@ -156,6 +179,7 @@ func runRuntimeCommand(args []string) error {
 
 	provider, model, err := buildActiveProvider(cfg)
 	if err != nil {
+		ledger.Fail("provider_unavailable", err)
 		return err
 	}
 	provider = contextcompiler.New().WrapProvider(provider)
@@ -193,6 +217,7 @@ func runRuntimeCommand(args []string) error {
 		})),
 	)
 	if err != nil {
+		ledger.Fail("pipeline_build_failed", err)
 		return fmt.Errorf("izen run: build v3 pipeline: %w", err)
 	}
 
@@ -209,9 +234,11 @@ func runRuntimeCommand(args []string) error {
 	auditDir := filepath.Join(dir, ".izen", "audit")
 	auditLogger, err := auditevents.NewLogger(auditDir, pipeline.Bus())
 	if err != nil {
+		ledger.Fail("audit_logger_failed", err)
 		return fmt.Errorf("izen run: wire audit logger: %w", err)
 	}
 	if err := auditLogger.Start(); err != nil {
+		ledger.Fail("audit_logger_failed", err)
 		return fmt.Errorf("izen run: start audit logger: %w", err)
 	}
 	// Signal-bound synchronous flush: SIGINT/SIGTERM trigger a blocking
@@ -277,6 +304,11 @@ func runRuntimeCommand(args []string) error {
 		events.ExecutionStartedPayload{RequestID: requestID, Mode: "run", Prompt: prompt},
 	))
 
+	// The operation this cycle executes enters the substrate here, BEFORE
+	// pipeline.Run, so a crash from this point on is reconcilable against the
+	// pre-dispatch worktree digest.
+	ledger.Dispatch()
+
 	res, runErr := pipeline.Run(ctx, app.Request{Intent: prompt, Targets: targets})
 
 	// The lifecycle closes here from the REAL pipeline outcome (never
@@ -293,6 +325,10 @@ func runRuntimeCommand(args []string) error {
 	// integrity as compromised (mutations are NOT rolled back).
 	if flushErr := auditLogger.Flush(); flushErr != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "izen run: audit persistence failed — evidence integrity compromised (mutations stand, success invalidated)")
+		// Audit persistence failure invalidates execution success, so it is a
+		// failure of the cycle and is recorded as one — never as a completed
+		// execution.
+		ledger.Fail("audit_persistence_failed", flushErr)
 		return fmt.Errorf("%w: audit flush: %w", orchestrator.ErrAuditPersistenceFailed, flushErr)
 	}
 
@@ -364,9 +400,21 @@ func runRuntimeCommand(args []string) error {
 		fmt.Printf("events: task_started=%d task_completed=%d task_failed=%d\n", started, completed, failed)
 	}
 
+	// ── DURABLE RECORD OF WHAT THE CYCLE ACTUALLY DID ────────────────
+	// Every error path records the real reason and parks the task; a cycle
+	// that finishes without error records the committed execution and the
+	// validation counts that produced the verdict. Neither is synthesised
+	// from "the provider returned DONE".
 	if runErr != nil {
+		ledger.Fail("pipeline_error", runErr)
 		return fmt.Errorf("izen run: %w", runErr)
 	}
+
+	// The cycle completed: the execution committed and the pipeline's
+	// validation gate produced the counts recorded in the terminal
+	// verification. This retires a committed EXECUTION, not a proven
+	// objective — the headless path holds no objective-proof authority.
+	ledger.Complete(res)
 	return nil
 }
 

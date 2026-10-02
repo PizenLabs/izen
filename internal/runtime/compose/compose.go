@@ -15,6 +15,7 @@ package compose
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/user"
 	"strings"
@@ -58,6 +59,7 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime/authority"
 	runtimeAutonomy "github.com/PizenLabs/izen/internal/runtime/autonomy"
 	"github.com/PizenLabs/izen/internal/runtime/contextpipeline"
+	"github.com/PizenLabs/izen/internal/runtime/durable"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	"github.com/PizenLabs/izen/internal/session"
@@ -109,10 +111,20 @@ type RuntimeInputs struct {
 type Application struct {
 	Bus      *events.Bus
 	Workflow workflow.WorkflowRuntime
-	Ledger   *runtime.ContextLedger
-	Builder  *runtime.LedgerBuilder
-	Runtime  *runtime.Runtime
-	Audit    *audit.AuditLogger
+	// ContextLedger is the read-only conversation/event projection. The
+	// durable EXECUTION ledger is Ledger(), reachable via Ledger(): the two
+	// are different authorities with different contracts and never share a
+	// name, because conflating them is exactly how a write-only projection
+	// ends up standing in for execution truth.
+	ContextLedger *runtime.ContextLedger
+	Builder       *runtime.LedgerBuilder
+	Runtime       *runtime.Runtime
+	Audit         *audit.AuditLogger
+
+	// ledger is the authoritative append-only execution ledger
+	// (.izen/runtime/ledger.ndjson). It is nil only in harness mode, where
+	// no workspace root was wired. Read it through Ledger().
+	ledger *durable.TaskStore
 
 	// auditDir is the workspace-relative audit log directory wired via
 	// WithAuditDir. Empty disables auditing.
@@ -443,6 +455,30 @@ func (a *Application) LanguageID() language.ID {
 	return a.Inputs.LanguageID
 }
 
+// Ledger returns the authoritative append-only execution ledger rooted at
+// <workspace>/.izen/runtime. It is the store the autonomous driver records
+// every objective transition into, and the only surface a restart may use to
+// learn what was in flight when the previous process died. Nil only in
+// harness mode (no workspace root was wired).
+func (a *Application) Ledger() *durable.TaskStore {
+	if a == nil {
+		return nil
+	}
+	return a.ledger
+}
+
+// InterruptedTask returns the most recently replayed ledger task that never
+// reached a terminal state — the §9 reconstruction answer to "what was the
+// process doing when it stopped?". ok is false when the ledger holds no
+// unfinished work, which is the ordinary case and never an error. It is nil
+// safe: with no ledger wired, ok is always false.
+func (a *Application) InterruptedTask() (durable.TaskState, bool) {
+	if a == nil || a.ledger == nil {
+		return durable.TaskState{}, false
+	}
+	return a.ledger.MostRecentRecoverable()
+}
+
 // Wire builds the Application: domain runtime, dispatcher, handlers, ledger
 // projection, the Runtime facade, and the complete engine tree — all bound to
 // the shared event bus. It is the sole place the application dependency graph
@@ -681,7 +717,7 @@ func Wire(opts ...Option) (*Application, error) {
 	builder := runtime.NewLedgerBuilder(a.Bus)
 	builder.Start()
 	a.Builder = builder
-	a.Ledger = builder.Ledger()
+	a.ContextLedger = builder.Ledger()
 
 	a.Runtime = runtime.NewRuntime(dispatcher, runtime.WithEventBus(a.Bus))
 
@@ -692,6 +728,26 @@ func Wire(opts ...Option) (*Application, error) {
 	cfg := a.Inputs.Config
 	sess := a.Inputs.Session
 	provider := a.provider
+
+	// ── DURABLE EXECUTION LEDGER (RFC v1.0 §10) ────────────────────────
+	// The journal of record for what this process actually did, opened and
+	// replayed BEFORE any engine can dispatch: a store that cannot be read
+	// back is not an execution truth, and a run that starts without one
+	// cannot be reconstructed after an interruption. Fail closed here rather
+	// than degrade to an unwritten runtime.
+	if root != "" {
+		store := durable.NewTaskStore(root)
+		if err := store.Open(); err != nil {
+			return nil, fmt.Errorf("wire: open durable execution ledger: %w", err)
+		}
+		a.ledger = store
+		// A journal whose sequence does not add up is reported, never
+		// silently folded: the caller decides what an incomplete record
+		// means for this workspace.
+		for _, gap := range store.SequenceGaps() {
+			log.Printf("[compose] durable ledger %s is missing event %d", store.LedgerPath(), gap)
+		}
+	}
 
 	a.Git = git.NewEngine(root)
 	a.Lea = lea.NewEngine(root)
@@ -881,6 +937,12 @@ func Wire(opts ...Option) (*Application, error) {
 				return strings.TrimSpace(ref.ID)
 			},
 		}),
+		// DURABLE EXECUTION LEDGER: the loop records the objective's
+		// lifecycle into the append-only journal so an interruption during
+		// compute, mutation or command is reconstructable after a restart.
+		// The session identity makes the task key stable across the run and
+		// keeps one session's objectives out of another's ledger.
+		runtimeAutonomy.WithLedger(a.ledger, sess.SessionID),
 	)
 	// ── AUTONOMY BOUNDARY-TELEMETRY SINK ─────────────────────────────────
 	// [boundary2]/[boundary5] diagnostic lines are routed onto the shared
@@ -990,6 +1052,17 @@ func (a *Application) Close() {
 	if a.Autonomous != nil {
 		a.Autonomous.Close()
 		a.Autonomous = nil
+	}
+	// The durable ledger closes AFTER the driver, so a run in flight can
+	// never have its terminal transition refused by a store that was already
+	// shut down. Its error is retained alongside the audit teardown error:
+	// the journal is the record of record, and a failure to close it must be
+	// reported rather than dropped.
+	if a.ledger != nil {
+		if err := a.ledger.Close(); err != nil {
+			a.auditCloseErr = err
+		}
+		a.ledger = nil
 	}
 	if a.Runtime != nil {
 		a.Runtime.Close()

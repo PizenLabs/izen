@@ -246,6 +246,23 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 	m.loadHistory()
 	m.historyIndex = len(m.history)
 
+	// ── DURABLE LEDGER RECONSTRUCTION SURFACE (§9 / §15) ────────────────
+	// A process that died during compute, mutation or a command left an
+	// unfinished task in the durable execution ledger. Surface it HERE, at
+	// startup and before any prompt, so a restart tells the human what was in
+	// flight instead of silently re-prompting for an objective it already
+	// began. Nothing is resumed automatically: the ledger records what
+	// happened, the human decides what happens next.
+	if task, ok := app.InterruptedTask(); ok {
+		m.interrupted = &interruptedTask{
+			id:     task.ID,
+			intent: task.Intent,
+			status: string(task.Status),
+			step:   task.CurrentStepID,
+		}
+		m.push(roleSystem, m.interrupted.surface())
+	}
+
 	// ── WIRE ACTIVITY LOGGERS ────────────────────────────────────────────
 	// The retrieval/execution activity sinks are routed through the event bus
 	// (never a direct model callback): each line is published as an

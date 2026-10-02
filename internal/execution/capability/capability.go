@@ -87,9 +87,24 @@ func (id ID) Valid() bool {
 // String returns the raw identifier.
 func (id ID) String() string { return string(id) }
 
-// FailureClass is the truthful failure taxonomy. Every blocked or failed
-// objective names exactly one of these; collapsing them into "failed" is what
-// makes a runtime impossible to debug and impossible to trust.
+// FailureClass is the truthful failure taxonomy: the closed vocabulary every
+// blocked or failed outcome names exactly one member of. Collapsing them into
+// "failed" is what makes a runtime impossible to debug and impossible to
+// trust.
+//
+// It deliberately covers more than capability failures. Alongside what a
+// capability could not do, the runtime's own control plane must be able to
+// name the CONTROL-PLANE terminal outcomes it decides for itself:
+//
+//   - FailureNoProgress: repeated rounds left the runtime state unchanged,
+//     so continuing is no longer honest work. Spec §36: NO_PROGRESS is more
+//     truthful than OBJECTIVE_UNPROVEN, because it names WHY the bound
+//     produced no proof.
+//   - FailureHumanRequired: no bounded continuation can produce the proof,
+//     so the decision must escalate to a human rather than be invented.
+//
+// Those two are still a closed vocabulary: adding an outcome requires editing
+// the taxonomy, which is what makes a terminal result attributable.
 type FailureClass string
 
 const (
@@ -129,6 +144,14 @@ const (
 	// FailureObjectiveUnproven: the runtime ran out of bounded attempts with
 	// the workspace in a legitimate state but no proof of the objective.
 	FailureObjectiveUnproven FailureClass = "OBJECTIVE_UNPROVEN"
+	// FailureNoProgress: the runtime stopped because rounds stopped changing
+	// anything — the same defects, the same evidence, no mutation. This is a
+	// control-plane stop, not a capability failure: nothing broke, the loop
+	// simply learned nothing.
+	FailureNoProgress FailureClass = "NO_PROGRESS"
+	// FailureHumanRequired: no bounded continuation can produce the proof the
+	// objective needs, so the runtime escalates instead of guessing.
+	FailureHumanRequired FailureClass = "HUMAN_REQUIRED"
 )
 
 // Valid reports whether c is a member of the taxonomy.
@@ -157,6 +180,8 @@ var AllFailureClasses = []FailureClass{
 	FailureRepairFailed,
 	FailureVerificationFailed,
 	FailureObjectiveUnproven,
+	FailureNoProgress,
+	FailureHumanRequired,
 }
 
 // Block is a truthful, attributable stop: what could not be done, which class

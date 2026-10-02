@@ -753,6 +753,18 @@ func (x *RuntimeExecutor) ResolveMutationTarget(ctx context.Context, prompt stri
 	return x.targetBindingResolver().Resolve(ctx, prompt, explicit)
 }
 
+// TargetResolver returns the executor's canonical target resolver so a
+// composition boundary can reach ISOLATED discovery without re-implementing it.
+// Returning the resolver (rather than a convenience scan) keeps discovery and
+// resolution on ONE implementation: a caller that rolled its own walk would
+// produce candidate sets that differ from the ones the admission gate judges.
+func (x *RuntimeExecutor) TargetResolver() *TargetResolver {
+	if x == nil {
+		return nil
+	}
+	return x.targetBindingResolver()
+}
+
 // DiscoverWorkspace is the Phase 16.1 discovery seam. It returns workspace
 // EVIDENCE only (I13): candidates are context, never authority.
 func (x *RuntimeExecutor) DiscoverWorkspace() WorkspaceProfile {
@@ -3451,6 +3463,26 @@ func lastOutputTokens(invs []ModelInvocation) int {
 // wrap it without touching this loop) while preserving the existing truth
 // matrix for full-file rewrites.
 func (x *RuntimeExecutor) artifactGate(target, modified string) (string, error) {
+	// ── ARTIFACT-SHAPE GATE ────────────────────────────────────────────
+	// Syntax validation alone cannot answer "is this a FILE?". It answers "is
+	// this well-formed?", and a completion-shaped chat reply is well-formed in
+	// several target languages at once: a sentence is a syntactically valid
+	// HTML body, and a sentence is a syntactically inert stylesheet.
+	//
+	// That gap is not theoretical. A model answering "Sure! I have redesigned
+	// your portfolio page" against a .html target produced a real, approvable
+	// patch candidate that would have overwritten the page with prose — the
+	// exact ComputeResult → mutation shortcut the Phase 14 invariants forbid.
+	//
+	// So before syntax: the response must carry at least one structural token of
+	// the target's own language. A response with none is not a bad artifact, it
+	// is not an artifact, and it is rejected as a retryable contract failure so
+	// the bounded continuation can re-prompt under the same authority.
+	if !carriesTargetStructure(target, modified) {
+		return "", fmt.Errorf("%w: %s: the response carries no %s structure, so it is a conversational answer rather than a file: %s",
+			ErrArtifactRetryableRejected, target, targetLanguageName(target),
+			summarizeArtifactRejection(modified))
+	}
 	gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
 	if !gate.Passed {
 		if gate.Decision == policy.DecisionRetry {

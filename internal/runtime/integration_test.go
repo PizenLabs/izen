@@ -131,10 +131,10 @@ func TestAskPlanBuildFlow(t *testing.T) {
 	// path. Snapshotting immediately races the projector under load and has
 	// flaked CI with `ledger phase = "plan"`.
 	ledgerCaughtUp := waitFor(2*time.Second, func() bool {
-		snap := app.Ledger.Snapshot()
+		snap := app.ContextLedger.Snapshot()
 		return snap.Phase == "build" && len(snap.Commands) > 0 && len(snap.Failures) == 2
 	})
-	snap := app.Ledger.Snapshot()
+	snap := app.ContextLedger.Snapshot()
 	if len(snap.Commands) == 0 {
 		t.Error("ledger: expected command entries")
 	}

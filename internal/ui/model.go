@@ -1457,6 +1457,11 @@ type model struct {
 	// the TUI can surface it and route directly to the model picker.
 	bootErr error
 
+	// interrupted is the unfinished durable task recovered at startup from the
+	// execution ledger (§9/§15). Nil when the previous process left no open
+	// work. It is surfaced, never auto-resumed.
+	interrupted *interruptedTask
+
 	investigateInvocationCount int
 
 	// Command history
