@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1625,6 +1626,29 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 
 	res.Targets = targets
 	res.Proof.Targets = targets
+
+	// ── CANDIDATE PROVENANCE: SUPERSESSION (spec §14) ─────────────────
+	//
+	// A new computation over a target SUPERSEDES every unresolved candidate a
+	// previous computation held for that target. A held MutationCandidate is
+	// derived from ONE computation and is only executable while that
+	// computation is the live one: "Previously generated partial, stale, or
+	// abandoned output must not remain executable after the computation that
+	// produced it has failed" (§14), and a candidate "must not be reconstructed
+	// from … an old execution step" (§3).
+	//
+	// Without this drain, a run that computed a candidate, then recomputed the
+	// same target and FAILED (OUTPUT_EXHAUSTED, a refused artifact, a cancelled
+	// step) still left the FIRST candidate live and approvable — so human
+	// approval could make a superseded computation executable. Approval answers
+	// "may this authorized operation occur?"; it cannot resurrect the authority
+	// of a computation that no longer exists.
+	//
+	// Scope is exactly the intersecting targets: a candidate held for an
+	// unrelated file is untouched, because two targets never contend for one
+	// approval.
+	x.supersedePendingCandidates(ctx, requestID, targets)
+
 	for _, t := range targets {
 		g.CompleteTarget(t, fileExists(filepath.Join(x.root, t)), "strategy")
 	}
@@ -2557,6 +2581,59 @@ func (x *RuntimeExecutor) PendingPatchIDs() []string {
 	return out
 }
 
+// supersedePendingCandidates rejects every approval-held candidate a SUPERSEDED
+// computation produced for any of targets, before the new computation does any
+// work.
+//
+// A held candidate is bound to the computation that produced it. Dispatching a
+// new computation over the same file ends the previous one's claim on that
+// file, whether the new computation later succeeds, fails, or exhausts its
+// output budget. The rejection is the same terminal, non-mutating `rejected`
+// transition a human rejection produces, so the ledger records a truthful
+// outcome instead of a candidate that silently stops being reachable.
+//
+// Nothing is written: Reject only seals evidence and drops the candidate.
+//
+// Candidates whose target set does not intersect are left alone — two distinct
+// files never contend for one approval, and draining them would destroy a
+// legitimate concurrent approval.
+func (x *RuntimeExecutor) supersedePendingCandidates(ctx context.Context, newRequestID string, targets []string) {
+	if x == nil || len(targets) == 0 {
+		return
+	}
+	want := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		if t != "" {
+			want[t] = true
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+
+	// Collect under the lock, then resolve outside it: Reject re-acquires x.mu.
+	x.mu.Lock()
+	stale := make([]string, 0, len(x.pending))
+	for id, pm := range x.pending {
+		if pm == nil || pm.requestID == newRequestID {
+			continue
+		}
+		for _, t := range pm.targets {
+			if want[t] {
+				stale = append(stale, id)
+				break
+			}
+		}
+	}
+	x.mu.Unlock()
+
+	// Deterministic order so the ledger is reproducible for evidence.
+	sort.Strings(stale)
+	for _, id := range stale {
+		_, _ = x.Reject(ctx, id, "superseded: a new computation was dispatched for the same target")
+	}
+}
+
 // RejectAllPending deterministically rejects every approval-held mutation. It
 // is the session-boundary drain: /new and /session resume cross the execution
 // lifecycle through this single RuntimeExecutor authority — never through a
@@ -3042,13 +3119,10 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			if !ok {
 				// Check every anchor before considering a complete-document fallback:
 				// a zero match in any block must never be hidden by an ambiguous one.
-				ambiguous := false
-				for _, b := range ParseSearchReplaceBlocks(verbatim) {
-					cnt := strings.Count(original, b.search)
-					if b.search == "" || cnt == 0 {
-						return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w: %s: SEARCH matches zero regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
-					}
-					ambiguous = ambiguous || cnt > 1
+				ambiguous, anchorErr := classifyAnchors(original, verbatim)
+				if anchorErr != nil {
+					return nil, invs, diffs, candidates, trace,
+						fmt.Errorf("%w: %w: %s: %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, anchorErr)
 				}
 				if ambiguous {
 					candidate, recovered := recoverSmallFileAmbiguousAnchor(original, verbatim, target, x.artifactGate)
@@ -3126,6 +3200,29 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					target, parseErr)
 			}
 			modified = ResolveModifiedContent(original, raw)
+			// ANCHOR HONESTY UNDER A FULL-ARTIFACT CONTRACT. A provider that
+			// answered a "replace the file" contract with a SEARCH/REPLACE
+			// envelope did NOT produce a whole document; it produced a patch
+			// that names a destination region. If that region does not exist in
+			// the target, the model hallucinated the anchor.
+			//
+			// ResolveModifiedContent deliberately returns the ORIGINAL bytes when
+			// an unresolvable envelope is present (so raw markers can never be
+			// written into a user's file). That safety choice is correct, but on
+			// its own it converts "I could not anchor this" into "there is
+			// nothing to change" — a fabricated no-op that then opens an approval
+			// surface and asks a human to authorize a mutation of nothing.
+			//
+			// A no-op is a CLAIM and may only come from the NO_CHANGES_REQUIRED
+			// sentinel, which is structurally classified. An unanchorable patch is
+			// a FAILURE and is classified here, at the artifact boundary, before
+			// any candidate exists.
+			if _, anchorErr := classifyAnchors(original, verbatim); anchorErr != nil {
+				log.Printf("[execution] request=%s target=%s artifact_anchor=REJECTED reason=%q — no patch staged, no approval surface opened",
+					requestID, target, anchorErr)
+				return nil, invs, diffs, candidates, trace,
+					fmt.Errorf("%w: %w: %s: %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, anchorErr)
+			}
 			if modified == "" {
 				// The payload carried a recognizable artifact but the content
 				// resolver produced nothing: fall back to the parsed body

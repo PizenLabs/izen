@@ -1699,11 +1699,6 @@ type model struct {
 	// hotfixCandidatesMode toggles the read-only candidate-inspection sub-view
 	// of the ambiguous card. Inspecting candidates never mutates the file.
 	hotfixCandidatesMode bool
-	// appliedHotfixFile records the target file of an APPROVED hotfix so the
-	// terminal buildResultMsg handler can dispatch the runtime approve_patch
-	// projection ONLY after the authoritative apply (budget/authorization
-	// gated) actually succeeded. Cleared on the terminal result.
-	appliedHotfixFile string
 
 	// ── Multi-file hotfix (Phase 9B): deterministic execution graph ──
 	// activeGraph is the single ExecutionGraph owned by the active multi-file
@@ -3361,10 +3356,17 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		m.finalizeSkeleton(states.StateWorkspacePatch, "")
 		m.logRuntimeDetail("[runtime] mutation started: %d target(s)", len(p.Targets))
 	case events.MutationCompletedPayload:
-		m.setStage("apply", p.Target, stageDone)
+		m.setStage("apply", p.Target, mutationStageState(p.Outcome))
 		m.logRuntimeDetail("[runtime] mutation completed: %s (%s)", p.Target, p.Outcome)
 	case events.VerificationCompletedPayload:
-		m.setStage("validate", "", stageDone)
+		// A stage marker is a CLAIM about what happened. `✓ Validate` after a
+		// FAILED verification is a false claim rendered at the most visible
+		// surface in the UI, so the marker is derived from the verdict.
+		if p.Passed {
+			m.setStage("validate", "", stageDone)
+		} else {
+			m.setStage("validate", "", stageFailed)
+		}
 		m.logRuntimeDetail("[runtime] verification %s: %d step(s)", verificationTick(p.Passed), len(p.Steps))
 	case events.ExecutionFinishedPayload:
 		m.logRuntimeDetail("[runtime] execution finished: success=%t (%s)", p.Success, p.Outcome)

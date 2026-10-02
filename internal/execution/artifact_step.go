@@ -334,6 +334,41 @@ func (x *RuntimeExecutor) invokeArtifactBoundedStep(
 	}
 }
 
+// classifyAnchors inspects every SEARCH/REPLACE block in a payload against the
+// target's real content and reports what the payload actually claims about the
+// workspace.
+//
+// It returns (ambiguous, err):
+//
+//   - err non-nil: at least one block's SEARCH text matches ZERO regions. The
+//     model named a destination that does not exist — a hallucinated anchor,
+//     which is a terminal artifact rejection under EVERY contract.
+//   - ambiguous true: at least one block's SEARCH text matches more than one
+//     region. The payload is ambiguous and needs a human or a bounded recovery.
+//   - both zero-valued: every block anchors exactly once, or the payload
+//     contains no SEARCH/REPLACE envelope at all.
+//
+// A payload with NO envelope is not an error here: a full-artifact contract
+// legitimately answers with a whole document. Only an envelope that claims a
+// destination the workspace does not contain is a violation, and it is one
+// regardless of which contract the request ran under — which is why the check is
+// shared instead of living inside the bounded-patch branch alone.
+func classifyAnchors(original, verbatim string) (bool, error) {
+	blocks := ParseSearchReplaceBlocks(verbatim)
+	if len(blocks) == 0 {
+		return false, nil
+	}
+	ambiguous := false
+	for _, b := range blocks {
+		cnt := strings.Count(original, b.search)
+		if b.search == "" || cnt == 0 {
+			return false, fmt.Errorf("SEARCH matches zero regions (match count %d)", cnt)
+		}
+		ambiguous = ambiguous || cnt > 1
+	}
+	return ambiguous, nil
+}
+
 // baseUserTurn extracts the step-1 user turn from the already-compiled request
 // so every continuation is rebuilt from the SAME base instead of accumulating
 // duplicate instruction blocks.

@@ -644,8 +644,16 @@ func TestExecutorApprovalGateHoldsEvidenceUntilTermination(t *testing.T) {
 	}
 
 	// A rejection terminates as CANCELLED evidence for its own attempt.
-	f.provider.responses = append(f.provider.responses, &ai.Response{Content: sampleReplace})
-	res2, err := f.x.Execute(context.Background(), f.mutationReq("gate-reject", "change bar to qux"))
+	//
+	// The SECOND attempt must anchor against the file as it exists AFTER the
+	// first commit (`foo\nqux\nbaz\n`). Replaying the original envelope would
+	// name a region that no longer exists — a hallucinated anchor, which the
+	// artifact boundary now rejects rather than silently resolving to "no
+	// change" and opening an approval surface over a fabricated no-op.
+	f.provider.responses = append(f.provider.responses, &ai.Response{
+		Content: "<<<<<<< SEARCH\nqux\n=======\ncorge\n>>>>>>>",
+	})
+	res2, err := f.x.Execute(context.Background(), f.mutationReq("gate-reject", "change qux to corge"))
 	if err != nil || res2.PendingPatchID == "" {
 		t.Fatalf("expected second hold: %v / %q", err, res2.PendingPatchID)
 	}

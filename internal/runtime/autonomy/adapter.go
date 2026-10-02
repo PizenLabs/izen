@@ -15,7 +15,6 @@ package autonomy
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -257,24 +256,32 @@ func (a *ExecutorAdapter) ReadTargetFile(target string) ([]byte, bool) {
 }
 
 // RestoreTargets restores exact file contents under the workspace root. It is
-// the ROLLBACK AUTHORITY of DAG execution: when a sub-task fails at Boundary
-// 3, 4 or 5, the driver restores every plan target to its base content so the
-// workspace provably returns to the BaseTreeDigest. Nothing is written for an
-// empty restore set (atomicity means: no partial rollback).
-func (a *ExecutorAdapter) RestoreTargets(contents map[string][]byte) error {
+// the DAG rollback SEAM: when a sub-task fails at Boundary 3, 4 or 5, the
+// driver restores every plan target to its base content so the workspace
+// provably returns to the BaseTreeDigest. Nothing is written for an empty
+// restore set (atomicity means: no partial rollback).
+//
+// It holds NO authority of its own. The restore and the post-restore integrity
+// assertion are delegated to the ONE authoritative Mutation Boundary
+// (execution.RollbackAndVerify), which both performs the restore and
+// cryptographically asserts the live tree digest against baseDigest. This seam
+// previously wrote the workspace itself with raw os.WriteFile and asserted
+// nothing, which made "the rollback succeeded" a claim rather than a fact and
+// gave DAG abort a second mutation path around the boundary.
+func (a *ExecutorAdapter) RestoreTargets(contents map[string][]byte, targets []string, baseDigest string) error {
 	if a == nil {
 		return errors.New("autonomy: restore requires an executor adapter")
 	}
-	for _, target := range sortedKeys(contents) {
-		full := filepath.Join(a.root, filepath.FromSlash(target))
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			return fmt.Errorf("autonomy: rollback mkdir %s: %w", target, err)
-		}
-		if err := os.WriteFile(full, contents[target], 0o644); err != nil {
-			return fmt.Errorf("autonomy: rollback write %s: %w", target, err)
-		}
+	if len(contents) == 0 {
+		// Atomicity: no partial rollback. Nothing to restore, and nothing to
+		// assert — a boundary call over an empty restore set would only
+		// recompute a digest nobody changed.
+		return nil
 	}
-	return nil
+	if len(targets) == 0 {
+		targets = sortedKeys(contents)
+	}
+	return execution.RollbackAndVerify(a.root, targets, baseDigest, contents)
 }
 
 // sortedKeys returns map keys in deterministic order (rollback must be

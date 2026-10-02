@@ -4647,7 +4647,10 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 		// Without this explicit approval, /build remains blocked.
 		if action.ID == "approve-plan" {
 			m.planApproved = true
-			m.push(roleSystem, infoStyle.Render("✓ Plan approved. Transitioning to /build for execution..."))
+			// The plan is AUTHORIZED; nothing has been executed yet. The mode
+			// transition is a request the workspace handler performs, and the
+			// execution verdict — if any — comes from runtime lifecycle events.
+			m.push(roleSystem, infoStyle.Render("Plan approved. Moving to /build; execution has not started."))
 		}
 
 		// ── PLAN REJECTION ─────────────────────────────────────────────

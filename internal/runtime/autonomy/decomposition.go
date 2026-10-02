@@ -1152,14 +1152,19 @@ func boundedEvidenceLine(diagnostic string) string {
 // a permanent abort. completed counts the sub-tasks that DID land before the
 // failure; they were rolled back too. Remaining sub-tasks never execute.
 func (d *Driver) failDAG(ctx context.Context, dag *planner.ExecutionDAG, originals map[string][]byte, completed int, reason string) *autonomy.LoopTermination {
-	if err := d.adapter.RestoreTargets(originals); err != nil {
+	// The rollback crosses the ONE authoritative mutation boundary, which also
+	// asserts the restored tree digest against the plan's BaseTreeDigest. A
+	// mismatch is returned as an error and is therefore already part of
+	// `reason`; the recomputation below is the driver's own independent
+	// confirmation, never its primary evidence.
+	if err := d.adapter.RestoreTargets(originals, dag.Targets(), dag.BaseTreeDigest); err != nil {
 		reason += "; ROLLBACK FAILED: " + err.Error()
 	}
 	digest := d.adapter.WorkspaceVersion(dag.Targets())
 	match := digest == dag.BaseTreeDigest
 	// Strict boundary telemetry: MUST emit canonical trace.
 	diagnosticf("[boundary] state rollback verified digest=%s match=%v", digest, match)
-	if !match {
+	if !match && !strings.Contains(reason, "ROLLBACK FAILED") {
 		reason += fmt.Sprintf("; post-rollback digest %s… does not match base %s…", short(digest), short(dag.BaseTreeDigest))
 	}
 	dag.Status = planner.DagExecutionFailed

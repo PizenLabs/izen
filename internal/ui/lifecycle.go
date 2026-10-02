@@ -176,7 +176,6 @@ func (m *model) resetTransientInteraction() {
 	m.pendingHotfixTask = nil
 	m.pendingHotfixPatch = nil
 	m.hotfixCandidatesMode = false
-	m.appliedHotfixFile = ""
 	m.clearAutonomyProposal()
 	m.denyPendingPermission("cleared")
 	if m.permissionWhitelist != nil {
@@ -316,7 +315,6 @@ func (m *model) discardPendingAction() {
 	m.pendingHotfixTask = nil
 	m.pendingHotfixPatch = nil
 	m.hotfixCandidatesMode = false
-	m.appliedHotfixFile = ""
 	// Discard the multi-file execution graph (Phase 9B). The MutationSet it
 	// owned was rolled back above.
 	m.activeGraph = nil

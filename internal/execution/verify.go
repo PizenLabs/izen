@@ -2,6 +2,7 @@ package execution
 
 import (
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -228,6 +229,13 @@ type Verifier struct {
 	steps  []VerificationStep
 	langID language.ID
 	auth   *authorization.MutationAuthorization
+	// explicit records whether `steps` was supplied by an operator through
+	// SetCustomSteps rather than DERIVED from a language definition. An
+	// explicitly supplied contract is itself an authority: the per-target
+	// artifact-identity seam refines DERIVED contracts and leaves explicit ones
+	// exactly as given. Silently replacing an injected contract with a derived
+	// one would make the injection a lie.
+	explicit bool
 }
 
 func (v *Verifier) SetAuthorization(auth *authorization.MutationAuthorization) {
@@ -327,14 +335,119 @@ func stepsForLanguage(langID language.ID) []VerificationStep {
 func (v *Verifier) SetLanguage(langID language.ID) {
 	v.langID = langID
 	v.steps = stepsForLanguage(langID)
+	v.explicit = false
 }
 
+// SetCustomSteps binds an EXPLICIT verification contract. It is the operator's
+// authority for this gate and is never overridden by per-target artifact
+// identity resolution: an injected contract answers for every target it is
+// asked about, by construction.
 func (v *Verifier) SetCustomSteps(steps []VerificationStep) {
 	v.steps = steps
+	v.explicit = true
 }
 
+// TargetLanguage reports the language identity the verification gate uses for a
+// workspace-relative target.
+//
+// This is the Artifact Identity rule (Workspace Contract §27): "Verification
+// must correspond to the actual artifact or operation. A CSS file must not
+// inherit an HTML verification identity merely because the files belong to the
+// same task." The verifier is constructed once per workspace from the
+// workspace's PRIMARY language, which is a property of the ENCLOSING project,
+// not of any individual target. Two mutations of different artifact types in
+// one run therefore shared a single contract unless the gate is told which file
+// it is verifying.
+//
+// TargetLanguage resolves the language from the target's OWN observable
+// identity — its file extension, resolved through the existing language
+// registry. It never consults the enclosing target, the prompt, or any
+// benchmark vocabulary. A target whose extension the registry does not know
+// carries NO determinable language, so the workspace language is the
+// workspace-level fallback and nothing more; it is never a substitute for a
+// determinable identity.
+func (v *Verifier) TargetLanguage(target string) language.ID {
+	if strings.TrimSpace(target) != "" {
+		if def, ok := language.Global().FromExtension(filepath.Ext(target)); ok {
+			return def.ID
+		}
+	}
+	return v.langID
+}
+
+// stepsForTarget resolves the verification contract that belongs to THIS
+// target. It returns the contract together with the language identity it was
+// derived from, and a determinable flag reporting whether the target carried
+// its own language identity at all.
+//
+// The distinction matters: a target with a determinable language whose
+// registry definition declares NO verification commands must report NOT
+// APPLICABLE. Falling back to the enclosing workspace's contract in that case
+// is precisely the identity leak this seam exists to close (a styles.css target
+// must not be compiled with the workspace's Go commands).
+func (v *Verifier) stepsForTarget(target string) (steps []VerificationStep, langID language.ID, determinate bool) {
+	if v.explicit {
+		// An explicitly bound contract is the operator's authority. Per-target
+		// identity resolution refines DERIVED contracts only.
+		return v.steps, v.langID, false
+	}
+	own := v.languageOf(target)
+	if own == "" {
+		// No language identity on the target itself.
+		return nil, v.langID, false
+	}
+	return stepsForLanguage(own), own, true
+}
+
+// languageOf resolves ONLY the target's own extension identity, with no
+// workspace fallback. An unknown extension yields the empty ID, which is the
+// honest "this target carries no determinable language" answer.
+func (v *Verifier) languageOf(target string) language.ID {
+	if strings.TrimSpace(target) == "" {
+		return ""
+	}
+	if def, ok := language.Global().FromExtension(filepath.Ext(target)); ok {
+		return def.ID
+	}
+	return ""
+}
+
+// RunAllFor runs the verification gate for ONE specific target, resolving the
+// verification contract from that target's own artifact identity.
+//
+// It is the same gate RunAll performs; the target is simply supplied so the
+// contract is chosen per artifact instead of per workspace. A target with no
+// determinable language falls back to the workspace contract, exactly like
+// RunAll.
+func (v *Verifier) RunAllFor(target string) VerificationReport {
+	if v == nil {
+		return VerificationReport{Skipped: true, Reason: "no verifier configured"}
+	}
+	steps, langID, determinate := v.stepsForTarget(target)
+	if !determinate {
+		// No language identity on the target itself: answer for the enclosing
+		// workspace, because that is the only identity available.
+		return v.runSteps(v.steps, v.langID)
+	}
+	return v.runSteps(steps, langID)
+}
+
+// RunAll runs the verification gate for the verifier's bound language. Prefer
+// RunAllFor whenever the target being written is known: RunAll cannot choose a
+// per-artifact contract and therefore answers for the ENCLOSING workspace.
 func (v *Verifier) RunAll() VerificationReport {
-	if len(v.steps) == 0 {
+	if v == nil {
+		return VerificationReport{Skipped: true, Reason: "no verifier configured"}
+	}
+	return v.runSteps(v.steps, v.langID)
+}
+
+// runSteps executes one resolved verification contract and reports the outcome.
+// An empty contract is NOT APPLICABLE — semantically distinct from a pass and
+// from a failure: nothing ran, nothing claimed, nothing rolled back (Phase 7
+// P1). Go verification is NEVER an implicit fallback.
+func (v *Verifier) runSteps(steps []VerificationStep, langID language.ID) VerificationReport {
+	if len(steps) == 0 {
 		// No verification contract exists for this target (unknown language or
 		// a language definition with an empty Verification config). Report the
 		// gate as NOT APPLICABLE — semantically distinct from a pass and from a
@@ -342,14 +455,14 @@ func (v *Verifier) RunAll() VerificationReport {
 		// P1). Go verification is NEVER an implicit fallback.
 		return VerificationReport{
 			Skipped: true,
-			Reason:  "no verification configured for language " + string(v.langID),
+			Reason:  "no verification configured for language " + string(langID),
 		}
 	}
 
 	var report VerificationReport
 	report.Passed = true
 
-	for _, step := range v.steps {
+	for _, step := range steps {
 		result := v.runStep(step)
 		// Populate SyntaxErrors for the micro-fix loop.
 		if !result.Passed {
