@@ -206,6 +206,17 @@ type Driver struct {
 	// run for this lifecycle, so a resumed or re-driven loop does not re-invalidate
 	// the context the current attempt is already using.
 	grantContextSynced bool
+
+	// behavior is the behavioral execution-and-observation stage. It is nil unless
+	// a reasoning backend was wired, which is what keeps every read-only objective
+	// and every existing test on exactly the pre-stage path. When present it
+	// observes the workspace's real runtime and drives evidence-driven repair
+	// through the SAME execution authority — it is a consumer, never a second
+	// authority.
+	behavior *BehaviorStage
+	// lastBehavior is the most recent behavioral stage result, retained so a
+	// terminal reason can name the evidence behind it.
+	lastBehavior BehaviorResult
 }
 
 // MaxContractRecoveryAttempts bounds how many times one execution lifecycle
@@ -456,6 +467,11 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// gate the context of an entirely different one.
 	d.grants.reset()
 	d.grantContextSynced = false
+	// A fresh run is a fresh behavioral lifecycle. Carrying the previous run's
+	// verdict forward would let one run's PROVEN observation stand in for
+	// another's, which is the exact split-brain the behavioral gate exists to
+	// prevent.
+	d.lastBehavior = BehaviorResult{}
 	d.runRequestID = fmt.Sprintf("run-%d", d.runID)
 	d.loop.Start("user objective: " + objective)
 	d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
@@ -1427,6 +1443,19 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// that returned, a step that came back nil and a verifier that
 			// merely ran are structurally incapable of producing it.
 			d.authorizeObjectiveCompletion(&decision)
+			// ── BEHAVIORAL PROOF GATE ───────────────────────────────────
+			// An objective that asks for a verifiable RESULT cannot be declared
+			// complete on the strength of an applied mutation alone. The workspace
+			// must be observed RUNNING and its observable requirements PROVEN.
+			//
+			// This gate runs AFTER the completion authority so it can only ever
+			// REMOVE a completion, never grant one: the existing authority decides
+			// whether the mutation contract was satisfied, and this decides whether
+			// the objective's behavioural claim is. An objective that does not
+			// require behavioural proof (a read, a document write) is untouched,
+			// and a run with no behavioral stage wired keeps its exact prior
+			// behaviour.
+			d.authorizeBehavioralCompletion(ctx, &decision)
 			// ── PHASE 15: CONTRACT RECOVERY CIRCUIT BREAKER ───────────────
 			// A prose-only response is repromptable, but only a bounded number
 			// of times. Once the bound is spent the proposed repair is rewritten

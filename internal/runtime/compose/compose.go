@@ -44,6 +44,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/git"
+	"github.com/PizenLabs/izen/internal/infrastructure/capabilities"
 	"github.com/PizenLabs/izen/internal/knowledge"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/lea"
@@ -621,6 +622,13 @@ func Wire(opts ...Option) (*Application, error) {
 	a.Executor = execution.NewRuntimeExecutor(a.Inputs.Root, a.Inputs.Config, a.provider, a.Bus, a.Inputs.LanguageID)
 	a.Executor.SetContextCompiler(a.Compiler)
 	a.Gateway = execution.NewIntentGateway(a.Inputs.Root)
+	// The behavioral runtime observes the workspace's REAL runtime (serve →
+	// readiness → fetch → probe subresources → structural audit) and drives
+	// evidence-driven repair back through this same executor. Binding the
+	// executor's command port here is what makes a behavioral command pass the
+	// SAME authorization and sandbox gates as a build or test command, rather
+	// than becoming a second, quieter execution path.
+	a.Executor.SetShellPort(capabilities.NewExecShell(behaviorCommandTimeout))
 	// ── CONTEXT DOMAIN (Phase 11.x) ─────────────────────────────────────
 	// The Context Pipeline reuses the executor's existing OCC hashing for its
 	// workspace snapshot port; it owns no filesystem or execution code. The
@@ -836,6 +844,10 @@ func Wire(opts ...Option) (*Application, error) {
 	// layer only projects those events.
 	adapter := runtimeAutonomy.NewExecutorAdapter(root, a.Gateway, a.Executor)
 	adapter.SetAuthority(a.Authority)
+	// The behavioral stage derives its capability grant from the SAME capability
+	// set the PolicyEngine adjudicates against, so a behavioral repair can never
+	// be granted more than the Control Plane already permits.
+	adapter.SetCapabilities(a.Caps)
 	a.Autonomous = runtimeAutonomy.NewDriver(
 		adapter,
 		a.Bus,
@@ -855,6 +867,20 @@ func Wire(opts ...Option) (*Application, error) {
 		// determined, so the plan is scoped to the mutation surface and
 		// unmodified sections are pruned (never a naive line slicer).
 		runtimeAutonomy.WithManifestPass(runtimeAutonomy.ManifestPassForExecutor(a.Executor)),
+		// BEHAVIORAL STAGE: the runtime's execution-and-observation half. The
+		// repair proposer is wired over the SAME provider the executor already
+		// uses, so behavioral repair joins the existing reasoning path instead of
+		// creating a parallel one.
+		runtimeAutonomy.WithBehaviorProposer(&execution.ProviderRepairProposer{
+			Provider: provider,
+			// The repair runs on the model the Workspace Target authority
+			// currently holds, resolved per call. An unassigned target model is a
+			// refusal, never a silent fallback to some other model.
+			ResolveModel: func() string {
+				ref := a.Authority.ActiveModel()
+				return strings.TrimSpace(ref.ID)
+			},
+		}),
 	)
 	// ── AUTONOMY BOUNDARY-TELEMETRY SINK ─────────────────────────────────
 	// [boundary2]/[boundary5] diagnostic lines are routed onto the shared
@@ -890,6 +916,11 @@ func Wire(opts ...Option) (*Application, error) {
 
 	return a, nil
 }
+
+// behaviorCommandTimeout bounds one command the behavioral runtime issues.
+// The behavioral runtime exists to observe; a command that never returns would
+// turn observation into a hang.
+const behaviorCommandTimeout = 60 * time.Second
 
 // FlushAudit performs the blocking, synchronous audit flush for session
 // finalization: it drains every accepted envelope and fsyncs

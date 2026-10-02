@@ -22,6 +22,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/domain/capability/policy"
+	"github.com/PizenLabs/izen/internal/domain/ports"
 	"github.com/PizenLabs/izen/internal/events"
 	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
 	"github.com/PizenLabs/izen/internal/execution/ingestion"
@@ -554,6 +555,11 @@ type RuntimeExecutor struct {
 	verifier  *Verifier
 	auth      *authorization.MutationAuthorization
 	admission *AdmissionGateway
+	// shellPort is the authorized command port shared by every component that
+	// executes commands on the workspace, so a behavioral command is gated
+	// exactly like a build or test command. Nil means no authority is bound,
+	// which is reported rather than bypassed.
+	shellPort ports.ShellPort
 	// sessionResolver resolves the active originating session at admission when
 	// the request does not carry one (INV-SESSION-10). It is atomically swapped
 	// by the composition root so admission can run before any executor mutex is

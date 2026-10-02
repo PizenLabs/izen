@@ -23,6 +23,8 @@ import (
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/contextcompiler"
+	"github.com/PizenLabs/izen/internal/core/domain"
+	domaincap "github.com/PizenLabs/izen/internal/domain/capability"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
@@ -58,6 +60,11 @@ type ExecutorAdapter struct {
 	gateway   *execution.IntentGateway
 	executor  *execution.RuntimeExecutor
 	authority *runtime.RuntimeAuthority
+	// caps is the workspace capability set the behavioral capability grant is
+	// derived from. It is bound at composition time and is the same set the
+	// PolicyEngine adjudicates against, so the grant can never exceed what the
+	// Control Plane already permits.
+	caps *domaincap.CapabilitySet
 }
 
 // NewExecutorAdapter wires the adapter over the unified IntentGateway and the
@@ -74,6 +81,60 @@ func (a *ExecutorAdapter) SetAuthority(auth *runtime.RuntimeAuthority) {
 		return
 	}
 	a.authority = auth
+}
+
+// ── Behavioral stage seams ─────────────────────────────────────────────────
+//
+// These three methods are the ONLY surface the behavioral stage uses. They exist
+// so the stage reaches the existing authority rather than growing its own:
+//
+//   - the capability set, to derive the capability grant;
+//   - the executor's shell port, so behavioral commands pass the SAME
+//     authorization and sandbox gates as every other command;
+//   - the executor's mutation authorization, so a behavioral repair passes the
+//     SAME gate as any other write.
+
+// SetCapabilities binds the workspace capability set the behavioral grant is
+// derived from. The set is IZEN's existing authorization state; the grant is
+// only ever a projection of it.
+func (a *ExecutorAdapter) SetCapabilities(caps *domaincap.CapabilitySet) {
+	if a == nil {
+		return
+	}
+	a.caps = caps
+}
+
+// grantSnapshot returns the bound capability set. The second return is false
+// when no set is bound, which the stage treats as AUTHORIZATION_BLOCKED rather
+// than defaulting to read access.
+func (a *ExecutorAdapter) grantSnapshot(domain.ScopeProvenance) (*domaincap.CapabilitySet, bool) {
+	if a == nil || a.caps == nil {
+		return nil, false
+	}
+	return a.caps, true
+}
+
+// BindShellPort wires the executor's authorized shell port onto a behavioral
+// runtime, so a command the behavioral runtime issues is gated exactly like one
+// issued anywhere else in IZEN.
+func (a *ExecutorAdapter) BindShellPort(rt *execution.BehavioralRuntime) {
+	if a == nil || rt == nil || a.executor == nil {
+		return
+	}
+	if port := a.executor.ShellPort(); port != nil {
+		rt.SetShellPort(port)
+	}
+}
+
+// AuthorizeMutation is the Control Plane gate every behavioral repair target must
+// pass before a proposal may be written. It delegates to the executor's own
+// authorization check, so the behavioral stage cannot authorize a write the rest
+// of the runtime would refuse.
+func (a *ExecutorAdapter) AuthorizeMutation(target string) error {
+	if a == nil || a.executor == nil {
+		return errors.New("autonomy: no execution authority is bound to authorize a behavioral repair")
+	}
+	return a.executor.AuthorizeMutationTarget(target)
 }
 
 // Root returns the workspace root the adapter resolves targets against. It is
