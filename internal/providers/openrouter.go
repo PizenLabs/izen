@@ -42,34 +42,86 @@ const DefaultOpenRouterModel = "anthropic/claude-3.5-sonnet"
 // genuine permission refusal is a configuration problem the user must see.
 var ErrOpenRouterModelIncompatible = errors.New("openrouter: model unavailable for Izen's current OpenRouter execution path")
 
-// promoteAgenticWireContract performs the adaptive runtime promotion for
-// agentic-harness models: when the target model requires a tool schema on the
-// wire and the request carries none (e.g. a DirectCompletion /ask request), it
-// elevates the interaction contract to ToolEnabledCompletion and attaches
-// IZEN's authentic read-only tools. Standard models are untouched so
-// DirectCompletion keeps its lower token overhead.
+// promoteAgenticWireContract attaches IZEN's authentic read-only capability tools to a
+// request whose canonical interaction contract is tool-bearing.
 //
-// It is a no-op when tools are already present or the existing contract is
-// already tool-bearing.
+// THE CONTRACT IS THE AUTHORITY. internal/protocol derives the wire tools flag as
+//
+//	tools := contract == ToolEnabledCompletion || contract == AgenticLoop
+//
+// (protocol/contract.go:388), and AllowsCapability(CapabilityTool) admits exactly those
+// two contracts (protocol/contract.go:662). The $prompt mutation lane runs under
+// AgenticLoop (execution/executor.go:1332, runtime/autonomy/driver.go:539), so the
+// canonical contract for that path has ALWAYS declared tool-bearing capability access.
+// Honoring it here is what makes the capability request surface real rather than
+// theoretical.
+//
+// A provider wire policy remains an INDEPENDENT, ADDITIONAL trigger: a model whose
+// provider refuses a toolless request must still receive tools even when the caller
+// negotiated a text contract. That is a wire-compatibility concern and it never
+// grants authority the contract withheld.
+//
+// It is a no-op when tools are already present or the existing contract already
+// carries them (structured completion cannot carry both a schema and tools).
 func promoteAgenticWireContract(req ai.Request, model string) ai.Request {
 	if len(req.Tools) > 0 {
 		return req
 	}
-	if !oregistry.RequiresAgenticHarnessWire("openrouter", model) {
+	if !contractIsToolBearing(req) && !oregistry.RequiresAgenticHarnessWire("openrouter", model) {
 		return req
 	}
 	switch req.InteractionContract {
 	case "", protocol.DirectCompletion:
+		// DirectCompletion is deliberately read-only and tool-free. A model that
+		// cannot serve it is a wire-policy problem the registry handles, not a
+		// reason to silently elevate a read-only contract to a propose contract.
+		if !oregistry.RequiresAgenticHarnessWire("openrouter", model) {
+			return req
+		}
 	default:
-		// Tool-enabled and agentic loops already carry tools; structured-
-		// completion keeps its schema contract (can't carry both).
-		return req
+		// Tool-enabled and agentic loops already carry tools; structured
+		// completion keeps its schema contract (it cannot carry both).
+		if req.InteractionContract != protocol.AgenticLoop {
+			return req
+		}
 	}
 	descriptor := protocol.Describe(protocol.ToolEnabledCompletion)
 	req.InteractionContract = descriptor.Contract
 	req.Contract = &descriptor
 	req.Tools = ai.ReadOnlyTools()
 	return req
+}
+
+// contractIsToolBearing reports whether the request's canonical interaction contract
+// declares tool-bearing capability access. It consults the runtime-chosen descriptor
+// first and falls back to the contract label, so a request that carries only a label
+// (the common adapter-bound shape) is still honored.
+func contractIsToolBearing(req ai.Request) bool {
+	if d := req.Contract; d != nil && d.Tools {
+		return true
+	}
+	return req.InteractionContract == protocol.ToolEnabledCompletion ||
+		req.InteractionContract == protocol.AgenticLoop
+}
+
+// capabilityToolsWire reports whether this invocation must run the bounded
+// read-only capability tool loop.
+//
+// The loop is the runtime's model→capability→observation→model boundary
+// (internal/ai/toolloop.go). It runs whenever the canonical interaction contract
+// declares tool-bearing access and a Control-Plane-authorized tool runner is wired —
+// for EVERY model, not only the handful whose provider requires a tool schema.
+//
+// The tool runner is the authorization boundary: it refuses any capability the grant
+// does not cover, and every call it does admit is recorded as evidence. A model
+// therefore cannot widen its own capability surface by asking for one.
+func capabilityToolsWire(req ai.Request, model string) bool {
+	if req.InteractionContract == protocol.StructuredCompletion {
+		// Structured completion owns a JSON schema contract; it cannot also carry
+		// a tool loop without losing the schema the plan parser depends on.
+		return false
+	}
+	return contractIsToolBearing(req) || oregistry.RequiresAgenticHarnessWire("openrouter", model)
 }
 
 // asCompatibilityError classifies a non-OK inference response for a dispatched
@@ -262,17 +314,18 @@ func (p *OpenRouterProvider) resolveAPIKey() string {
 	return ""
 }
 
-// Execute performs one logical OpenRouter invocation. Agentic-harness models
-// run the adaptive read-only tool loop when a runner is available; every other
-// model runs a single request. The wire contract is promoted before dispatch in
-// both cases, so an agentic model never receives a toolless request.
+// Execute performs one logical OpenRouter invocation. It runs the bounded read-only
+// capability tool loop whenever the canonical interaction contract is tool-bearing and
+// a Control-Plane-authorized tool runner is wired; every other request runs a single
+// shot. The wire contract is promoted before dispatch in both cases, so a model that
+// can request capabilities never receives a toolless request.
 func (p *OpenRouterProvider) Execute(ctx context.Context, req ai.Request) (*ai.Response, error) {
 	model, err := p.resolveModel(req.Model)
 	if err != nil {
 		return nil, err
 	}
 	req = promoteAgenticWireContract(req, model)
-	if p.toolRunner != nil && oregistry.RequiresAgenticHarnessWire("openrouter", model) {
+	if p.toolRunner != nil && capabilityToolsWire(req, model) {
 		return ai.RunReadOnlyToolLoop(ctx, p.executeOnce, p.toolRunner, req, ai.ToolLoopOptions{})
 	}
 	return p.executeOnce(ctx, req)
@@ -391,15 +444,16 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 	if err != nil {
 		return nil, err
 	}
-	// Dynamic Contract Promotion: an agentic-harness model is executed
-	// natively — the contract is promoted to ToolEnabledCompletion and
-	// IZEN's authentic read-only tools are attached before dispatch. There is
-	// no local pre-flight guard and no model reversion on this path.
+	// Dynamic Contract Promotion: a tool-bearing contract is dispatched natively
+	// with IZEN's authentic read-only capability tools attached, and an
+	// agentic-harness model that requires a tool schema gets one even when the
+	// caller negotiated a text contract. There is no local pre-flight guard and no
+	// model reversion on this path.
 	req = promoteAgenticWireContract(req, model)
-	// Agentic-harness models: execute the bounded read-only tool loop
-	// in-process and surface the final answer as a one-shot stream. This keeps
-	// /ask working for models whose provider requires a tool schema.
-	if p.toolRunner != nil && oregistry.RequiresAgenticHarnessWire("openrouter", model) {
+	// Tool-bearing contracts: execute the bounded read-only capability tool loop
+	// in-process and surface the final answer as a one-shot stream. This is the
+	// model→capability→observation→model boundary for the mutation lane.
+	if p.toolRunner != nil && capabilityToolsWire(req, model) {
 		resp, loopErr := ai.RunReadOnlyToolLoop(ctx, p.executeOnce, p.toolRunner, req, ai.ToolLoopOptions{})
 		if loopErr != nil {
 			return nil, loopErr
@@ -758,11 +812,13 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 	// minimal casual contract, tools MUST be omitted entirely (not even an empty
 	// array). Defensive: even if caller erroneously sets Tools, drop them.
 	//
-	// EXCEPTION (adaptive runtime): an agentic-harness model rejects a toolless
-	// request with HTTP 403 regardless of the prompt profile, so the read-only
-	// tool schema must survive even on a casual turn.
+	// EXCEPTIONS (both are contract- or wire-derived, never model-derived):
+	//   - a tool-bearing canonical interaction contract, which declared its
+	//     capability access before the prompt was assembled;
+	//   - an agentic-harness model, which the provider refuses to serve with a
+	//     toolless request regardless of prompt profile.
 	agenticWire := oregistry.RequiresAgenticHarnessWire("openrouter", model)
-	if isCasualSystemPrompt(req.System) && !agenticWire {
+	if isCasualSystemPrompt(req.System) && !agenticWire && !contractIsToolBearing(req) {
 		body.Tools = nil
 	} else if len(req.Tools) > 0 {
 		rawTools := make([]json.RawMessage, 0, len(req.Tools))

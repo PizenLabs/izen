@@ -1796,6 +1796,27 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				req.InteractionContract = activeContract
 				req.Contract = cloneContract(activeDescriptor)
 			}
+			// ── OBJECTIVE-LEVEL POST-EXECUTION OBSERVATION ────────────────
+			// A repair is a NEW AUTHORIZED COMPUTATION, so the model must be able
+			// to reason from what the workspace actually looks like NOW rather
+			// than from the artifact-format diagnostic alone.
+			//
+			// Before this, a recovery re-prompt carried at most 512 bytes of
+			// validation text (adapter.diagnosticEvidence) and deliberately
+			// withheld response bytes. That is correct for format recovery but
+			// insufficient for an objective repair: the question the model must
+			// answer is "what changed", and only a live read can answer it.
+			//
+			// The observation is:
+			//   - READ-ONLY, so it can never mutate;
+			//   - GRANT-AUTHORIZED, via the same GrantFor projection the
+			//     behavioural stage uses — no bound capability set means no
+			//     observation, never a default read;
+			//   - BOUNDED to the DECLARED target set, so a recovery can never
+			//     widen its own scope by observing something it was not granted;
+			//   - FACTS ONLY: bytes/lines/evidence identity. It is not the
+			//     artifact, not the rejected output, and never a completion claim.
+			req.Evidence = joinEvidence(req.Evidence, d.observeDeclaredTargets(ctx))
 			// Child attempt identity: parent run ID plus attempt number.
 			if req.RecoveryAttempt > 0 {
 				req.RequestID = fmt.Sprintf("%s-attempt-%d", d.runRequestID, req.RecoveryAttempt)
@@ -1829,6 +1850,44 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 		}
 	}
 	return d.term(), nil
+}
+
+// observeDeclaredTargets renders the CURRENT on-disk state of every DECLARED
+// target as bounded observation evidence for a repair re-prompt.
+//
+// AUTHORITY. It uses the same grant derivation the behavioural observation stage
+// uses (execution.GrantFor over the bound capability set), so it can never observe
+// more than the Control Plane already granted. A driver with no bound capability
+// set observes nothing and says so, rather than defaulting to read access.
+//
+// SCOPE. Only d.objectiveTargets() is observed — the declared target set. A repair
+// therefore cannot widen its own scope by inspecting something outside it.
+//
+// TRUTH. The facts are what the workspace reports right now: whether the target
+// exists, how many bytes and lines it has, and the capability evidence identity
+// that produced the reading. It carries no completion claim and no artifact bytes.
+func (d *Driver) observeDeclaredTargets(ctx context.Context) string {
+	if d == nil || d.adapter == nil {
+		return ""
+	}
+	targets := d.objectiveTargets()
+	if len(targets) == 0 {
+		return ""
+	}
+	auth := d.adapter.ObservationAuthority(d.scopeProvenance())
+	if auth == nil {
+		return "[POST-EXECUTION OBSERVATION unavailable: no capability set is bound to this run]"
+	}
+	var b strings.Builder
+	b.WriteString("[POST-EXECUTION OBSERVATION — current workspace state of the declared targets]")
+	for _, t := range targets {
+		b.WriteString("\n")
+		b.WriteString(auth.ObserveEvidence(ctx, t))
+	}
+	if d.bus != nil {
+		d.bus.Publish(events.NewActivity("[loop] post-execution observation captured for repair re-prompt"))
+	}
+	return b.String()
 }
 
 func (d *Driver) step(ctx context.Context, decision autonomy.LoopDecision) (autonomy.RuntimeState, error) {

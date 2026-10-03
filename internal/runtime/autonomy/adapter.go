@@ -125,6 +125,36 @@ func (a *ExecutorAdapter) BindShellPort(rt *execution.BehavioralRuntime) {
 	}
 }
 
+// ObservationAuthority returns the grant-authorized READ-ONLY observation surface
+// for this workspace: the capability vocabulary the Control Plane has already
+// granted, bound to the canonical capability layer.
+//
+// This exists because the capability layer's only production consumer was the
+// behavioural stage, which the driver engages through a substring heuristic over
+// the objective text. Post-execution observation must not depend on English word
+// choice, so the driver derives the same GrantFor projection the behavioural stage
+// uses and observes through it.
+//
+// The returned authority holds no authority of its own: it cannot widen a Grant,
+// and every call is authorized by capability.Runner before the disk is touched.
+// A caller with no bound capability set gets nil, which the driver treats as
+// "observation unavailable" rather than as permission.
+func (a *ExecutorAdapter) ObservationAuthority(provenance domain.ScopeProvenance) *execution.CapabilityAuthority {
+	if a == nil || a.root == "" {
+		return nil
+	}
+	caps, ok := a.grantSnapshot(provenance)
+	if !ok {
+		return nil
+	}
+	// No bus is threaded through this adapter: it is a capability-execution seam,
+	// not an event source. Evidence still travels — capability.Evidence is
+	// returned to the caller on every call — and the driver publishes it.
+	auth := execution.NewCapabilityAuthority(a.root, nil)
+	auth.SetGrant(execution.GrantFor(provenance, caps))
+	return auth
+}
+
 // AuthorizeMutation is the Control Plane gate every behavioral repair target must
 // pass before a proposal may be written. It delegates to the executor's own
 // authorization check, so the behavioral stage cannot authorize a write the rest

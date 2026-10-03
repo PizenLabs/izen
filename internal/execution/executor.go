@@ -670,16 +670,33 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 	} else {
 		x.verifier = NewVerifier(root)
 	}
-	// Inject the execution-pipeline read-only tool runner into providers that
-	// accept one, enabling the adaptive tool loop for agentic-harness models.
+	// Inject the model-facing capability runner into providers that accept one.
+	//
+	// This is the model→capability→observation→model boundary. The runner is
+	// NOT the bare filesystem reader: it authorizes every call against this
+	// executor's own admission capability vector and records a capability.Evidence
+	// record per execution, so a capability the model requested is both
+	// Control-Plane-governed and auditable.
 	if provider != nil {
 		if setter, ok := provider.(interface {
 			SetToolRunner(ai.ToolRunner)
 		}); ok {
-			setter.SetToolRunner(NewReadOnlyToolRunner(root))
+			setter.SetToolRunner(x.capabilityTools())
 		}
 	}
 	return x
+}
+
+// capabilityTools builds the model-facing capability runner bound to THIS executor's
+// live admission capability vector and event bus.
+//
+// Reading the vector through a closure (rather than copying it) is deliberate: the
+// Control Plane may re-grant or restrict capabilities via SetAdmittedCapabilities, and
+// the next model capability request must observe that without rewiring the provider.
+func (x *RuntimeExecutor) capabilityTools() *CapabilityToolRunner {
+	return NewCapabilityToolRunner(x.root, func() AdmittedCapabilities {
+		return x.AdmittedCapabilities()
+	}, x.bus)
 }
 
 // invalidateSnapshot purges the observe snapshot cache keys for target. It is
@@ -961,16 +978,16 @@ func (x *RuntimeExecutor) resolveSessionID(req ExecuteRequest) string {
 
 // SetProvider re-binds the provider (provider switching is a runtime concern).
 //
-// Providers that accept read-only tools receive the execution-pipeline runner
-// so agentic-harness models can execute their tool calls and complete the
-// answer in-process. The injection is transparent through the context-compiler
-// facade.
+// Providers that accept capability tools receive the Control-Plane-authorized
+// runner, so a model that requests an inspection capability gets it executed
+// against the live workspace under this executor's admission vector and recorded
+// as evidence. The injection is transparent through the context-compiler facade.
 func (x *RuntimeExecutor) SetProvider(p ai.Provider) {
 	if p != nil {
 		if setter, ok := p.(interface {
 			SetToolRunner(ai.ToolRunner)
 		}); ok {
-			setter.SetToolRunner(NewReadOnlyToolRunner(x.root))
+			setter.SetToolRunner(x.capabilityTools())
 		}
 	}
 	x.mu.Lock()
