@@ -65,25 +65,45 @@ func TestRenderLicenseFallback(t *testing.T) {
 	}
 }
 
-func TestSynthesizeBuildTodosFromMutation_StaticWebsite(t *testing.T) {
-	content := "i want to create a static website with html css and js"
-	todos := synthesizeBuildTodosFromMutation(content)
-	if len(todos) != 3 {
-		t.Fatalf("expected 3 todos, got %d", len(todos))
+// TestSynthesizeBuildTodosFromMutation_NoHardcodedFilenames pins the §13 boundary.
+//
+// This test used to REQUIRE that a "static website" objective produce three tasks
+// naming index.html, styles.css and script.js. That is `html -> index.html` target
+// mapping: benchmark-specific intelligence baked into production presentation code,
+// guessing a workspace layout from an English phrase. It has been removed, and this
+// test now asserts its absence for every wording — including the exact wording that
+// used to trigger it.
+func TestSynthesizeBuildTodosFromMutation_NoHardcodedFilenames(t *testing.T) {
+	markupWordings := []string{
+		"i want to create a static website with html css and js",
+		"build a static website",
+		"html css js",
+		"redesign the portfolio website including styles and scripts",
+		"create index.html, styles.css and script.js",
 	}
-	for _, todo := range todos {
-		if !strings.Contains(todo, "[FILE_MUTATE]") {
-			t.Errorf("expected FILE_MUTATE in todo, got: %s", todo)
+	forbidden := []string{"index.html", "styles.css", "script.js", "style.css"}
+
+	for _, content := range markupWordings {
+		todos := synthesizeBuildTodosFromMutation(content)
+		if len(todos) != 1 {
+			t.Fatalf("%q: expected exactly one domain-neutral task, got %d: %v", content, len(todos), todos)
 		}
-	}
-	if !strings.Contains(todos[0], "index.html") {
-		t.Errorf("expected first todo to reference index.html, got: %s", todos[0])
-	}
-	if !strings.Contains(todos[1], "styles.css") {
-		t.Errorf("expected second todo to reference styles.css, got: %s", todos[1])
-	}
-	if !strings.Contains(todos[2], "script.js") {
-		t.Errorf("expected third todo to reference script.js, got: %s", todos[2])
+		if !strings.Contains(todos[0], "[FILE_MUTATE]") {
+			t.Errorf("%q: expected FILE_MUTATE in task, got: %s", content, todos[0])
+		}
+		if !strings.Contains(todos[0], content) {
+			t.Errorf("%q: task must carry the original intent, got: %s", content, todos[0])
+		}
+		// The runtime's OWN prefix must never name a file. The objective text is
+		// echoed verbatim — if the HUMAN wrote "index.html", that is their target,
+		// not an inference — so only the runtime-authored portion is asserted on.
+		prefix := strings.TrimSuffix(todos[0], content)
+		for _, f := range forbidden {
+			if strings.Contains(prefix, f) {
+				t.Errorf("%q: runtime must never infer the target filename %q from the objective wording; prefix: %q",
+					content, f, prefix)
+			}
+		}
 	}
 }
 

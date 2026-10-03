@@ -54,11 +54,12 @@ func TestIsQuietTraceTextPatterns(t *testing.T) {
 	}
 }
 
-// TestBuildQuietTraceLineFormat pins the single muted per-turn summary line:
-// "▸ Trace: direct_response (21ms) · Alt+E to toggle".
+// TestBuildQuietTraceLineFormat pins the single muted per-turn summary line. The
+// summary REPORTS the runtime's recorded decision and its measured duration; it
+// never substitutes a default for either.
 func TestBuildQuietTraceLineFormat(t *testing.T) {
 	got := buildQuietTraceLine("[AUTONOMY DECISION]\n  decision    : ◇ direct_response (no work)")
-	want := "▸ Trace: direct_response (21ms) · Alt+E to toggle"
+	want := "▸ Trace: direct_response · Alt+E to toggle"
 	if got != want {
 		t.Errorf("buildQuietTraceLine = %q, want %q", got, want)
 	}
@@ -69,6 +70,32 @@ func TestBuildQuietTraceLineFormat(t *testing.T) {
 	}
 	if !strings.HasPrefix(gotEvent, "▸ Trace: ") || !strings.Contains(gotEvent, "Alt+E to toggle") {
 		t.Errorf("buildQuietTraceLine format wrong: %q", gotEvent)
+	}
+}
+
+// TestBuildQuietTraceLineNeverFabricatesADecision is the invariant behind
+// removing the hardcoded default: a turn whose trace records no autonomy
+// verdict must SAY SO. Reporting "direct_response" for a turn that dispatched a
+// mutation is a false execution fact, and it is indistinguishable from a real
+// conversational verdict once rendered.
+func TestBuildQuietTraceLineNeverFabricatesADecision(t *testing.T) {
+	for _, trace := range []string{
+		"[event] PromptAdmitted intent=modification latency=8ms",
+		"[stage] mutation.completed index.html=applied",
+		"[approval] awaiting human for index.html",
+		"",
+	} {
+		got := buildQuietTraceLine(trace)
+		if strings.Contains(got, "direct_response") {
+			t.Errorf("buildQuietTraceLine(%q) = %q; fabricated a direct_response verdict for a turn that recorded none",
+				trace, got)
+		}
+		if !strings.Contains(got, "no verdict recorded") {
+			t.Errorf("buildQuietTraceLine(%q) = %q; want an explicit no-decision label", trace, got)
+		}
+		if strings.Contains(got, "21ms") {
+			t.Errorf("buildQuietTraceLine(%q) = %q; fabricated a duration for a turn that measured none", trace, got)
+		}
 	}
 }
 

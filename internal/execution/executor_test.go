@@ -108,11 +108,16 @@ func (c *eventCollector) waitHas(typ string, d time.Duration) bool {
 
 // trivialVerifier is a verifier whose single step is a real command that always
 // succeeds — a real verifier result, not a fabricated one.
+//
+// It is bound through SetCustomSteps, which marks the contract EXPLICIT. That is
+// the accurate description of what a test double is: an operator-injected gate,
+// not a contract derived from a workspace language. Explicit contracts are never
+// re-derived per target, so this double keeps answering for every artifact type
+// exactly as it always has.
 func trivialVerifier(root string) *Verifier {
-	return &Verifier{
-		root:  root,
-		steps: []VerificationStep{{Name: "noop", Command: "true", Optional: false}},
-	}
+	v := NewVerifier(root)
+	v.SetCustomSteps([]VerificationStep{{Name: "noop", Command: "true", Optional: false}})
+	return v
 }
 
 // namedMockProvider is an ai.Provider with a controllable identity + call

@@ -257,9 +257,14 @@ func (m *model) resumeAutonomousApprove() tea.Cmd {
 			m.Viewport.GotoBottom()
 			return nil
 		}
-		m.push(roleError, "[autonomous] authorization: "+err.Error())
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		// The refusal has already been reported and the gate closed by
+		// convergeAutonomousApproval; a second line here would only stack noise
+		// on a boundary that no longer exists.
+		if m.autonomousBoundary != nil {
+			m.push(roleError, "[autonomous] authorization: "+err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+		}
 		return nil
 	}
 	m.autonomousBoundary = nil
@@ -363,9 +368,13 @@ func (m *model) resumeAutonomousProposalApprove() tea.Cmd {
 			m.Viewport.GotoBottom()
 			return nil
 		}
-		m.push(roleError, "[autonomous] proposal authorization: "+err.Error())
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		// convergeAutonomousAuthorization already stated the refusal and closed
+		// the gate; a duplicate line here would only stack noise.
+		if m.autonomousBoundary != nil {
+			m.push(roleError, "[autonomous] proposal authorization: "+err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+		}
 		return nil
 	}
 	m.autonomousBoundary = nil
@@ -553,7 +562,15 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 				m.finalizeOperation(OpOutcomeFailure, nil)
 				m.renderAutonomousInformBoundary(b)
 			}
-			m.enterApprovalState()
+			// Only a boundary that actually asks a human for a DECISION arms the
+			// pending-approval workflow override. An informational park has no
+			// resume decision, so freezing the workflow as "awaiting
+			// authorization" would report a pause as a permission request.
+			if b.Resumable {
+				m.enterApprovalState()
+			} else {
+				m.resolveApprovalState()
+			}
 		} else {
 			m.finalizeOperation(OpOutcomeFailure, nil)
 		}
@@ -609,9 +626,30 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 // authorizeAutonomousApproval issues a MutationAuthorization over the parked
 // approval boundary's target files and attaches it to the executor the driver
 // shares, so ResumeApprove applies the held patch under governance.
+//
+// The token is bound to the boundary's MutationCandidate identity. Authorization
+// is therefore a statement about ONE artifact: a token opened for one candidate
+// can never apply another, and a boundary whose candidate the execution authority
+// no longer holds is refused here instead of at the mutation boundary.
+//
+// CONVERGENCE. Every refusal is terminal for this boundary. The parked approval
+// state is dropped so the same impossible authorization can never be requested
+// twice: human approval is the final authorization gate, not a retry loop around
+// a proposal the runtime already knows it cannot authorize.
 func (m *model) authorizeAutonomousApproval() error {
 	if m.executor == nil || m.authEngine == nil {
 		return nil
+	}
+	b := m.autonomousBoundary
+	// ── CANDIDATE FRESHNESS (lineage, re-checked at the release seam) ───
+	// The runtime's admission gate already refused an approval boundary whose
+	// candidate was not held at park time; this is the same read taken again at
+	// the moment of release, because a human answer takes unbounded time.
+	if b != nil && b.Action == autonomy.HumanBoundaryApproval && !m.executor.CandidateHeld(b.PatchID) {
+		m.convergeAutonomousAuthorization("mutation candidate " + b.PatchID +
+			" is no longer held by the execution authority — the computation that produced it failed, " +
+			"was superseded or was cancelled. No files were modified.")
+		return fmt.Errorf("candidate %s is no longer executable", b.PatchID)
 	}
 	// ── STAGED DAG HANDSHAKE (planning → building guard) ────────────────
 	// An approved DECOMPOSITION_PROPOSAL IS an authorized plan: the staged
@@ -620,7 +658,6 @@ func (m *model) authorizeAutonomousApproval() error {
 	// is requested — otherwise the guard rejects planning → building with
 	// "no authorized plan or micro-plan" even though the human just approved
 	// every sub-task.
-	b := m.autonomousBoundary
 	if m.orch != nil && b != nil && b.Action == autonomy.HumanBoundaryDecomposition && b.Proposal != nil {
 		if err := m.orch.BindAuthorizedMicroPlan(context.Background(), b.Proposal); err != nil {
 			return fmt.Errorf("micro-plan binding failed: %w", err)
@@ -660,22 +697,43 @@ func (m *model) authorizeAutonomousApproval() error {
 		return fmt.Errorf("workflow transition to building failed: %w", err)
 	}
 	var targets []string
+	candidateID := ""
 	if b != nil {
 		targets = b.Targets
+		candidateID = b.PatchID
 	}
-	auth, err := m.authEngine.AuthorizeBuild(
+	auth, err := m.authEngine.AuthorizeBuildCandidate(
 		targets,
 		m.caps,
 		m.mutationBudget,
 		m.microBudget,
 		false,
 		true, // human-approved: the developer pressed Alt+A on the boundary
+		candidateID,
 	)
 	if err != nil {
+		m.convergeAutonomousAuthorization("authorization refused: " + err.Error() +
+			". No files were modified; start a fresh run after resolving the refusal.")
 		return err
 	}
 	m.executor.SetAuthorization(auth)
 	return nil
+}
+
+// convergeAutonomousAuthorization is the terminal outcome of a refused
+// authorization: the parked approval state is released so the operator is not
+// invited to press Approve again for a mutation the runtime has already refused,
+// and the truthful reason is stated.
+func (m *model) convergeAutonomousAuthorization(reason string) {
+	m.autonomousBoundary = nil
+	m.autonomousActive = false
+	m.resolveApprovalState()
+	m.finalizeOperation(OpOutcomeFailure, nil)
+	m.unwindBuildFailure()
+	m.push(roleError, "[autonomous] "+reason)
+	m.push(roleSystem, infoStyle.Render("  The approval gate is closed. Start a fresh run (Ctrl+C to dismiss)."))
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
 }
 
 // navigateAutonomousBoundary moves the clarify-candidate highlight. delta is

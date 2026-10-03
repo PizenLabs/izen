@@ -1,12 +1,18 @@
+// Package boundary is the workspace-integrity ASSERTION surface.
+//
+// The rollback authority itself lives in exactly one place:
+// internal/execution.RollbackAndVerify, next to the MutationSet and the OCC
+// verifier it shares a digest with. This package is a thin re-export so a
+// caller that only needs the integrity assertion does not have to import the
+// execution authority — it is NOT a second implementation.
+//
+// It previously carried its own os.MkdirAll / os.WriteFile / os.Remove copy of
+// the restore loop, which made "the workspace was rolled back" obtainable
+// through a path that asserted nothing and was not covered by any architecture
+// guard. There is now one restore implementation and one digest assertion.
 package boundary
 
 import (
-	"fmt"
-	"log"
-	"os"
-	"path/filepath"
-	"sort"
-
 	"github.com/PizenLabs/izen/internal/execution"
 )
 
@@ -21,37 +27,12 @@ func AssertWorkspaceIntegrity(root string, targets []string, baseDigest string) 
 }
 
 // RollbackAndVerify restores originals and verifies digest, emitting the
-// canonical telemetry: [boundary] state rollback verified digest=<hash> match=<bool>.
+// canonical telemetry: [boundary] state rollback verified digest=<hash>
+// match=<bool>.
+//
+// It delegates to the single authoritative boundary rather than reimplementing
+// the restore loop, so the restore and the assertion that justifies it are one
+// operation owned by one component.
 func RollbackAndVerify(root string, targets []string, baseDigest string, originals map[string][]byte) error {
-	for _, t := range sortedKeys(originals) {
-		full := filepath.Join(root, filepath.FromSlash(t))
-		data := originals[t]
-		if data == nil {
-			_ = os.Remove(full)
-			continue
-		}
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			return fmt.Errorf("boundary: rollback mkdir %s: %w", t, err)
-		}
-		if err := os.WriteFile(full, data, 0o644); err != nil {
-			return fmt.Errorf("boundary: rollback write %s: %w", t, err)
-		}
-	}
-	b := execution.NewExecutionBoundary(root, targets)
-	err := b.AssertWorkspaceIntegrity(baseDigest)
-	// Ensure canonical log is emitted even if the boundary already logged it;
-	// duplicate line is acceptable for traceability.
-	if err == nil {
-		log.Printf("[boundary] state rollback verified digest=%s match=true", baseDigest)
-	}
-	return err
-}
-
-func sortedKeys(m map[string][]byte) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+	return execution.RollbackAndVerify(root, targets, baseDigest, originals)
 }

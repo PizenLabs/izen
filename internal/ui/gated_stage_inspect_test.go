@@ -54,9 +54,14 @@ func TestGatedExecutionDrivesTruthfulStage(t *testing.T) {
 // TestInspectRetainsRuntimeGraph pins P1 #6: a gated RuntimeExecutor result
 // retains the runtime-owned ExecutionProof + RuntimeGraph so $inspect renders
 // the authoritative execution timeline — never reconstructed from UI state.
+//
+// The scripted response is a real HTML document, not a chat reply. The artifact
+// boundary rejects conversational prose for a .html target (it carries none of
+// the language's structure), so a prose fixture here would fail the artifact
+// gate before the graph this test is about was ever built.
 func TestInspectRetainsRuntimeGraph(t *testing.T) {
 	mock := &mockProvider{responses: []*ai.Response{{
-		Content: "```\nfixed\n```",
+		Content: "<p>fixed</p>",
 		Usage:   ai.ProviderUsage{Known: true, PromptTokens: 12, CompletionTokens: 6},
 	}}}
 	m := gatedDispatchModel(t, mock, map[string]string{"index.html": "<p>old</p>"})

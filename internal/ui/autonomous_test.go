@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -132,6 +134,36 @@ func autonomousTestModel(drv *fakeAutonomousDriver) *model {
 	return m
 }
 
+// holdRealCandidate puts a GENUINE approval-held candidate on the executor under
+// the model and returns its patch identity.
+//
+// Approval boundaries in this package must name a candidate the execution
+// authority actually holds: the UI refuses an approval whose candidate is not
+// held (see authorizeAutonomousApproval), because a proposal whose producing
+// computation is gone is not an executable artifact. A fabricated PatchID would
+// therefore test the refusal path, not the approval path.
+func holdRealCandidate(t *testing.T, m *model, root, target, original, replacement string) string {
+	t.Helper()
+	provider := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n" + original + "=======\n" + replacement + ">>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true, PromptTokens: 40, CompletionTokens: 20, FinishReason: "stop"},
+	}}}
+	m.executor = execution.NewRuntimeExecutor(root, m.cfg, provider, nil, "")
+	res, err := m.executor.Execute(context.Background(), execution.ExecuteRequest{
+		Mode: "build", Prompt: "update @" + target, Target: target,
+	})
+	if err != nil {
+		t.Fatalf("seeding a held candidate: %v", err)
+	}
+	if res == nil || res.PendingPatchID == "" {
+		t.Fatalf("seeding a held candidate: outcome=%v", res)
+	}
+	if !m.executor.CandidateHeld(res.PendingPatchID) {
+		t.Fatalf("candidate %s is not held by the executor", res.PendingPatchID)
+	}
+	return res.PendingPatchID
+}
+
 // TestAutonomousRunParksAtApproval proves a driver run that parks at an
 // approval boundary renders the boundary card, enters StateAwaitingApproval,
 // and keeps the run parked (not terminal) for a human decision.
@@ -252,11 +284,19 @@ func TestAutonomousRunParksAtClarify(t *testing.T) {
 // boundary issues a MutationAuthorization over the boundary targets and
 // attaches it to the executor BEFORE the driver resumes.
 func TestAutonomousResumeApproveAuthorizesExecutor(t *testing.T) {
+	root := t.TempDir()
+	const note = "foo\nbar\nbaz\n"
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte(note), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := autonomousTestModel(&fakeAutonomousDriver{})
+	patchID := holdRealCandidate(t, m, root, "note.txt", "bar\n", "qux\n")
+
 	drv := &fakeAutonomousDriver{
 		state:     autonomy.RuntimeAwaitingHuman,
 		parkOnRun: true,
 		boundary: &autonomy.HumanBoundary{
-			PatchID:   "p1",
+			PatchID:   patchID,
 			Reason:    "ready",
 			Action:    autonomy.HumanBoundaryApproval,
 			Resumable: true,
@@ -268,7 +308,7 @@ func TestAutonomousResumeApproveAuthorizesExecutor(t *testing.T) {
 			Class:  autonomy.FailureRecoverable,
 		},
 	}
-	m := autonomousTestModel(drv)
+	m.autonomousDriver = drv
 	// Set workflow to Building state so authorization succeeds.
 	m.workflowSM = workflow.NewWorkflowStateMachine()
 	_ = m.workflowSM.SendEvent(workflow.EventPlan, workflow.TransitionContext{})
@@ -288,7 +328,6 @@ func TestAutonomousResumeApproveAuthorizesExecutor(t *testing.T) {
 	caps.Grant(capability.CapabilityWrite)
 	caps.Grant(capability.CapabilityPatch)
 	m.caps = caps
-	m.executor = execution.NewRuntimeExecutor(".", m.cfg, &mockProvider{responses: []*ai.Response{}}, nil, "")
 
 	// Park the boundary first.
 	cmd := m.runAutonomousDriver("change bar to qux @note.txt")

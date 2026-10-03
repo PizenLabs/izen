@@ -408,6 +408,13 @@ func TestBuildLifecycleNoDuplicateDispatch(t *testing.T) {
 
 // ── 8 + 9. No execution remains stuck in "Processing file mutations" ───────
 
+func errOf(g *gatedExecutionMsg) error {
+	if g == nil {
+		return nil
+	}
+	return g.err
+}
+
 func TestBuildLifecycleProcessingStateTerminates(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		// A valid SEARCH/REPLACE patch holds at the executor approval gate: the
@@ -502,8 +509,13 @@ func TestBuildLifecycleProcessingStateTerminates(t *testing.T) {
 		// The fixture stays inside the Boundary-2 feasibility envelope of the
 		// 1024-token strategy budget so the rewrite legitimately executes.
 		var lines []string
-		for i := 0; i < 120; i++ {
-			lines = append(lines, fmt.Sprintf("line %d", i))
+		for i := 0; i < 100; i++ {
+			// Each line carries HTML markup, not prose: the artifact boundary
+			// rejects a response carrying none of the target language's
+			// structure. The markup is one short tag per line and the line count
+			// is trimmed to match, so the fixture stays inside the Boundary-2
+			// feasibility envelope the comment below describes.
+			lines = append(lines, fmt.Sprintf("line %d <br>", i))
 		}
 		large := strings.Join(lines, "\n")
 		mock := &mockProvider{responses: []*ai.Response{{Content: large}}}
@@ -517,7 +529,7 @@ func TestBuildLifecycleProcessingStateTerminates(t *testing.T) {
 			}
 		}
 		if gem == nil || gem.err != nil {
-			t.Fatalf("expected a held patch at the executor approval gate, got %+v", gem)
+			t.Fatalf("expected a held patch at the executor approval gate, got %+v err=%v", gem, errOf(gem))
 		}
 		if gem.res == nil || gem.res.PendingPatchID == "" {
 			t.Fatalf("the executor must hold the no-change artifact at the gate, got %+v", gem.res)

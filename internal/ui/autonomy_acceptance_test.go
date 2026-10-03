@@ -270,8 +270,11 @@ func TestAcceptanceCaseDPromptMutationProposalAndEvidence(t *testing.T) {
 	if len(gem.res.Targets) == 0 || gem.res.Targets[0] != "index.html" {
 		t.Errorf("execution target = %v, want index.html", gem.res.Targets)
 	}
-	// The deterministic evidence ledger (context + redundancy) reaches the
-	// provider request as the authoritative evidence contract (§9/§10).
+	// The deterministic evidence ledger reaches the provider request as the
+	// authoritative evidence contract (§9/§10). It is the GENERIC Context Evidence
+	// Ledger: the build path no longer appends a markup-only redundancy ledger
+	// chosen by the target's file extension, because evidence must not depend on
+	// which extension a file happens to have.
 	if len(mock.requests) == 0 {
 		t.Fatal("provider must have received the execution request")
 	}
@@ -284,8 +287,9 @@ func TestAcceptanceCaseDPromptMutationProposalAndEvidence(t *testing.T) {
 	if !strings.Contains(userContent, "Context Evidence Ledger") {
 		t.Errorf("mutation prompt missing context ledger: %q", userContent)
 	}
-	if !strings.Contains(userContent, "Redundant content findings") {
-		t.Errorf("mutation prompt missing redundancy ledger: %q", userContent)
+	// The structural finding itself is still surfaced — by the generic ledger.
+	if !strings.Contains(userContent, "orphan") {
+		t.Errorf("mutation prompt missing the structural orphan finding: %q", userContent)
 	}
 }
 
@@ -379,7 +383,9 @@ func TestAcceptanceCaseFMalformedHTMLEvidence(t *testing.T) {
 		t.Fatal("granted mutation must hold a patch at the executor approval gate")
 	}
 	// The deterministic evidence reaches the provider request — the model never
-	// re-discovers the redundant content from raw text.
+	// re-discovers the redundant content from raw text. It comes from the
+	// GENERIC Context Evidence Ledger; there is no longer an extension-gated
+	// markup-only ledger appended for .html targets.
 	if len(mock.requests) == 0 {
 		t.Fatal("provider must have received the execution request")
 	}
@@ -389,8 +395,8 @@ func TestAcceptanceCaseFMalformedHTMLEvidence(t *testing.T) {
 			userContent += m.Content
 		}
 	}
-	if !strings.Contains(userContent, "Redundant content findings") {
-		t.Errorf("mutation prompt missing redundancy ledger:\n%s", userContent)
+	if !strings.Contains(userContent, "Context Evidence Ledger") {
+		t.Errorf("mutation prompt missing the context evidence ledger:\n%s", userContent)
 	}
 	if !strings.Contains(userContent, "orphan") {
 		t.Errorf("mutation prompt missing orphan-content finding:\n%s", userContent)

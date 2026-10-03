@@ -820,7 +820,12 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	gateRun := false
 	gatePassed := false
 	if pm.verifier != nil {
-		report := pm.verifier.RunAll()
+		// ARTIFACT IDENTITY (Workspace Contract §27): the gate is resolved for
+		// THIS patch's own target, never for the enclosing workspace. A CSS or
+		// JS target in a portfolio task must not be compiled with the language
+		// contract of whatever the workspace primary happened to be, and a Go
+		// target must not be skipped because the workspace primary was HTML.
+		report := pm.verifier.RunAllFor(patch.File)
 		// The gate report is captured on the mutation boundary unconditionally
 		// so the execution result reads the REAL gate outcome — including the
 		// not-applicable (Skipped) case — and never re-runs verification.

@@ -1,0 +1,38 @@
+/* The workspace provides `styles.css` (plural). The served document requests
+   `style.css` (singular). The mismatch is only observable by resolving the
+   reference against the running workspace — never by reading either file
+   alone, and never by a filename convention. */
+
+:root {
+  --bg: #0f1115;
+  --fg: #e6e6e6;
+  --accent: #5ac8fa;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, sans-serif;
+}
+
+#board {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  padding: 1.5rem;
+}
+
+.column h2 {
+  color: var(--accent);
+  font-size: 0.9rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.card {
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  margin: 0.25rem 0;
+}

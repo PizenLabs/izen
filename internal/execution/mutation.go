@@ -287,6 +287,8 @@ func ParseMutationOutcome(s string) MutationOutcome {
 		return OutcomePendingApproval
 	case "rejected":
 		return OutcomeRejected
+	case "preflight_infeasible", "preflight-infeasible", "preflight infeasible":
+		return OutcomePreflightInfeasible
 	case "failed", "execution_failed":
 		return OutcomeFailed
 	case "completed", "done":

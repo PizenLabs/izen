@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/core/stream"
 	"github.com/PizenLabs/izen/internal/domain/capability/policy"
+	"github.com/PizenLabs/izen/internal/domain/ports"
 	"github.com/PizenLabs/izen/internal/events"
 	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
 	"github.com/PizenLabs/izen/internal/execution/ingestion"
@@ -554,6 +556,11 @@ type RuntimeExecutor struct {
 	verifier  *Verifier
 	auth      *authorization.MutationAuthorization
 	admission *AdmissionGateway
+	// shellPort is the authorized command port shared by every component that
+	// executes commands on the workspace, so a behavioral command is gated
+	// exactly like a build or test command. Nil means no authority is bound,
+	// which is reported rather than bypassed.
+	shellPort ports.ShellPort
 	// sessionResolver resolves the active originating session at admission when
 	// the request does not carry one (INV-SESSION-10). It is atomically swapped
 	// by the composition root so admission can run before any executor mutex is
@@ -588,6 +595,12 @@ type RuntimeExecutor struct {
 	// prompt (buildManifestPrompt) at bootstrap via SetManifestSystemPrompt; a
 	// direct InvokeManifestPass call without injection keeps the default.
 	manifestSystemPromptOverride string
+	// requirementSystemPromptOverride, when non-empty, replaces the default
+	// objective-requirement derivation prompt (RequirementPassSystemPrompt).
+	// The autonomy layer injects it at bootstrap via
+	// SetRequirementPassSystemPrompt; a direct InvokeRequirementPass call
+	// without injection keeps the default.
+	requirementSystemPromptOverride string
 	// targetResolver is the Phase 16 evidence-bound target resolver. It sits
 	// between Admission and the ContextCompiler: admission decides whether the
 	// objective may act, the resolver decides WHERE it may act. They are
@@ -663,16 +676,33 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 	} else {
 		x.verifier = NewVerifier(root)
 	}
-	// Inject the execution-pipeline read-only tool runner into providers that
-	// accept one, enabling the adaptive tool loop for agentic-harness models.
+	// Inject the model-facing capability runner into providers that accept one.
+	//
+	// This is the model→capability→observation→model boundary. The runner is
+	// NOT the bare filesystem reader: it authorizes every call against this
+	// executor's own admission capability vector and records a capability.Evidence
+	// record per execution, so a capability the model requested is both
+	// Control-Plane-governed and auditable.
 	if provider != nil {
 		if setter, ok := provider.(interface {
 			SetToolRunner(ai.ToolRunner)
 		}); ok {
-			setter.SetToolRunner(NewReadOnlyToolRunner(root))
+			setter.SetToolRunner(x.capabilityTools())
 		}
 	}
 	return x
+}
+
+// capabilityTools builds the model-facing capability runner bound to THIS executor's
+// live admission capability vector and event bus.
+//
+// Reading the vector through a closure (rather than copying it) is deliberate: the
+// Control Plane may re-grant or restrict capabilities via SetAdmittedCapabilities, and
+// the next model capability request must observe that without rewiring the provider.
+func (x *RuntimeExecutor) capabilityTools() *CapabilityToolRunner {
+	return NewCapabilityToolRunner(x.root, func() AdmittedCapabilities {
+		return x.AdmittedCapabilities()
+	}, x.bus)
 }
 
 // invalidateSnapshot purges the observe snapshot cache keys for target. It is
@@ -745,6 +775,18 @@ func (x *RuntimeExecutor) ResolveMutationTarget(ctx context.Context, prompt stri
 		}
 	}
 	return x.targetBindingResolver().Resolve(ctx, prompt, explicit)
+}
+
+// TargetResolver returns the executor's canonical target resolver so a
+// composition boundary can reach ISOLATED discovery without re-implementing it.
+// Returning the resolver (rather than a convenience scan) keeps discovery and
+// resolution on ONE implementation: a caller that rolled its own walk would
+// produce candidate sets that differ from the ones the admission gate judges.
+func (x *RuntimeExecutor) TargetResolver() *TargetResolver {
+	if x == nil {
+		return nil
+	}
+	return x.targetBindingResolver()
 }
 
 // DiscoverWorkspace is the Phase 16.1 discovery seam. It returns workspace
@@ -942,16 +984,16 @@ func (x *RuntimeExecutor) resolveSessionID(req ExecuteRequest) string {
 
 // SetProvider re-binds the provider (provider switching is a runtime concern).
 //
-// Providers that accept read-only tools receive the execution-pipeline runner
-// so agentic-harness models can execute their tool calls and complete the
-// answer in-process. The injection is transparent through the context-compiler
-// facade.
+// Providers that accept capability tools receive the Control-Plane-authorized
+// runner, so a model that requests an inspection capability gets it executed
+// against the live workspace under this executor's admission vector and recorded
+// as evidence. The injection is transparent through the context-compiler facade.
 func (x *RuntimeExecutor) SetProvider(p ai.Provider) {
 	if p != nil {
 		if setter, ok := p.(interface {
 			SetToolRunner(ai.ToolRunner)
 		}); ok {
-			setter.SetToolRunner(NewReadOnlyToolRunner(x.root))
+			setter.SetToolRunner(x.capabilityTools())
 		}
 	}
 	x.mu.Lock()
@@ -1607,6 +1649,29 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 
 	res.Targets = targets
 	res.Proof.Targets = targets
+
+	// ── CANDIDATE PROVENANCE: SUPERSESSION (spec §14) ─────────────────
+	//
+	// A new computation over a target SUPERSEDES every unresolved candidate a
+	// previous computation held for that target. A held MutationCandidate is
+	// derived from ONE computation and is only executable while that
+	// computation is the live one: "Previously generated partial, stale, or
+	// abandoned output must not remain executable after the computation that
+	// produced it has failed" (§14), and a candidate "must not be reconstructed
+	// from … an old execution step" (§3).
+	//
+	// Without this drain, a run that computed a candidate, then recomputed the
+	// same target and FAILED (OUTPUT_EXHAUSTED, a refused artifact, a cancelled
+	// step) still left the FIRST candidate live and approvable — so human
+	// approval could make a superseded computation executable. Approval answers
+	// "may this authorized operation occur?"; it cannot resurrect the authority
+	// of a computation that no longer exists.
+	//
+	// Scope is exactly the intersecting targets: a candidate held for an
+	// unrelated file is untouched, because two targets never contend for one
+	// approval.
+	x.supersedePendingCandidates(ctx, requestID, targets)
+
 	for _, t := range targets {
 		g.CompleteTarget(t, fileExists(filepath.Join(x.root, t)), "strategy")
 	}
@@ -2149,6 +2214,20 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 // through the mutation/verification/completion stages — every event comes from
 // a graph transition.
 func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*ExecutionResult, error) {
+	// ── CANDIDATE LINEAGE GATE ─────────────────────────────────────────
+	// A MutationAuthorization may be bound to ONE MutationCandidate identity. If
+	// the bound authorization names a different candidate than the one being
+	// applied, the human gate was opened for a different artifact and this apply
+	// would write bytes nobody approved.
+	//
+	// The check runs BEFORE the candidate is removed from `pending`, so a
+	// mismatched token leaves the held candidate exactly as it was: a refused
+	// lineage is not a consumed approval.
+	if x.auth != nil && x.auth.CandidateID != "" && x.auth.CandidateID != patchID {
+		return nil, fmt.Errorf("executor: %w: authorization %s is bound to candidate %q, refusing to apply %q",
+			authorization.ErrAuthorizationCandidateMismatch, x.auth.ID, x.auth.CandidateID, patchID)
+	}
+
 	x.mu.Lock()
 	pm, ok := x.pending[patchID]
 	if ok {
@@ -2537,6 +2616,78 @@ func (x *RuntimeExecutor) PendingPatchIDs() []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+// CandidateHeld reports whether patchID is still an approval-held candidate of
+// THIS executor — the single map Approve consults.
+//
+// It is the freshness read an approval boundary needs: a candidate is executable
+// only while the computation that produced it is the live one, so a boundary that
+// names a candidate this map no longer holds is proposing an artifact that can
+// never be applied. Callers use it to refuse an approval BEFORE asking a human,
+// never to decide that a held candidate is valid (only the artifact gate, the
+// authorization engine and OCC do that).
+func (x *RuntimeExecutor) CandidateHeld(patchID string) bool {
+	if x == nil || patchID == "" {
+		return false
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	_, ok := x.pending[patchID]
+	return ok
+}
+
+// supersedePendingCandidates rejects every approval-held candidate a SUPERSEDED
+// computation produced for any of targets, before the new computation does any
+// work.
+//
+// A held candidate is bound to the computation that produced it. Dispatching a
+// new computation over the same file ends the previous one's claim on that
+// file, whether the new computation later succeeds, fails, or exhausts its
+// output budget. The rejection is the same terminal, non-mutating `rejected`
+// transition a human rejection produces, so the ledger records a truthful
+// outcome instead of a candidate that silently stops being reachable.
+//
+// Nothing is written: Reject only seals evidence and drops the candidate.
+//
+// Candidates whose target set does not intersect are left alone — two distinct
+// files never contend for one approval, and draining them would destroy a
+// legitimate concurrent approval.
+func (x *RuntimeExecutor) supersedePendingCandidates(ctx context.Context, newRequestID string, targets []string) {
+	if x == nil || len(targets) == 0 {
+		return
+	}
+	want := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		if t != "" {
+			want[t] = true
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+
+	// Collect under the lock, then resolve outside it: Reject re-acquires x.mu.
+	x.mu.Lock()
+	stale := make([]string, 0, len(x.pending))
+	for id, pm := range x.pending {
+		if pm == nil || pm.requestID == newRequestID {
+			continue
+		}
+		for _, t := range pm.targets {
+			if want[t] {
+				stale = append(stale, id)
+				break
+			}
+		}
+	}
+	x.mu.Unlock()
+
+	// Deterministic order so the ledger is reproducible for evidence.
+	sort.Strings(stale)
+	for _, id := range stale {
+		_, _ = x.Reject(ctx, id, "superseded: a new computation was dispatched for the same target")
+	}
 }
 
 // RejectAllPending deterministically rejects every approval-held mutation. It
@@ -3024,13 +3175,10 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			if !ok {
 				// Check every anchor before considering a complete-document fallback:
 				// a zero match in any block must never be hidden by an ambiguous one.
-				ambiguous := false
-				for _, b := range ParseSearchReplaceBlocks(verbatim) {
-					cnt := strings.Count(original, b.search)
-					if b.search == "" || cnt == 0 {
-						return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w: %s: SEARCH matches zero regions", ErrHallucinatedAnchorError, ErrArtifactRejected, target)
-					}
-					ambiguous = ambiguous || cnt > 1
+				ambiguous, anchorErr := classifyAnchors(original, verbatim)
+				if anchorErr != nil {
+					return nil, invs, diffs, candidates, trace,
+						fmt.Errorf("%w: %w: %s: %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, anchorErr)
 				}
 				if ambiguous {
 					candidate, recovered := recoverSmallFileAmbiguousAnchor(original, verbatim, target, x.artifactGate)
@@ -3108,6 +3256,29 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					target, parseErr)
 			}
 			modified = ResolveModifiedContent(original, raw)
+			// ANCHOR HONESTY UNDER A FULL-ARTIFACT CONTRACT. A provider that
+			// answered a "replace the file" contract with a SEARCH/REPLACE
+			// envelope did NOT produce a whole document; it produced a patch
+			// that names a destination region. If that region does not exist in
+			// the target, the model hallucinated the anchor.
+			//
+			// ResolveModifiedContent deliberately returns the ORIGINAL bytes when
+			// an unresolvable envelope is present (so raw markers can never be
+			// written into a user's file). That safety choice is correct, but on
+			// its own it converts "I could not anchor this" into "there is
+			// nothing to change" — a fabricated no-op that then opens an approval
+			// surface and asks a human to authorize a mutation of nothing.
+			//
+			// A no-op is a CLAIM and may only come from the NO_CHANGES_REQUIRED
+			// sentinel, which is structurally classified. An unanchorable patch is
+			// a FAILURE and is classified here, at the artifact boundary, before
+			// any candidate exists.
+			if _, anchorErr := classifyAnchors(original, verbatim); anchorErr != nil {
+				log.Printf("[execution] request=%s target=%s artifact_anchor=REJECTED reason=%q — no patch staged, no approval surface opened",
+					requestID, target, anchorErr)
+				return nil, invs, diffs, candidates, trace,
+					fmt.Errorf("%w: %w: %s: %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, anchorErr)
+			}
 			if modified == "" {
 				// The payload carried a recognizable artifact but the content
 				// resolver produced nothing: fall back to the parsed body
@@ -3445,6 +3616,26 @@ func lastOutputTokens(invs []ModelInvocation) int {
 // wrap it without touching this loop) while preserving the existing truth
 // matrix for full-file rewrites.
 func (x *RuntimeExecutor) artifactGate(target, modified string) (string, error) {
+	// ── ARTIFACT-SHAPE GATE ────────────────────────────────────────────
+	// Syntax validation alone cannot answer "is this a FILE?". It answers "is
+	// this well-formed?", and a completion-shaped chat reply is well-formed in
+	// several target languages at once: a sentence is a syntactically valid
+	// HTML body, and a sentence is a syntactically inert stylesheet.
+	//
+	// That gap is not theoretical. A model answering "Sure! I have redesigned
+	// your portfolio page" against a .html target produced a real, approvable
+	// patch candidate that would have overwritten the page with prose — the
+	// exact ComputeResult → mutation shortcut the Phase 14 invariants forbid.
+	//
+	// So before syntax: the response must carry at least one structural token of
+	// the target's own language. A response with none is not a bad artifact, it
+	// is not an artifact, and it is rejected as a retryable contract failure so
+	// the bounded continuation can re-prompt under the same authority.
+	if !carriesTargetStructure(target, modified) {
+		return "", fmt.Errorf("%w: %s: the response carries no %s structure, so it is a conversational answer rather than a file: %s",
+			ErrArtifactRetryableRejected, target, targetLanguageName(target),
+			summarizeArtifactRejection(modified))
+	}
 	gate := v3Artifact.ValidateContent(target, []byte(modified), 0)
 	if !gate.Passed {
 		if gate.Decision == policy.DecisionRetry {

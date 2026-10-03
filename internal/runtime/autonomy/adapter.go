@@ -15,7 +15,6 @@ package autonomy
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,6 +22,8 @@ import (
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/contextcompiler"
+	"github.com/PizenLabs/izen/internal/core/domain"
+	domaincap "github.com/PizenLabs/izen/internal/domain/capability"
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
@@ -58,6 +59,11 @@ type ExecutorAdapter struct {
 	gateway   *execution.IntentGateway
 	executor  *execution.RuntimeExecutor
 	authority *runtime.RuntimeAuthority
+	// caps is the workspace capability set the behavioral capability grant is
+	// derived from. It is bound at composition time and is the same set the
+	// PolicyEngine adjudicates against, so the grant can never exceed what the
+	// Control Plane already permits.
+	caps *domaincap.CapabilitySet
 }
 
 // NewExecutorAdapter wires the adapter over the unified IntentGateway and the
@@ -76,6 +82,90 @@ func (a *ExecutorAdapter) SetAuthority(auth *runtime.RuntimeAuthority) {
 	a.authority = auth
 }
 
+// ── Behavioral stage seams ─────────────────────────────────────────────────
+//
+// These three methods are the ONLY surface the behavioral stage uses. They exist
+// so the stage reaches the existing authority rather than growing its own:
+//
+//   - the capability set, to derive the capability grant;
+//   - the executor's shell port, so behavioral commands pass the SAME
+//     authorization and sandbox gates as every other command;
+//   - the executor's mutation authorization, so a behavioral repair passes the
+//     SAME gate as any other write.
+
+// SetCapabilities binds the workspace capability set the behavioral grant is
+// derived from. The set is IZEN's existing authorization state; the grant is
+// only ever a projection of it.
+func (a *ExecutorAdapter) SetCapabilities(caps *domaincap.CapabilitySet) {
+	if a == nil {
+		return
+	}
+	a.caps = caps
+}
+
+// grantSnapshot returns the bound capability set. The second return is false
+// when no set is bound, which the stage treats as AUTHORIZATION_BLOCKED rather
+// than defaulting to read access.
+func (a *ExecutorAdapter) grantSnapshot(domain.ScopeProvenance) (*domaincap.CapabilitySet, bool) {
+	if a == nil || a.caps == nil {
+		return nil, false
+	}
+	return a.caps, true
+}
+
+// BindShellPort wires the executor's authorized shell port onto a behavioral
+// runtime, so a command the behavioral runtime issues is gated exactly like one
+// issued anywhere else in IZEN.
+func (a *ExecutorAdapter) BindShellPort(rt *execution.BehavioralRuntime) {
+	if a == nil || rt == nil || a.executor == nil {
+		return
+	}
+	if port := a.executor.ShellPort(); port != nil {
+		rt.SetShellPort(port)
+	}
+}
+
+// ObservationAuthority returns the grant-authorized READ-ONLY observation surface
+// for this workspace: the capability vocabulary the Control Plane has already
+// granted, bound to the canonical capability layer.
+//
+// This exists because the capability layer's only production consumer was the
+// behavioural stage, which the driver engages through a substring heuristic over
+// the objective text. Post-execution observation must not depend on English word
+// choice, so the driver derives the same GrantFor projection the behavioural stage
+// uses and observes through it.
+//
+// The returned authority holds no authority of its own: it cannot widen a Grant,
+// and every call is authorized by capability.Runner before the disk is touched.
+// A caller with no bound capability set gets nil, which the driver treats as
+// "observation unavailable" rather than as permission.
+func (a *ExecutorAdapter) ObservationAuthority(provenance domain.ScopeProvenance) *execution.CapabilityAuthority {
+	if a == nil || a.root == "" {
+		return nil
+	}
+	caps, ok := a.grantSnapshot(provenance)
+	if !ok {
+		return nil
+	}
+	// No bus is threaded through this adapter: it is a capability-execution seam,
+	// not an event source. Evidence still travels — capability.Evidence is
+	// returned to the caller on every call — and the driver publishes it.
+	auth := execution.NewCapabilityAuthority(a.root, nil)
+	auth.SetGrant(execution.GrantFor(provenance, caps))
+	return auth
+}
+
+// AuthorizeMutation is the Control Plane gate every behavioral repair target must
+// pass before a proposal may be written. It delegates to the executor's own
+// authorization check, so the behavioral stage cannot authorize a write the rest
+// of the runtime would refuse.
+func (a *ExecutorAdapter) AuthorizeMutation(target string) error {
+	if a == nil || a.executor == nil {
+		return errors.New("autonomy: no execution authority is bound to authorize a behavioral repair")
+	}
+	return a.executor.AuthorizeMutationTarget(target)
+}
+
 // Root returns the workspace root the adapter resolves targets against. It is
 // the source of truth for local file-reference resolution in the zero-token
 // preflight evaluation.
@@ -84,6 +174,21 @@ func (a *ExecutorAdapter) Root() string {
 		return ""
 	}
 	return a.root
+}
+
+// CandidateHeld reports whether patchID is still an approval-held candidate of
+// the executor this adapter drives.
+//
+// It is the LINEAGE READ an approval boundary needs, and it introduces no new
+// identity: the answer comes from the executor's own pending-candidate map, the
+// exact map Reject drains on supersession and Approve resolves. A candidate that
+// is not held there can never be applied, so a boundary naming one is proposing
+// an artifact that no longer exists.
+func (a *ExecutorAdapter) CandidateHeld(patchID string) bool {
+	if a == nil || a.executor == nil {
+		return false
+	}
+	return a.executor.CandidateHeld(patchID)
 }
 
 // PreflightTarget is the adapter's Phase 16.1 target-resolution seam for the
@@ -103,11 +208,53 @@ func (a *ExecutorAdapter) PreflightTarget(ctx context.Context, prompt string, ex
 	return a.executor.ResolveMutationTarget(ctx, prompt, explicit)
 }
 
+// DeriveScope is the adapter's EVIDENCE-BOUND SCOPE DERIVATION seam.
+//
+// It answers the one question the target resolver deliberately refuses to
+// answer: when the objective names no file but DOES name artifact kinds, which
+// OBSERVED files satisfy them? The resolver refuses to choose from a scan
+// because choosing from a scan is how a broad objective silently becomes a write
+// to an arbitrary file (I13). This seam does not relax that: it filters the
+// scan by extension against a kind the objective itself declared, and hands the
+// result to the SAME canonical resolver, so a derived target is bound, digested
+// and admission-checked exactly like a stated one.
+//
+// The adapter owns this because it is the composition boundary that already owns
+// both halves of the question — the gateway (what kind of work this is) and the
+// executor (what the workspace actually contains). Putting it here keeps
+// strategy.Select a pure text classifier and keeps the executor free of
+// objective-language parsing.
+func (a *ExecutorAdapter) DeriveScope(prompt string, stated []string) execution.Derivation {
+	if a == nil || a.executor == nil {
+		return execution.Derivation{Reason: "no executor is bound to the adapter; scope derivation is impossible"}
+	}
+	resolver := a.executor.TargetResolver()
+	return execution.DeriveScope(execution.DerivationRequest{
+		Prompt:        prompt,
+		Profile:       resolver.DiscoverProfile(),
+		StatedTargets: stated,
+	})
+}
+
 // Resolve determines the execution target set for an objective WITHOUT
 // executing. It surfaces HumanClarification as an ambiguous resolution so the
 // driver parks before any model call or mutation.
 func (a *ExecutorAdapter) Resolve(prompt string) Resolved {
-	profile := a.gateway.SelectStrategy(prompt)
+	return a.resolveWith(prompt, a.SelectStrategy(prompt))
+}
+
+// SelectStrategy exposes the canonical gateway's strategy decision so the
+// driver can re-resolve an objective against an evidence-bound scope without
+// introducing a second strategy selector. The gateway remains the sole
+// authority for which execution contract a request runs under.
+func (a *ExecutorAdapter) SelectStrategy(prompt string) strategy.ExecutionStrategyProfile {
+	if a == nil || a.gateway == nil {
+		return strategy.ExecutionStrategyProfile{Intent: prompt}
+	}
+	return a.gateway.SelectStrategy(prompt)
+}
+
+func (a *ExecutorAdapter) resolveWith(prompt string, profile strategy.ExecutionStrategyProfile) Resolved {
 	res := Resolved{Prompt: prompt, Profile: profile}
 	if profile.Strategy == strategy.HumanClarification {
 		// A clarification NEVER leaks a target set: the loop must park, not
@@ -154,24 +301,32 @@ func (a *ExecutorAdapter) ReadTargetFile(target string) ([]byte, bool) {
 }
 
 // RestoreTargets restores exact file contents under the workspace root. It is
-// the ROLLBACK AUTHORITY of DAG execution: when a sub-task fails at Boundary
-// 3, 4 or 5, the driver restores every plan target to its base content so the
-// workspace provably returns to the BaseTreeDigest. Nothing is written for an
-// empty restore set (atomicity means: no partial rollback).
-func (a *ExecutorAdapter) RestoreTargets(contents map[string][]byte) error {
+// the DAG rollback SEAM: when a sub-task fails at Boundary 3, 4 or 5, the
+// driver restores every plan target to its base content so the workspace
+// provably returns to the BaseTreeDigest. Nothing is written for an empty
+// restore set (atomicity means: no partial rollback).
+//
+// It holds NO authority of its own. The restore and the post-restore integrity
+// assertion are delegated to the ONE authoritative Mutation Boundary
+// (execution.RollbackAndVerify), which both performs the restore and
+// cryptographically asserts the live tree digest against baseDigest. This seam
+// previously wrote the workspace itself with raw os.WriteFile and asserted
+// nothing, which made "the rollback succeeded" a claim rather than a fact and
+// gave DAG abort a second mutation path around the boundary.
+func (a *ExecutorAdapter) RestoreTargets(contents map[string][]byte, targets []string, baseDigest string) error {
 	if a == nil {
 		return errors.New("autonomy: restore requires an executor adapter")
 	}
-	for _, target := range sortedKeys(contents) {
-		full := filepath.Join(a.root, filepath.FromSlash(target))
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			return fmt.Errorf("autonomy: rollback mkdir %s: %w", target, err)
-		}
-		if err := os.WriteFile(full, contents[target], 0o644); err != nil {
-			return fmt.Errorf("autonomy: rollback write %s: %w", target, err)
-		}
+	if len(contents) == 0 {
+		// Atomicity: no partial rollback. Nothing to restore, and nothing to
+		// assert — a boundary call over an empty restore set would only
+		// recompute a digest nobody changed.
+		return nil
 	}
-	return nil
+	if len(targets) == 0 {
+		targets = sortedKeys(contents)
+	}
+	return execution.RollbackAndVerify(a.root, targets, baseDigest, contents)
 }
 
 // sortedKeys returns map keys in deterministic order (rollback must be
@@ -214,7 +369,21 @@ func (a *ExecutorAdapter) Execute(ctx context.Context, req autonomy.LoopRequest)
 			return a.driftObservation(req, targets), nil
 		}
 	}
-	profile := a.gateway.SelectStrategy(req.Prompt)
+	// ── STRATEGY SELECTION OVER THE BOUND SCOPE ─────────────────────────
+	// The strategy MUST be decided against the scope the run actually holds,
+	// not against the raw objective text. The driver may have bound an
+	// evidence-derived target set (see ExecutorAdapter.DeriveScope) after the
+	// initial resolve; re-selecting on the bare prompt would silently discard
+	// that work and dispatch the read-only contract the text alone implies.
+	//
+	// This is the SAME gateway on the SAME objective — only the scope it is
+	// asked about differs — so the adapter remains a translation layer and the
+	// gateway remains the sole strategy authority.
+	scopePrompt := req.Prompt
+	if len(targets) > 0 {
+		scopePrompt = req.Prompt + " " + joinTargets(targets)
+	}
+	profile := a.gateway.SelectStrategy(scopePrompt)
 	strategyPtr := &profile
 	if (len(req.Targets) > 0 || req.Target != "") && profile.Strategy == strategy.HumanClarification {
 		// The loop carries a resolved target set the raw prompt could not

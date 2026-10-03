@@ -306,7 +306,7 @@ func (d *WorkspaceDiscovery) Discover() WorkspaceProfile {
 		rel = filepath.ToSlash(rel)
 		depth := strings.Count(rel, "/") + 1
 		if entry.IsDir() {
-			if d.ignored(rel, true) {
+			if d.ignored(rel, true) || d.ignoredByDotDirectoryRule(rel, depth) {
 				return fs.SkipDir
 			}
 			if depth <= d.maxDepth && sourceRootNames[path.Base(rel)] {
@@ -378,6 +378,30 @@ func (d *WorkspaceDiscovery) Discover() WorkspaceProfile {
 		return profile.SourceRoots[i].Path < profile.SourceRoots[j].Path
 	})
 	return profile
+}
+
+// ignoredByDotDirectoryRule reports whether rel is a TOP-LEVEL dot-directory —
+// a workspace-root child whose name begins with "." — and therefore tool or
+// agent state rather than authored source.
+//
+// The named deny list above enumerates the directories this runtime happens to
+// know about (.git, .izen, .cache, …). That list cannot be complete: every tool
+// that keeps workspace state in a dot-directory adds a new one, and each unknown
+// entry poisons the candidate set. On a real workspace this is not theoretical —
+// a scan of a four-file project returned eight candidates, four of them agent
+// state under a tool directory this codebase has never heard of. Filtering by
+// SHAPE rather than by name is what keeps the candidate set about the project.
+//
+// The rule is deliberately narrow: it applies only at depth 1. A dot-directory
+// nested deeper (src/.well-known/…) may well be authored content, and a dotFILE
+// at any depth is untouched, because legitimate conventions (.gitignore,
+// .env.example, .editorconfig) depend on those being observed.
+func (d *WorkspaceDiscovery) ignoredByDotDirectoryRule(rel string, depth int) bool {
+	if depth != 1 {
+		return false
+	}
+	base := path.Base(rel)
+	return len(base) > 1 && strings.HasPrefix(base, ".")
 }
 
 // ignored reports whether rel is excluded by the discovery deny rules. The

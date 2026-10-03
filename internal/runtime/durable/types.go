@@ -18,6 +18,18 @@ const (
 	TaskRePlan TaskStatus = "RE_PLAN"
 )
 
+// Terminal reports whether the status is a final lifecycle state. A non
+// terminal task is unfinished work: it is what a restart must surface
+// instead of silently re-prompting the human (§9 state reconstruction).
+func (s TaskStatus) Terminal() bool {
+	switch s {
+	case TaskCompleted, TaskFailed:
+		return true
+	default:
+		return false
+	}
+}
+
 // CursorPhase tracks where an operation sits in its lifecycle.
 type CursorPhase string
 
@@ -209,13 +221,43 @@ func (e EventType) IsTruthBoundary() bool {
 	}
 }
 
+// SequenceFaultKind classifies a ledger sequence defect observed while
+// replaying ledger.ndjson.
+type SequenceFaultKind string
+
+const (
+	// SequenceFaultGap: a sequenced event appeared with a value higher than
+	// expected, so at least one event is missing from the journal.
+	SequenceFaultGap SequenceFaultKind = "GAP"
+	// SequenceFaultNonMonotonic: a sequenced event appeared with a value
+	// that does not exceed the highest value already seen. Ordering can no
+	// longer be trusted to follow the append order.
+	SequenceFaultNonMonotonic SequenceFaultKind = "NON_MONOTONIC"
+)
+
+// SequenceFault records one sequence defect observed during replay. A
+// corrupt journal is never silently accepted: the fault is surfaced to the
+// caller instead of being folded away.
+type SequenceFault struct {
+	Kind     SequenceFaultKind `json:"kind"`
+	Observed uint64            `json:"observed"`
+	Expected uint64            `json:"expected"`
+}
+
 // LedgerEvent is one append-only line in ledger.ndjson.
 type LedgerEvent struct {
-	EventID   string         `json:"eventId"`
-	TaskID    string         `json:"taskId"`
-	Timestamp string         `json:"timestamp"`
-	EventType EventType      `json:"eventType"`
-	Payload   map[string]any `json:"payload"`
+	EventID   string    `json:"eventId"`
+	TaskID    string    `json:"taskId"`
+	Timestamp string    `json:"timestamp"`
+	EventType EventType `json:"eventType"`
+	// Sequence is the store-assigned monotonic position of this event in
+	// the journal. It is assigned by appendLocked under the same lock as
+	// the append itself and is durable with the event, so the journal's
+	// order is verifiable without trusting file order. A zero means the
+	// event was written by a build that predates the sequence: it is
+	// legacy, not corrupt, and never moves the counter.
+	Sequence uint64         `json:"sequence"`
+	Payload  map[string]any `json:"payload"`
 }
 
 // NegativeKnowledgeRecord is the durable projection of one verified

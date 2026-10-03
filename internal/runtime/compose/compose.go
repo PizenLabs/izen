@@ -15,6 +15,7 @@ package compose
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/user"
 	"strings"
@@ -44,6 +45,7 @@ import (
 	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/preflight"
 	"github.com/PizenLabs/izen/internal/git"
+	"github.com/PizenLabs/izen/internal/infrastructure/capabilities"
 	"github.com/PizenLabs/izen/internal/knowledge"
 	"github.com/PizenLabs/izen/internal/language"
 	"github.com/PizenLabs/izen/internal/lea"
@@ -57,6 +59,7 @@ import (
 	"github.com/PizenLabs/izen/internal/runtime/authority"
 	runtimeAutonomy "github.com/PizenLabs/izen/internal/runtime/autonomy"
 	"github.com/PizenLabs/izen/internal/runtime/contextpipeline"
+	"github.com/PizenLabs/izen/internal/runtime/durable"
 	"github.com/PizenLabs/izen/internal/runtime/handlers"
 	runtimeOrchestrator "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 	"github.com/PizenLabs/izen/internal/session"
@@ -108,10 +111,20 @@ type RuntimeInputs struct {
 type Application struct {
 	Bus      *events.Bus
 	Workflow workflow.WorkflowRuntime
-	Ledger   *runtime.ContextLedger
-	Builder  *runtime.LedgerBuilder
-	Runtime  *runtime.Runtime
-	Audit    *audit.AuditLogger
+	// ContextLedger is the read-only conversation/event projection. The
+	// durable EXECUTION ledger is Ledger(), reachable via Ledger(): the two
+	// are different authorities with different contracts and never share a
+	// name, because conflating them is exactly how a write-only projection
+	// ends up standing in for execution truth.
+	ContextLedger *runtime.ContextLedger
+	Builder       *runtime.LedgerBuilder
+	Runtime       *runtime.Runtime
+	Audit         *audit.AuditLogger
+
+	// ledger is the authoritative append-only execution ledger
+	// (.izen/runtime/ledger.ndjson). It is nil only in harness mode, where
+	// no workspace root was wired. Read it through Ledger().
+	ledger *durable.TaskStore
 
 	// auditDir is the workspace-relative audit log directory wired via
 	// WithAuditDir. Empty disables auditing.
@@ -442,6 +455,30 @@ func (a *Application) LanguageID() language.ID {
 	return a.Inputs.LanguageID
 }
 
+// Ledger returns the authoritative append-only execution ledger rooted at
+// <workspace>/.izen/runtime. It is the store the autonomous driver records
+// every objective transition into, and the only surface a restart may use to
+// learn what was in flight when the previous process died. Nil only in
+// harness mode (no workspace root was wired).
+func (a *Application) Ledger() *durable.TaskStore {
+	if a == nil {
+		return nil
+	}
+	return a.ledger
+}
+
+// InterruptedTask returns the most recently replayed ledger task that never
+// reached a terminal state — the §9 reconstruction answer to "what was the
+// process doing when it stopped?". ok is false when the ledger holds no
+// unfinished work, which is the ordinary case and never an error. It is nil
+// safe: with no ledger wired, ok is always false.
+func (a *Application) InterruptedTask() (durable.TaskState, bool) {
+	if a == nil || a.ledger == nil {
+		return durable.TaskState{}, false
+	}
+	return a.ledger.MostRecentRecoverable()
+}
+
 // Wire builds the Application: domain runtime, dispatcher, handlers, ledger
 // projection, the Runtime facade, and the complete engine tree — all bound to
 // the shared event bus. It is the sole place the application dependency graph
@@ -621,6 +658,13 @@ func Wire(opts ...Option) (*Application, error) {
 	a.Executor = execution.NewRuntimeExecutor(a.Inputs.Root, a.Inputs.Config, a.provider, a.Bus, a.Inputs.LanguageID)
 	a.Executor.SetContextCompiler(a.Compiler)
 	a.Gateway = execution.NewIntentGateway(a.Inputs.Root)
+	// The behavioral runtime observes the workspace's REAL runtime (serve →
+	// readiness → fetch → probe subresources → structural audit) and drives
+	// evidence-driven repair back through this same executor. Binding the
+	// executor's command port here is what makes a behavioral command pass the
+	// SAME authorization and sandbox gates as a build or test command, rather
+	// than becoming a second, quieter execution path.
+	a.Executor.SetShellPort(capabilities.NewExecShell(behaviorCommandTimeout))
 	// ── CONTEXT DOMAIN (Phase 11.x) ─────────────────────────────────────
 	// The Context Pipeline reuses the executor's existing OCC hashing for its
 	// workspace snapshot port; it owns no filesystem or execution code. The
@@ -673,7 +717,7 @@ func Wire(opts ...Option) (*Application, error) {
 	builder := runtime.NewLedgerBuilder(a.Bus)
 	builder.Start()
 	a.Builder = builder
-	a.Ledger = builder.Ledger()
+	a.ContextLedger = builder.Ledger()
 
 	a.Runtime = runtime.NewRuntime(dispatcher, runtime.WithEventBus(a.Bus))
 
@@ -684,6 +728,26 @@ func Wire(opts ...Option) (*Application, error) {
 	cfg := a.Inputs.Config
 	sess := a.Inputs.Session
 	provider := a.provider
+
+	// ── DURABLE EXECUTION LEDGER (RFC v1.0 §10) ────────────────────────
+	// The journal of record for what this process actually did, opened and
+	// replayed BEFORE any engine can dispatch: a store that cannot be read
+	// back is not an execution truth, and a run that starts without one
+	// cannot be reconstructed after an interruption. Fail closed here rather
+	// than degrade to an unwritten runtime.
+	if root != "" {
+		store := durable.NewTaskStore(root)
+		if err := store.Open(); err != nil {
+			return nil, fmt.Errorf("wire: open durable execution ledger: %w", err)
+		}
+		a.ledger = store
+		// A journal whose sequence does not add up is reported, never
+		// silently folded: the caller decides what an incomplete record
+		// means for this workspace.
+		for _, gap := range store.SequenceGaps() {
+			log.Printf("[compose] durable ledger %s is missing event %d", store.LedgerPath(), gap)
+		}
+	}
 
 	a.Git = git.NewEngine(root)
 	a.Lea = lea.NewEngine(root)
@@ -836,9 +900,40 @@ func Wire(opts ...Option) (*Application, error) {
 	// layer only projects those events.
 	adapter := runtimeAutonomy.NewExecutorAdapter(root, a.Gateway, a.Executor)
 	adapter.SetAuthority(a.Authority)
+	// The behavioral stage derives its capability grant from the SAME capability
+	// set the PolicyEngine adjudicates against, so a behavioral repair can never
+	// be granted more than the Control Plane already permits.
+	adapter.SetCapabilities(a.Caps)
+
+	// ── AUTHORIZATION ENGINE ───────────────────────────────────────────────
+	// Production AuthorizationEngine wired with a no-op source hash verifier
+	// and a checkpoint checker that inspects .izen/checkpoints/ on disk. The
+	// unified PolicyEngine is bound to it, so every mutation that passes the
+	// operational gates is still adjudicated by the single governance owner.
+	//
+	// It is built BEFORE the autonomous driver because the driver's approval
+	// admission gate must consult the SAME engine that later issues the mutation
+	// token — otherwise the pre-check and the authorization it previews would be
+	// two different opinions about the same mutation.
+	a.Policy = policy.NewPolicyEngine(composedCapabilityGraph{ws: wsGraph, caps: a.Caps})
+	a.Auth = authorization.NewProductionAuthorizationEngine(root, func() coreWorkflow.WorkflowState {
+		return a.WorkflowSM.State()
+	}).WithPolicyEngine(a.Policy)
+
 	a.Autonomous = runtimeAutonomy.NewDriver(
 		adapter,
 		a.Bus,
+		// APPROVAL ADMISSION: the runtime refuses to open a human approval
+		// surface for a mutation its own AuthorizationEngine would refuse. The
+		// probe is AdmissibleBuild — the identical clause list AuthorizeBuild
+		// runs, consuming nothing — so "approve" can never be offered for a
+		// proposal that authorization cannot admit.
+		runtimeAutonomy.WithApprovalAdmission(func(targets []string, _ string) error {
+			if a.Auth == nil {
+				return nil
+			}
+			return a.Auth.AdmissibleBuild(targets, a.Caps, a.Budget)
+		}),
 		runtimeAutonomy.WithPreflightBarrier(loopBarrier),
 		runtimeAutonomy.WithPreflightState(preflightState),
 		// PHASE 15: the grant-gated workspace context barrier. The session grant
@@ -855,7 +950,51 @@ func Wire(opts ...Option) (*Application, error) {
 		// determined, so the plan is scoped to the mutation surface and
 		// unmodified sections are pruned (never a naive line slicer).
 		runtimeAutonomy.WithManifestPass(runtimeAutonomy.ManifestPassForExecutor(a.Executor)),
+		// OBJECTIVE REQUIREMENT DERIVATION: the read-only pass that asks the
+		// model what the objective requires, ONCE per lifecycle, BEFORE the first
+		// computation. Every proposal then passes the runtime's admissibility
+		// gate (traceable to the request, grounded in a target of the resolved
+		// scope) and each admitted requirement must be discharged by evidence the
+		// runtime observed itself before the objective can be PROVEN.
+		//
+		// This is what makes "a valid mutation happened" and "the objective was
+		// satisfied" different states: the mutation answers the execution-shape
+		// contract, and this answers the outcome contract. The pass cannot grant
+		// completion — a model that returns nothing simply leaves the runtime's
+		// own obligations in force.
+		runtimeAutonomy.WithRequirementPass(runtimeAutonomy.RequirementPassForExecutor(a.Executor,
+			// The requirement pass derives part of the completion contract, so it
+			// runs on the SAME Workspace Target model the main lane dispatches
+			// under. An unassigned target model is a refusal, never a fallback.
+			func() string {
+				if a.Authority == nil {
+					return ""
+				}
+				ref := a.Authority.ActiveModel()
+				return strings.TrimSpace(ref.ID)
+			})),
+		// BEHAVIORAL STAGE: the runtime's execution-and-observation half. The
+		// repair proposer is wired over the SAME provider the executor already
+		// uses, so behavioral repair joins the existing reasoning path instead of
+		// creating a parallel one.
+		runtimeAutonomy.WithBehaviorProposer(&execution.ProviderRepairProposer{
+			Provider: provider,
+			// The repair runs on the model the Workspace Target authority
+			// currently holds, resolved per call. An unassigned target model is a
+			// refusal, never a silent fallback to some other model.
+			ResolveModel: func() string {
+				ref := a.Authority.ActiveModel()
+				return strings.TrimSpace(ref.ID)
+			},
+		}),
+		// DURABLE EXECUTION LEDGER: the loop records the objective's
+		// lifecycle into the append-only journal so an interruption during
+		// compute, mutation or command is reconstructable after a restart.
+		// The session identity makes the task key stable across the run and
+		// keeps one session's objectives out of another's ledger.
+		runtimeAutonomy.WithLedger(a.ledger, sess.SessionID),
 	)
+
 	// ── AUTONOMY BOUNDARY-TELEMETRY SINK ─────────────────────────────────
 	// [boundary2]/[boundary5] diagnostic lines are routed onto the shared
 	// event bus as engine.activity events instead of the standard logger:
@@ -890,6 +1029,11 @@ func Wire(opts ...Option) (*Application, error) {
 
 	return a, nil
 }
+
+// behaviorCommandTimeout bounds one command the behavioral runtime issues.
+// The behavioral runtime exists to observe; a command that never returns would
+// turn observation into a hang.
+const behaviorCommandTimeout = 60 * time.Second
 
 // FlushAudit performs the blocking, synchronous audit flush for session
 // finalization: it drains every accepted envelope and fsyncs
@@ -959,6 +1103,17 @@ func (a *Application) Close() {
 	if a.Autonomous != nil {
 		a.Autonomous.Close()
 		a.Autonomous = nil
+	}
+	// The durable ledger closes AFTER the driver, so a run in flight can
+	// never have its terminal transition refused by a store that was already
+	// shut down. Its error is retained alongside the audit teardown error:
+	// the journal is the record of record, and a failure to close it must be
+	// reported rather than dropped.
+	if a.ledger != nil {
+		if err := a.ledger.Close(); err != nil {
+			a.auditCloseErr = err
+		}
+		a.ledger = nil
 	}
 	if a.Runtime != nil {
 		a.Runtime.Close()

@@ -32,7 +32,6 @@ import (
 	domainorch "github.com/PizenLabs/izen/internal/domain/orchestration"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/gateway"
-	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -2650,33 +2649,6 @@ func (m *model) hasStagedBuildWork() bool {
 		(m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0)
 }
 
-// formatRedundancyLedger renders the deterministic redundant-content findings
-// as a compact Context Evidence Ledger the model reasons over — it never
-// re-discovers structural facts (requirement §8: context evidence precedes
-// model reasoning).
-func formatRedundancyLedger(target string, redundant []hotfix.RedundantTarget) string {
-	if len(redundant) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "Context Evidence Ledger\nTarget: %s\nRedundant content findings:\n", target)
-	for i, r := range redundant {
-		if i >= 6 {
-			b.WriteString("* ... more findings omitted\n")
-			break
-		}
-		fmt.Fprintf(&b, "* %s — %s\n", r.Kind, r.Describe())
-	}
-	return strings.TrimSpace(b.String())
-}
-
-// isHTMLTarget reports whether the target file is an HTML document eligible for
-// the deterministic target-resolution stage.
-func isHTMLTarget(target string) bool {
-	ext := strings.ToLower(filepath.Ext(target))
-	return ext == ".html" || ext == ".htm" || ext == ".xhtml"
-}
-
 // a single, unambiguous full-creation contract.
 
 // findFailedBuildTask returns the step number of the first task in the build
@@ -4647,7 +4619,10 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 		// Without this explicit approval, /build remains blocked.
 		if action.ID == "approve-plan" {
 			m.planApproved = true
-			m.push(roleSystem, infoStyle.Render("✓ Plan approved. Transitioning to /build for execution..."))
+			// The plan is AUTHORIZED; nothing has been executed yet. The mode
+			// transition is a request the workspace handler performs, and the
+			// execution verdict — if any — comes from runtime lifecycle events.
+			m.push(roleSystem, infoStyle.Render("Plan approved. Moving to /build; execution has not started."))
 		}
 
 		// ── PLAN REJECTION ─────────────────────────────────────────────

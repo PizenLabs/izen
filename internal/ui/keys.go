@@ -813,7 +813,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if m.proposalTUI != nil {
 					intent = m.proposalTUI.Select()
 				}
-				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Recovery selected — "+string(intent)+"..."))
+				m.push(roleSystem, infoStyle.Render("  Recovery intent selected ("+string(intent)+") — the runtime will re-plan."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousProposal(string(intent))
@@ -824,14 +824,19 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, m.resumeAutonomousProposal("cancel")
 			case b.Action == autonomy.HumanBoundaryApproval &&
 				(msg.String() == "alt+a" || msg.Type == tea.KeyEnter):
-				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Approved — runtime applying patch..."))
+				// Authorization is a PERMISSION, not a fact. Nothing has been
+				// applied yet, so this line carries no success glyph; the
+				// authoritative apply/verify verdict arrives later as runtime
+				// lifecycle events.
+				m.push(roleSystem, infoStyle.Render("  Approved — the runtime will apply the held patch."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousApprove()
 			case b.Action == autonomy.HumanBoundaryDecomposition && msg.Type == tea.KeyEnter:
 				// Authorize the WHOLE staged DAG: every sub-task executes as
 				// one atomic transaction under the plan's own preflight scopes.
-				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Plan authorized — running the staged DAG..."))
+				// The plan is authorized; the DAG has NOT run yet.
+				m.push(roleSystem, infoStyle.Render("  Plan authorized — the runtime will run the staged DAG."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousProposalApprove()
@@ -946,8 +951,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if executorPatchID != "" {
 					m.executorPendingPatchID = ""
 					m.executorPendingTargets = nil
+					// Authorization is a PERMISSION, not a fact. Nothing has been
+					// applied yet, so the line states the request and carries no
+					// success glyph: the authoritative apply/verify/commit verdict
+					// arrives later as runtime lifecycle events.
 					m.push(roleSystem, infoStyle.Render(
-						fmt.Sprintf("  "+Icon.Success+" Approved — runtime applying patch to %s...", patch.File)))
+						fmt.Sprintf("  Approved — asking the runtime to apply the patch to %s.", patch.File)))
 					return m, tea.Batch(
 						func() tea.Msg { return agentStartMsg{label: "runtime hotfix apply"} },
 						m.runExecutorApproveCmd(executorPatchID),
@@ -966,7 +975,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.followTail()
 					return m, nil
 				}
-				m.appliedHotfixFile = patch.File
+				m.push(roleSystem, infoStyle.Render(
+					fmt.Sprintf("  Approved — asking the runtime to apply the patch to %s.", patch.File)))
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
 					m.runExecutorApproveCmd(patch.ID),
@@ -1017,7 +1027,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.ti.Focus()
 				m.refreshViewportContent()
 				m.followTail()
-				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Approved — executing shell command..."))
+				m.push(roleSystem, infoStyle.Render("  Approved — the runtime will run the command."))
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),
@@ -1035,7 +1045,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.refreshViewportContent()
 				m.followTail()
 				m.push(roleSystem, infoStyle.Render(
-					"  "+Icon.Success+" Approved (always) — executing shell command..."))
+					"  Approved (always) — the runtime will run the command."))
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),

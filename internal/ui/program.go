@@ -246,6 +246,23 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 	m.loadHistory()
 	m.historyIndex = len(m.history)
 
+	// ── DURABLE LEDGER RECONSTRUCTION SURFACE (§9 / §15) ────────────────
+	// A process that died during compute, mutation or a command left an
+	// unfinished task in the durable execution ledger. Surface it HERE, at
+	// startup and before any prompt, so a restart tells the human what was in
+	// flight instead of silently re-prompting for an objective it already
+	// began. Nothing is resumed automatically: the ledger records what
+	// happened, the human decides what happens next.
+	if task, ok := app.InterruptedTask(); ok {
+		m.interrupted = &interruptedTask{
+			id:     task.ID,
+			intent: task.Intent,
+			status: string(task.Status),
+			step:   task.CurrentStepID,
+		}
+		m.push(roleSystem, m.interrupted.surface())
+	}
+
 	// ── WIRE ACTIVITY LOGGERS ────────────────────────────────────────────
 	// The retrieval/execution activity sinks are routed through the event bus
 	// (never a direct model callback): each line is published as an
@@ -357,7 +374,40 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 	// event type is an authoritative barrier that passes through unchanged.
 	co := newStreamCoalescer(p.Send, uiStreamCoalesceInterval)
 
-	for _, typ := range []string{
+	for _, typ := range projectedEventTypes() {
+		eventBus.Subscribe(typ, co.Accept)
+	}
+
+	return p
+}
+
+// projectedEventTypes is the COMPLETE list of canonical domain event types the
+// TUI projects.
+//
+// Completeness is a contract, not a preference (spec §17: "The UI must render
+// runtime state. The UI must not predict runtime state"). A reducer that is
+// handed a subset of the runtime's events renders a subset of the truth, and the
+// missing events fail silently — the UI keeps drawing a confident picture from
+// partial evidence.
+//
+// Two omissions previously lived here:
+//
+//   - EventExecutionEvidence: the sealed terminal record. The completion gate
+//     turns "this execution entered the mutation boundary" into a demand for
+//     that record, so subscribing to EventMutationStarted WITHOUT it left every
+//     mutation execution rendering "not completed — no sealed execution
+//     evidence was published" while the runtime had in fact sealed a COMMITTED
+//     record. The UI contradicted the runtime's own authority.
+//   - EventStepStarted / EventStepCompleted: the bounded-step ledger. Every
+//     step line the authorization card renders is derived from these, so
+//     without them the ledger was permanently empty and the whole Phase-16
+//     step surface unreachable in production.
+//
+// Events deliberately excluded are the ones that would fabricate state:
+// EventPhaseCompleted and friends that the runtime never publishes for an
+// execution. Anything else belongs here.
+func projectedEventTypes() []string {
+	return []string{
 		events.EventPatchAttempted,
 		events.EventEngineTelemetry,
 		events.EventReasoningStream,
@@ -372,6 +422,14 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventStrategySelected,
 		events.EventTargetResolved,
 		events.EventContextPrepared,
+		// The SEALED terminal record. It is published BEFORE execution.finished
+		// precisely so a consumer that observes the completion event has already
+		// observed the record that justifies it.
+		events.EventExecutionEvidence,
+		// The bounded-step ledger. A step line exists only for a step the runtime
+		// actually started or completed.
+		events.EventStepStarted,
+		events.EventStepCompleted,
 		// Pre-execution lifecycle boundaries: the context compiler starting and
 		// a tool batch starting/finishing are the real moments a surface is
 		// being produced but cannot be shown yet, so the UI mounts its one-row
@@ -427,11 +485,7 @@ func NewProgramWithApp(root string, cfg *config.Config, localCfg *config.LocalCo
 		events.EventAutonomousParked,
 		events.EventAutonomousResumed,
 		events.EventAutonomousAborted,
-	} {
-		eventBus.Subscribe(typ, co.Accept)
 	}
-
-	return p
 }
 
 // resolveUsername resolves the user's display name with the following
