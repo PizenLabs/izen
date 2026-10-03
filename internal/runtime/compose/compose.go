@@ -950,6 +950,29 @@ func Wire(opts ...Option) (*Application, error) {
 		// determined, so the plan is scoped to the mutation surface and
 		// unmodified sections are pruned (never a naive line slicer).
 		runtimeAutonomy.WithManifestPass(runtimeAutonomy.ManifestPassForExecutor(a.Executor)),
+		// OBJECTIVE REQUIREMENT DERIVATION: the read-only pass that asks the
+		// model what the objective requires, ONCE per lifecycle, BEFORE the first
+		// computation. Every proposal then passes the runtime's admissibility
+		// gate (traceable to the request, grounded in a target of the resolved
+		// scope) and each admitted requirement must be discharged by evidence the
+		// runtime observed itself before the objective can be PROVEN.
+		//
+		// This is what makes "a valid mutation happened" and "the objective was
+		// satisfied" different states: the mutation answers the execution-shape
+		// contract, and this answers the outcome contract. The pass cannot grant
+		// completion — a model that returns nothing simply leaves the runtime's
+		// own obligations in force.
+		runtimeAutonomy.WithRequirementPass(runtimeAutonomy.RequirementPassForExecutor(a.Executor,
+			// The requirement pass derives part of the completion contract, so it
+			// runs on the SAME Workspace Target model the main lane dispatches
+			// under. An unassigned target model is a refusal, never a fallback.
+			func() string {
+				if a.Authority == nil {
+					return ""
+				}
+				ref := a.Authority.ActiveModel()
+				return strings.TrimSpace(ref.ID)
+			})),
 		// BEHAVIORAL STAGE: the runtime's execution-and-observation half. The
 		// repair proposer is wired over the SAME provider the executor already
 		// uses, so behavioral repair joins the existing reasoning path instead of

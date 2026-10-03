@@ -365,6 +365,34 @@ type ObjectiveEvidence struct {
 	// SealedRecord is the runtime's immutable terminal record when one exists.
 	// When set it is authoritative over any derived field.
 	SealedRecord *ExecutionEvidence
+
+	// ── Boundary 5: OBJECTIVE (meaning, beyond execution shape) ───────
+	//
+	// Everything above is an EXECUTION fact: a transport spoke, a parser found
+	// something, a filesystem changed, a gate ran. None of it says the user's
+	// objective was achieved. These four fields carry the OUTCOME half.
+
+	// Conditions are the authoritative completion conditions of the objective
+	// lifecycle (objective_contract.go). When non-empty, EVERY condition must be
+	// satisfied before the objective may be PROVEN.
+	//
+	// The authority RECOMPUTES each condition from the fields below and never
+	// reads a caller-supplied status, so a caller cannot assert its own
+	// homework. An empty condition set reproduces the pre-contract behaviour
+	// exactly: no condition means no additional clause.
+	Conditions []CompletionCondition
+	// PostMutationObserved names declared targets the runtime RE-READ AFTER the
+	// mutation landed. Requesting a target is not observing it, and a
+	// pre-dispatch snapshot is not a post-mutation result.
+	PostMutationObserved []string
+	// DischargedRequirements names admitted requirements the runtime itself
+	// attributed an observed execution fact to. A requirement is discharged by
+	// evidence, never by the model saying so.
+	DischargedRequirements []string
+	// ClaimedRequirements names requirements the model CLAIMS it satisfied. They
+	// are recorded so the trace can show a claim that carried no evidence; they
+	// never count as discharge.
+	ClaimedRequirements []string
 }
 
 // Mutated reports whether at least one declared target was durably transformed.
@@ -674,12 +702,18 @@ func NewObjectiveCompletionAuthority() *ObjectiveCompletionAuthority {
 //  1. a sealed record says FAILED / tainted  → FAILED (positive contradiction)
 //  2. the generation was truncated           → UNSUBSTANTIATED (CONTINUING)
 //  3. the provider refused or errored        → FAILED
-//  4. the contract's own clauses             → per-kind
-//  5. no rule was violated and no clause
+//  4. the OBJECTIVE completion contract      → every condition must hold
+//  5. the execution-shape contract           → per-kind
+//  6. no rule was violated and no clause
 //     was satisfied                          → UNSUBSTANTIATED (fail-closed)
 //
+// Clause 4 is what makes "a valid mutation happened" and "the user's objective
+// has been satisfied" different states. It runs BEFORE the per-kind clauses so
+// a lifecycle can never reach PROVEN by satisfying the mutation shape alone
+// while leaving the objective's own conditions unmet.
+//
 // The function is TOTAL: it always returns an outcome, and it can never return
-// PROVEN without satisfying every clause of the contract.
+// PROVEN without satisfying every clause of both contracts.
 func (a *ObjectiveCompletionAuthority) Evaluate(contract TaskContract, ev ObjectiveEvidence) ObjectiveOutcome {
 	// ── 0 — a human gate owns the decision ──────────────────────────
 	if ev.ApprovalPending {
@@ -719,7 +753,15 @@ func (a *ObjectiveCompletionAuthority) Evaluate(contract TaskContract, ev Object
 		}
 	}
 
-	// ── 4 — the contract's own clauses ─────────────────────────────
+	// ── 4 — the OBJECTIVE completion contract ──────────────────────
+	// Every completion condition the runtime authored must hold. This runs
+	// before the per-kind execution clauses so an execution shape can never
+	// stand in for the objective it was serving.
+	if unmet := UnmetCondition(ev); unmet != nil {
+		return ObjectiveUnsubstantiated
+	}
+
+	// ── 5 — the contract's own clauses ─────────────────────────────
 	switch contract.Kind {
 	case TaskCreate:
 		return a.evaluateCreate(contract, ev)
@@ -737,6 +779,32 @@ func (a *ObjectiveCompletionAuthority) Evaluate(contract TaskContract, ev Object
 		// An unknown contract kind can never prove anything.
 		return ObjectiveUnsubstantiated
 	}
+}
+
+// UnmetCondition returns the FIRST completion condition the evidence fails, or
+// nil when every condition holds (including the vacuous case of no conditions).
+//
+// It is the single authority for the objective half of the contract, and it is
+// exposed so the continuation path, the trace and the tests all read the SAME
+// computation rather than three lookalikes.
+func UnmetCondition(ev ObjectiveEvidence) *CompletionCondition {
+	if len(ev.Conditions) == 0 {
+		return nil
+	}
+	for _, c := range ReduceConditions(ev.Conditions, ev) {
+		if !c.Satisfied() {
+			unmet := c
+			return &unmet
+		}
+	}
+	return nil
+}
+
+// SatisfiedConditions returns the recomputed condition states for a lifecycle.
+// The returned statuses are RUNTIME-COMPUTED; the authored statuses on the input
+// are discarded.
+func SatisfiedConditions(ev ObjectiveEvidence) []CompletionCondition {
+	return ReduceConditions(ev.Conditions, ev)
 }
 
 // evaluateCreate — CREATE: artifact parsed + mutation applied + durable target
@@ -932,6 +1000,11 @@ func evaluationFor(contract TaskContract, ev ObjectiveEvidence, outcome Objectiv
 
 // unsatisfiedClause names the FIRST contract clause the evidence fails. The
 // order mirrors Evaluate so the reason and the verdict can never disagree.
+//
+// The OBJECTIVE completion contract is reported before the execution-shape
+// clauses, matching Evaluate's precedence: "the mutation was the right shape
+// but the objective's own conditions were not met" is the truthful reason, and
+// it is the reason an operator needs.
 func unsatisfiedClause(contract TaskContract, ev ObjectiveEvidence) (string, string) {
 	if ev.SealedRecord != nil {
 		switch {
@@ -948,6 +1021,9 @@ func unsatisfiedClause(contract TaskContract, ev ObjectiveEvidence) (string, str
 		return "artifact_continuing", fmt.Sprintf(
 			"the provider stream ended at finish_reason=%s; the partial artifact is preserved for continuation and is not a completed artifact",
 			orUnknown(ev.FinishReason))
+	}
+	if unmet := UnmetCondition(ev); unmet != nil {
+		return unmetConditionClause(*unmet)
 	}
 	switch contract.Kind {
 	case TaskCreate:
@@ -1007,6 +1083,77 @@ func orUnknown(s string) string {
 		return "unknown"
 	}
 	return s
+}
+
+// unmetConditionClause renders the deterministic clause/reason pair for a
+// completion condition the evidence failed.
+//
+// The clause label is DERIVED FROM THE OBLIGATION, not from the condition's
+// authored identity, so a trace cannot be made to claim a specific, more
+// flattering clause than the one that actually decided.
+func unmetConditionClause(c CompletionCondition) (string, string) {
+	detail := conditionDetail(c)
+	switch c.Obligation {
+	case ObligationScopeMutated:
+		return "objective_scope_unmutated",
+			fmt.Sprintf("completion condition %q is unmet: %s — a valid mutation of the right shape is not the objective being satisfied", c.ID, detail)
+	case ObligationPostMutationReinspected:
+		return "objective_result_uninspected",
+			fmt.Sprintf("completion condition %q is unmet: %s — the resulting state was never inspected, so no claim about it is admissible", c.ID, detail)
+	case ObligationRequirementDischarged:
+		return "objective_requirement_undischarged",
+			fmt.Sprintf("completion condition %q is unmet: %s — the model proposed this requirement and the runtime observed no evidence discharging it", c.ID, detail)
+	case ObligationObserved:
+		return "objective_scope_unobserved",
+			fmt.Sprintf("completion condition %q is unmet: %s", c.ID, detail)
+	case ObligationTargetExists:
+		return "objective_target_unobserved",
+			fmt.Sprintf("completion condition %q is unmet: %s", c.ID, detail)
+	case ObligationScopeAbsent:
+		return "objective_target_still_present",
+			fmt.Sprintf("completion condition %q is unmet: %s", c.ID, detail)
+	case ObligationIntegrityHeld:
+		return "objective_integrity_" + strings.ToLower(string(c.VerificationState)),
+			fmt.Sprintf("completion condition %q is unmet: %s", c.ID, detail)
+	case ObligationResponseDelivered:
+		return "objective_response_missing",
+			fmt.Sprintf("completion condition %q is unmet: %s", c.ID, detail)
+	default:
+		return "objective_condition_unmet",
+			fmt.Sprintf("completion condition %q is unmet: %s", c.ID, detail)
+	}
+}
+
+// conditionDetail renders WHY one condition failed, from its recomputed
+// verification state and target scope.
+func conditionDetail(c CompletionCondition) string {
+	scope := strings.Join(c.Targets, ", ")
+	if scope == "" {
+		scope = "(no declared target)"
+	}
+	if c.VerificationState == VerifyClaimedOnly {
+		return "claimed by the model with no observed evidence, target scope " + scope
+	}
+	switch c.Obligation {
+	case ObligationRequirementDischarged:
+		return "requirement " + c.RequirementID + " has no discharging observation"
+	case ObligationScopeMutated:
+		return "no durable delta observed on " + scope
+	case ObligationPostMutationReinspected:
+		return "no post-mutation re-read of " + scope
+	case ObligationObserved:
+		return "no workspace observation event for " + scope
+	case ObligationTargetExists:
+		return "no durable existence observation for " + scope
+	case ObligationScopeAbsent:
+		return "no explicit absence observation for " + scope
+	case ObligationIntegrityHeld:
+		return "the verification gate reported " + string(c.VerificationState)
+	case ObligationResponseDelivered:
+		return "no response and no deterministic structural verdict"
+	default:
+		return "the runtime could not observe the obligation satisfied (" + string(c.VerificationState) + ")"
+	}
 }
 
 // AuthorizeCompletion is the fail-closed convenience wrapper: it returns the

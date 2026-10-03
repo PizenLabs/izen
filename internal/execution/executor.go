@@ -595,6 +595,12 @@ type RuntimeExecutor struct {
 	// prompt (buildManifestPrompt) at bootstrap via SetManifestSystemPrompt; a
 	// direct InvokeManifestPass call without injection keeps the default.
 	manifestSystemPromptOverride string
+	// requirementSystemPromptOverride, when non-empty, replaces the default
+	// objective-requirement derivation prompt (RequirementPassSystemPrompt).
+	// The autonomy layer injects it at bootstrap via
+	// SetRequirementPassSystemPrompt; a direct InvokeRequirementPass call
+	// without injection keeps the default.
+	requirementSystemPromptOverride string
 	// targetResolver is the Phase 16 evidence-bound target resolver. It sits
 	// between Admission and the ContextCompiler: admission decides whether the
 	// objective may act, the resolver decides WHERE it may act. They are

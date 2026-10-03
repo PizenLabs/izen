@@ -870,6 +870,7 @@ func (d *Driver) ResumeApproveProposal(ctx context.Context) (*autonomy.LoopTermi
 		return d.term(), err
 	}
 	d.runID++
+	d.markHumanGated()
 	d.loop.ReleaseHuman("DECOMPOSITION_PROPOSAL approved")
 	d.publish(ctx)
 	term := d.runProposalDAG(ctx, dag)
@@ -885,6 +886,7 @@ func (d *Driver) ResumeRejectProposal(ctx context.Context, reason string) (*auto
 	if d.Proposal() == nil {
 		return d.term(), errors.New("autonomy: proposal rejection requires a parked DECOMPOSITION_PROPOSAL boundary")
 	}
+	d.markHumanGated()
 	d.loop.ReleaseHuman("DECOMPOSITION_PROPOSAL rejected")
 	d.publish(ctx)
 	if d.dag != nil && !d.dag.Status.Terminal() {
@@ -995,6 +997,15 @@ func (d *Driver) runProposalDAG(ctx context.Context, dag *planner.ExecutionDAG) 
 				fmt.Sprintf("sub-task %s (%d/%d) terminal outcome %s (finish_reason=%q)%s — boundaries 3/4/5 refused the unit",
 					st.ID, i+1, n, obs.Outcome, obs.FinishReason, attemptNote))
 		}
+
+		// ── OBJECTIVE EVIDENCE BINDING ─────────────────────────────
+		// A decomposed plan is ONE objective executed in units, so the objective
+		// lifecycle accumulates across every unit exactly as it does on the
+		// monolithic path: each unit's result is re-read, and the delta it landed
+		// is attributed to whatever requirements it actually reaches. Per-unit
+		// isolation is not enough — the objective contract is judged once, at the
+		// end, over the aggregate.
+		d.bindStepEvidence()
 
 		// ── BOUNDARY 5 — digest AFTER the sub-task ─────────────────────
 		after := d.adapter.WorkspaceVersion(targets)

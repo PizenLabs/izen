@@ -192,7 +192,11 @@ func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
 		return
 	}
 	contract := d.taskContract()
-	evidence := d.objectiveEvidence()
+	// The evidence bundle the authority judges is the SAME bundle the objective
+	// progress reducer and the trace read. One computation of "what holds",
+	// consulted from three places — a projection that could disagree with the
+	// verdict would reintroduce exactly the ambiguity this seam removes.
+	evidence := d.objectiveEvidenceWithContract()
 	evaluation := d.objectiveAuthority.Authorize(contract, evidence)
 	d.lastObjective = evaluation
 	d.lastContract = contract

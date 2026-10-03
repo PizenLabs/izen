@@ -184,6 +184,20 @@ type Driver struct {
 	// lastContract is the canonical TaskContract the last verdict was judged
 	// against. Keeping it adjacent to the verdict makes the pairing auditable.
 	lastContract execution.TaskContract
+	// ── Objective lifecycle (the OUTCOME half of the contract) ──────────
+	// objective is the per-run objective state: the derived completion contract,
+	// the requirement ledger, the runtime-attributed discharge set and the
+	// post-mutation re-inspection set. It is reset wholesale per run, because
+	// every field in it is objective-scoped and must never satisfy a different
+	// objective's completion contract.
+	objective objectiveLifecycle
+	// requirementPass is the read-only objective requirement derivation. Nil
+	// disables it; the runtime's own obligations still gate completion without it.
+	requirementPass RequirementPassFunc
+	// scopeResolution records how the lifecycle's target set came to be: the
+	// typed UNRESOLVED → DISCOVERED → RESOLVED transition, so an empty preflight
+	// scope reads as "not yet bound" rather than as a value that was overwritten.
+	scopeResolution ScopeResolution
 	// intents is the lifecycle's ONE canonical intent authority. Preflight, the
 	// context compiler and the driver all read it, and only a blocking revision
 	// advances it — so no two components can hold conflicting intent states.
@@ -490,6 +504,13 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.contractRecoveries = 0
 	d.contractRecoveryExhausted = false
 	d.derivationNote = ""
+	// ── OBJECTIVE LIFECYCLE RESET ─────────────────────────────────────
+	// Every objective-scoped fact — the completion contract, the requirement
+	// ledger, the attributed discharge set, the post-mutation observations — is
+	// dropped here. A new Run is a new objective, and carrying any of it forward
+	// would let one objective's discharged requirements satisfy another's
+	// completion contract.
+	d.resetObjectiveContract()
 	// A fresh run is a fresh LIFECYCLE, and the canonical intent is per
 	// lifecycle. Reusing the previous run's authority would let an elevation
 	// leak into a read-only objective — the exact split-brain this authority
@@ -631,6 +652,13 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		return d.term(), nil //nolint:nilerr // the incomplete revision is a park, not a run failure
 	}
 	d.obs = d.contextObservation()
+	// ── OBJECTIVE REQUIREMENT DERIVATION (once per lifecycle) ─────────
+	// The completion contract is authored BEFORE the first computation, so the
+	// model is never asked to work against an obligation set invented after the
+	// fact. The pass is read-only, bounded, and best-effort: a failure leaves
+	// the runtime's own obligations in place and never loosens the contract.
+	d.deriveObjectiveRequirements(ctx)
+	d.publishIntentAxes()
 	term, err := d.observeAndRun(d.runCtx, runID) //nolint:contextcheck // runCtx is the run's own cancellation context
 	// Clear run context on terminal completion; preserve when parked.
 	if term != nil && term.State.IsTerminal() {
@@ -710,6 +738,7 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 			reason = "approval failed: " + err.Error()
 		}
 		if d.loop != nil && !d.loop.State().IsTerminal() {
+			d.markHumanGated()
 			d.loop.ReleaseHuman(reason)
 			d.publish(ctx)
 			term := d.terminateAbort(ctx, reason, autonomy.FailurePermanent)
@@ -719,6 +748,14 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 		return d.term(), nil
 	}
 	d.obs = obs
+	// The apply landed through the human gate, so the runtime — not an executor
+	// dispatch — is what produced this observation. Fold it into the objective
+	// lifecycle here: the result must be re-inspected and the step's evidence
+	// attributed exactly as it is on the autonomous path. Skipping this would
+	// make every approved objective permanently incomplete for want of a read
+	// the runtime never took.
+	d.bindStepEvidence()
+	d.markHumanGated()
 	d.loop.ReleaseHuman("patch approved")
 	d.publish(ctx)
 	if approvalFailureOutcome(obs) {
@@ -761,6 +798,7 @@ func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.Loo
 			r = "rejection failed: " + err.Error()
 		}
 		if d.loop != nil && !d.loop.State().IsTerminal() {
+			d.markHumanGated()
 			d.loop.ReleaseHuman(r)
 			d.publish(ctx)
 			term := d.terminateAbort(ctx, r, autonomy.FailurePermanent)
@@ -770,6 +808,8 @@ func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.Loo
 		return d.term(), nil
 	}
 	d.obs = obs
+	d.bindStepEvidence()
+	d.markHumanGated()
 	d.loop.ReleaseHuman("patch rejected")
 	d.publish(ctx)
 	d.runID++
@@ -811,6 +851,7 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	// first observation of a changed scope, not a refresh of an existing claim.
 	d.capturePreExecutionTargets()
 	d.obs = d.contextObservation()
+	d.markHumanGated()
 	d.loop.ReleaseHuman("target specified: " + target)
 	d.publish(ctx)
 	d.runID++
@@ -877,6 +918,7 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 	d.resolveSurfaceLifecycle(ctx, "human choice: "+string(intent))
 	// ProposalCancel: ABORTED with $0 spent.
 	if intent.IsCancel() {
+		d.markHumanGated()
 		d.loop.ReleaseHuman("proposal cancelled")
 		d.publish(ctx)
 		d.emitAutonomousAborted(ctx, "proposal cancelled: "+string(intent))
@@ -915,6 +957,7 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 	// Anti-loop guard: the SAME strategy was already selected-and-failed enough
 	// times without altering workspace state — force ABORTED instead of looping.
 	if d.proposalFails >= proposalAntiLoopLimit {
+		d.markHumanGated()
 		d.loop.ReleaseHuman("proposal anti-loop guard: " + string(intent))
 		d.publish(ctx)
 		d.emitAutonomousAborted(ctx, "proposal anti-loop guard: "+string(intent))
@@ -1097,6 +1140,7 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 	}
 	// The surface is resolved and the run re-enters observation.
 	d.surface = nil
+	d.markHumanGated()
 	d.loop.ReleaseHuman("proposal selected: " + string(intent))
 	d.publish(ctx)
 	d.emitAutonomousResumed(ctx, "proposal selected: "+string(intent))
@@ -1347,6 +1391,11 @@ func (d *Driver) deriveEvidenceScope() {
 	// A resolved target set is already authoritative. Deriving over it would be
 	// second-guessing the gateway with a scan.
 	if len(d.resolved.Targets) > 0 {
+		d.noteScopeTransition(ScopeResolution{
+			State:   ScopeResolved,
+			Targets: append([]string(nil), d.resolved.Targets...),
+			Reason:  "the strategy gateway resolved the target set from the objective itself",
+		})
 		return
 	}
 	derivation := d.adapter.DeriveScope(d.prompt, nil)
@@ -1354,9 +1403,7 @@ func (d *Driver) deriveEvidenceScope() {
 		if derivation.Reason != "" {
 			d.derivationNote = derivation.Reason
 			diagnosticf("[scope] no evidence-bound target derived: %s", derivation.Reason)
-			if d.bus != nil {
-				d.bus.Publish(events.NewActivity("[scope] " + derivation.Reason))
-			}
+			d.noteScopeTransition(ScopeResolution{State: ScopeUnresolved, Reason: derivation.Reason})
 		}
 		return
 	}
@@ -1378,9 +1425,12 @@ func (d *Driver) deriveEvidenceScope() {
 			string(profile.Strategy) + "); no mutation was dispatched"
 		diagnosticf("[scope] derivation produced %v but gateway selected %s — no dispatch",
 			derivation.Targets, profile.Strategy)
-		if d.bus != nil {
-			d.bus.Publish(events.NewActivity("[scope] " + d.derivationNote))
-		}
+		d.noteScopeTransition(ScopeResolution{
+			State:   ScopeRefused,
+			Targets: append([]string(nil), derivation.Targets...),
+			Kinds:   append([]string(nil), derivation.Kinds...),
+			Reason:  d.derivationNote,
+		})
 		return
 	}
 
@@ -1393,6 +1443,11 @@ func (d *Driver) deriveEvidenceScope() {
 	if len(proven) == 0 {
 		d.derivationNote = "derived candidates did not resolve to existing workspace files: " + derivation.Reason
 		diagnosticf("[scope] %s", d.derivationNote)
+		d.noteScopeTransition(ScopeResolution{
+			State:  ScopeRefused,
+			Kinds:  append([]string(nil), derivation.Kinds...),
+			Reason: d.derivationNote,
+		})
 		return
 	}
 
@@ -1401,11 +1456,22 @@ func (d *Driver) deriveEvidenceScope() {
 	d.derivationNote = derivation.Reason
 	diagnosticf("[scope] evidence-bound derivation: %v (kinds=%v) — %s",
 		proven, derivation.Kinds, derivation.Reason)
-	if d.bus != nil {
-		d.bus.Publish(events.NewActivity(fmt.Sprintf(
-			"[scope] observed workspace evidence bound %d target(s) %v — %s",
-			len(proven), proven, derivation.Reason)))
-	}
+	// The two-step transition is recorded explicitly: DISCOVERED is the
+	// observation, RESOLVED is the gateway's authority. Publishing only the end
+	// state is what made `targets=[]` look like a value that had been silently
+	// overwritten.
+	d.noteScopeTransition(ScopeResolution{
+		State:   ScopeDiscovered,
+		Targets: append([]string(nil), proven...),
+		Kinds:   append([]string(nil), derivation.Kinds...),
+		Reason:  derivation.Reason,
+	})
+	d.noteScopeTransition(ScopeResolution{
+		State:   ScopeResolved,
+		Targets: append([]string(nil), proven...),
+		Kinds:   append([]string(nil), derivation.Kinds...),
+		Reason:  "the strategy gateway accepted the observed files as this run's mutation scope",
+	})
 }
 
 // joinTargets renders derived targets as @scope tokens so the canonical gateway
@@ -1604,7 +1670,17 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// that returned, a step that came back nil and a verifier that
 			// merely ran are structurally incapable of producing it.
 			d.authorizeObjectiveCompletion(&decision)
-			// ── BEHAVIORAL PROOF GATE ───────────────────────────────────
+			// ── OBJECTIVE EVIDENCE-CARRY-OVER ──────────────────────
+			// When the completion gate REFUSED a claim, the lifecycle is not
+			// finished — it is incomplete. This is where that fact becomes the
+			// next action: the objective's own progress decides between
+			// continuing against the SAME contract, replanning against the
+			// current evidence state, waiting for a human and reporting the
+			// objective unsubstantiated. A refused claim is never silently
+			// converted into a terminal verdict when the bounds allow another
+			// step, and it is never converted into a success either.
+			d.routeObjectiveContinuation(&decision)
+			// ── BEHAVIORAL PROOF GATE ────────────────────────────────────
 			// An objective that asks for a verifiable RESULT cannot be declared
 			// complete on the strength of an applied mutation alone. The workspace
 			// must be observed RUNNING and its observable requirements PROVEN.
@@ -1683,6 +1759,13 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				return nil, fmt.Errorf("autonomy: execute: %w", err)
 			}
 			d.obs = obs
+			// ── OBJECTIVE EVIDENCE BINDING ───────────────────────
+			// Fold this step's facts into the objective lifecycle: re-read the
+			// declared targets so the RESULT is observed (not just requested),
+			// and attribute whatever durable evidence landed to the requirements
+			// it actually reaches. Attribution is runtime-side; a model's own
+			// "all done" discharges nothing.
+			d.bindStepEvidence()
 			// ── CONTROL-PLANE OUTCOME ROUTING ─────────────────────────
 			// preflight_infeasible (Boundary 2) and workspace_drift (Boundary 5)
 			// are CONTROL-PLANE verdicts, NOT execution results: the executor
@@ -1776,6 +1859,7 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 					// The zero-trust matrix forbade any continuation: converge
 					// to a terminal inform boundary — never a raw error and
 					// never an implicit retry.
+					d.markHumanGated()
 					d.loop.ReleaseHuman("recovery halted by invariant matrix")
 					b := &autonomy.HumanBoundary{
 						Reason:  "recovery halted: " + err.Error(),
@@ -2293,10 +2377,27 @@ func (d *Driver) emitObjectiveUnsubstantiated(contract execution.TaskContract, e
 		return
 	}
 	runID, contractID, target, _ := d.driverFacts()
+	objectiveID := d.ObjectiveIdentity()
 	d.bus.Publish(events.NewActivity(fmt.Sprintf(
-		"[objective] run=%s contract_id=%s kind=%s target=%s outcome=%s clause=%s — %s",
-		orUnknownField(runID), orUnknownField(contractID), contract.Kind, orUnknownField(target),
+		"[objective] run=%s objective_id=%s contract_id=%s kind=%s target=%s outcome=%s clause=%s — %s",
+		orUnknownField(runID), orUnknownField(objectiveID), orUnknownField(contractID), contract.Kind, orUnknownField(target),
 		evaluation.Outcome, orClause(evaluation.Clause), evaluation.Reason)))
+	// The unmet completion conditions are named individually. "the objective was
+	// not proven" is a verdict; "requirements req-2 and cond-post-mutation-
+	// reinspected are unmet" is the thing an operator (or the next computation)
+	// can actually act on.
+	conditions := d.ObjectiveConditions()
+	var unmet []string
+	for _, c := range conditions {
+		if !c.Satisfied() {
+			unmet = append(unmet, c.ID)
+		}
+	}
+	if len(unmet) > 0 {
+		d.bus.Publish(events.NewActivity(fmt.Sprintf(
+			"[objective] unmet completion conditions (%d/%d): %s",
+			len(unmet), len(conditions), strings.Join(unmet, ", "))))
+	}
 }
 
 func orUnknownField(value string) string {
