@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -48,6 +49,22 @@ type MutationAuthorization struct {
 	ExpiresAt     time.Time
 	SingleUse     bool
 	IssuedAt      time.Time
+	// CandidateID is the MutationCandidate identity this token was issued FOR,
+	// when the caller knows it. It is the lineage binding that closes the last
+	// gap in
+	//
+	//	ComputationID → ArtifactCandidate → MutationProposal → Authorization → Mutation
+	//
+	// Without it, an authorization is a bare PERMISSION: it names a target set
+	// and nothing else, so an approval obtained for one candidate would also read
+	// as an approval for a different (or superseded) one. With it, the mutation
+	// boundary refuses a token whose CandidateID is not the candidate being
+	// applied, so a human gate opened for computation A can never carry
+	// computation B's bytes into the workspace.
+	//
+	// Empty means "unbound": the caller had no candidate identity to bind (a
+	// direct build execution), and the historical behaviour is preserved.
+	CandidateID string
 }
 
 func (a *MutationAuthorization) IsExpired() bool {
@@ -101,6 +118,12 @@ type AuthorizationDenied struct {
 func (e *AuthorizationDenied) Error() string {
 	return fmt.Sprintf("authorization: %s: %s", e.Step, e.Message)
 }
+
+// AuthorizationCandidateMismatch is returned by a mutation boundary that was
+// handed an authorization bound to a DIFFERENT candidate than the one being
+// applied. It is a lineage failure, not a permission failure: the human gate was
+// opened for one artifact and a different one is being written.
+var ErrAuthorizationCandidateMismatch = errors.New("authorization: candidate identity mismatch")
 
 type CapabilityFlags int
 

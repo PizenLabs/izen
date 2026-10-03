@@ -904,9 +904,36 @@ func Wire(opts ...Option) (*Application, error) {
 	// set the PolicyEngine adjudicates against, so a behavioral repair can never
 	// be granted more than the Control Plane already permits.
 	adapter.SetCapabilities(a.Caps)
+
+	// ── AUTHORIZATION ENGINE ───────────────────────────────────────────────
+	// Production AuthorizationEngine wired with a no-op source hash verifier
+	// and a checkpoint checker that inspects .izen/checkpoints/ on disk. The
+	// unified PolicyEngine is bound to it, so every mutation that passes the
+	// operational gates is still adjudicated by the single governance owner.
+	//
+	// It is built BEFORE the autonomous driver because the driver's approval
+	// admission gate must consult the SAME engine that later issues the mutation
+	// token — otherwise the pre-check and the authorization it previews would be
+	// two different opinions about the same mutation.
+	a.Policy = policy.NewPolicyEngine(composedCapabilityGraph{ws: wsGraph, caps: a.Caps})
+	a.Auth = authorization.NewProductionAuthorizationEngine(root, func() coreWorkflow.WorkflowState {
+		return a.WorkflowSM.State()
+	}).WithPolicyEngine(a.Policy)
+
 	a.Autonomous = runtimeAutonomy.NewDriver(
 		adapter,
 		a.Bus,
+		// APPROVAL ADMISSION: the runtime refuses to open a human approval
+		// surface for a mutation its own AuthorizationEngine would refuse. The
+		// probe is AdmissibleBuild — the identical clause list AuthorizeBuild
+		// runs, consuming nothing — so "approve" can never be offered for a
+		// proposal that authorization cannot admit.
+		runtimeAutonomy.WithApprovalAdmission(func(targets []string, _ string) error {
+			if a.Auth == nil {
+				return nil
+			}
+			return a.Auth.AdmissibleBuild(targets, a.Caps, a.Budget)
+		}),
 		runtimeAutonomy.WithPreflightBarrier(loopBarrier),
 		runtimeAutonomy.WithPreflightState(preflightState),
 		// PHASE 15: the grant-gated workspace context barrier. The session grant
@@ -944,6 +971,7 @@ func Wire(opts ...Option) (*Application, error) {
 		// keeps one session's objectives out of another's ledger.
 		runtimeAutonomy.WithLedger(a.ledger, sess.SessionID),
 	)
+
 	// ── AUTONOMY BOUNDARY-TELEMETRY SINK ─────────────────────────────────
 	// [boundary2]/[boundary5] diagnostic lines are routed onto the shared
 	// event bus as engine.activity events instead of the standard logger:

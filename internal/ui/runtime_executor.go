@@ -47,6 +47,11 @@ func (m *model) runExecutorApproveCmd(patchID string) tea.Cmd {
 		}
 	}
 	if err := m.authorizeExecutorApproval(); err != nil {
+		// A refused authorization is TERMINAL for this proposal: the staged
+		// patch is dropped and the approval state released, so the operator is
+		// never invited to press Alt+A again for a mutation the runtime has
+		// already refused.
+		m.closeExecutorApprovalGate(patchID, err)
 		return func() tea.Msg {
 			return executionResultMsg{err: err}
 		}
@@ -62,11 +67,37 @@ func (m *model) runExecutorApproveCmd(patchID string) tea.Cmd {
 	}
 }
 
+// closeExecutorApprovalGate releases a held candidate whose authorization the
+// runtime refused. The candidate is REJECTED through the executor (the same
+// terminal transition a human rejection produces, so the ledger records the true
+// outcome rather than a candidate that silently stopped being reachable) and the
+// UI drops every staged approval artefact.
+func (m *model) closeExecutorApprovalGate(patchID string, cause error) {
+	if m.executor != nil && patchID != "" {
+		if _, rejErr := m.executor.Reject(context.Background(), patchID,
+			"authorization refused: "+cause.Error()); rejErr != nil {
+			m.logActivity("[autonomy] held candidate %s could not be released: %v", patchID, rejErr)
+		}
+	}
+	m.executorPendingPatchID = ""
+	m.executorPendingTargets = nil
+	m.pendingHotfixTask = nil
+	m.pendingHotfixPatch = nil
+	m.pendingProposals = nil
+	m.resolveApprovalState()
+	m.finalizeOperation(OpOutcomeFailure, cause)
+	m.push(roleError, "[autonomy] authorization refused: "+cause.Error())
+	m.push(roleSystem, infoStyle.Render("  No files were modified."))
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
+}
+
 // authorizeExecutorApproval issues a MutationAuthorization through the
 // production AuthorizationEngine and attaches it to the RuntimeExecutor. The
-// token covers exactly the execution's held target files; the human approval
-// flag is true (the user pressed Alt+A on the proposal). Nil-safe for
-// harnesses without an AuthorizationEngine.
+// token covers exactly the execution's held target files AND is bound to the held
+// candidate's identity, so the mutation boundary refuses a token that was issued
+// for a different artifact; the human approval flag is true (the user pressed
+// Alt+A on the proposal). Nil-safe for harnesses without an AuthorizationEngine.
 func (m *model) authorizeExecutorApproval() error {
 	if m.executor == nil || m.authEngine == nil {
 		return nil
@@ -77,13 +108,14 @@ func (m *model) authorizeExecutorApproval() error {
 			targets = []string{m.pendingHotfixPatch.File}
 		}
 	}
-	auth, err := m.authEngine.AuthorizeBuild(
+	auth, err := m.authEngine.AuthorizeBuildCandidate(
 		targets,
 		m.caps,
 		m.mutationBudget,
 		m.microBudget,
 		false,
 		true, // human-approved: the developer pressed Alt+A on the proposal
+		m.executorPendingPatchID,
 	)
 	if err != nil {
 		return fmt.Errorf("build authorization: %w", err)

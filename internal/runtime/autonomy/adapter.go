@@ -176,6 +176,21 @@ func (a *ExecutorAdapter) Root() string {
 	return a.root
 }
 
+// CandidateHeld reports whether patchID is still an approval-held candidate of
+// the executor this adapter drives.
+//
+// It is the LINEAGE READ an approval boundary needs, and it introduces no new
+// identity: the answer comes from the executor's own pending-candidate map, the
+// exact map Reject drains on supersession and Approve resolves. A candidate that
+// is not held there can never be applied, so a boundary naming one is proposing
+// an artifact that no longer exists.
+func (a *ExecutorAdapter) CandidateHeld(patchID string) bool {
+	if a == nil || a.executor == nil {
+		return false
+	}
+	return a.executor.CandidateHeld(patchID)
+}
+
 // PreflightTarget is the adapter's Phase 16.1 target-resolution seam for the
 // pre-flight admission gate. It delegates to the executor's resolver (pure
 // os.Stat classification plus ISOLATED discovery) so the gate and the executor

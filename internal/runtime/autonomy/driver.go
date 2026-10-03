@@ -225,6 +225,14 @@ type Driver struct {
 	// terminal reason can name the evidence behind it.
 	lastBehavior BehaviorResult
 
+	// admission is the runtime's APPROVAL ADMISSION authority: the answer to
+	// "may this candidate reach a human approval gate at all?". It is bound by
+	// the composition root to the SAME AuthorizationEngine that issues the
+	// mutation token on approve, so the pre-check and the authorization it
+	// previews cannot disagree. Nil keeps the historical behaviour (a parked
+	// candidate identity alone is an approval boundary).
+	admission ApprovalAdmissionFunc
+
 	// ── Durable execution ledger ───────────────────────────────────────
 	// ledger is the append-only execution record the run is witnessed into
 	// (see ledger.go). It is nil unless a store was bound, and every write
@@ -2043,6 +2051,16 @@ func (d *Driver) approvalPatchID() (string, error) {
 		// park safely without state corruption.
 		return "", fmt.Errorf("%w: parked boundary is not an approval gate (no held patch)", ErrNoHeldPatch)
 	}
+	// FRESHNESS RE-CHECK at the release seam. The park-time admission gate
+	// proved the candidate was held then; a human takes unbounded time to answer,
+	// and a successor computation dispatched for the same target in between has
+	// superseded it. Re-reading the executor's own pending map here is what makes
+	// a stale candidate unapprovable rather than merely unlikely to be approved.
+	if !d.adapter.CandidateHeld(b.PatchID) {
+		return "", fmt.Errorf("%w: mutation candidate %s is no longer held by the execution authority "+
+			"(superseded, failed or cancelled); there is no executable artifact to authorize",
+			ErrNoHeldPatch, b.PatchID)
+	}
 	return b.PatchID, nil
 }
 
@@ -2050,6 +2068,12 @@ func (d *Driver) approvalPatchID() (string, error) {
 // derives Action/Resumable at park time; the driver supplies the authoritative
 // target set the parked execution holds (approval) or would hold (clarify).
 // The UI's executor authorization on approve covers exactly these targets.
+//
+// It is also the runtime's APPROVAL ADMISSION choke point: every park in this
+// package passes through it, so an approval boundary is validated (candidate
+// still held + authorization admissible) here, before any consumer can observe
+// it. A proposal the runtime cannot authorize never becomes an approval surface —
+// see approval_admission.go.
 func (d *Driver) enrichBoundary() {
 	b := d.loop.Boundary()
 	if b == nil {
@@ -2071,6 +2095,9 @@ func (d *Driver) enrichBoundary() {
 	if len(b.Targets) == 0 {
 		b.Targets = append([]string(nil), d.req.Targets...)
 	}
+	// The target set must be complete BEFORE admission runs: the admission
+	// authority judges exactly the files an approval would authorize.
+	d.admitApproval(b)
 }
 
 // publish emits every not-yet-published loop transition as a canonical

@@ -2208,6 +2208,20 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 // through the mutation/verification/completion stages — every event comes from
 // a graph transition.
 func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*ExecutionResult, error) {
+	// ── CANDIDATE LINEAGE GATE ─────────────────────────────────────────
+	// A MutationAuthorization may be bound to ONE MutationCandidate identity. If
+	// the bound authorization names a different candidate than the one being
+	// applied, the human gate was opened for a different artifact and this apply
+	// would write bytes nobody approved.
+	//
+	// The check runs BEFORE the candidate is removed from `pending`, so a
+	// mismatched token leaves the held candidate exactly as it was: a refused
+	// lineage is not a consumed approval.
+	if x.auth != nil && x.auth.CandidateID != "" && x.auth.CandidateID != patchID {
+		return nil, fmt.Errorf("executor: %w: authorization %s is bound to candidate %q, refusing to apply %q",
+			authorization.ErrAuthorizationCandidateMismatch, x.auth.ID, x.auth.CandidateID, patchID)
+	}
+
 	x.mu.Lock()
 	pm, ok := x.pending[patchID]
 	if ok {
@@ -2596,6 +2610,25 @@ func (x *RuntimeExecutor) PendingPatchIDs() []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+// CandidateHeld reports whether patchID is still an approval-held candidate of
+// THIS executor — the single map Approve consults.
+//
+// It is the freshness read an approval boundary needs: a candidate is executable
+// only while the computation that produced it is the live one, so a boundary that
+// names a candidate this map no longer holds is proposing an artifact that can
+// never be applied. Callers use it to refuse an approval BEFORE asking a human,
+// never to decide that a held candidate is valid (only the artifact gate, the
+// authorization engine and OCC do that).
+func (x *RuntimeExecutor) CandidateHeld(patchID string) bool {
+	if x == nil || patchID == "" {
+		return false
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	_, ok := x.pending[patchID]
+	return ok
 }
 
 // supersedePendingCandidates rejects every approval-held candidate a SUPERSEDED
