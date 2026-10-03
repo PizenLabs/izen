@@ -628,6 +628,65 @@ func (d *Driver) carryObjectiveForward() {
 	d.req.Evidence = joinEvidence(d.req.Evidence, evidence)
 }
 
+// ── Recovery brief ─────────────────────────────────────────────────────────
+
+// recoveryBrief renders what the previous attempt FAILED at, in the runtime's
+// own classified vocabulary, together with the authoritative scope and the
+// failure ledger.
+//
+// It fills the gap that made recovery indistinguishable from a restart. The
+// continuation evidence already carried the objective identity, the contract and
+// the discharged/unresolved requirements; what it did NOT carry was the reason
+// the last attempt did not work, so the next planner invocation had no way to
+// avoid repeating an approach the runtime had already proven unsupported.
+//
+// Everything here is derived from RUNTIME state: the structured classification,
+// the objective lifecycle and the failure ledger. Nothing is inferred from
+// model prose, and nothing is invented when no failure was recorded.
+func (d *Driver) recoveryBrief() string {
+	if d == nil {
+		return ""
+	}
+	verdict := d.lastRecovery
+	failure := verdict.Failure
+	if failure.Class == execution.FailureNone {
+		failure = ClassifyObservation(d.obs)
+	}
+	if failure.Class == execution.FailureNone && len(d.failures.entriesOrNil()) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[FAILED APPROACH] class=%s policy=%s retry_admissible=%t\n",
+		failure.Class, failure.Class.RetryPolicy(), failure.RetryAdmissible())
+	if failure.Target != "" {
+		fmt.Fprintf(&b, "  requested target: %s (this is the EXACT name requested; it is not a substitute)\n", failure.Target)
+	}
+	if failure.Evidence != "" {
+		fmt.Fprintf(&b, "  evidence: %s\n", failure.Evidence)
+	}
+	fmt.Fprintf(&b, "  provider_state=%s artifact_state=%s finish_reason=%s\n",
+		failure.ProviderState, failure.ArtifactState, orNotCarried(failure.FinishReason))
+	fmt.Fprintf(&b, "  authoritative scope (unchanged; do not substitute a target): [%s]\n",
+		strings.Join(d.authoritativeScope(), ","))
+	if entries := d.failures.LedgerReport(); len(entries) > 0 {
+		b.WriteString("  previously observed failures in this objective:\n")
+		for _, e := range entries {
+			fmt.Fprintf(&b, "    - %s\n", e)
+		}
+	}
+	return boundContinuationEvidence(b.String())
+}
+
+// orNotCarried renders an absent scalar explicitly rather than as an empty
+// string, so a reader can tell "not reported" from "reported as nothing".
+func orNotCarried(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return NotCarried
+	}
+	return v
+}
+
 // ── Telemetry ──────────────────────────────────────────────────────────────
 
 // publishObjectiveContract emits the structured OBJECTIVE event. It is emitted
@@ -801,6 +860,18 @@ func (d *Driver) bindStepEvidence() {
 			"[objective] result re-inspected: " + strings.Join(observed, ", ")))
 	}
 
+	// A durable mutation is the ONE thing that genuinely changes the evidence
+	// state: the workspace the next attempt reads is not the workspace the last
+	// one failed against. Opening a new ledger epoch here is what lets an
+	// otherwise-identical request be re-tried legitimately AFTER a change, while
+	// keeping repeats under UNCHANGED evidence non-progressing.
+	//
+	// It is gated on the runtime having OBSERVED a post-mutation state, not on a
+	// claim: an unobserved mutation must not manufacture permission to retry.
+	if len(observed) > 0 {
+		d.failures.AdvanceEvidence()
+	}
+
 	ev := d.obs.Objective
 	d.bindRequirementDischarge(d.objectiveContract(), &ev)
 }
@@ -850,32 +921,84 @@ func (d *Driver) observedDeltaTargets() []string {
 // composition root and is not carried into the loop), it reports
 // (not-carried) rather than substituting a neighbouring axis. A missing value is
 // visible; a plausible wrong one is not.
+// NotCarried is the explicit representation for an axis the runtime genuinely
+// does not have.
+//
+// It exists because "unknown" is ambiguous: it reads as "the runtime looked and
+// could not determine this", when the truth in several cases is "this concept is
+// not carried into this layer at all". A missing value must be VISIBLE as a
+// missing value; substituting a neighbouring field is how a trace ends up
+// asserting something the runtime never established.
+const NotCarried = "(not-carried)"
+
+// intentAxes renders the four intent-shaped axes, using the AUTHORITATIVE owner
+// for each and an explicit not-carried marker where the runtime has none.
+//
+// The two defects this replaces:
+//
+//   - user_intent was read from `d.obs.Intent`, which `contextObservation` fills
+//     with `autonomy.ParseIntent(d.prompt)`. `ParseIntent` maps canonical LABELS,
+//     not prompt text, so it returned IntentUnknown for every real objective and
+//     the axis rendered `unknown` while the run was provably a modification.
+//   - scope was read from `d.req.Scope`, which `Run` never assigns, even though
+//     the authoritative resolved scope was already established and published by
+//     `noteScopeTransition`.
 func (d *Driver) intentAxes() (userIntent, commandMode, interaction, executionIntent string) {
 	if d == nil {
-		return "(none)", "(not-carried)", "(none)", "(none)"
+		return "(none)", NotCarried, "(none)", "(none)"
 	}
-	userIntent = d.obs.Intent.String()
+	// The canonical intent AUTHORITY is the lifecycle's own, not a re-parse of
+	// the prompt: it already reflects the gateway's revision, which a re-parse
+	// would silently undo.
+	if d.intents != nil {
+		if canonical, err := d.intents.Current(); err == nil && strings.TrimSpace(string(canonical)) != "" {
+			userIntent = string(canonical)
+		}
+	}
 	if userIntent == "" {
-		userIntent = autonomy.Classify(d.prompt, nil).Intent.String()
+		// Fall back to the deterministic classifier, which reads the prompt text
+		// correctly. This is a real classification, not a placeholder.
+		if classified := autonomy.Classify(d.prompt, nil).Intent; classified != autonomy.IntentUnknown {
+			userIntent = classified.String()
+		}
 	}
+	if userIntent == "" {
+		userIntent = NotCarried
+	}
+
+	// The command SURFACE is chosen by the UI composition root and is not
+	// carried into the loop. It is reported as not-carried rather than guessed
+	// from a neighbouring axis.
+	commandMode = d.subcommand
+	if strings.TrimSpace(commandMode) == "" {
+		commandMode = NotCarried
+	}
+
 	interaction = d.activeInteraction.String()
 	if strings.TrimSpace(interaction) == "" {
 		interaction = "(none)"
 	}
 	executionIntent = string(d.taskContract().Kind)
+	if strings.TrimSpace(executionIntent) == "" {
+		executionIntent = NotCarried
+	}
 	return userIntent, commandMode, interaction, executionIntent
 }
 
 // publishIntentAxes emits the explicit four-axis intent record on the bus so a
 // trace shows four concepts rather than four interchangeable words. It is
 // emitted once per lifecycle, alongside the objective contract.
+//
+// It also carries the AUTHORITATIVE scope resolution — state and targets — so a
+// reader never has to correlate this line with an earlier one to learn that the
+// scope was resolved.
 func (d *Driver) publishIntentAxes() {
 	if d == nil || d.bus == nil {
 		return
 	}
 	user, mode, interaction, exec := d.intentAxes()
 	d.bus.Publish(events.NewActivity(fmt.Sprintf(
-		"[intent] user_intent=%s command_mode=%s interaction_contract=%s execution_intent=%s objective=%s scope=%s",
+		"[intent] user_intent=%s command_mode=%s interaction_contract=%s execution_intent=%s objective=%s scope_state=%s scope=[%s]",
 		user, mode, interaction, exec, d.ObjectiveIdentity(),
-		orUnknownField(d.req.Scope))))
+		d.scopeResolution.State, strings.Join(d.authoritativeScope(), ","))))
 }

@@ -246,10 +246,15 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 	if isHallucinatedAnchor(o) {
 		if o.AttemptNum < 1 {
 			return autonomy.LoopDecision{Action: autonomy.LoopRepair,
-				Reason: "strict line-anchor recovery: one automatic re-prompt"}
+				Reason: "strict line-anchor recovery: one automatic re-prompt against current workspace evidence"}
 		}
+		// The reason names the ANCHOR failure. It previously read "Physical
+		// Output Budget Breach", which is a statement about a different boundary
+		// entirely and sent an operator looking for a token-budget problem the run
+		// never had.
 		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
-			Reason: "Physical Output Budget Breach: strict line-anchor recovery exhausted"}
+			Reason: "ANCHOR_NOT_FOUND: strict line-anchor recovery exhausted — " +
+				"the patch anchored on content that does not exist in the authoritative target"}
 	}
 	// ── CIRCUIT BREAKER: NonRetryableArtifactError (ambiguous anchors N>1) ───
 	if isNonRetryableAmbiguous(o) {
@@ -419,7 +424,7 @@ func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.Loo
 	// CIRCUIT BREAKER: Hallucinated (N=0) — distinct options.
 	if isHallucinatedAnchor(o) {
 		if o.AttemptNum >= 1 {
-			return req, fmt.Errorf("%w: Physical Output Budget Breach after strict line-anchor retry for %s", ErrRecoveryHalted, o.Target)
+			return req, fmt.Errorf("%w: ANCHOR_NOT_FOUND — the strict line-anchor re-prompt for %s also produced an unresolvable anchor", ErrRecoveryHalted, o.Target)
 		}
 		req.RecoveryStrategy = autonomy.StrategyBoundedPatch
 		req.RecoveryAttempt = 1

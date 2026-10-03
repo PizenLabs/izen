@@ -98,6 +98,20 @@ func (r *ReadOnlyToolRunner) readFile(args string) (string, error) {
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {
+		// A path that is not there is a TARGET-IDENTITY fact, not a broken read.
+		// It is wrapped in the typed refusal so the caller classifies it with
+		// errors.Is instead of matching "no such file or directory" in prose.
+		// The requested path is preserved verbatim — this error never proposes a
+		// substitute.
+		if errors.Is(err, os.ErrNotExist) {
+			return "", &TargetNotFoundError{
+				Request: TargetRequest{
+					Requested: params.Path,
+					Status:    TargetRequestNotFound,
+					Reason:    params.Path + " does not exist in this workspace",
+				},
+			}
+		}
 		return "", fmt.Errorf("read_file %s: %w", params.Path, err)
 	}
 	if len(data) > readFileMaxBytes {

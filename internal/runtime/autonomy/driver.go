@@ -215,6 +215,27 @@ type Driver struct {
 	// the observation happened to say last.
 	contractRecoveryExhausted bool
 
+	// failures is the objective-scoped record of observed execution failures.
+	//
+	// It is the runtime's MEMORY of what already failed. Without it the recovery
+	// matrix held only counters (attempts, recovery cycles), which cannot tell
+	// "the same deterministic refusal, twice" from "two different problems" —
+	// so a request for a nonexistent target was re-issued with identical
+	// evidence until the generic bounds stopped it.
+	//
+	// It is reset per Run for the same reason the objective contract is: failure
+	// evidence is objective-scoped, and one objective's dead end must never
+	// constrain another's recovery.
+	failures *FailureLedger
+	// lastRecovery is the most recent typed recovery verdict. It is retained for
+	// telemetry and tests; it is never consulted to decide anything (the decision
+	// has already been applied).
+	lastRecovery RecoveryDecision
+	// defaultDecider reports whether the built-in decision policy is still
+	// installed. Go func values are not comparable, so an injected policy records
+	// its own presence here rather than being inferred.
+	defaultDecider bool
+
 	// grants answers whether a full workspace capability grant is in force for
 	// this lifecycle (Phase 15). It is the signal that turns a granted workspace
 	// capability into a mandatory, synchronous context re-compilation before the
@@ -297,6 +318,10 @@ func WithDecider(dec Decider) Option {
 	return func(d *Driver) {
 		if dec != nil {
 			d.decide = dec
+			// A caller-supplied policy takes full authority, including over
+			// failures. The driver records the replacement so the objective-aware
+			// recovery path stands down rather than silently outvoting it.
+			d.defaultDecider = false
 		}
 	}
 }
@@ -442,13 +467,17 @@ func (d *Driver) Substrate() substrate.ProposalExecutor {
 // objective as preflight_infeasible; see WithDecompose to override or disable.
 func NewDriver(adapter *ExecutorAdapter, bus *events.Bus, opts ...Option) *Driver {
 	d := &Driver{
-		adapter:      adapter,
-		bus:          bus,
-		bounds:       autonomy.DefaultLoopBounds(),
-		decide:       decideDefault,
-		repair:       typedRepair,
-		decompose:    defaultDecompose,
-		globalVerify: defaultGlobalVerify,
+		adapter: adapter,
+		bus:     bus,
+		bounds:  autonomy.DefaultLoopBounds(),
+		decide:  decideDefault,
+		// The built-in policy is installed, so the objective-aware recovery path
+		// governs failures. An injected decider clears this and takes over.
+		defaultDecider: true,
+		failures:       newFailureLedger(),
+		repair:         typedRepair,
+		decompose:      defaultDecompose,
+		globalVerify:   defaultGlobalVerify,
 		// The completion authority is domain code with no UI dependency: the
 		// driver stays fully executable and testable headless.
 		objectiveAuthority: objectiveReducer{},
@@ -504,6 +533,10 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.contractRecoveries = 0
 	d.contractRecoveryExhausted = false
 	d.derivationNote = ""
+	// A new run is a new objective lifecycle, so it starts with no memory of
+	// prior failures. Carrying the ledger forward would let one objective's dead
+	// ends suppress another objective's legitimate recovery.
+	d.failures = newFailureLedger()
 	// ── OBJECTIVE LIFECYCLE RESET ─────────────────────────────────────
 	// Every objective-scoped fact — the completion contract, the requirement
 	// ledger, the attributed discharge set, the post-mutation observations — is
@@ -1661,7 +1694,7 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// decide "exhausted → ask human" from the authoritative facts.
 			d.obs.AttemptNum = d.loop.Attempts()
 			d.obs.RecoveryCycle = d.loop.RecoveryCycles()
-			decision := d.decide(d.obs, d.loop.Bounds())
+			decision := d.decideWithObjective(d.obs, d.loop.Bounds())
 			// ── PHASE 14: OBJECTIVE COMPLETION AUTHORITY ────────────────
 			// The decision matrix proposes; the authority disposes. A proposed
 			// completion is rewritten into the terminal state that matches WHY
@@ -1828,14 +1861,30 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			if isPhysicalOutputBudgetBreach(obs) {
 				return d.terminateAbort(ctx, "Physical Output Budget Breach", autonomy.FailurePermanent), nil
 			}
-			// ── CIRCUIT BREAKER: NonRetryableArtifactError
-			// Differentiate N=0 (hallucinated) vs N>1 (ambiguous).
-			// Bypass interpreting -> recovering -> executing. Transition
-			// IMMEDIATELY from verifying to awaiting_human on DecisionSurface.
-			// Guarantees max 1 API request.
+			// ── ANCHOR FAILURES: INVALIDATE, THEN REPLAN ──────────────────
+			// A patch whose anchor matched nothing (N=0) is a structured ARTIFACT
+			// failure, not an output-budget breach. The previous code
+			// short-circuited here and terminated the run with a "Physical Output
+			// Budget Breach" label — naming a completely different failure — and
+			// it did so BEFORE the recovery matrix could see the observation, so
+			// the runtime never recorded what actually happened.
+			//
+			// The required semantics are now explicit and ordered:
+			//
+			//	anchor mismatch → candidate INVALID → evidence recorded
+			//	              → replan against CURRENT workspace evidence
+			//
+			// No fuzzy patch application happens on this path, and no mutation
+			// candidate survives: an unanchorable patch is not a patch. A repeat
+			// under unchanged evidence terminates as UNSUBSTANTIATED through
+			// decideWithObjective — truthfully, and under its own name.
 			if isHallucinatedInDriver(obs) {
-				return d.terminateAbort(ctx, "Physical Output Budget Breach: strict line-anchor recovery exhausted", autonomy.FailurePermanent), nil
+				d.recordAnchorFailure(obs, execution.FailureAnchorNotFound, ctx)
+				continue
 			}
+			// ── AMBIGUOUS ANCHOR (N>1): park on the typed DecisionSurface ────
+			// This failure has a genuine human remedy (bound the region), so it
+			// keeps its decision surface with the two options that actually help.
 			if isNonRetryableInDriver(obs) {
 				b := autonomy.HumanBoundary{
 					Reason:          "circuit-breaker: NonRetryableArtifactError (ambiguous anchors) — park at DecisionSurface awaiting_human [1] Inject line-offset bounds to prompt [2] Fall back to full-file write authorization",
@@ -1909,7 +1958,33 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			//   - FACTS ONLY: bytes/lines/evidence identity. It is not the
 			//     artifact, not the rejected output, and never a completion claim.
 			req.Evidence = joinEvidence(req.Evidence, d.observeDeclaredTargets(ctx))
-			// Child attempt identity: parent run ID plus attempt number.
+			// ── OBJECTIVE IDENTITY + FAILED-APPROACH CARRY-OVER ──────────
+			// A recovery is a continuation, not a restart. The next planner
+			// invocation must receive:
+			//
+			//	objective identity, the objective contract, current progress,
+			//	observed evidence, the FAILED APPROACH, remaining obligations
+			//
+			// `carryObjectiveForward` supplies the first four (identity,
+			// contract, discharged/unresolved requirements and unmet
+			// conditions). `recoveryBrief` supplies the two that were previously
+			// absent: WHICH approach failed and WHY, in the runtime's own
+			// classified vocabulary, plus the authoritative scope verbatim.
+			//
+			// Without them the model was asked to try again without being told
+			// what had already been tried — which is how the same anchor or the
+			// same nonexistent target was re-requested.
+			d.carryObjectiveForward()
+			req.Evidence = joinEvidence(req.Evidence, d.recoveryBrief())
+			// The scope is carried through UNCHANGED. A recovery may re-read its
+			// targets; it may never widen them. Writing the authoritative set
+			// here makes that structural rather than conventional.
+			if scope := d.authoritativeScope(); len(scope) > 0 {
+				req.Targets = append([]string(nil), scope...)
+			}
+			// Child attempt identity: parent run ID plus attempt number. The
+			// OBJECTIVE identity is unchanged by this — only the execution
+			// attempt identity advances.
 			if req.RecoveryAttempt > 0 {
 				req.RequestID = fmt.Sprintf("%s-attempt-%d", d.runRequestID, req.RecoveryAttempt)
 			}
@@ -2483,6 +2558,163 @@ func decideDefault(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopD
 	}
 }
 
+// decideWithObjective is the driver's decision entry point. It routes SUCCESS
+// outcomes through the existing decision policy unchanged, and routes FAILURES
+// through the objective-aware recovery path.
+//
+// The split matters: a success decision is a question about the execution's
+// outcome, which `decide` already answers authoritatively. A failure decision is
+// a question about what to try NEXT, and only the driver can answer it — it owns
+// the objective lifecycle, the failure ledger and the authoritative scope. Asking
+// a pure (Observation, Bounds) function that question is what made recovery
+// blind to everything the runtime had learned.
+//
+// The injected `decide` policy is still honoured: an operator- or test-supplied
+// decider continues to decide, and the objective-aware recovery only governs the
+// failure classes the policy did not already claim. A custom decider that wants
+// full authority can claim the failure by returning any non-repair action.
+func (d *Driver) decideWithObjective(o autonomy.Observation, b autonomy.LoopBounds) autonomy.LoopDecision {
+	// Outcomes the default policy decides ITSELF — successes, terminal
+	// cancellations/rejections, the no-op review hold, the approval gate and a
+	// clarification request — keep their established disposition. Routing them
+	// through recovery would be a change of authority, not an improvement: the
+	// recovery matrix answers "what may we try next", and these outcomes are not
+	// failures to recover from.
+	if decidedByDefaultPolicy(o) {
+		return d.decide(o, b)
+	}
+
+	// A custom (injected) decider owns the decision. The driver cannot tell a
+	// test harness from an operator policy, and overriding either would make the
+	// injected option a lie. The flag records whether the DEFAULT policy is still
+	// installed, because Go funcs are not comparable and a caller-supplied decider
+	// must keep full authority.
+	if !d.isDefaultDecider() {
+		return d.decide(o, b)
+	}
+
+	verdict := DecideRecoveryWith(d.recoveryInput(o, b))
+	d.lastRecovery = verdict
+	return verdict.loopDecision()
+}
+
+// decidedByDefaultPolicy reports whether the default decision policy resolves
+// this outcome without consulting the recovery matrix.
+//
+// It mirrors `decideDefault`'s switch exactly. The two MUST stay in agreement:
+// if this predicate admitted an outcome `decideDefault` also handles, the
+// objective-aware path would second-guess a decision that was never a recovery
+// question.
+func decidedByDefaultPolicy(o autonomy.Observation) bool {
+	if o.ClarificationRequired {
+		return true
+	}
+	// A typed ANCHOR failure is owned by the recovery matrix even when the
+	// execution reports artifact_rejected, because the required semantics are
+	// specific: invalidate the candidate, record the evidence, then REPLAN against
+	// the current workspace. The default policy would abort immediately, which is
+	// truthful but skips the one evidence-bearing attempt the anchor case
+	// legitimately earns.
+	if isHallucinatedInDriver(o) || isNonRetryableInDriver(o) {
+		return false
+	}
+	switch o.Outcome {
+	case autonomy.OutcomeChanged, autonomy.OutcomeCreated, autonomy.OutcomeNoChange,
+		autonomy.OutcomeCompleted, autonomy.OutcomeArtifactProduced,
+		autonomy.OutcomeNoOpObjectiveSatisfied,
+		autonomy.OutcomeNoOpNoSafeMutation,
+		autonomy.OutcomePendingApproval,
+		autonomy.OutcomeCancelled, autonomy.OutcomeRejected, autonomy.OutcomeArtifactRejected,
+		"":
+		return true
+	default:
+		return false
+	}
+}
+
+// isDefaultDecider reports whether the driver is using its own default decision
+// policy. Go cannot compare function values, so the driver records the fact
+// explicitly when WithDecider replaces the default.
+func (d *Driver) isDefaultDecider() bool { return d == nil || d.defaultDecider }
+
+// recoveryInput assembles the complete, multi-owner input to a recovery decision.
+// Every field comes from the component that owns it; none is recomputed here.
+func (d *Driver) recoveryInput(o autonomy.Observation, b autonomy.LoopBounds) RecoveryInput {
+	scope := d.authoritativeScope()
+	return RecoveryInput{
+		Observation:  o,
+		Bounds:       b,
+		Failure:      ClassifyObservation(o),
+		Ledger:       d.failures,
+		Progress:     d.objectiveProgress(),
+		Continuation: d.ObjectiveContinuation(),
+		ObjectiveID:  d.ObjectiveIdentity(),
+		Scope:        scope,
+	}
+}
+
+// authoritativeScope returns the resolved target set the runtime holds as
+// authority. It prefers the scope-resolution RECORD over the request, because the
+// record is the typed transition the trace published; both carry the same set
+// once resolved, and using the record keeps telemetry, recovery and telemetry
+// agreeing on one answer.
+func (d *Driver) authoritativeScope() []string {
+	if len(d.scopeResolution.Targets) > 0 && d.scopeResolution.State == ScopeResolved {
+		return append([]string(nil), d.scopeResolution.Targets...)
+	}
+	if len(d.resolved.Targets) > 0 {
+		return append([]string(nil), d.resolved.Targets...)
+	}
+	return append([]string(nil), d.req.Targets...)
+}
+
+// recordAnchorFailure records a patch-anchor failure, invalidates the candidate
+// it produced, and publishes the structured evidence.
+//
+// The ordering is the contract, and each step is observable:
+//
+//  1. RECORD the typed failure (class + target + evidence) in the ledger.
+//  2. INVALIDATE every pending candidate — an unanchorable patch is not a patch,
+//     and it must not remain approvable.
+//  3. PUBLISH the structured record so a trace shows the class, not a phrase.
+//
+// What does NOT happen here, by construction:
+//
+//   - no fuzzy patch application: nothing re-resolves the anchor approximately;
+//   - no mutation: the workspace is untouched by this path;
+//   - no termination: the decision belongs to the recovery matrix, which now has
+//     the evidence it needs to choose REPLAN or an honest terminal state.
+func (d *Driver) recordAnchorFailure(o autonomy.Observation, class execution.FailureClass, ctx context.Context) {
+	if d == nil {
+		return
+	}
+	fail := execution.ExecutionFailure{
+		Class:    class,
+		Target:   o.Target,
+		Evidence: boundedEvidence(o.Diagnostic, "a patch anchor did not resolve against the authoritative target"),
+	}
+	// The ledger is observed exactly ONCE per attempt, by DecideRecoveryWith.
+	// This helper only records the candidate invalidation and publishes the
+	// evidence; double-observing here would inflate the count and make a
+	// first-time anchor failure look like a repeat.
+	repeated := d.failures.NonProgressing(fail)
+	dropped := 0
+	if d.adapter != nil {
+		dropped = d.adapter.InvalidatePendingCandidates(string(class))
+	}
+
+	if d.bus != nil {
+		verdict := "candidate invalidated; replan against current workspace evidence"
+		if repeated {
+			verdict = string(execution.FailureNonProgressing) + " — no new evidence; terminate truthfully"
+		}
+		d.bus.Publish(events.NewActivity(fmt.Sprintf(
+			"[anchor] class=%s target=%s seen=%d candidates_invalidated=%d mutated=false — %s",
+			class, o.Target, d.failures.Count(fail), dropped, verdict)))
+	}
+	d.publish(ctx) //nolint:contextcheck // ctx is the run's own cancellation context
+}
+
 // proposalIntentFailed reports whether an observation represents a failure of
 // the selected proposal strategy that did NOT alter workspace state. Only such
 // state-unchanging failures advance the anti-loop guard; a successful outcome
@@ -2509,8 +2741,16 @@ func isHallucinatedInDriver(o autonomy.Observation) bool {
 	return false
 }
 
+// isPhysicalOutputBudgetBreach reports whether the observation carries a genuine
+// physical output-budget breach.
+//
+// It is a TYPED check, not a substring match. The previous implementation
+// matched the literal phrase "physical output budget breach", which the executor
+// used to wrap ANCHOR failures in — so every hallucinated-anchor run was
+// terminated here as a token-budget problem, before the recovery matrix could
+// classify it, and with a reason naming a failure that never occurred.
 func isPhysicalOutputBudgetBreach(o autonomy.Observation) bool {
-	return strings.Contains(strings.ToLower(o.Diagnostic), "physical output budget breach")
+	return strings.Contains(o.Diagnostic, execution.ErrPhysicalOutputBudgetBreach.Error())
 }
 
 // isNonRetryableInDriver reports whether an observation is a

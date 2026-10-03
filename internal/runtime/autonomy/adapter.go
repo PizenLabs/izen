@@ -191,6 +191,20 @@ func (a *ExecutorAdapter) CandidateHeld(patchID string) bool {
 	return a.executor.CandidateHeld(patchID)
 }
 
+// InvalidatePendingCandidates drops every approval-held candidate from the
+// executor behind this adapter, returning how many were dropped.
+//
+// The driver calls it when a candidate has been proven INVALID (an anchor that
+// did not resolve, an artifact the parser rejected). Keeping such a candidate
+// approvable would let a human be asked to authorize a patch the runtime already
+// knows cannot be applied.
+func (a *ExecutorAdapter) InvalidatePendingCandidates(reason string) int {
+	if a == nil || a.executor == nil {
+		return 0
+	}
+	return a.executor.InvalidatePendingCandidates(reason)
+}
+
 // PreflightTarget is the adapter's Phase 16.1 target-resolution seam for the
 // pre-flight admission gate. It delegates to the executor's resolver (pure
 // os.Stat classification plus ISOLATED discovery) so the gate and the executor

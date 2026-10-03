@@ -623,6 +623,78 @@ type RuntimeExecutor struct {
 	// invalidated after mutations.
 	observeSnapshot   map[string][]byte
 	observeSnapshotMu sync.RWMutex
+
+	// capabilityRunner is the SINGLE model-facing capability seam for this
+	// executor's lifetime.
+	//
+	// It is constructed ONCE, not per SetProvider call, because it owns the
+	// per-objective failure ledger that makes NON_PROGRESSING_EXECUTION
+	// detectable. A fresh runner per provider rebind would silently discard the
+	// record that "style.css was already observed to not exist", which is
+	// exactly the memory whose absence caused the repeated retry.
+	capabilityRunner *CapabilityToolRunner
+
+	// scopeMu guards resolvedScope, the AUTHORITATIVE resolved target set of the
+	// objective currently being dispatched.
+	scopeMu         sync.RWMutex
+	resolvedScope   []string
+	scopeObserved   []string
+	scopeResetEpoch int
+}
+
+// setResolvedScope records the authoritative target set of the objective now
+// being dispatched. It is written at admission (before any provider call) and
+// read by the capability seam, so every model-requested read is judged against
+// the SAME scope the mutation authority holds.
+//
+// It is per-DISPATCH, not per-executor: a new objective starts with a new scope,
+// and the capability failure ledger is reset with it so one objective's dead
+// ends never constrain another's.
+func (x *RuntimeExecutor) setResolvedScope(scope []string, observed []string) {
+	if x == nil {
+		return
+	}
+	x.scopeMu.Lock()
+	defer x.scopeMu.Unlock()
+	changed := !sameScopeSet(x.resolvedScope, scope)
+	x.resolvedScope = append([]string(nil), scope...)
+	x.scopeObserved = append([]string(nil), observed...)
+	if changed {
+		// A different scope is NEW EVIDENCE. The failure ledger is objective
+		// scoped, so a scope change legitimately re-opens requests that were
+		// refused against the previous scope.
+		x.scopeResetEpoch++
+		if x.capabilityRunner != nil {
+			x.capabilityRunner.ResetFailures()
+		}
+	}
+}
+
+// sameScopeSet reports exact equality of two target sets.
+func sameScopeSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if normalizeTargetRef(a[i]) != normalizeTargetRef(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// resolvedScopeEvidence returns the authoritative scope snapshot the capability
+// seam judges requests against.
+func (x *RuntimeExecutor) resolvedScopeEvidence() TargetScopeEvidence {
+	if x == nil {
+		return TargetScopeEvidence{}
+	}
+	x.scopeMu.RLock()
+	defer x.scopeMu.RUnlock()
+	return TargetScopeEvidence{
+		Scope:    append([]string(nil), x.resolvedScope...),
+		Observed: append([]string(nil), x.scopeObserved...),
+	}
 }
 
 // NewRuntimeExecutor wires a self-contained execution authority. When langID is
@@ -699,10 +771,40 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 // Reading the vector through a closure (rather than copying it) is deliberate: the
 // Control Plane may re-grant or restrict capabilities via SetAdmittedCapabilities, and
 // the next model capability request must observe that without rewiring the provider.
+// capabilityTools returns THIS executor's single model-facing capability runner,
+// constructing it on first use.
+//
+// It is memoized deliberately. The runner owns the per-objective capability
+// failure ledger, and that ledger is the runtime's memory of which targets it
+// has already observed to be absent. Handing the provider a fresh runner on
+// every rebind would erase that memory at precisely the moment a repeated
+// request has to be recognised as non-progressing.
 func (x *RuntimeExecutor) capabilityTools() *CapabilityToolRunner {
-	return NewCapabilityToolRunner(x.root, func() AdmittedCapabilities {
+	if x == nil {
+		return nil
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.capabilityRunner != nil {
+		return x.capabilityRunner
+	}
+	x.capabilityRunner = NewCapabilityToolRunner(x.root, func() AdmittedCapabilities {
 		return x.AdmittedCapabilities()
 	}, x.bus)
+	// Bind the authoritative scope authority. The closure reads the live
+	// snapshot, so a scope established at admission is visible to the very
+	// first capability request of the objective.
+	x.capabilityRunner.WithTargetScope(x.resolvedScopeEvidence)
+	return x.capabilityRunner
+}
+
+// CapabilityFailures exposes the executor's recorded capability failures. It is
+// the evidence surface a trace and a recovery decision read; it grants nothing.
+func (x *RuntimeExecutor) CapabilityFailures() []ExecutionFailure {
+	if x == nil {
+		return nil
+	}
+	return x.capabilityTools().CapabilityFailures()
 }
 
 // invalidateSnapshot purges the observe snapshot cache keys for target. It is
@@ -909,6 +1011,31 @@ func (x *RuntimeExecutor) observeTargets(targets []string) {
 	for _, t := range targets {
 		x.getSnapshotContent(t)
 	}
+}
+
+// workspaceEvidence reports which of the dispatch's targets the runtime actually
+// OBSERVED on disk.
+//
+// It is deliberately narrow: it reports existence for the DECLARED targets and
+// nothing else. It does not scan the workspace, does not rank candidates and
+// cannot introduce a target. Its only job is to let the target-identity authority
+// distinguish a scope member that exists from one that does not — the
+// distinction between "the model asked for a real in-scope file" and "the model
+// invented a name".
+func (x *RuntimeExecutor) workspaceEvidence(targets []string) []string {
+	if x == nil {
+		return nil
+	}
+	var observed []string
+	for _, t := range targets {
+		if strings.TrimSpace(t) == "" {
+			continue
+		}
+		if _, err := os.Stat(x.resolveSnapshotPath(t)); err == nil {
+			observed = append(observed, t)
+		}
+	}
+	return observed
 }
 
 // getSnapshotContent returns the snapshot bytes for a target. On a cache hit
@@ -1125,9 +1252,34 @@ func IsAmbiguousAnchorContinuation(err error) bool {
 // ambiguous (N>1) sentinel and is handled by one strict automatic retry.
 var ErrHallucinatedAnchorError = errors.New("executor: hallucinated anchor — zero match")
 
-// ErrPhysicalOutputBudgetBreach is terminal: a strict-patch recovery has
-// already consumed its single retry and must not open a full-file fallback.
+// ErrStrictAnchorRecoveryExhausted is terminal for a strict-patch recovery: the
+// single automatic re-prompt under the strict line-anchor contract has already
+// been spent, and the run must NOT open a full-file fallback to paper over an
+// anchor that does not resolve.
+//
+// NAMING NOTE. This failure was previously wrapped in a sentinel called
+// "Physical Output Budget Breach". That name is wrong and actively harmful: it
+// describes a TOKEN-budget failure, while this is a PATCH-ANCHOR failure. A
+// trace carrying it sent an operator to raise `max_tokens` for a run whose real
+// problem was that the model anchored on content that does not exist. The
+// sentinel now names the failure that actually occurred.
+var ErrStrictAnchorRecoveryExhausted = errors.New("executor: STRICT_ANCHOR_RECOVERY_EXHAUSTED: the strict line-anchor re-prompt also produced an unresolvable anchor")
+
+// ErrPhysicalOutputBudgetBreach is retained for compatibility with existing
+// callers of the old name.
+//
+// IT IS NO LONGER PRODUCED BY THE ANCHOR PATH. It remains reserved for a genuine
+// physical output-budget breach, and the strict-anchor terminal is now
+// ErrStrictAnchorRecoveryExhausted. Kept so an external caller comparing against
+// the old value still compiles; new code must use the honest sentinel.
 var ErrPhysicalOutputBudgetBreach = errors.New("executor: Physical Output Budget Breach")
+
+// IsStrictAnchorRecoveryExhausted reports whether err is the strict-anchor
+// terminal sentinel. It is the check the recovery path uses, replacing a
+// substring match on a mislabelled phrase.
+func IsStrictAnchorRecoveryExhausted(err error) bool {
+	return err != nil && errors.Is(err, ErrStrictAnchorRecoveryExhausted)
+}
 
 // AmbiguousAnchorFallbackLimit is the file-size ceiling under which an
 // ambiguous-anchor patch failure recovers via full-document replacement
@@ -1682,6 +1834,17 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// All downstream stages consume SnapshotContent() without repeating os.ReadFile.
 	x.observeTargets(targets)
 
+	// ── TARGET IDENTITY AUTHORITY BINDING ──────────────────────────────
+	// The authoritative resolved scope is bound HERE — after target resolution
+	// and before any provider request — so every capability the model asks for
+	// during this dispatch is judged against the SAME target set the mutation
+	// authority holds.
+	//
+	// Binding it later would leave the model's first reads unjudged, which is
+	// precisely how a request for `style.css` got executed as a filesystem read
+	// against a scope that never contained it.
+	x.setResolvedScope(targets, x.workspaceEvidence(targets))
+
 	// ── ADMISSION III: CONTRACT IDENTITY RESOLUTION (Phase 2 P2) ──────
 	// The execution's immutable identity is derived from the VERIFIED context
 	// digest, the selected strategy and the RESOLVED target set — never
@@ -1926,14 +2089,18 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			ingTrace = retryTrace
 		}
 		if retryErr != nil {
-			err = fmt.Errorf("%w: strict line-anchor retry failed: %w", ErrPhysicalOutputBudgetBreach, retryErr)
+			// The strict re-prompt also failed. That is a PATCH-ANCHOR terminal,
+			// not a token-budget breach, and it is named as such so the recovery
+			// matrix classifies it as ANCHOR_NOT_FOUND rather than aborting with a
+			// budget label that describes a different failure.
+			err = fmt.Errorf("%w: strict line-anchor retry failed: %w", ErrStrictAnchorRecoveryExhausted, retryErr)
 			patches, diffs = nil, nil
 		} else {
 			patches, diffs, err = retryPatches, retryDiffs, nil
 		}
 	}
 	if err != nil && IsHallucinatedAnchorError(err) && req.RecoveryAttempt >= 1 {
-		err = fmt.Errorf("%w: strict line-anchor attempt exhausted: %w", ErrPhysicalOutputBudgetBreach, err)
+		err = fmt.Errorf("%w: strict line-anchor attempt exhausted: %w", ErrStrictAnchorRecoveryExhausted, err)
 	}
 	if ingTrace != nil {
 		res.IngestionTrace = ingTrace
@@ -2616,6 +2783,42 @@ func (x *RuntimeExecutor) PendingPatchIDs() []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+// InvalidatePendingCandidates drops every approval-held candidate and returns how
+// many were dropped.
+//
+// IT IS CALLED WHEN A CANDIDATE IS PROVEN INVALID — a patch whose anchor did not
+// resolve against the authoritative target, or an artifact the parser rejected.
+// An invalid candidate must not remain approvable: leaving it held would let a
+// human be asked to authorize a patch the runtime already knows cannot be
+// applied, which is the "patch exists but nothing would change" state the
+// objective authority is specifically built to prevent.
+//
+// It is deliberately narrow. It drops candidates; it never mutates the
+// workspace, never fabricates a replacement and never decides that a REMAINING
+// candidate is valid. The artifact gate, the authorization engine and OCC remain
+// the only authorities on that.
+func (x *RuntimeExecutor) InvalidatePendingCandidates(reason string) int {
+	if x == nil {
+		return 0
+	}
+	x.mu.Lock()
+	dropped := len(x.pending)
+	ids := make([]string, 0, dropped)
+	for id := range x.pending {
+		ids = append(ids, id)
+	}
+	x.pending = make(map[string]*pendingMutation)
+	x.mu.Unlock()
+	if dropped == 0 {
+		return 0
+	}
+	sort.Strings(ids)
+	x.emit(events.NewActivity(fmt.Sprintf(
+		"[candidate] invalidated %d pending candidate(s) (%s): %s",
+		dropped, reason, strings.Join(ids, ","))))
+	return dropped
 }
 
 // CandidateHeld reports whether patchID is still an approval-held candidate of
