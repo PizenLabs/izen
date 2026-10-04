@@ -592,3 +592,128 @@ func callName(call *ast.CallExpr) string {
 	}
 	return receiver.Name + "." + selector.Sel.Name
 }
+
+// kernelMutationPrimitives are the direct calls that change the workspace — put
+// bytes there, remove them, or create the directory that holds them.
+//
+// The separate `workspacePrimitives` vocabulary above is deliberately wider (it
+// includes reads) and is enforced against a whole file. This one is narrower on
+// purpose: it is enforced against ONE method, the canonical mutation seam, where
+// reads for patch derivation are legitimate but a write is a bypass.
+var kernelMutationPrimitives = map[string]string{
+	"os.WriteFile":  "os.WriteFile",
+	"os.Create":     "os.Create",
+	"os.CreateTemp": "os.CreateTemp",
+	"os.OpenFile":   "os.OpenFile",
+	"os.Rename":     "os.Rename",
+	"os.Remove":     "os.Remove",
+	"os.RemoveAll":  "os.RemoveAll",
+	"os.MkdirAll":   "os.MkdirAll",
+	"os.Mkdir":      "os.Mkdir",
+}
+
+// TestKernelLock_CanonicalMutationRoutesThroughKernel pins the RuntimeExecutor's
+// final filesystem primitive to the bridge.
+//
+// `internal/execution/patch.go` resolves what a target should hold and then must
+// place it through `internal/kernelbridge`. Before this lock, the method placed
+// bytes with a bare os.WriteFile: no grant, no event, no evidence, no
+// verification, and a symlink out of the workspace resolved by the kernel was
+// followed instead. These assertions fail when that regresses, in either
+// direction: a direct mutation primitive reappearing in the method, the bridge
+// import being dropped, or the method no longer calling the seam.
+func TestKernelLock_CanonicalMutationRoutesThroughKernel(t *testing.T) {
+	root := repoRoot(t)
+	const migrated = "internal/execution/patch.go"
+	abs := filepath.Join(root, migrated)
+
+	source, err := os.ReadFile(abs)
+	if err != nil {
+		t.Fatalf("reading %s: %v", migrated, err)
+	}
+	if !strings.Contains(string(source), kernelBridgePackage) {
+		t.Errorf("%s no longer imports %s; the canonical mutation seam is not routed through the kernel any more",
+			migrated, kernelBridgePackage)
+	}
+
+	// The method that places the resolved bytes must call the kernel seam.
+	if calls := functionCalls(t, abs, "apply"); !calls["pm.commitThroughKernel"] {
+		t.Errorf("%s: PatchManager.apply no longer calls pm.commitThroughKernel; the canonical write does not reach the kernel", migrated)
+	}
+	// ...and the seam it calls must be the bridge.
+	if calls := functionCalls(t, abs, "commitThroughKernel"); !calls["kernelbridge.Apply"] {
+		t.Errorf("%s: PatchManager.commitThroughKernel no longer calls kernelbridge.Apply", migrated)
+	}
+
+	// The method itself must own no direct workspace mutation. Reads for patch
+	// derivation are allowed; a write or a directory creation is not.
+	if sites := scanFunctionMutationPrimitives(t, abs, "apply"); len(sites) > 0 {
+		t.Errorf("%s: PatchManager.apply reaches the filesystem directly: %s.\n"+
+			"The resolved bytes must be placed by %s under an explicit grant, so they\n"+
+			"are written by the confined capability and re-read from disk by a verifier\n"+
+			"that did not write them. A direct write here has no event, no state, no\n"+
+			"evidence and no verification behind it.",
+			migrated, strings.Join(sites, ", "), kernelBridgePackage)
+	}
+}
+
+// functionCalls returns the qualified call names used inside the named top-level
+// function or method, so a lock can constrain one method instead of a file.
+func functionCalls(t *testing.T, path, name string) map[string]bool {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+	out := map[string]bool{}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || fn.Name.Name != name {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if q := qualifiedCallName(call); q != "" {
+				out[q] = true
+			}
+			return true
+		})
+	}
+	return out
+}
+
+// scanFunctionMutationPrimitives returns every direct workspace-mutation call in
+// one named function, as "file:line (call)" sites.
+func scanFunctionMutationPrimitives(t *testing.T, path, name string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		return []string{fmt.Sprintf("%s (unparseable: %v)", path, err)}
+	}
+	var out []string
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || fn.Name.Name != name {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			callerName := qualifiedCallName(call)
+			if kernelMutationPrimitives[callerName] == "" {
+				return true
+			}
+			out = append(out, fmt.Sprintf("%s:%d (%s)", path, fset.Position(call.Pos()).Line, callerName))
+			return true
+		})
+	}
+	sort.Strings(out)
+	return out
+}

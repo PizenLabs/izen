@@ -37,6 +37,14 @@ const (
 	// FileWrite replaces the whole content of one workspace file. Mutating.
 	FileWrite CapabilityID = "file.write"
 
+	// FileDelete removes one workspace file. Mutating, and the counterpart of
+	// FileWrite: together they are the two ways a declared destination's
+	// content can change. A delete is its own capability rather than a write of
+	// zero bytes, because "the target is gone" and "the target now holds an
+	// empty string" are different filesystem facts and a contract that could
+	// not tell them apart could never demand either one.
+	FileDelete CapabilityID = "file.delete"
+
 	// FileExists reports whether a declared target is present. Read-only, and
 	// distinct from FileRead: existence is its own observation, and claiming a
 	// file exists without reading the directory is a claim, not an observation.
@@ -54,6 +62,7 @@ var allCapabilityIDs = []CapabilityID{
 	FileSearch,
 	FileExists,
 	FileWrite,
+	FileDelete,
 	CommandRun,
 }
 
@@ -82,7 +91,7 @@ func (id CapabilityID) String() string { return string(id) }
 // widened into a mutating one by accident.
 func (id CapabilityID) Mutating() bool {
 	switch id {
-	case FileWrite, CommandRun:
+	case FileWrite, FileDelete, CommandRun:
 		return true
 	default:
 		return false

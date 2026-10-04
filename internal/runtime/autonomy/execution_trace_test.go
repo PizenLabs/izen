@@ -129,6 +129,24 @@ func (r *traceRecorder) hasKind(kind string) bool {
 	return false
 }
 
+// waitForKind waits until any of the given kinds has been delivered. The bus
+// delivers on per-subscription goroutines, so reading hasKind immediately after
+// a run can observe scheduling latency rather than a missing event.
+func (r *traceRecorder) waitForKind(d time.Duration, kinds ...string) bool {
+	want := make(map[string]bool, len(kinds))
+	for _, k := range kinds {
+		want[k] = true
+	}
+	return r.waitFor(func(steps []traceStep) bool {
+		for _, s := range steps {
+			if want[s.Kind] {
+				return true
+			}
+		}
+		return false
+	}, d)
+}
+
 // containsText reports whether any recorded step mentions substr in its text.
 // It is how stage-name-addressed capability evidence is matched without inventing
 // new event types.
@@ -246,7 +264,7 @@ func TestExecutionTrace_CanonicalObjectiveSequence(t *testing.T) {
 	if !rec.hasKind(events.EventTargetResolved) {
 		t.Errorf("objective.accepted: no target resolution evidence\n%s", traceAllText(rec))
 	}
-	if !rec.hasKind(events.EventContextPrepared) && !rec.hasKind(events.EventContextCompilation) {
+	if !rec.waitForKind(5*time.Second, events.EventContextPrepared, events.EventContextCompilation) {
 		t.Errorf("context.acquired: no context preparation evidence\n%s", traceAllText(rec))
 	}
 

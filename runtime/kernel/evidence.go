@@ -29,6 +29,11 @@ const (
 	// EvidenceFileWritten: bytes reached a destination. Produced only by a
 	// mutating capability that actually wrote.
 	EvidenceFileWritten EvidenceKind = "FILE_WRITTEN"
+	// EvidenceFileDeleted: a declared target was removed. Produced only by a
+	// mutating capability that actually removed it. It is distinct from
+	// EvidenceFileAbsent, which says the target was not there: this one says the
+	// target WAS there and a mutation is what made it not there.
+	EvidenceFileDeleted EvidenceKind = "FILE_DELETED"
 	// EvidenceCommandRun: a command ran and its real exit code is recorded.
 	EvidenceCommandRun EvidenceKind = "COMMAND_RUN"
 	// EvidenceCommandTruncated: a command's output hit the declared bound, so
@@ -45,6 +50,7 @@ var allEvidenceKinds = []EvidenceKind{
 	EvidenceFilePresent,
 	EvidenceFileAbsent,
 	EvidenceFileWritten,
+	EvidenceFileDeleted,
 	EvidenceCommandRun,
 	EvidenceCommandTruncated,
 	EvidenceResponseProduced,
@@ -70,8 +76,14 @@ func (k EvidenceKind) Valid() bool {
 // Mutating reports whether this evidence kind implies the workspace changed. A
 // mutating evidence kind produced by a read-only capability is a contradiction
 // the kernel refuses to record, which is why the reducer cross-checks it.
+//
+// A write and a delete are both workspace changes: the destination's content
+// after them is not what it was before, and either can satisfy a mutation
+// obligation. They are not interchangeable as evidence — a contract that names
+// one is not satisfied by the other — which is why they are separate kinds even
+// though they share the mutation boundary.
 func (k EvidenceKind) Mutating() bool {
-	return k == EvidenceFileWritten
+	return k == EvidenceFileWritten || k == EvidenceFileDeleted
 }
 
 // Observation is what a capability reports immediately after it runs.
@@ -282,18 +294,24 @@ func (s *evidenceSet) observedAnywhere(target string, kinds ...EvidenceKind) boo
 }
 
 // mutatedTargets returns the concrete targets the log proves were durably
-// written, in canonical sorted order.
+// changed, in canonical sorted order.
+//
+// A write and a delete both count: each is a durable change to the target's
+// content, and the mutation boundary is "the workspace changed", not "bytes were
+// added". The kinds stay separate on the evidence record so a contract that
+// names a write is never satisfied by a delete.
 func (s *evidenceSet) mutatedTargets() []string {
 	if s == nil {
 		return nil
 	}
 	seen := make(map[string]bool)
 	var out []string
-	for _, e := range s.byKind[EvidenceFileWritten] {
-		if e.Target != "" && !seen[e.Target] {
-			seen[e.Target] = true
-			out = append(out, e.Target)
+	for _, e := range s.all {
+		if !e.Kind.Mutating() || e.Target == "" || seen[e.Target] {
+			continue
 		}
+		seen[e.Target] = true
+		out = append(out, e.Target)
 	}
 	sort.Strings(out)
 	return out

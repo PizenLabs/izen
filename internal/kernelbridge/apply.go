@@ -133,6 +133,71 @@ func (a Applied) Written() []string {
 	return out
 }
 
+// Removed returns the destinations the evidence log proves were durably
+// deleted, in sorted order.
+//
+// It is the mutating counterpart of Written for the DELETE direction. Like
+// Written it reports what the log proves and nothing more: a destination whose
+// bytes reached disk and then failed verification is not listed here, because a
+// delete produced no FILE_DELETED evidence in that case.
+func (a Applied) Removed() []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, e := range a.Evidence {
+		if e.Kind != kernel.EvidenceFileDeleted || e.Target == "" || seen[e.Target] {
+			continue
+		}
+		seen[e.Target] = true
+		out = append(out, e.Target)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Deleted reports whether the evidence proves target was removed AND
+// adjudication accepted the execution as a whole.
+//
+// It is the DELETE-direction twin of Landed: evidence that a destination was
+// removed beside an unproven outcome describes a deletion the runtime cannot
+// vouch for, and this seam will not present that as a completed removal.
+func (a Applied) Deleted(target string) bool {
+	want := canonical(target)
+	if want == "" || !a.Proven() {
+		return false
+	}
+	for _, t := range a.Removed() {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+// Wrote reports whether the evidence log carries durable write evidence for
+// target, whether or not adjudication accepted the execution as a whole.
+//
+// It is the weaker twin of Landed and it exists for a specific caller need: a
+// concurrent writer can replace a destination between the capability's write and
+// the verifier's independent re-read, producing write evidence beside an unproven
+// outcome. Core still has to treat that as an executed mutation — the workspace
+// changed and the enclosing transaction must roll it back and be marked tainted —
+// and Landed deliberately returns false in that case. Wrote answers "did bytes
+// reach disk", which is the fact the transaction needs; Landed answers "is this a
+// completed write", which is the fact a human needs. Collapsing the two would
+// either taint a refusal that never wrote, or hide a write that did.
+func (a Applied) Wrote(target string) bool {
+	want := canonical(target)
+	if want == "" {
+		return false
+	}
+	for _, t := range a.Written() {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
 // Created reports whether this execution created target.
 //
 // Both halves are read out of the evidence log, and their order matters: the

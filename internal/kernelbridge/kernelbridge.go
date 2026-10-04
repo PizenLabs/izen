@@ -508,9 +508,13 @@ func collect(result kernel.Result, events []kernel.Event, executionID string, ta
 // file.search is deliberately excluded. Its FILE_READ evidence records a match
 // count over content it loaded, not a reading of the target as a file, so letting
 // it populate presence would let a search answer a question it was not asked.
+//
+// file.delete is included because its FILE_ABSENT record is a real observation
+// that the target is gone — the same fact file.exists would report, produced by
+// the step that made it true.
 func presenceCapable(id kernel.CapabilityID) bool {
 	switch id {
-	case kernel.FileRead, kernel.FileExists, kernel.FileWrite:
+	case kernel.FileRead, kernel.FileExists, kernel.FileWrite, kernel.FileDelete:
 		return true
 	default:
 		return false

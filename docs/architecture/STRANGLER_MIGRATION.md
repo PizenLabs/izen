@@ -1,6 +1,8 @@
 # Strangler Migration: from three execution stacks to one kernel
 
-**Status:** in progress. Slices 1 (`file.exists`), 2 (`file.write`) and 3 (`file.read`) complete.
+**Status:** in progress. Slices 1 (`file.exists`), 2 (`file.write`), 3 (`file.read`),
+4 (`file.write` on the canonical `RuntimeExecutor` mutation seam) and 5 (`file.delete`)
+complete.
 **Date:** 2026-10-04
 **Branch:** `refactor/kernel`
 
@@ -415,6 +417,114 @@ case.
 
 ---
 
+## 5a. Slice 4 — the canonical `RuntimeExecutor` mutation seam, and slice 5 — `file.delete`
+
+Slices 2 and 3 migrated the native tool-call path. Slice 4 migrates the
+**canonical** execution authority — the one named in
+`docs/architecture/AUDIT-RUNTIME-AUTHORITY.md` as the declared authority — and
+slice 5 completes the kernel's mutation vocabulary.
+
+### Where the seam is
+
+```
+RuntimeExecutor.Approve            internal/execution/executor.go:2584
+  → PatchManager.ApplyContext      internal/execution/patch.go
+  → PatchManager.apply             (patch derivation: diff → SEARCH/REPLACE → full content)
+  → commitThroughKernel            internal/execution/patch.go  ← the seam
+  → kernelbridge.Apply
+  → runtime/kernel                 engine → dispatch → verify → adjudicate
+  → runtime/capabilities/filesystem file.write
+```
+
+The write happens in exactly one method, `PatchManager.apply`, at two former
+`os.WriteFile` sites (the `FILE_CREATE` branch and the main branch). Both now
+call `commitThroughKernel`, which invokes `kernelbridge.Apply` and fails closed
+when the kernel does not report the destination landed. Patch **derivation**
+does not move: deciding what a target should hold is the Control Plane's job,
+and the kernel owns only the deterministic placement of the resolved bytes.
+
+The two `os.MkdirAll` calls that used to create the destination's parent
+directory were also removed. Creating a destination's directory is itself a
+workspace mutation, and doing it before the grant is checked is a mutation the
+grant does not cover. The kernel's `file.write` performs the `MkdirAll` inside
+the same authorized step that writes the file.
+
+### Concurrent writers: an unproven write is still an executed mutation
+
+The kernel's content verifier re-reads the destination after writing it. A
+concurrent writer that lands between the capability's write and that re-read
+produces `FILE_WRITTEN` evidence beside an unproven outcome. `Applied.Landed`
+deliberately returns false there — the runtime cannot vouch for the final bytes —
+but the write did happen, and the enclosing `MutationSet` must roll it back and
+report the attempt as tainted rather than as a no-op.
+
+`Applied.Wrote` draws exactly that distinction from the log, and
+`PatchManager.failKernelWrite` projects it into the existing `MutationEvidence`
+vocabulary (`ApplyExecuted`, `FilesystemChanged`). This is what keeps
+`TestPhase3ConcurrentOutBandWriterNeverPersistsPartialState` truthful: a
+rolled-back apply whose bytes reached disk is `Tainted`, and a refused apply that
+never wrote is not.
+
+### The atomic replace preserves the destination's mode
+
+The kernel write commits by renaming a staged file into place, which installs a
+new inode. The capability now reads the destination's existing permission bits
+before staging and applies them to the staged file (defaulting to 0644 for a new
+target). Without that, every write through the canonical path would have reset an
+existing file's mode — the exact defect slice 2's report attributed to the old
+`os.WriteFile` path.
+
+### What slice 4 is not
+
+It is not a rewrite of `PatchManager`. Shadow backups, the transaction record,
+the OCC gate, the micro-fix / syntax verifier, and the rollback path remain in
+Core and are deliberately untouched:
+
+| Site | Classification | Reason |
+|---|---|---|
+| `createShadowBackup` (`patch.go`) | KEEP | writes the runtime's OWN `.izen/checkpoints` bookkeeping, not a mutation target |
+| `appendMutationLog` (`patch.go`) | KEEP | `.izen/audit` bookkeeping |
+| `restoreFromShadowBackup` (`patch.go`) | EXEMPT | recovery/rollback, out of scope until the kernel owns transactions |
+| `patch.Store` (`patch.go`) | KEEP | `.izen` patch bookkeeping |
+| `os.ReadFile` in `apply` | KEEP | patch derivation reads against the live file; not a mutation |
+
+### Slice 5 — `file.delete`
+
+The kernel's contract vocabulary has always named `DELETE` (`ContractDelete`,
+and the `target_absent` / `mutation_applied` clauses that adjudicate it), but no
+capability implemented a removal, so the contract was unsatisfiable. Slice 5
+fills that gap:
+
+- `runtime/kernel`: `CapabilityID("file.delete")` and the mutating evidence kind
+  `FILE_DELETED`. A write and a delete are both workspace changes
+  (`EvidenceKind.Mutating`), so either can satisfy the mutation boundary, but
+  they stay distinct kinds so a contract that names a write is never satisfied by
+  a delete.
+- `runtime/capabilities/filesystem`: `deleteCap` removes exactly one confined
+  file, refuses a directory, reports `PASS` with `FILE_DELETED` + a fresh
+  `FILE_ABSENT` when it removed one, and `NO_OP` with `FILE_ABSENT` when the
+  target was already gone. An already-absent target therefore does **not**
+  satisfy a DELETE contract, which demands a durable change.
+- `internal/kernelbridge/delete.go`: `Delete` runs one DELETE execution per
+  target under a grant naming exactly those targets, with an independent
+  verifier that re-derives absence.
+
+### Changed files
+
+| File | Change |
+|---|---|
+| `internal/execution/patch.go` | both execution writes routed through `commitThroughKernel`; `os.MkdirAll` removed; `apply` takes a context |
+| `runtime/kernel/capability.go` | `file.delete` capability |
+| `runtime/kernel/evidence.go` | `FILE_DELETED`; `Mutating` and `mutatedTargets` cover it |
+| `runtime/kernel/dispatch.go` | mutation axis projected from any mutating evidence kind |
+| `runtime/capabilities/filesystem/filesystem.go` | `deleteCap` |
+| `internal/kernelbridge/delete.go` | new — the deleting direction |
+| `internal/kernelbridge/apply.go` | `Removed` / `Deleted` result predicates |
+| `internal/kernelbridge/kernelbridge.go` | presence projection includes `file.delete` |
+| `test/architecture/kernel_lock_test.go` | `TestKernelLock_CanonicalMutationRoutesThroughKernel` |
+
+---
+
 ## 6. Remaining work, in order
 
 Each line is an allowlist entry in `test/architecture/kernel_lock_test.go` marked
@@ -441,7 +551,9 @@ Mutation sites NOT taken, and why:
 | Site | Why not yet |
 |---|---|
 | `internal/runtime/executor/file_executor.go` — `PrepareSnapshot` / `Commit` / `atomicWrite` / `Rollback` | transactional: snapshot, staged write, symbol baseline, use-time confinement, automatic rollback. Migrating it means recovery, which is out of scope. |
-| `internal/execution/patch.go` — `ApplyContext`, `os.WriteFile` at :475/:661/:793 | SEARCH/REPLACE materialisation and fuzzy matching. Migrating it means moving patch derivation, which is out of scope. |
+| `internal/execution/patch.go` — `ApplyContext`, `restoreFromShadowBackup` `os.WriteFile` at :475, `patch.Store` | Slice 4 moved the two EXECUTION writes (`:661`/`:793`) onto the kernel. What remains is rollback (`restoreFromShadowBackup`), which is recovery, and `.izen` bookkeeping (`patch.Store`), which is not a mutation target. |
+| `internal/runtime/substrate/substrate.go` (`osFilePort.Write`/`Remove`) and `internal/runtime/substrate/engine.go` | Path A (`izen run`) owns its own `FilePort`/`ShellPort` transaction pipe, separate from the `RuntimeExecutor` path slice 4 migrates. It is a distinct execution authority and remains a strangler target. |
+| `internal/runtime/executor/file_executor.go` — `PrepareSnapshot` / `Commit` / `atomicWrite` / `Rollback` | transactional: snapshot, staged write, symbol baseline, use-time confinement, automatic rollback. Migrating it means recovery, which is out of scope. |
 | `internal/execution/boundary.go:76`, `internal/patch/applicator.go:44`, `internal/infrastructure/capabilities/osfile.go:179` | other write authorities, each with its own approval and transaction machinery. |
 
 ### Out of scope until the strangler completes

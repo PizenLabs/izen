@@ -261,10 +261,11 @@ func TestDeleteContractVerifiesAbsence(t *testing.T) {
 		t.Fatalf("runner: %v", err)
 	}
 
-	// The program observes the file, then "deletes" it. No file.delete capability
-	// exists yet, so the write cannot actually remove anything — which is exactly
-	// the honest outcome: a DELETE contract whose mutation did not happen cannot
-	// be proven.
+	// The program observes the file, then WRITES it. It deliberately does not use
+	// the file.delete capability: a DELETE contract whose named target was not
+	// removed cannot be proven, so an unrelated mutation must leave the verdict
+	// unproven. This pins the difference between "something changed" and "the
+	// target is gone".
 	spec := kernel.Spec{
 		ExecutionID: "headless-delete-1",
 		Contract: kernel.Contract{
@@ -300,5 +301,55 @@ func TestDeleteContractVerifiesAbsence(t *testing.T) {
 	}
 	if _, statErr := os.Stat(obsolete); statErr != nil {
 		t.Errorf("the target disappeared, which no authorized step could do: %v", statErr)
+	}
+}
+
+// TestDeleteContractWithFileDeleteCapabilityProves proves the other half: with a
+// real file.delete step, a DELETE contract reaches PROVEN, and only because the
+// target is genuinely gone and the verifier observed the absence.
+func TestDeleteContractWithFileDeleteCapabilityProves(t *testing.T) {
+	root := t.TempDir()
+	const target = "obsolete.txt"
+	full := filepath.Join(root, target)
+	if err := os.WriteFile(full, []byte("old"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	runner, err := headless.New(root)
+	if err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+
+	spec := kernel.Spec{
+		ExecutionID: "headless-delete-2",
+		Contract: kernel.Contract{
+			Kind:                 kernel.ContractDelete,
+			Targets:              []string{target},
+			RequiresVerification: true,
+		},
+		Program: kernel.Program{
+			{ID: "remove", Capability: kernel.FileDelete, Target: target},
+		},
+	}
+	grant, err := kernel.NewGrant("g2", []kernel.CapabilityID{kernel.FileDelete}, []string{target})
+	if err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	result, err := runner.Run(context.Background(), spec, grant)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !result.Proves() {
+		t.Fatalf("outcome = %s (%s): %s; want PROVEN", result.Outcome, result.Class, result.Reason)
+	}
+	if result.State.Mutation != kernel.MutationApplied {
+		t.Errorf("mutation axis = %s; want %s", result.State.Mutation, kernel.MutationApplied)
+	}
+	if result.State.Verify != kernel.VerifyPassed {
+		t.Errorf("verify axis = %s; want %s", result.State.Verify, kernel.VerifyPassed)
+	}
+	if _, statErr := os.Stat(full); !os.IsNotExist(statErr) {
+		t.Fatalf("the target is still on disk after a PROVEN delete (stat err = %v)", statErr)
 	}
 }

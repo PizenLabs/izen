@@ -16,6 +16,7 @@ import (
 	"github.com/PizenLabs/izen/internal/core/authorization"
 	"github.com/PizenLabs/izen/internal/core/budget"
 	"github.com/PizenLabs/izen/internal/engine"
+	"github.com/PizenLabs/izen/internal/kernelbridge"
 	"github.com/PizenLabs/izen/internal/modes/build"
 	"github.com/PizenLabs/izen/internal/patch"
 	"github.com/PizenLabs/izen/internal/templates"
@@ -538,7 +539,84 @@ func sanitizeCtxID(id string) string {
 	return strings.NewReplacer("#", "", "-", "_", "/", "_").Replace(id)
 }
 
+// commitThroughKernel places the resolved bytes for one workspace-relative
+// target on disk through the Runtime Kernel bridge.
+//
+// This is the canonical execution path's final filesystem primitive. Patch
+// DERIVATION — parsing a unified diff, matching SEARCH/REPLACE context, the
+// full-content fallback — stays here, because it is the Control Plane's decision
+// about WHAT the target should hold. The kernel owns only the deterministic
+// placement of those bytes: it is invoked under an explicit grant naming exactly
+// this destination, writes through the confined filesystem capability, re-reads
+// the result from disk through code that did not write it, and adjudicates the
+// outcome from that evidence.
+//
+// A write that the kernel cannot prove landed is returned as an error, never
+// swallowed. The surrounding MutationSet transaction then rolls back, so a
+// destination whose bytes did not verifiably reach disk is not reported as a
+// change. The legacy bare os.WriteFile this replaced reported success from the
+// syscall alone, which is exactly the unverifiable claim the kernel removes.
+//
+// The Applied is returned alongside the error because "the kernel could not prove
+// it" still has two cases a caller must distinguish: nothing was written (an
+// admission or confinement refusal) and bytes reached disk but the independent
+// re-read disagreed (a concurrent writer). Only the second is an executed
+// mutation that the transaction must roll back and taint.
+func (pm *PatchManager) commitThroughKernel(ctx context.Context, target string, content []byte) (kernelbridge.Applied, error) {
+	applied := kernelbridge.Apply(ctx, pm.root, []kernelbridge.Write{{
+		Target:   target,
+		Content:  string(content),
+		Contract: kernelbridge.ContractPatch,
+	}})
+	if !applied.Landed(target) {
+		return applied, fmt.Errorf(
+			"kernel did not prove the write of %s: outcome=%s class=%s reason=%s execution=%s",
+			target, applied.Outcome, applied.Class, applied.Reason, applied.ExecutionID)
+	}
+	return applied, nil
+}
+
+// failKernelWrite records a kernel write failure at the mutation boundary and
+// returns the wrapped error.
+//
+// It exists because the mutation boundary's evidence must distinguish a refused
+// write from a write that reached disk and then failed verification. The kernel's
+// own log already draws that distinction (Wrote reads the write evidence, which
+// survives an unproven outcome); this projects it into the existing
+// MutationEvidence vocabulary so the enclosing rollback is summarised as tainted
+// rather than as a no-op. Without it, a concurrent writer that replaced the
+// target after the write produced a rolled-back apply that claimed nothing had
+// happened.
+func (pm *PatchManager) failKernelWrite(patch *Patch, applied kernelbridge.Applied, fullPath string, err error) error {
+	executed := applied.Wrote(patch.File)
+	changed := false
+	if executed {
+		// The bytes reached disk. Whether they still differ from the pre-apply
+		// original is measured, not assumed: the post-mutation reconciliation
+		// corrects this again after a rollback, but the boundary's own record
+		// must be truthful at the moment it is written.
+		if data, readErr := os.ReadFile(fullPath); readErr == nil {
+			changed = string(data) != patch.Original
+		} else {
+			changed = true
+		}
+	}
+	pm.recordMutationEvidence(patch, OutcomeApplyFailed, err.Error(), applyFacts{executed: executed, changed: changed})
+	return fmt.Errorf("write %s: %w", patch.File, err)
+}
+
+// Apply applies a patch without a caller-supplied deadline. It is the
+// backward-compatible entry point for callers that do not own a context
+// (admission tests, the engine-admission seam); the write itself is still a
+// bounded kernel execution.
 func (pm *PatchManager) Apply(patch *Patch) error {
+	return pm.apply(context.Background(), patch)
+}
+
+// apply is Apply under a caller's context. The context is threaded to the one
+// place that can honour it — the kernel write — so a withdrawn execution stops
+// the kernel rather than abandoning a goroutine that is still placing bytes.
+func (pm *PatchManager) apply(ctx context.Context, patch *Patch) error {
 	if pm.admissionCheck != nil {
 		if err := pm.admissionCheck("FILE_MUTATE"); err != nil {
 			return err
@@ -568,10 +646,10 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		return fmt.Errorf("path traversal detected in patch file: %s", patch.File)
 	}
 	fullPath := filepath.Join(pm.root, cleaned)
-	dir := filepath.Dir(fullPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", dir, err)
-	}
+	// Parent directories are created by the kernel's file.write capability, in
+	// the same authorized step that writes the file. Creating a destination's
+	// directory here would be a workspace mutation performed before the grant is
+	// checked, which is precisely the bypass this seam exists to remove.
 
 	if globalActivityLog != nil {
 		globalActivityLog("⚙ [system] applying structural patch to: %s ...", patch.File)
@@ -641,10 +719,7 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 			return fmt.Errorf("invalid FILE_CREATE path: %s", patch.File)
 		}
 		fullPath = filepath.Join(pm.root, cleaned)
-		dir = filepath.Dir(fullPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("mkdir %s: %w", dir, err)
-		}
+		// As above: the kernel creates the parent directories under the grant.
 		patch.Original = ""
 		if err := pm.recordTransaction(fullPath); err != nil {
 			return fmt.Errorf("transaction record %s: %w", patch.File, err)
@@ -658,8 +733,8 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 		}
 		// Write the new file directly — skip diff/SEARCH/REPLACE flow.
 		writeBytes := []byte(patch.Modified)
-		if err := os.WriteFile(fullPath, writeBytes, 0644); err != nil {
-			return fmt.Errorf("write %s: %w", patch.File, err)
+		if applied, err := pm.commitThroughKernel(ctx, patch.File, writeBytes); err != nil {
+			return pm.failKernelWrite(patch, applied, fullPath, err)
 		}
 		// Invalidate the observation cache for this target immediately upon a
 		// successful write so post-mutation verification reads the NEW file
@@ -790,11 +865,11 @@ func (pm *PatchManager) Apply(patch *Patch) error {
 	}
 
 	finalBytes := []byte(final)
-	if err := os.WriteFile(fullPath, finalBytes, 0644); err != nil {
+	if applied, err := pm.commitThroughKernel(ctx, patch.File, finalBytes); err != nil {
 		if globalActivityLog != nil {
 			globalActivityLog("[FAIL] patch rejected on %s: write failed: %v", patch.File, err)
 		}
-		return fmt.Errorf("write %s: %w", patch.File, err)
+		return pm.failKernelWrite(patch, applied, fullPath, err)
 	}
 	// Invalidate the observation cache for this target immediately upon a
 	// successful write so post-mutation verification reads the NEW file
@@ -1003,14 +1078,16 @@ func (pm *PatchManager) ApplyContext(ctx context.Context, patch *Patch) error {
 	}
 	type outcome struct{ err error }
 	done := make(chan outcome, 1)
-	//nolint:contextcheck // legacy Apply has no ctx; the deadline is enforced here
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				done <- outcome{err: fmt.Errorf("patch apply panic: %v", r)}
 			}
 		}()
-		done <- outcome{err: pm.Apply(patch)}
+		// The caller's context is threaded so a deadline that fires stops the
+		// kernel write too, rather than leaving a goroutine placing bytes after
+		// the caller has given up on it.
+		done <- outcome{err: pm.apply(ctx, patch)}
 	}()
 	select {
 	case o := <-done:

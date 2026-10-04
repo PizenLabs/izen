@@ -181,14 +181,14 @@ func (e *Engine) runStep(ctx context.Context, step Step, spec Spec, grant Grant)
 // means the mutation boundary was crossed. That separation is what keeps the
 // axes from becoming a second, looser opinion about what happened.
 func (e *Engine) projectAxes(executionID string, step Step, records []Evidence, obs Observation) error {
-	wrote := false
+	mutated := false
 	for _, rec := range records {
-		if rec.Kind == EvidenceFileWritten {
-			wrote = true
+		if rec.Kind.Mutating() {
+			mutated = true
 			break
 		}
 	}
-	if wrote {
+	if mutated {
 		if _, err := e.emit(Event{
 			Kind:        EventMutationApplied,
 			ExecutionID: executionID,

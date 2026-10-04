@@ -124,6 +124,7 @@ func (c *Capability) Capabilities() []kernel.Capability {
 		&searchCap{fs: c},
 		&existsCap{fs: c},
 		&writeCap{fs: c},
+		&deleteCap{fs: c},
 	}
 }
 
@@ -658,6 +659,16 @@ func (w *writeCap) Invoke(ctx context.Context, req kernel.Request) (kernel.Obser
 		}, nil
 	}
 
+	// Preserve the destination's existing permission bits across the atomic
+	// replace, defaulting to 0644 for a target that does not exist yet. The
+	// rename installs a NEW inode, so without this the mode of the file being
+	// replaced would be silently reset on every write — a state change the
+	// request never asked for.
+	mode := fs.FileMode(0o644)
+	if info, statErr := os.Stat(abs); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+
 	tmp, err := os.CreateTemp(filepath.Dir(abs), ".izen-write-*")
 	if err != nil {
 		return kernel.Observation{
@@ -681,7 +692,7 @@ func (w *writeCap) Invoke(ctx context.Context, req kernel.Request) (kernel.Obser
 			Detail:  fmt.Sprintf("close staged file for %s: %v", req.Target, err),
 		}, nil
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := os.Chmod(tmpName, mode); err != nil {
 		return kernel.Observation{
 			Verdict: kernel.VerdictFail,
 			Detail:  fmt.Sprintf("chmod staged file for %s: %v", req.Target, err),
@@ -723,6 +734,163 @@ func (w *writeCap) Invoke(ctx context.Context, req kernel.Request) (kernel.Obser
 				Summary: fmt.Sprintf("atomic rename committed %d bytes", len(content)),
 			},
 			existsFact,
+		},
+	}, nil
+}
+
+// ── file.delete ────────────────────────────────────────────────────────────
+
+type deleteCap struct{ fs *Capability }
+
+// ID implements kernel.Capability.
+func (d *deleteCap) ID() kernel.CapabilityID { return kernel.FileDelete }
+
+// Authorize implements kernel.Capability.
+//
+// Like file.write, this is a mutating gate, so it checks three things rather
+// than one: that the grant permits file.delete, that an explicit target was
+// named, and that the target is inside the workspace. The confinement check is
+// not redundant — a grant naming "../outside.txt" would pass the first two and
+// must still fail. A capability that could be redirected out of the workspace is
+// a capability no grant can reason about.
+//
+// A target that resolves to a symlink pointing outside the workspace is refused
+// by resolve for the same reason a write is: the grant names a workspace-relative
+// path, and the bytes must not leave the workspace through a link.
+func (d *deleteCap) Authorize(req kernel.Request) error {
+	if !req.Grant.Permits(kernel.FileDelete) {
+		return kernel.Block{
+			Class:      kernel.FailureAuthorization,
+			Step:       req.Step,
+			Capability: kernel.FileDelete,
+			Reason:     fmt.Sprintf("grant %q does not permit file.delete", req.Grant.ID),
+		}
+	}
+	if req.Target == "" {
+		return kernel.Block{
+			Class:      kernel.FailureAuthorization,
+			Step:       req.Step,
+			Capability: kernel.FileDelete,
+			Reason:     "file.delete requires an explicit target; the kernel does not choose a filename",
+		}
+	}
+	if _, err := d.fs.resolve(req.Target); err != nil {
+		var b kernel.Block
+		if errors.As(err, &b) {
+			b.Step = req.Step
+			b.Capability = kernel.FileDelete
+			return b
+		}
+		return err
+	}
+	return nil
+}
+
+// Invoke implements kernel.Capability.
+//
+// The three outcomes are kept distinct because a contract can tell them apart:
+//
+//   - the target was there and os.Remove removed it: PASS with FILE_DELETED and
+//     a fresh FILE_ABSENT, the two facts a DELETE contract needs;
+//   - the target was not there: NO_OP with FILE_ABSENT. Nothing was removed, so
+//     no FILE_DELETED is recorded and a DELETE contract that demands a durable
+//     mutation cannot be satisfied by it. That is the honest answer, not a
+//     fabricated success;
+//   - the removal did not happen for any other reason: FAIL with no evidence, so
+//     the mutation axis stays untouched.
+//
+// A directory is refused rather than removed, even if it happens to be empty:
+// removing a tree is a different operation with a different blast radius, and
+// this capability removes exactly one file that the grant named.
+func (d *deleteCap) Invoke(ctx context.Context, req kernel.Request) (kernel.Observation, error) {
+	if err := ctx.Err(); err != nil {
+		return kernel.Observation{}, err
+	}
+	abs, err := d.fs.resolve(req.Target)
+	if err != nil {
+		return kernel.Observation{}, err
+	}
+
+	info, statErr := os.Stat(abs)
+	switch {
+	case errors.Is(statErr, fs.ErrNotExist):
+		// Already absent. A real observation, but not a mutation.
+		return kernel.Observation{
+			Verdict: kernel.VerdictNoOp,
+			Detail:  fmt.Sprintf("%s was already absent", req.Target),
+			Facts: []kernel.Fact{{
+				Kind:    kernel.EvidenceFileAbsent,
+				Target:  req.Target,
+				Summary: "stat reported no such file",
+			}},
+		}, nil
+	case statErr != nil:
+		return kernel.Observation{
+			Verdict: kernel.VerdictFail,
+			Detail:  fmt.Sprintf("stat %s: %v", req.Target, statErr),
+		}, nil
+	case info.IsDir():
+		return kernel.Observation{
+			Verdict: kernel.VerdictFail,
+			Detail:  fmt.Sprintf("%s is a directory; file.delete removes one file", req.Target),
+		}, nil
+	}
+
+	size := int(info.Size())
+	if err := os.Remove(abs); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// A concurrent remover won the race. The target is absent, which is
+			// the fact a DELETE contract asks about, but this invocation did not
+			// remove it, so it reports NO_OP rather than claiming the mutation.
+			return kernel.Observation{
+				Verdict: kernel.VerdictNoOp,
+				Detail:  fmt.Sprintf("%s was already absent", req.Target),
+				Facts: []kernel.Fact{{
+					Kind:    kernel.EvidenceFileAbsent,
+					Target:  req.Target,
+					Summary: "stat reported no such file",
+				}},
+			}, nil
+		}
+		return kernel.Observation{
+			Verdict: kernel.VerdictFail,
+			Detail:  fmt.Sprintf("remove %s: %v", req.Target, err),
+		}, nil
+	}
+
+	// Confirm the removal rather than trusting os.Remove's nil return: the
+	// confirmation is the observation a later reader can check, and a delete
+	// whose only witness is the syscall that performed it is exactly the
+	// unverified mutation this kernel exists to make unrepresentable.
+	if _, restatErr := os.Stat(abs); !errors.Is(restatErr, fs.ErrNotExist) {
+		if restatErr != nil {
+			return kernel.Observation{
+				Verdict: kernel.VerdictFail,
+				Detail:  fmt.Sprintf("confirm removal of %s: %v", req.Target, restatErr),
+			}, nil
+		}
+		return kernel.Observation{
+			Verdict: kernel.VerdictFail,
+			Detail:  fmt.Sprintf("remove %s reported success but the target is still present", req.Target),
+		}, nil
+	}
+
+	return kernel.Observation{
+		Verdict:     kernel.VerdictPass,
+		OutputBytes: size,
+		Detail:      fmt.Sprintf("removed %s (%d bytes)", req.Target, size),
+		Facts: []kernel.Fact{
+			{
+				Kind:    kernel.EvidenceFileDeleted,
+				Target:  req.Target,
+				Bytes:   size,
+				Summary: fmt.Sprintf("removed %d bytes", size),
+			},
+			{
+				Kind:    kernel.EvidenceFileAbsent,
+				Target:  req.Target,
+				Summary: "stat confirmed the target is gone",
+			},
 		},
 	}, nil
 }
