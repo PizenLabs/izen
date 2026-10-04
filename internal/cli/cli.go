@@ -324,7 +324,12 @@ func Wire(llm LLMProvider, root string, in io.Reader, out io.Writer) *Stack {
 	apGate := authorization.NewGate(authorization.WithMinDelayWindow(0))
 	pf := preflight.NewEngine(target.NewTargetResolver(), runtimectx.NewCompiler())
 	val := executor.NewValidator()
-	exec := executor.NewExecutor()
+	// The FileExecutor is bound to the workspace root here, at the one place
+	// that already knows it. That root is what the kernel grant is formed
+	// over: an executor without one has nothing to authorize against, and
+	// would otherwise have to guess the process working directory — placing
+	// bytes outside the grant the caller believes it holds.
+	exec := executor.NewExecutor().WithWorkspace(root)
 
 	// New invariants wiring (DI audit).
 	budgetGate := preflight.NewGate()

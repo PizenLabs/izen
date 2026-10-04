@@ -250,7 +250,7 @@ func (o *Orchestrator) RunCycle(ctx context.Context, req preflight.PreflightRequ
 	// Step 7: Atomic execution or abort.
 	switch action {
 	case authorization.ActionExecute:
-		if err := o.executor.Commit(*proposal, backup); err != nil {
+		if err := o.executor.Commit(ctx, *proposal, backup); err != nil {
 			return nil, fmt.Errorf("orchestrator: commit: %w", err)
 		}
 		result.Committed = true

@@ -1,6 +1,7 @@
 # Kernel Integration Map
 
-**Status:** current as of slice 6 (`izen run` / stack A's filesystem commit).
+**Status:** current as of the FileExecutor slice (the `izen orchestrate` /
+`izen prompt` commit and rollback path).
 **Companion:** `docs/architecture/STRANGLER_MIGRATION.md`.
 
 This document is the audit that precedes the integration. Every line was
@@ -21,6 +22,13 @@ of the strangler described in `STRANGLER_MIGRATION.md`.
 | A — headless `izen run` | `cmd/izen/runtime.go` → `app.Pipeline.Run` (`internal/app/pipeline.go`) → `internal/runtime/substrate` | `ConcreteSubstrate.commitWrite`/`commitDelete` → `internal/kernelbridge` (slice 6) |
 | B — LEA layered engine | `internal/engine/pipeline` (plan synthesis only) | none live |
 | C — TUI / `RuntimeExecutor` | `compose.Wire` → `autonomy.Driver` → `ExecutorAdapter` → `execution.RuntimeExecutor` | `PatchManager.apply` → `internal/kernelbridge` (slice 4) |
+| O — `izen orchestrate` / `izen prompt` | `cmd/izen/orchestrate.go` → `cli.Wire` → `cli.Stack.Run` → `orchestrator.RunCycle` → `FileExecutor` | `FileExecutor.Commit`/`Rollback` → `internal/kernelbridge` (FileExecutor slice) |
+
+Stack O is not a fourth stack; it is the CLI control plane, which until this
+slice had no row here at all because it was missing from the census rather
+than because it had no filesystem effect. It is listed now because the census
+that found it is the reason this document's §4 grew an entry for
+`internal/app/plan.go`'s brownfield branch.
 
 Stack A's committed filesystem effects are on the kernel as of slice 6. What is
 still outside it on stack A is **not** the commit path: it is the substrate's
@@ -107,27 +115,61 @@ created the destination directory before the grant was checked.
 | `createShadowBackup`, `appendMutationLog`, `patch.Store` | KEEP | `.izen` runtime bookkeeping, not a mutation target |
 | `restoreFromShadowBackup`, `MutationSet.RollbackTo` | EXEMPT | recovery/rollback, out of scope |
 | `os.ReadFile` in `apply`, fresh-context retry | KEEP | patch derivation against live bytes |
-| `internal/runtime/executor/file_executor.go` `atomicWrite`/`Rollback` | REPLACE (future) | transactional executor; needs recovery to move |
-| `internal/execution/boundary.go`, `internal/patch/applicator.go`, `internal/infrastructure/capabilities/osfile.go` | REPLACE (future) | other write authorities |
+| `internal/runtime/executor/file_executor.go` `atomicWrite`/`Rollback` | REPLACED (FileExecutor slice) | the transaction stayed in Core; only the final filesystem effect moved. See §7 |
+| `internal/app/plan.go` brownfield branch → `internal/resource/file.FileResource.Write` | **OPEN — live bypass** | `izen run` on any existing workspace takes this branch, writes through a bare `os.WriteFile`, and never reaches the substrate, so no kernel, no `ExecutionProof` and no rollback. Highest-priority remaining item. See §4.1 |
+| `internal/app/pipeline.go` `ensureParentDirs` | OPEN | same brownfield branch; `os.MkdirAll` for artifact parents |
+| `internal/fs/txfs.go` `TxFS.Commit` | EXEMPT | zero production callers; dead. Its rollback siblings are recovery |
+| `internal/substrate/patch.go` `ApplyPatch` | EXEMPT | zero production callers; dead |
+| `internal/runtime/substrate` `Substrate.ExecuteUnit` | EXEMPT | belongs to `internal/runtime/executor.RuntimeExecutor`, which has no production constructor; dead |
+| `internal/execution/boundary.go` `RollbackAndVerify` | EXEMPT | recovery: restores a caller-supplied `originals` map after a DAG abort. Never places a new mutation |
+| `internal/patch/applicator.go` `FileApplicator.Apply` | EXEMPT | DI-wired but never invoked; `Engine.Apply` has no production caller. Dead |
+| `internal/infrastructure/capabilities/osfile.go` `OSFile.Write`/`Remove` | EXEMPT | every production call site writes a `.izen/` bookkeeping path; `main.go`'s instance is stored in `compose.Capabilities.File` and never read |
 | `internal/runtime/substrate` `ConcreteSubstrate.commitWrite`/`commitDelete` | REPLACED (slice 6) | stack A's commit path now crosses `internal/kernelbridge` |
 | `internal/runtime/substrate` rollback (`writeForRecovery`/`removeForRecovery`) | EXEMPT | recovery; Core owns undo and it never migrates |
 | `internal/runtime/substrate` `writeEvidenceProof` | KEEP | `.izen` bookkeeping, not a mutation target |
 | `internal/runtime/substrate` `Substrate.ExecuteUnit` → `FilePort.Write` | REPLACE (future) | belongs to `internal/runtime/executor.RuntimeExecutor`, a separate authority |
 | `internal/runtime/substrate` `osShellPort` / `OpExecCmd` | REPLACE (future) | process execution: a different capability, a different seam |
 
+### 4.1 The canonicality question, answered from the call graph
+
+> Can any authorized IZEN operation currently mutate a workspace without
+> crossing `internal/kernelbridge`?
+
+**Yes.** `izen run` on any workspace `defaultDetector` classifies as brownfield —
+which is any workspace containing a non-hidden directory, source file, or
+manifest — takes `internal/app/plan.go:316-340`. That branch builds raw
+`*file.FileResource` targets (`internal/planner/brownfield/brownfield.go:218`),
+lowers them to `op.OpWriteFile`, and executes them through
+`internal/graph/node.go:102` → `internal/resource/file/file.go:213`, which is a
+bare `os.WriteFile`.
+
+The consequence is structural, not incidental. The greenfield branch stages
+through `TxFS` and only reaches the substrate when `p.tx.StagedPaths()` is
+non-empty (`internal/app/pipeline.go:499`). The brownfield branch never stages,
+so `ConcreteSubstrate.Execute` is never called and the kernel is never crossed
+on that run at all — no grant, no event, no evidence, no verification, and no
+transaction to roll the write back.
+
+This is the strangler's next slice, and it is larger than the one just
+completed: the mutation is dispatched through a graph operation layer rather
+than through a transaction owner, so there is no rollback to preserve and no
+existing seam to widen — the path has to be given one.
+
 ## 5. The seams, stated once
 
-There are two, and they are the same shape because they are the same decision
-taken on two paths.
+There are three, and they are the same shape because they are the same decision
+taken on three paths.
 
 | Path | Seam | Delegates to |
 |---|---|---|
 | C — `RuntimeExecutor` | `internal/execution/patch.go : commitThroughKernel` | `kernelbridge.Apply` |
 | A — `izen run` | `internal/runtime/substrate/kernelcommit.go : commitWrite` / `commitDelete` | `kernelbridge.Apply` / `kernelbridge.Delete` |
+| O — `izen orchestrate` | `internal/runtime/executor/kernelcommit.go : placeThroughKernel` / `removeThroughKernel` | `kernelbridge.Apply` / `kernelbridge.Delete` |
 
 Each is authoritative because it is the only place on its path that places
 resolved bytes on disk, and each delegates that placement to `internal/kernelbridge`,
 the only sanctioned path from the legacy tree to `runtime/kernel`.
+
 
 ## 6. Stack A call graph (as built, slice 6)
 
@@ -180,3 +222,94 @@ contain no direct workspace mutation and no `FilePort` write or remove, and keep
 an exact two-way register of the recovery and bookkeeping sites that are allowed
 to. It targets the architectural execution path, not the repository: the substrate
 package still legitimately contains `os.WriteFile`.
+
+## 7. The orchestrate path (as built, FileExecutor slice)
+
+```
+izen orchestrate / izen prompt         cmd/izen/orchestrate.go
+  → cli.Wire                          internal/cli/cli.go (binds the workspace root)
+  → cli.Stack.Run
+  → Orchestrator.RunCycle             internal/runtime/orchestrator/engine.go
+  → approval gate                     ui.WaitForApproval → gate.Evaluate → ActionExecute
+  → FileExecutor.PrepareSnapshot      Core: snapshot + use-time confinement
+  → FileExecutor.Commit               Core: materialization, symbol baseline, rollback policy
+  → placeThroughKernel                ← THE SEAM
+  → kernelbridge.Apply / Delete
+  → runtime/kernel                    Engine.Open → Run → dispatch → verify → adjudicate
+  → runtime/capabilities/filesystem   file.write / file.delete
+  → FileExecutor.Rollback             Core: failWithRollback, snapshot restore
+```
+
+**Authorization boundary.** Unchanged and still Core's: `RunCycle` evaluates an
+`authorization.ApprovalEvent` against an armed gate session and commits only on
+`authorization.ActionExecute` (`internal/runtime/orchestrator/engine.go:252`).
+The kernel does not see that decision and does not need to; it executes the
+request the bridge hands it under a grant naming exactly one destination.
+
+**Request / grant representation.** `ProposedMutation` → a workspace-relative
+target plus resolved content. `kernel.Spec` / `kernel.Grant` are composed by the
+bridge from fixed seam policy; Core constructs neither. `ContractPatch` is
+declared for the same reason as Path A — a whole-content replace does not
+distinguish creation from overwrite, and under-claiming is the safe direction.
+
+**Snapshot, transaction, rollback, recovery.** All Core, all still in
+`internal/runtime/executor/file_executor.go`. `FileBackup` remains the single
+source of truth for rollback; `failWithRollback` remains the policy that a
+commit failure undoes the snapshot; the kernel holds no transaction state and
+none was moved into it.
+
+**What moved, exactly.** The final filesystem effect of both directions. The
+hand-rolled temp-file-and-rename protocol (`os.MkdirAll`, `os.CreateTemp`,
+`os.Chmod`, `os.Rename`) and the rollback's `os.WriteFile`/`os.Chmod`/
+`os.Remove` are gone. The kernel's write capability already performs the same
+protocol — stage to a temp file in the destination directory, preserve the
+destination's permission bits, rename into place, delete the staging file on
+every path that does not — so nothing about the atomicity guarantee was
+reimplemented on the Core side.
+
+Two behavioural differences follow from moving, and both are recorded rather
+than papered over:
+
+  - **Durability.** The legacy `atomicWrite` called `tmp.Sync()` before the
+    rename and best-effort `fsyncDir` after it. The kernel capability does
+    neither. This is the same trade Path A and Path C already made; the
+    durability property is the kernel's, and it is now stated in one place
+    instead of three.
+  - **Rollback will not delete a directory.** `os.Remove` removed an empty
+    directory; the kernel's `file.delete` refuses one outright, because
+    removing a tree is a different operation with a different blast radius.
+    This is strictly safer: rollback exists to undo what the transaction
+    produced, and a directory the transaction never created is not that.
+
+**Evidence.** `commitThroughKernel` returns the kernel's `Applied` alongside
+its error, and `failWithKernelWrite` annotates the rollback with whether the
+log records the destination as written. That is the distinction Core needs: a
+refused write changed nothing, and a write that reached disk but failed its
+independent re-read did. Both are rolled back; only the second is reported as
+an executed mutation.
+
+**Construction requirement.** An executor must be bound to a workspace
+(`WithWorkspace`, or `WithScopeRoot`, which declares both from one handle).
+The grant is formed over one root, so an executor without one has nothing to
+authorize against, and it refuses with `ErrUnboundWorkspace` rather than
+falling back to the process working directory — which would place bytes outside
+the grant the caller believes it holds. `cli.Wire` binds `root` at the one
+place that already knows it. The same call also means `izen orchestrate` is now
+confined to its `-dir`, which it was not before.
+
+**Architecture lock.** `TestKernelLock_OrchestrateMutationRoutesThroughKernel`
+in `test/architecture/kernel_lock_test.go`. It pins the four functions that
+place or remove bytes (`Commit`, `Rollback`, `placeThroughKernel`,
+`removeThroughKernel`) to contain no direct mutation primitive, asserts each
+still calls its recorded seam, and asserts each still exists — so the lock
+cannot be satisfied by deleting the migration instead of preserving it. It
+targets the architectural execution path, not the repository:
+`PrepareSnapshot` still reads the filesystem, and that is legitimate.
+
+**Behavioural proof.**
+`internal/runtime/executor/file_executor_kernel_seam_test.go` asserts the
+observable consequences rather than the wiring: a commit whose target resolves
+outside the workspace through a symlink is refused and the file beyond the
+boundary is byte-for-byte unchanged; a confined target is still written with
+the resolved bytes; both rollback directions still work; and an unbound
+executor mutates nothing.

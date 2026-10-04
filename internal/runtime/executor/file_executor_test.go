@@ -39,6 +39,17 @@ func writeFile(t *testing.T, dir, name, content string) string {
 	return path
 }
 
+// execIn returns a FileExecutor whose mutations are authorized against dir.
+//
+// The workspace has to be named: the kernel grant is formed over exactly one
+// root, so an executor without one has nothing to authorize against. Tests
+// written before the kernel seam existed committed against an undeclared root
+// — which is precisely the state the seam removes, so they bind it here
+// rather than inheriting an implicit one.
+func execIn(dir string) *FileExecutor {
+	return NewExecutor().WithWorkspace(dir)
+}
+
 // readFile reads content from path and fails the test on error.
 func readFile(t *testing.T, path string) string {
 	t.Helper()
@@ -385,11 +396,10 @@ func TestPrepareSnapshot(t *testing.T) {
 func TestCommitAtomicOverwriteAndCreate(t *testing.T) {
 	t.Parallel()
 
-	e := NewExecutor()
-
 	t.Run("atomic overwrite of existing file", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
+		e := execIn(dir)
 		path := writeFile(t, dir, "f.txt", "old\n")
 		if err := os.Chmod(path, 0o640); err != nil {
 			t.Fatalf("chmod: %v", err)
@@ -402,7 +412,7 @@ func TestCommitAtomicOverwriteAndCreate(t *testing.T) {
 			TargetRef: &target.TargetRef{Raw: "f.txt", Canonical: path, Exists: true},
 			RawPatch:  "new content\n",
 		}
-		if err := e.Commit(proposal, backup); err != nil {
+		if err := e.Commit(t.Context(), proposal, backup); err != nil {
 			t.Fatalf("Commit: %v", err)
 		}
 		if got := readFile(t, path); got != "new content\n" {
@@ -421,6 +431,7 @@ func TestCommitAtomicOverwriteAndCreate(t *testing.T) {
 	t.Run("creation of new file via whole-file patch", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
+		e := execIn(dir)
 		path := filepath.Join(dir, "new.txt")
 		backup, err := e.PrepareSnapshot(path)
 		if err != nil {
@@ -433,7 +444,7 @@ func TestCommitAtomicOverwriteAndCreate(t *testing.T) {
 			TargetRef: &target.TargetRef{Raw: "new.txt", Canonical: path, Exists: false},
 			RawPatch:  "line1\nline2\n",
 		}
-		if err := e.Commit(proposal, backup); err != nil {
+		if err := e.Commit(t.Context(), proposal, backup); err != nil {
 			t.Fatalf("Commit: %v", err)
 		}
 		if got := readFile(t, path); got != "line1\nline2\n" {
@@ -445,6 +456,7 @@ func TestCommitAtomicOverwriteAndCreate(t *testing.T) {
 	t.Run("creation via typed patch lines", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
+		e := execIn(dir)
 		path := filepath.Join(dir, "lines.txt")
 		backup, err := e.PrepareSnapshot(path)
 		if err != nil {
@@ -458,7 +470,7 @@ func TestCommitAtomicOverwriteAndCreate(t *testing.T) {
 				{Type: diff.MutationAdd, Content: "b"},
 			},
 		}
-		if err := e.Commit(proposal, backup); err != nil {
+		if err := e.Commit(t.Context(), proposal, backup); err != nil {
 			t.Fatalf("Commit: %v", err)
 		}
 		if got := readFile(t, path); got != "a\nb\n" {
@@ -470,6 +482,7 @@ func TestCommitAtomicOverwriteAndCreate(t *testing.T) {
 	t.Run("creation of nested file creates parent directories", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
+		e := execIn(dir)
 		path := filepath.Join(dir, "nested", "deep", "f.txt")
 		backup, err := e.PrepareSnapshot(path)
 		if err != nil {
@@ -479,7 +492,7 @@ func TestCommitAtomicOverwriteAndCreate(t *testing.T) {
 			TargetRef: &target.TargetRef{Raw: "nested/deep/f.txt", Canonical: path, Exists: false},
 			RawPatch:  "deep\n",
 		}
-		if err := e.Commit(proposal, backup); err != nil {
+		if err := e.Commit(t.Context(), proposal, backup); err != nil {
 			t.Fatalf("Commit: %v", err)
 		}
 		if got := readFile(t, path); got != "deep\n" {
@@ -491,8 +504,8 @@ func TestCommitAtomicOverwriteAndCreate(t *testing.T) {
 func TestCommitUnifiedDiffApply(t *testing.T) {
 	t.Parallel()
 
-	e := NewExecutor()
 	dir := t.TempDir()
+	e := execIn(dir)
 	path := writeFile(t, dir, "file.go", "line1\nline2\nline3\n")
 	backup, err := e.PrepareSnapshot(path)
 	if err != nil {
@@ -503,7 +516,7 @@ func TestCommitUnifiedDiffApply(t *testing.T) {
 		TargetRef: &target.TargetRef{Raw: "file.go", Canonical: path, Exists: true},
 		RawPatch:  sampleDiff,
 	}
-	if err := e.Commit(proposal, backup); err != nil {
+	if err := e.Commit(t.Context(), proposal, backup); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	if got := readFile(t, path); got != "line1\nline2\nline3\nline4\n" {
@@ -515,8 +528,8 @@ func TestCommitUnifiedDiffApply(t *testing.T) {
 func TestRollbackExistingFile(t *testing.T) {
 	t.Parallel()
 
-	e := NewExecutor()
 	dir := t.TempDir()
+	e := execIn(dir)
 	path := writeFile(t, dir, "f.txt", "original\n")
 	if err := os.Chmod(path, 0o640); err != nil {
 		t.Fatalf("chmod: %v", err)
@@ -530,14 +543,14 @@ func TestRollbackExistingFile(t *testing.T) {
 		TargetRef: &target.TargetRef{Raw: "f.txt", Canonical: path, Exists: true},
 		RawPatch:  "mutated\n",
 	}
-	if err := e.Commit(proposal, backup); err != nil {
+	if err := e.Commit(t.Context(), proposal, backup); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	if got := readFile(t, path); got != "mutated\n" {
 		t.Fatalf("pre-rollback content = %q, want %q", got, "mutated\n")
 	}
 
-	if err := e.Rollback(backup); err != nil {
+	if err := e.Rollback(t.Context(), backup); err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
 	if got := readFile(t, path); got != "original\n" {
@@ -555,8 +568,8 @@ func TestRollbackExistingFile(t *testing.T) {
 func TestRollbackNewFile(t *testing.T) {
 	t.Parallel()
 
-	e := NewExecutor()
 	dir := t.TempDir()
+	e := execIn(dir)
 	path := filepath.Join(dir, "created.txt")
 
 	backup, err := e.PrepareSnapshot(path)
@@ -567,14 +580,14 @@ func TestRollbackNewFile(t *testing.T) {
 		TargetRef: &target.TargetRef{Raw: "created.txt", Canonical: path, Exists: false},
 		RawPatch:  "created content\n",
 	}
-	if err := e.Commit(proposal, backup); err != nil {
+	if err := e.Commit(t.Context(), proposal, backup); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("file should exist after commit: %v", err)
 	}
 
-	if err := e.Rollback(backup); err != nil {
+	if err := e.Rollback(t.Context(), backup); err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
@@ -587,8 +600,8 @@ func TestCommitAutoRollback(t *testing.T) {
 
 	t.Run("materialization failure restores original content", func(t *testing.T) {
 		t.Parallel()
-		e := NewExecutor()
 		dir := t.TempDir()
+		e := execIn(dir)
 		path := writeFile(t, dir, "f.txt", "original\n")
 
 		backup, err := e.PrepareSnapshot(path)
@@ -599,7 +612,7 @@ func TestCommitAutoRollback(t *testing.T) {
 			TargetRef: &target.TargetRef{Raw: "f.txt", Canonical: path, Exists: true},
 			RawPatch:  sampleDiff, // hunks expect line1..3, file has only "original"
 		}
-		if err := e.Commit(proposal, backup); err == nil {
+		if err := e.Commit(t.Context(), proposal, backup); err == nil {
 			t.Fatal("expected Commit error for mismatched unified diff")
 		}
 		if got := readFile(t, path); got != "original\n" {
@@ -608,12 +621,12 @@ func TestCommitAutoRollback(t *testing.T) {
 		assertNoTempOrphans(t, dir)
 	})
 
-	t.Run("rename failure rolls back created artifact", func(t *testing.T) {
+	t.Run("commit failure over a pre-existing directory changes nothing", func(t *testing.T) {
 		t.Parallel()
-		e := NewExecutor()
 		dir := t.TempDir()
-		// Inject a rename failure by making the target an existing empty
-		// directory; Commit's rename onto a directory fails.
+		e := execIn(dir)
+		// Inject a commit failure by making the target an existing empty
+		// directory; the kernel's write cannot rename a file over one.
 		blocker := filepath.Join(dir, "occupied.txt")
 		if err := os.Mkdir(blocker, 0o755); err != nil {
 			t.Fatalf("mkdir blocker: %v", err)
@@ -624,29 +637,41 @@ func TestCommitAutoRollback(t *testing.T) {
 			TargetRef: &target.TargetRef{Raw: "occupied.txt", Canonical: blocker, Exists: false},
 			RawPatch:  "new content\n",
 		}
-		if err := e.Commit(proposal, backup); err == nil {
+		if err := e.Commit(t.Context(), proposal, backup); err == nil {
 			t.Fatal("expected Commit error for rename onto directory")
 		}
-		if _, err := os.Stat(blocker); !errors.Is(err, fs.ErrNotExist) {
-			t.Errorf("rollback should have removed the blocker, stat err = %v", err)
+
+		// The blocker survives, and that is the correct outcome rather than a
+		// weakened guarantee. Rollback exists to undo what the transaction
+		// produced; here the transaction produced nothing, and the directory
+		// was already on disk before the snapshot. Removing it would have the
+		// rollback deleting pre-existing workspace state it never created, so
+		// the kernel's file.delete refuses a directory outright.
+		info, err := os.Stat(blocker)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("the pre-existing directory was disturbed: info=%v err=%v", info, err)
 		}
+		// What the transaction must never leave behind is its own scratch
+		// state. The staging file is the kernel capability's, and the kernel
+		// removes it on every path that does not rename it into place.
 		assertNoTempOrphans(t, dir)
 	})
 
 	t.Run("nil backup rejected before any write", func(t *testing.T) {
 		t.Parallel()
-		e := NewExecutor()
-		tr := tmpRef(t.TempDir(), "x.txt")
-		if err := e.Commit(ProposedMutation{TargetRef: tr, RawPatch: "x"}, nil); err == nil {
+		dir := t.TempDir()
+		e := execIn(dir)
+		tr := tmpRef(dir, "x.txt")
+		if err := e.Commit(t.Context(), ProposedMutation{TargetRef: tr, RawPatch: "x"}, nil); err == nil {
 			t.Fatal("expected error for nil backup")
 		}
 	})
 
 	t.Run("nil target reference rejected", func(t *testing.T) {
 		t.Parallel()
-		e := NewExecutor()
+		e := execIn(t.TempDir())
 		backup := &FileBackup{Path: "x.txt", Exists: false}
-		if err := e.Commit(ProposedMutation{RawPatch: "x"}, backup); err == nil {
+		if err := e.Commit(t.Context(), ProposedMutation{RawPatch: "x"}, backup); err == nil {
 			t.Fatal("expected error for nil target reference")
 		}
 	})
@@ -655,26 +680,27 @@ func TestCommitAutoRollback(t *testing.T) {
 func TestRollbackValidation(t *testing.T) {
 	t.Parallel()
 
-	e := NewExecutor()
-
 	t.Run("nil backup rejected", func(t *testing.T) {
 		t.Parallel()
-		if err := e.Rollback(nil); err == nil {
+		e := execIn(t.TempDir())
+		if err := e.Rollback(t.Context(), nil); err == nil {
 			t.Fatal("expected error for nil backup")
 		}
 	})
 
 	t.Run("empty path rejected", func(t *testing.T) {
 		t.Parallel()
-		if err := e.Rollback(&FileBackup{}); err == nil {
+		e := execIn(t.TempDir())
+		if err := e.Rollback(t.Context(), &FileBackup{}); err == nil {
 			t.Fatal("expected error for empty path")
 		}
 	})
 
 	t.Run("removing already-absent file is idempotent", func(t *testing.T) {
 		t.Parallel()
-		backup := &FileBackup{Path: filepath.Join(t.TempDir(), "never.txt"), Exists: false}
-		if err := e.Rollback(backup); err != nil {
+		dir := t.TempDir()
+		backup := &FileBackup{Path: filepath.Join(dir, "never.txt"), Exists: false}
+		if err := execIn(dir).Rollback(t.Context(), backup); err != nil {
 			t.Fatalf("Rollback: %v", err)
 		}
 	})
@@ -682,12 +708,13 @@ func TestRollbackValidation(t *testing.T) {
 	t.Run("restoring pristine snapshot is idempotent", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
+		e := execIn(dir)
 		path := writeFile(t, dir, "a.txt", "original\n")
 		backup, err := e.PrepareSnapshot(path)
 		if err != nil {
 			t.Fatalf("PrepareSnapshot: %v", err)
 		}
-		if err := e.Rollback(backup); err != nil {
+		if err := e.Rollback(t.Context(), backup); err != nil {
 			t.Fatalf("Rollback: %v", err)
 		}
 		if got := readFile(t, path); got != "original\n" {
@@ -698,7 +725,7 @@ func TestRollbackValidation(t *testing.T) {
 	t.Run("nil executor receiver", func(t *testing.T) {
 		t.Parallel()
 		var nilExec *FileExecutor
-		if err := nilExec.Rollback(&FileBackup{}); err == nil {
+		if err := nilExec.Rollback(t.Context(), &FileBackup{}); err == nil {
 			t.Fatal("expected error for nil executor")
 		}
 	})
@@ -745,12 +772,12 @@ func TestNewFileDiffValidationAndCommit(t *testing.T) {
 		t.Errorf("evidence = +%d -%d, want +2 -0", res.Evidence.Added, res.Evidence.Deleted)
 	}
 
-	e := NewExecutor()
+	e := execIn(dir)
 	backup, err := e.PrepareSnapshot(path)
 	if err != nil {
 		t.Fatalf("PrepareSnapshot: %v", err)
 	}
-	if err := e.Commit(proposal, backup); err != nil {
+	if err := e.Commit(t.Context(), proposal, backup); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	if got := readFile(t, path); got != "line1\nline2\n" {
@@ -762,8 +789,8 @@ func TestNewFileDiffValidationAndCommit(t *testing.T) {
 func TestMultiHunkDiffCommit(t *testing.T) {
 	t.Parallel()
 
-	e := NewExecutor()
 	dir := t.TempDir()
+	e := execIn(dir)
 	path := writeFile(t, dir, "m.txt", "a\nx\nc\n")
 
 	proposal := ProposedMutation{
@@ -787,7 +814,7 @@ func TestMultiHunkDiffCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareSnapshot: %v", err)
 	}
-	if err := e.Commit(proposal, backup); err != nil {
+	if err := e.Commit(t.Context(), proposal, backup); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	if got := readFile(t, path); got != "b\nx\nd\n" {
@@ -802,28 +829,28 @@ func TestCommitFailureInjection(t *testing.T) {
 		t.Parallel()
 		var nilExec *FileExecutor
 		backup := &FileBackup{Path: "x.txt", Exists: false}
-		if err := nilExec.Commit(ProposedMutation{TargetRef: &target.TargetRef{Canonical: "x.txt"}, RawPatch: "x"}, backup); err == nil {
+		if err := nilExec.Commit(t.Context(), ProposedMutation{TargetRef: &target.TargetRef{Canonical: "x.txt"}, RawPatch: "x"}, backup); err == nil {
 			t.Fatal("expected error for nil executor")
 		}
 	})
 
 	t.Run("empty target path rejected", func(t *testing.T) {
 		t.Parallel()
-		e := NewExecutor()
+		e := execIn(t.TempDir())
 		backup := &FileBackup{Exists: false}
 		proposal := ProposedMutation{
 			TargetRef: &target.TargetRef{},
 			RawPatch:  "x",
 		}
-		if err := e.Commit(proposal, backup); err == nil {
+		if err := e.Commit(t.Context(), proposal, backup); err == nil {
 			t.Fatal("expected error for empty target path")
 		}
 	})
 
 	t.Run("empty payload rolls back", func(t *testing.T) {
 		t.Parallel()
-		e := NewExecutor()
 		dir := t.TempDir()
+		e := execIn(dir)
 		path := writeFile(t, dir, "f.txt", "original\n")
 		backup, err := e.PrepareSnapshot(path)
 		if err != nil {
@@ -832,7 +859,7 @@ func TestCommitFailureInjection(t *testing.T) {
 		proposal := ProposedMutation{
 			TargetRef: &target.TargetRef{Raw: "f.txt", Canonical: path, Exists: true},
 		}
-		if err := e.Commit(proposal, backup); err == nil {
+		if err := e.Commit(t.Context(), proposal, backup); err == nil {
 			t.Fatal("expected error for empty mutation payload")
 		}
 		if got := readFile(t, path); got != "original\n" {
@@ -843,8 +870,8 @@ func TestCommitFailureInjection(t *testing.T) {
 
 	t.Run("directory creation failure rolls back and reports rollback error", func(t *testing.T) {
 		t.Parallel()
-		e := NewExecutor()
 		dir := t.TempDir()
+		e := execIn(dir)
 		// "x" is a regular file, so MkdirAll(dir/x) fails and the subsequent
 		// Rollback of dir/x/y.txt fails too (parent is not a directory).
 		if err := os.WriteFile(filepath.Join(dir, "x"), []byte("file"), 0o644); err != nil {
@@ -856,7 +883,7 @@ func TestCommitFailureInjection(t *testing.T) {
 			TargetRef: &target.TargetRef{Raw: "x/y.txt", Canonical: targetPath, Exists: false},
 			RawPatch:  "content\n",
 		}
-		err := e.Commit(proposal, backup)
+		err := e.Commit(t.Context(), proposal, backup)
 		if err == nil {
 			t.Fatal("expected Commit error for directory creation failure")
 		}
@@ -867,8 +894,8 @@ func TestCommitFailureInjection(t *testing.T) {
 
 	t.Run("malformed hunk diff rolls back via materialization failure", func(t *testing.T) {
 		t.Parallel()
-		e := NewExecutor()
 		dir := t.TempDir()
+		e := execIn(dir)
 		path := writeFile(t, dir, "f.go", "line1\n")
 		backup, err := e.PrepareSnapshot(path)
 		if err != nil {
@@ -879,7 +906,7 @@ func TestCommitFailureInjection(t *testing.T) {
 			TargetRef: &target.TargetRef{Raw: "f.go", Canonical: path, Exists: true},
 			RawPatch:  raw,
 		}
-		if err := e.Commit(proposal, backup); err == nil {
+		if err := e.Commit(t.Context(), proposal, backup); err == nil {
 			t.Fatal("expected Commit error for malformed hunk diff")
 		}
 		if got := readFile(t, path); got != "line1\n" {
@@ -890,15 +917,15 @@ func TestCommitFailureInjection(t *testing.T) {
 
 	t.Run("backup path empty falls back to target canonical", func(t *testing.T) {
 		t.Parallel()
-		e := NewExecutor()
 		dir := t.TempDir()
+		e := execIn(dir)
 		path := filepath.Join(dir, "fallback.txt")
 		backup := &FileBackup{Exists: false}
 		proposal := ProposedMutation{
 			TargetRef: &target.TargetRef{Raw: "fallback.txt", Canonical: path, Exists: false},
 			RawPatch:  "via canonical\n",
 		}
-		if err := e.Commit(proposal, backup); err != nil {
+		if err := e.Commit(t.Context(), proposal, backup); err != nil {
 			t.Fatalf("Commit: %v", err)
 		}
 		if got := readFile(t, path); got != "via canonical\n" {
@@ -910,17 +937,16 @@ func TestCommitFailureInjection(t *testing.T) {
 func TestRollbackFailureInjection(t *testing.T) {
 	t.Parallel()
 
-	e := NewExecutor()
-
 	t.Run("restoring over a directory fails", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
+		e := execIn(dir)
 		blocker := filepath.Join(dir, "d")
 		if err := os.Mkdir(blocker, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
 		backup := &FileBackup{Path: blocker, Exists: true, Content: []byte("x"), FileMode: 0o644}
-		if err := e.Rollback(backup); err == nil {
+		if err := e.Rollback(t.Context(), backup); err == nil {
 			t.Fatal("expected Rollback error when target is a directory")
 		}
 	})
@@ -928,6 +954,7 @@ func TestRollbackFailureInjection(t *testing.T) {
 	t.Run("removing a non-empty directory fails", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
+		e := execIn(dir)
 		blocker := filepath.Join(dir, "d")
 		if err := os.Mkdir(blocker, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
@@ -936,7 +963,7 @@ func TestRollbackFailureInjection(t *testing.T) {
 			t.Fatalf("write child: %v", err)
 		}
 		backup := &FileBackup{Path: blocker, Exists: false}
-		if err := e.Rollback(backup); err == nil {
+		if err := e.Rollback(t.Context(), backup); err == nil {
 			t.Fatal("expected Rollback error for non-empty directory")
 		}
 	})
@@ -944,9 +971,10 @@ func TestRollbackFailureInjection(t *testing.T) {
 	t.Run("zero file mode falls back to default on restore", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
+		e := execIn(dir)
 		path := writeFile(t, dir, "z.txt", "original\n")
 		backup := &FileBackup{Path: path, Exists: true, Content: []byte("original\n"), FileMode: 0}
-		if err := e.Rollback(backup); err != nil {
+		if err := e.Rollback(t.Context(), backup); err != nil {
 			t.Fatalf("Rollback: %v", err)
 		}
 		if got := readFile(t, path); got != "original\n" {
@@ -1182,9 +1210,9 @@ func TestDiffHelperFunctions(t *testing.T) {
 func TestSnapshotCommitRollbackRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	e := NewExecutor()
 	v := NewValidator()
 	dir := t.TempDir()
+	e := execIn(dir)
 	path := writeFile(t, dir, "f.txt", "line1\nline2\nline3\n")
 
 	backup, err := e.PrepareSnapshot(path)
@@ -1209,14 +1237,14 @@ func TestSnapshotCommitRollbackRoundTrip(t *testing.T) {
 		t.Errorf("evidence = +%d -%d, want +1 -0", res.Evidence.Added, res.Evidence.Deleted)
 	}
 
-	if err := e.Commit(proposal, backup); err != nil {
+	if err := e.Commit(t.Context(), proposal, backup); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
 	if got := readFile(t, path); got != "line1\nline2\nline3\nline4\n" {
 		t.Fatalf("post-commit content = %q", got)
 	}
 
-	if err := e.Rollback(backup); err != nil {
+	if err := e.Rollback(t.Context(), backup); err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
 	if got := readFile(t, path); got != "line1\nline2\nline3\n" {

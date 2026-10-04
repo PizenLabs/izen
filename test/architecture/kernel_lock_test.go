@@ -49,8 +49,8 @@ func repoRoot(t *testing.T) string {
 // one convenience helper, one "temporary" direct syscall, and the kernel is
 // advisory again while every document still claims it is authoritative.
 //
-// So there are four locks here, and each one closes a different way back in:
-//
+// So there are six locks here, and each one closes a different way back in:
+
 //  1. TestKernelLock_SingleKernelEntryPoint — only internal/kernelbridge may
 //     import the kernel. This stops a NEW caller from reaching past the bridge,
 //     which is what makes the bridge the seam rather than one more path around
@@ -73,6 +73,15 @@ func repoRoot(t *testing.T) string {
 //     stronger than the other two per-slice locks: it does not forbid specific
 //     calls, it forbids ALL of them, because after slices 2 and 3 this file has
 //     no business touching the filesystem at all.
+//
+//  5. TestKernelLock_CanonicalMutationRoutesThroughKernel — the TUI
+//     RuntimeExecutor's final primitive cannot regress to os.WriteFile.
+//
+//  6. TestKernelLock_PathAMutationRoutesThroughKernel and
+//     TestKernelLock_OrchestrateMutationRoutesThroughKernel — the two
+//     migrated commit paths (`izen run` and `izen orchestrate`) cannot regress
+//     to a direct mutation primitive. Each names the functions that place
+//     bytes, so a rollback half cannot drift away from its commit half.
 
 // kernelImportPaths are the kernel modules a legacy caller must reach through the
 // bridge rather than importing directly.
@@ -176,7 +185,7 @@ var knownExistenceBypasses = map[string]string{
 	"internal/runtime/autonomy/adapter.go:777":       "target-existence: TargetExists/TargetAbsent evidence",
 	"internal/runtime/autonomy/adapter.go:800":       "target-existence: TargetExistence pre-dispatch evidence",
 	"internal/runtime/autonomy/preflight.go:526":     "target-existence: local dependency feasibility",
-	"internal/runtime/executor/file_executor.go:104": "type-gate: preserving the existing file's permission bits",
+	"internal/runtime/executor/file_executor.go:148": "type-gate: preserving the existing file's permission bits",
 	"internal/runtime/handlers/handlers.go:605":      "target-existence: filtering @file references",
 	"internal/engine/context/providers.go:210":       "workspace-probe: git repository for context providers",
 	"internal/engine/layer0/resolver.go:218":         "type-gate: refusing a root that is not a directory",
@@ -952,5 +961,170 @@ func functionsUsingPortMutation(t *testing.T, abs string) []string {
 		}
 	}
 	sort.Strings(out)
+	return out
+}
+
+// orchestrateExecutionFiles are the files that make up the orchestrate path:
+// the workspace mutation route `izen orchestrate` and `izen prompt` take
+// through FileExecutor — cmd/izen/orchestrate.go → cli.Wire → cli.Stack.Run →
+// orchestrator.RunCycle → FileExecutor.Commit / FileExecutor.Rollback.
+//
+// It is named for its entry point rather than for a letter because the
+// repository already uses "stack B" for something else entirely (the LEA
+// layered engine, which places no bytes). The lock is scoped to exactly these
+// two files, because that is the architectural execution path being pinned —
+// not the package, which still legitimately reads the filesystem to take a
+// snapshot.
+var orchestrateExecutionFiles = []string{
+	"internal/runtime/executor/file_executor.go",
+	"internal/runtime/executor/kernelcommit.go",
+}
+
+// orchestrateMutationSites is every function on the orchestrate path that
+// places or removes bytes on the workspace, paired with the seam it is
+// required to call instead.
+//
+// It is a map so each entry can only fail in one direction per problem. A
+// function that places bytes without its recorded call is a bypass. A
+// function that IS recorded here but no longer exists is a migration that was
+// quietly deleted rather than preserved — and a lock satisfiable by removing
+// the new path is just a declaration that the old path is unreachable.
+var orchestrateMutationSites = map[string]string{
+	"Commit":              "e.commitThroughKernel",
+	"Rollback":            "e.restoreThroughKernel",
+	"placeThroughKernel":  "kernelbridge.Apply",
+	"removeThroughKernel": "kernelbridge.Delete",
+}
+
+// TestKernelLock_OrchestrateMutationRoutesThroughKernel pins the orchestrate
+// path to the kernel and forbids it from regressing to a direct mutation
+// primitive.
+//
+// FileExecutor used to place a commit with a hand-rolled temp-file-and-rename
+// protocol — os.MkdirAll, os.CreateTemp, os.Chmod, os.Rename — and undo it
+// with os.WriteFile, os.Chmod and os.Remove. No grant, no event, no state, no
+// evidence, no verification, and a symlink out of the workspace followed by
+// the syscall rather than refused. It behaves identically to a kernel
+// execution on a cooperative filesystem, which is exactly why the deletion
+// needs a lock rather than a reviewer — nothing in the product would look
+// different if it came back.
+//
+// It is also the one path whose transaction the migration had to leave intact,
+// so the lock covers both directions of it. Commit and Rollback stay Core's:
+// they own the snapshot, the rollback policy, and the decision that a failure
+// rolls back at all. Only the final filesystem effect moved. A lock that
+// pinned the files but not the functions would let either half drift, and a
+// half-migrated transaction is the failure that is hardest to see — the commit
+// still reports an error whether or not anything was undone.
+func TestKernelLock_OrchestrateMutationRoutesThroughKernel(t *testing.T) {
+	root := repoRoot(t)
+	const (
+		core = "internal/runtime/executor/file_executor.go"
+		seam = "internal/runtime/executor/kernelcommit.go"
+	)
+
+	for _, rel := range orchestrateExecutionFiles {
+		abs := filepath.Join(root, rel)
+		if _, err := os.Stat(abs); err != nil {
+			t.Fatalf("%s is missing: %v\n"+
+				"That file is where the orchestrate path crosses the kernel. Without it\n"+
+				"the committed write and the rollback have no sanctioned route back to %s.", rel, err, kernelBridgePackage)
+		}
+		source, err := os.ReadFile(abs)
+		if err != nil {
+			t.Fatalf("reading %s: %v", rel, err)
+		}
+		if !strings.Contains(string(source), kernelBridgePackage) {
+			t.Errorf("%s no longer imports %s; the orchestrate path's mutation is not routed through the kernel any more", rel, kernelBridgePackage)
+		}
+	}
+
+	// ── The execution path still calls its seams ────────────────────────
+	//
+	// Both directions are checked. A Commit that stopped asking the kernel to
+	// write would be a bypass; a Rollback that stopped asking it to restore
+	// would leave a failed commit with nothing to undo it, which reads as
+	// working right up until a write fails.
+	coreAbs := filepath.Join(root, core)
+	if calls := functionCalls(t, coreAbs, "Commit"); !calls["e.commitThroughKernel"] {
+		t.Errorf("%s: FileExecutor.Commit no longer calls e.commitThroughKernel; the\n"+
+			"committed write does not reach the kernel", core)
+	}
+	rollbackCalls := functionCalls(t, coreAbs, "Rollback")
+	if !rollbackCalls["e.restoreThroughKernel"] {
+		t.Errorf("%s: FileExecutor.Rollback no longer calls e.restoreThroughKernel;\n"+
+			"a failed commit would have no way to put the original bytes back", core)
+	}
+	if !rollbackCalls["e.removeThroughKernel"] {
+		t.Errorf("%s: FileExecutor.Rollback no longer calls e.removeThroughKernel;\n"+
+			"a commit that created a file could no longer be undone", core)
+	}
+
+	seamAbs := filepath.Join(root, seam)
+	if calls := functionCalls(t, seamAbs, "placeThroughKernel"); !calls["kernelbridge.Apply"] {
+		t.Errorf("%s: placeThroughKernel no longer calls kernelbridge.Apply", seam)
+	}
+	if calls := functionCalls(t, seamAbs, "removeThroughKernel"); !calls["kernelbridge.Delete"] {
+		t.Errorf("%s: removeThroughKernel no longer calls kernelbridge.Delete", seam)
+	}
+
+	// ── The execution path owns no direct mutation ───────────────────────
+	//
+	// Snapshot reads are legitimate and are not in this vocabulary:
+	// PrepareSnapshot has to read the target to have something to restore.
+	// What is forbidden is placing or removing bytes without crossing the
+	// kernel, and that is exactly what these functions used to do.
+	for fn, required := range orchestrateMutationSites {
+		file := core
+		if fn == "placeThroughKernel" || fn == "removeThroughKernel" {
+			file = seam
+		}
+		if offenders := scanFunctionDirectMutation(t, root, file, fn); len(offenders) > 0 {
+			t.Errorf("%s: %s places bytes on the workspace directly: %s.\n"+
+				"The orchestrate path's final filesystem primitive is the Runtime\n"+
+				"Kernel. A direct write or removal here carries no grant, no event,\n"+
+				"no state, no evidence and no verification, and a destination a\n"+
+				"symlink redirects out of the workspace is followed by the syscall\n"+
+				"rather than refused. It must reach %s through %s instead.", file, fn, strings.Join(offenders, ", "),
+				kernelBridgePackage, required)
+		}
+	}
+
+	// ── Every recorded seam still exists ─────────────────────────────────
+	//
+	// Without this the assertions above could be satisfied by deleting the
+	// migration outright, which would leave FileExecutor with no way to place
+	// a byte while looking perfectly clean to every other check.
+	seamFns := map[string]bool{}
+	for _, rel := range orchestrateExecutionFiles {
+		for _, fn := range declaredFuncNames(filepath.Join(root, rel)) {
+			seamFns[fn] = true
+		}
+	}
+	for fn := range orchestrateMutationSites {
+		if !seamFns[fn] {
+			t.Errorf("the orchestrate path no longer defines %s.\n"+
+				"That function is registered as its only route to the kernel. If it was\n"+
+				"removed deliberately, delete its entry from orchestrateMutationSites\n"+
+				"too; if not, the migration has been deleted rather than preserved.",
+				fn)
+		}
+	}
+}
+
+// declaredFuncNames returns every top-level function and method name defined
+// in one file.
+func declaredFuncNames(path string) []string {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			out = append(out, fn.Name.Name)
+		}
+	}
 	return out
 }

@@ -133,10 +133,16 @@ func assertNoTempOrphans(t *testing.T, dir string) {
 
 // newStack wires an Orchestrator with a real preflight engine (scriptable
 // resolver), validator, executor, and a zero-delay approval gate.
+//
+// The executor is bound to the workspace the target lives in, and has to be:
+// the kernel grant is formed over exactly one root, so an executor without
+// one has nothing to authorize a mutation against. The root is the target's
+// own directory, which is the same workspace baseRequest reports as WorkDir.
 func newStack(ref *target.TargetRef) (*Orchestrator, *authorization.ApprovalGate) {
 	gate := authorization.NewGate(authorization.WithMinDelayWindow(0))
 	pf := preflight.NewEngine(&fakeResolver{ref: ref}, runtimectx.NewCompiler())
-	orch := NewOrchestrator(pf, executor.NewValidator(), executor.NewExecutor(), gate)
+	exec := executor.NewExecutor().WithWorkspace(filepath.Dir(ref.Canonical))
+	orch := NewOrchestrator(pf, executor.NewValidator(), exec, gate)
 	return orch, gate
 }
 
@@ -452,7 +458,7 @@ func TestRunCycleErrorPaths(t *testing.T) {
 	t.Run("nil preflight engine", func(t *testing.T) {
 		t.Parallel()
 		gate := authorization.NewGate(authorization.WithMinDelayWindow(0))
-		orch := NewOrchestrator(nil, executor.NewValidator(), executor.NewExecutor(), gate)
+		orch := NewOrchestrator(nil, executor.NewValidator(), executor.NewExecutor().WithWorkspace(dir), gate)
 		_, err := orch.RunCycle(context.Background(), baseRequest(ref), &stubProvider{}, &stubBridge{}, OrchestratorConfig{})
 		if err == nil || !strings.Contains(err.Error(), "preflight") {
 			t.Errorf("expected preflight wiring error, got %v", err)
@@ -462,7 +468,7 @@ func TestRunCycleErrorPaths(t *testing.T) {
 	t.Run("nil validator", func(t *testing.T) {
 		t.Parallel()
 		gate := authorization.NewGate(authorization.WithMinDelayWindow(0))
-		orch := NewOrchestrator(preflight.NewEngine(&fakeResolver{ref: ref}, runtimectx.NewCompiler()), nil, executor.NewExecutor(), gate)
+		orch := NewOrchestrator(preflight.NewEngine(&fakeResolver{ref: ref}, runtimectx.NewCompiler()), nil, executor.NewExecutor().WithWorkspace(dir), gate)
 		_, err := orch.RunCycle(context.Background(), baseRequest(ref), &stubProvider{}, &stubBridge{}, OrchestratorConfig{})
 		if err == nil || !strings.Contains(err.Error(), "validator") {
 			t.Errorf("expected validator wiring error, got %v", err)
@@ -481,7 +487,7 @@ func TestRunCycleErrorPaths(t *testing.T) {
 
 	t.Run("nil gate", func(t *testing.T) {
 		t.Parallel()
-		orch := NewOrchestrator(preflight.NewEngine(&fakeResolver{ref: ref}, runtimectx.NewCompiler()), executor.NewValidator(), executor.NewExecutor(), nil)
+		orch := NewOrchestrator(preflight.NewEngine(&fakeResolver{ref: ref}, runtimectx.NewCompiler()), executor.NewValidator(), executor.NewExecutor().WithWorkspace(dir), nil)
 		_, err := orch.RunCycle(context.Background(), baseRequest(ref), &stubProvider{}, &stubBridge{}, OrchestratorConfig{})
 		if err == nil || !strings.Contains(err.Error(), "approval gate") {
 			t.Errorf("expected gate wiring error, got %v", err)
@@ -510,7 +516,7 @@ func TestRunCycleErrorPaths(t *testing.T) {
 		t.Parallel()
 		sentinel := errors.New("resolve exploded")
 		gate := authorization.NewGate(authorization.WithMinDelayWindow(0))
-		orch := NewOrchestrator(preflight.NewEngine(&fakeResolver{err: sentinel}, runtimectx.NewCompiler()), executor.NewValidator(), executor.NewExecutor(), gate)
+		orch := NewOrchestrator(preflight.NewEngine(&fakeResolver{err: sentinel}, runtimectx.NewCompiler()), executor.NewValidator(), executor.NewExecutor().WithWorkspace(dir), gate)
 		_, err := orch.RunCycle(context.Background(), baseRequest(ref), &stubProvider{}, &stubBridge{}, OrchestratorConfig{})
 		if err == nil || !errors.Is(err, sentinel) {
 			t.Errorf("expected resolver error propagation, got %v", err)
