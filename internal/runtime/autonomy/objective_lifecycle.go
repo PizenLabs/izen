@@ -997,8 +997,9 @@ func (d *Driver) publishIntentAxes() {
 		return
 	}
 	user, mode, interaction, exec := d.intentAxes()
+	sem := d.objectiveSemantics()
 	d.bus.Publish(events.NewActivity(fmt.Sprintf(
-		"[intent] user_intent=%s command_mode=%s interaction_contract=%s execution_intent=%s objective=%s scope_state=%s scope=[%s]",
-		user, mode, interaction, exec, d.ObjectiveIdentity(),
-		d.scopeResolution.State, strings.Join(d.authoritativeScope(), ","))))
+		"[intent] user_intent=%s operation=%s command_mode=%s interaction_contract=%s execution_intent=%s objective=%s scope_state=%s target=%s discovery=%s scope=[%s]",
+		user, sem.Operation, mode, interaction, exec, d.ObjectiveIdentity(),
+		sem.Scope, sem.Target, sem.Discovery, strings.Join(d.authoritativeScope(), ","))))
 }

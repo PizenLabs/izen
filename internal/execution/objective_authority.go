@@ -552,8 +552,8 @@ var reviewIntents = map[string]bool{
 // The rules, in precedence order:
 //
 //  1. a deletion objective                 → DELETE
-//  2. a mutation objective whose target has no durable pre-existing content
-//     (or whose artifact contract is a creation shape) → CREATE
+//  2. a mutation objective that NAMES a target with no durable pre-existing
+//     content (or whose artifact contract is a creation shape) → CREATE
 //  3. a mutation objective that applied no delta AND carries a structural
 //     confirmation that its target state was already satisfied
 //     (pre-execution determination or the executor's NO-OP structural verdict)
@@ -561,6 +561,11 @@ var reviewIntents = map[string]bool{
 //  4. any other mutation objective        → PATCH
 //  5. a review-classified read-only intent → REVIEW
 //  6. any other read-only intent           → READ
+//
+// A mutation objective that names NO target (target DEFERRED) takes rule 4, not
+// rule 2: an unresolved target is not evidence of a new artifact. Discovery
+// resolves the target later and the execution-shape kind may then be re-derived
+// against the concrete target; until then it is a modification, never a CREATE.
 //
 // Rule 3 is the ONLY path to IDEMPOTENT, and it REQUIRES a structural
 // confirmation. "The file existed and nothing changed" is execution inertia, not
@@ -582,24 +587,45 @@ func DeriveTaskContract(in TaskClassification) TaskContract {
 	}
 
 	if in.RequiresMutation {
-		// 2 — CREATE: the target has no durable pre-existing content, or the
-		// dispatched artifact contract was itself a creation shape.
-		noExistingContent := !anyTargetExisted(in.TargetsExistedBefore, targets)
-		askedForNewFile := containsAnyWord(objective, creationVerbs) &&
-			!allTargetsExisted(in.TargetsExistedBefore, targets)
-		if noExistingContent || askedForNewFile {
-			contract.Kind = TaskCreate
-			contract.RequiresVerifier = true
-			return contract
-		}
-		// A creation SHAPE is authoritative and outranks every other mutation
-		// rule: a creation contract has no existing content to anchor a bounded
-		// patch against, so relabelling it — by recovery or by evidence — would
-		// ask the model for a patch against a file that does not exist.
-		if creationShape(in.ArtifactShape) {
-			contract.Kind = TaskCreate
-			contract.RequiresVerifier = true
-			return contract
+		// 2 — CREATE: the objective NAMES a target AND that target has no
+		// durable pre-existing content, or the dispatched artifact contract was
+		// itself a creation shape.
+		//
+		// A DECLARED target is a precondition for CREATE. When the objective
+		// names no target at all, its target is DEFERRED: the runtime has not
+		// discovered it yet. The absence of a resolved target is NOT evidence
+		// that the artifact is new, and reading it as CREATE is precisely the
+		// defect this guard removes — it invents a creation objective (with an
+		// empty creation scope) out of an unresolved one. A targetless mutation
+		// objective stays a PATCH, a MODIFY whose concrete target discovery must
+		// resolve, and is never relabelled. See objective_operation.go.
+		if len(targets) > 0 {
+			// `TargetsExistedBefore` nil means the runtime made NO pre-execution
+			// observation; an EMPTY map means it observed that nothing existed.
+			// Only the latter is positive evidence of a new artifact. Treating
+			// an unobserved target as new is the same category error as treating
+			// an unresolved target as new, one layer down.
+			noExistingContent := in.TargetsExistedBefore != nil &&
+				!anyTargetExisted(in.TargetsExistedBefore, targets)
+			askedForNewFile := containsAnyWord(objective, creationVerbs) &&
+				!allTargetsExisted(in.TargetsExistedBefore, targets)
+			if noExistingContent || askedForNewFile {
+				contract.Kind = TaskCreate
+				contract.RequiresVerifier = true
+				return contract
+			}
+			// A creation SHAPE is authoritative and outranks every other
+			// mutation rule: a creation contract has no existing content to
+			// anchor a bounded patch against, so relabelling it — by recovery
+			// or by evidence — would ask the model for a patch against a file
+			// that does not exist. It is only meaningful once the objective
+			// names the file being created; a targetless creation shape is a
+			// deferred target, not an invention.
+			if creationShape(in.ArtifactShape) {
+				contract.Kind = TaskCreate
+				contract.RequiresVerifier = true
+				return contract
+			}
 		}
 		// 3 — IDEMPOTENT: every declared target already existed BEFORE
 		// execution, the boundary applied no delta, AND a deterministic
@@ -642,10 +668,16 @@ func creationShape(shape string) bool {
 }
 
 // containsAnyWord reports whether the padded lowercased text carries any of the
-// space-delimited markers.
+// space-delimited markers AS A WORD. The leading-space requirement is
+// load-bearing: without it "write " matches inside "rewrite ", so a REWRITE of an
+// existing file would be misread as asking for a NEW artifact's creation verb.
 func containsAnyWord(paddedLower string, markers []string) bool {
 	for _, marker := range markers {
-		if strings.Contains(paddedLower, marker) {
+		word := strings.TrimLeft(marker, " ")
+		if word == "" {
+			continue
+		}
+		if strings.Contains(paddedLower, " "+word) {
 			return true
 		}
 	}

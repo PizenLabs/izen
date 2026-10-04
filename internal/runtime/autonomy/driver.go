@@ -1483,6 +1483,14 @@ func (d *Driver) deriveEvidenceScope() {
 		})
 		return
 	}
+	// The objective is a MUTATING operation whose concrete target is DEFERRED:
+	// discovery is REQUIRED before any mutation may be proposed. This is an
+	// explicit state, not an inference — an empty scope is never read as a
+	// verdict that nothing is needed (see scope_resolution.go).
+	if sem := d.objectiveSemantics(); sem.RequiresDiscovery() {
+		diagnosticf("[discovery] REQUIRED: operation=%s scope=%s target=%s — observing the workspace before any mutation",
+			sem.Operation, sem.Scope, sem.Target)
+	}
 	derivation := d.adapter.DeriveScope(d.prompt, nil)
 	if !derivation.Derivable || len(derivation.Targets) == 0 {
 		if derivation.Reason != "" {
@@ -2028,6 +2036,14 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// same nonexistent target was re-requested.
 			d.carryObjectiveForward()
 			req.Evidence = joinEvidence(req.Evidence, d.recoveryBrief())
+			// ── REPLAN CONSUMES DISCOVERY EVIDENCE ────────────────────────
+			// A lifecycle whose target was DEFERRED re-observes the CURRENT
+			// workspace here. The resolved scope is then carried into the
+			// recovery request exactly like a stated target; if discovery still
+			// cannot resolve it, the scope stays unresolved and nothing is
+			// invented. This is what makes a replan an evidence-driven
+			// continuation rather than a recompile from the original prompt.
+			d.replanDeferredScope()
 			// The scope is carried through UNCHANGED. A recovery may re-read its
 			// targets; it may never widen them. Writing the authoritative set
 			// here makes that structural rather than conventional.
@@ -2724,6 +2740,65 @@ func (d *Driver) authoritativeScope() []string {
 		return append([]string(nil), d.resolved.Targets...)
 	}
 	return append([]string(nil), d.req.Targets...)
+}
+
+// objectiveSemantics reads the objective's independent semantic model from the
+// SAME facts the completion contract uses: the execution-shape kind and the
+// currently-bound scope. It is cheap and does not cache, so it is safe to
+// consult before the contract is authored.
+func (d *Driver) objectiveSemantics() execution.ObjectiveSemantics {
+	if d == nil {
+		return execution.DeriveObjectiveSemantics(execution.OperationRead, nil)
+	}
+	return execution.DeriveObjectiveSemantics(
+		execution.OperationForTaskKind(d.taskContract().Kind),
+		d.objectiveTargets(),
+	)
+}
+
+// invalidateObjectiveContractForScopeChange re-opens the one-shot objective
+// contract so it is re-authored against the scope discovery just proved.
+//
+// It deliberately resets ONLY the derived contract, never the requirement
+// ledger, the discharge set or the step count: a scope resolution is a change
+// of the objective's TARGET (a runtime fact), not a new objective, and the
+// contract must be allowed to judge the obligations against the evidence-derived
+// targets rather than the empty scope it was first authored with. Nothing here
+// can make a completion claim succeed — the authority still recomputes every
+// condition from evidence.
+func (d *Driver) invalidateObjectiveContractForScopeChange() {
+	if d == nil {
+		return
+	}
+	d.objective.contract = execution.ObjectiveContract{}
+	d.objective.derived = false
+}
+
+// replanDeferredScope makes a REPLAN consume CURRENT workspace evidence instead
+// of recompiling scope from the original prompt.
+//
+// A lifecycle that began with a DEFERRED target (a mutating objective that named
+// no file) reaches recovery with an empty scope. Rebuilding that scope from the
+// prompt would produce the same empty set forever; instead the replan re-runs
+// the existing evidence-bound discovery against the workspace as it is NOW. The
+// derivation is the SAME one the initial run used, so it can only bind files the
+// bounded scan actually observed and the objective's declared artifact kinds
+// match — a replan cannot invent a target, and if discovery still cannot resolve
+// the scope stays unresolved and the run fails closed.
+func (d *Driver) replanDeferredScope() {
+	if d == nil || d.adapter == nil {
+		return
+	}
+	if len(d.resolved.Targets) > 0 {
+		return // already resolved; a replan may never re-pick or widen it
+	}
+	before := d.scopeResolution.State
+	d.deriveEvidenceScope()
+	if len(d.resolved.Targets) > 0 && before != ScopeResolved {
+		d.invalidateObjectiveContractForScopeChange()
+		diagnosticf("[replan] discovery resolved a deferred scope from current workspace evidence: %v",
+			d.resolved.Targets)
+	}
 }
 
 // recordAnchorFailure records a patch-anchor failure, invalidates the candidate

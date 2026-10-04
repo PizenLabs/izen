@@ -321,6 +321,13 @@ type ObjectiveContract struct {
 	// under. It is recorded here for traceability; the authority still reads it
 	// from its own TaskContract argument.
 	TaskKind TaskKind `json:"task_kind"`
+	// Semantics is the independent semantic model of the objective: the intended
+	// operation, the current scope-resolution state, whether the target is
+	// concrete or deferred, and whether discovery is required. It exists so
+	// "target unresolved" is a first-class state rather than an inference that
+	// becomes CREATE. It is a pure label derived from TaskKind and Scope; it
+	// carries no authority.
+	Semantics ObjectiveSemantics `json:"semantics"`
 	// Scope is the declared, evidence-bound target set of the objective.
 	Scope []string `json:"scope,omitempty"`
 	// Clauses is the deterministic segmentation of the user's request.
@@ -397,6 +404,11 @@ type ObjectiveDerivation struct {
 	Request string
 	// Kind is the canonical task contract kind.
 	Kind TaskKind
+	// Operation is the semantic operation the objective intends. When empty it
+	// is derived from Kind. It is an explicit input so a caller that already
+	// classified the operation does not have to round-trip it through the
+	// execution-shape kind.
+	Operation Operation
 	// Scope is the evidence-bound declared target set.
 	Scope []string
 	// Clauses is the deterministic clause segmentation of the request. When
@@ -448,10 +460,21 @@ func DeriveObjectiveContract(in ObjectiveDerivation) ObjectiveContract {
 		clauses = SegmentObjectiveRequest(in.Request)
 	}
 
+	// The semantic operation is intent; the execution kind is shape. Derive the
+	// operation from an explicit caller value when one is supplied, otherwise
+	// project it from the shape. The scope state / target disposition / discovery
+	// requirement are then a pure function of the operation and the KNOWN scope —
+	// never of the absence of a target read as evidence of creation.
+	operation := in.Operation
+	if operation == "" {
+		operation = OperationForTaskKind(in.Kind)
+	}
+
 	contract := ObjectiveContract{
 		ObjectiveID: deriveObjectiveID(in.ObjectiveID, in.Request),
 		Request:     in.Request,
 		TaskKind:    in.Kind,
+		Semantics:   DeriveObjectiveSemantics(operation, scope),
 		Scope:       scope,
 		Clauses:     clauses,
 	}
