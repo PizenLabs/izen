@@ -109,6 +109,102 @@ func TestConfinementRefusesEscapingTargets(t *testing.T) {
 	}
 }
 
+// TestConfinementRefusesSymlinkedEscape is the second half of the security
+// contract, and the half the lexical checks cannot reach.
+//
+// A symlink INSIDE the workspace pointing at a directory outside it satisfies
+// every lexical rule: the cleaned relative path has no "..", and the joined
+// absolute path is textually under the root. The bytes still land outside. Before
+// the real-path check, `Apply` on such a target was reported PROVEN with the file
+// written beyond the boundary — a grant naming workspace-relative paths and a
+// capability writing to absolute paths somewhere else.
+func TestConfinementRefusesSymlinkedEscape(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "workspace")
+	outside := filepath.Join(base, "outside")
+	for _, dir := range []string{root, outside} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+
+	caps, err := filesystem.New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	grant, err := kernel.NewGrant("g", []kernel.CapabilityID{kernel.FileWrite}, []string{"link/escaped.txt"})
+	if err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	write := lookup(t, caps, kernel.FileWrite)
+	req := kernel.Request{
+		Capability: kernel.FileWrite,
+		Step:       "write",
+		Target:     "link/escaped.txt",
+		Args:       map[string]string{"content": "pwned"},
+		Grant:      grant,
+	}
+	if err := write.Authorize(req); err == nil {
+		t.Error("Authorize accepted a destination that symlinks outside the workspace")
+	}
+	if _, err := write.Invoke(context.Background(), req); err == nil {
+		t.Error("Invoke accepted a destination that symlinks outside the workspace")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "escaped.txt")); err == nil {
+		t.Fatal("a write crossed the workspace boundary through a symlink")
+	}
+}
+
+// TestConfinementAllowsSymlinksResolvingInsideTheRoot proves the real-path check
+// refuses escapes without breaking a legitimate layout.
+//
+// A symlink pointing at another directory INSIDE the workspace names a real file
+// in the workspace. Refusing it would be confinement theatre that breaks real
+// repositories, and a security check that is routinely disabled is not one.
+func TestConfinementAllowsSymlinksResolvingInsideTheRoot(t *testing.T) {
+	caps, root := newWorkspace(t)
+	if err := os.MkdirAll(filepath.Join(root, "real"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "real"), filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+
+	write := lookup(t, caps, kernel.FileWrite)
+	grant, err := kernel.NewGrant("g", []kernel.CapabilityID{kernel.FileWrite}, []string{"link/inside.txt"})
+	if err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	req := kernel.Request{
+		Capability: kernel.FileWrite,
+		Step:       "write",
+		Target:     "link/inside.txt",
+		Args:       map[string]string{"content": "inside\n"},
+		Grant:      grant,
+	}
+	if err := write.Authorize(req); err != nil {
+		t.Fatalf("Authorize refused a symlink resolving inside the workspace: %v", err)
+	}
+	obs, err := write.Invoke(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if obs.Verdict != kernel.VerdictPass {
+		t.Fatalf("verdict = %s (%s); want PASS", obs.Verdict, obs.Detail)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "real", "inside.txt"))
+	if err != nil {
+		t.Fatalf("the write did not land: %v", err)
+	}
+	if string(body) != "inside\n" {
+		t.Errorf("content = %q; want the written bytes", string(body))
+	}
+}
+
 // TestAbsolutePathRefused proves an absolute destination is refused rather than
 // reinterpreted relative to the root.
 func TestAbsolutePathRefused(t *testing.T) {

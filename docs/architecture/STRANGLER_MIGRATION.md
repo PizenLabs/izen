@@ -1,6 +1,6 @@
 # Strangler Migration: from three execution stacks to one kernel
 
-**Status:** in progress. Slice 1 (`file.exists`) complete.
+**Status:** in progress. Slices 1 (`file.exists`), 2 (`file.write`) and 3 (`file.read`) complete.
 **Date:** 2026-10-04
 **Branch:** `refactor/kernel`
 
@@ -117,20 +117,56 @@ One slice, four obligations. A slice that does not do all four is not finished:
 ### The seam
 
 `internal/kernelbridge` is the only sanctioned path from the legacy tree to the
-kernel. Two locks enforce it:
+kernel. Three locks enforce it:
 
 - `TestKernelLock_SingleKernelEntryPoint` — only `internal/kernelbridge` may import
   `runtime/kernel` or `runtime/capabilities/filesystem`. A caller that constructs a
   capability itself would get an `Observation` with no `Spec`, no `Grant`, no event
-  and no verdict, so the import is locked too, not just the kernel package.
+  and no verdict, so the import is locked too, not just the kernel package. Because
+  that lock is real, the seam re-exports the two mutation contracts as
+  `kernelbridge.ContractCreate` / `ContractPatch`; a sanctioned caller has to be
+  able to obey the lock.
 - `TestKernelLock_NoUnregisteredWorkspaceExistenceDecision` — a ratchet over every
   remaining existence decision in the execution packages. The allowlist is the
   strangler's work list; it may only shrink, and it fails in **both** directions
   (a new site is a new bypass; a stale entry means the list has stopped describing
   reality).
+- `TestKernelLock_MigratedToolCallsOwnNoFilesystemOfTheirOwn` — after slices 2 and
+  3, `internal/execution/toolcalls.go` may not call **any** workspace syscall. This
+  one is deliberately not a specific-call list: that file's only correct future is
+  to keep asking the seam, so any direct `os.*` filesystem call appearing there is a
+  regression whatever its intent.
 
-Both locks were verified to fail when violated: adding a stray `os.Stat` branch, a
-direct kernel import, and restoring the deleted `os.Stat` each turn the build red.
+All four locks (including the slice-1 pin) were verified to fail when violated: a
+stray `os.Stat` branch, a direct kernel import, a restored `os.WriteFile`, a
+reintroduced `DispatchToolCalls`, and a restored `os.Stat` in the migrated file each
+turn the build red.
+
+### The seam is not a layer
+
+`internal/kernelbridge` holds no execution state between calls, does no planning,
+names no provider, implements no recovery, retries nothing, and decides no mutation
+policy beyond which grant it builds. Each of its three directions is a pure function
+of `(ctx, root, request)`:
+
+| Direction | Entry point | Contract | Verifier |
+|---|---|---|---|
+| observe existence | `Observe` | `OBSERVE` | re-stats each target; agreement is the check |
+| mutate | `Apply` | `CREATE` / `PATCH`, declared by the caller | re-reads each destination and compares content |
+| read | `ReadFiles` | `OBSERVE` over `file.read` | re-reads each target; presence and absence are both passes, only disagreement fails |
+
+Two rules make that checkable rather than aspirational:
+
+- **the seam never decides what to do.** It composes a Spec, a Grant and a
+  verifier and returns what the kernel adjudicated. An oversized request is
+  refused, never truncated; a destination that escapes the workspace is passed to
+  the kernel so the refusal is recorded in the kernel's own vocabulary; a write set
+  whose calls disagree about the contract is refused rather than resolved.
+- **no verdict is a field.** `Proven()`, `Exists()`, `Absent()`, `Landed()`,
+  `Created()`, `Written()`, `Found()` and `Content()` are all derived, so a
+  hand-built value cannot disagree with the state it claims to describe. There is no
+  `Success`, `Verified`, `Applied`, `Completed` or `Proven` boolean anywhere in the
+  seam or on its results.
 
 ### Failure has to be an answer
 
@@ -138,6 +174,18 @@ An unanswered question is never rendered as a negative answer. `Observation.Exis
 and `Observation.Absent` both return false when the execution did not reach PROVEN,
 and `targetResolution.unproven()` lets the presentation layer say "the runtime
 could not prove this" instead of asserting an absence nobody established.
+
+`Applied.Landed` is the identical rule on the mutating side: write evidence beside
+an unproven outcome describes a workspace the runtime cannot vouch for, and it is
+not reported as a completed write.
+
+### Refusals carry no state
+
+A request refused before admission returns a zero `State`, because no execution
+exists to describe. Its axes are empty rather than `NONE`, and an empty axis is not
+a claim. Consumers decide from `Proven()`, `Landed()` and the evidence — never from
+an axis on a refusal. `Verify` is set explicitly even then, because callers read it
+directly.
 
 ---
 
@@ -212,28 +260,189 @@ requires `FILE_ABSENT` evidence and a PROVEN outcome, which is the case a bare
 | `internal/ui/autonomy_target.go` | routed through the bridge; `os.Stat` deleted |
 | `internal/ui/runtime_cutover.go` | consumes the kernel-carrying result |
 | `internal/ui/autonomy_target_kernel_test.go` | new — user-facing proof |
-| `test/architecture/kernel_lock_test.go` | new — the three locks |
+| `test/architecture/kernel_lock_test.go` | new — the locks |
 
 ---
 
-## 5. Remaining work, in order
+## 5. Slice 2 — `file.write`, and slice 3 — `file.read`
+
+Both slices migrate the same user-facing path: a native `write_file` /
+`apply_patch` tool call arriving from the model, buffered for review, approved by
+the human pressing `a` or `l` in the approval prompt.
+
+```
+key "a" / "l"   internal/ui/keys.go:1180,1184
+  → internal/ui/model.go            applyToolCallBuffer
+  → internal/execution/toolcalls.go ToolCallBuffer.ApplyApproved   (write)
+                                     bufferWriteFile / bufferApplyPatch (read)
+  → internal/kernelbridge           Apply / ReadFiles
+  → runtime/kernel                  engine → dispatch → verify → adjudicate
+  → runtime/capabilities/filesystem file.write / file.read
+```
+
+### What slice 2 was
+
+`ToolCallBuffer.ApplyApproved` wrote the workspace itself:
+
+```go
+absPath := resolvePath(b.cwd, b.calls[i].Path)
+if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil { ... }
+if err := os.WriteFile(absPath, []byte(b.calls[i].Modified), 0644); err != nil { ... }
+```
+
+Five defects, all of them invisible on a cooperative filesystem:
+
+1. no event, no state, no evidence, no verification — a write whose only witness is
+   the syscall that performed it;
+2. not atomic: `os.WriteFile` truncates and then writes, so a failure mid-write
+   leaves a target no contract described;
+3. unconfinement: `resolvePath` joined the working directory with whatever path the
+   model asked for, so `../` left the workspace with no grant behind it;
+4. the file's existing mode was discarded in favour of a hardcoded `0644`;
+5. `ToolCallResult.IsNew` reported "created" from `orig == ""`, computed at
+   BUFFERING time — so an existing zero-byte file was reported as newly created,
+   and any file that appeared between buffering and approval was reported as a
+   modification.
+
+### What slice 2 is now
+
+One `MUTATE` execution per approved batch:
+
+- two steps per destination, in a fixed order: `file.exists` then `file.write`.
+  The order is the program's only control flow and it is load-bearing — an
+  observation taken *after* the write could not distinguish "created" from
+  "overwritten", which is the question the caller has to answer;
+- an explicit grant naming `file.exists` + `file.write` over exactly the requested
+  destinations;
+- a verifier that re-reads every destination and compares it against what was
+  requested. It does **not** reuse the capability: replaying `file.write` would
+  only re-run the implementation whose report is being judged;
+- `Landed(target)` = write evidence **and** a PROVEN outcome. Write evidence beside
+  an unproven outcome describes a workspace the runtime cannot vouch for, and is
+  not reported as a completed write;
+- `Created(target)` = proven ABSENT before the write, write evidence after. Both
+  halves come from recorded evidence, so "created" cannot be asserted for a file the
+  runtime only overwrote.
+
+The contract is always `PATCH` — "the named destination ends up holding this
+content" — because that is the one obligation the caller can state truthfully for
+every call whether it creates or replaces. `CREATE`'s obligations are a strict
+superset, so declaring `CREATE` for a call that turns out to overwrite would assert
+the creation of a file that was already there. Whether a write *created* its
+destination is a fact, not an obligation, and it is read back from evidence.
+
+### What slice 3 was
+
+`bufferWriteFile` and `bufferApplyPatch` read the baseline themselves and treated
+**any** read error as "the file is empty":
+
+```go
+var orig string
+if data, err := os.ReadFile(absPath); err == nil {
+    orig = string(data)
+}
+```
+
+A missing file, a permission error, a directory and an empty file were one thing.
+The approval prompt then showed an empty baseline for an unreadable target, and the
+approved write replaced whatever was there.
+
+### What slice 3 is now
+
+`readThroughKernel` asks the seam, and the three answers stay distinct:
+
+| on disk | `Found` | `Absent` | `Content` | what the caller does |
+|---|---|---|---|---|
+| file with bytes | true | false | the bytes | diff against real content |
+| zero-byte file | true | false | `""` | diff shows the addition |
+| absent | false | **true** | `""` | `write_file` proceeds, `apply_patch` refuses |
+| unreadable / no verdict | false | false | `""` | the buffer refuses with the cause |
+
+`FILE_ABSENT` is a real observed fact that reaches `PROVEN`, not an error disguised
+as success. `apply_patch` against an absent target is **refused** rather than
+satisfied: reading some other file's bytes to compute a baseline would be inventing
+the thing the mutation is supposed to change.
+
+### Deleted in the same change
+
+| Deleted | Where | Why |
+|---|---|---|
+| `ToolCallBuffer.ApplyApproved`'s write loop | `internal/execution/toolcalls.go` | replaced by `kernelbridge.Apply` |
+| `dispatchWriteFile` | `internal/execution/toolcalls.go` | a **second** `write_file` implementation, with no callers, that wrote straight to disk with no grant, no evidence and no verification |
+| `DispatchToolCalls` / `dispatchToolCall` / `dispatchApplyPatch` | `internal/execution/toolcalls.go` | only callers of the above |
+| `BufferedToolCall.IsNew` | `internal/execution/toolcalls.go` | obsolete state: decided by `orig == ""` at buffering time, now established by the kernel's pre-write observation |
+| `resolvePath`'s write use | `internal/execution/toolcalls.go` | the write no longer resolves a path itself; the read keeps it for naming only |
+
+### The proof
+
+`internal/ui/toolcall_write_kernel_test.go` drives the real approval command and
+asserts each link separately — a removed intermediate cannot pass:
+
+| Link | Assertion |
+|---|---|
+| entry point | `m.applyToolCallBuffer()`, the exact command the `a`/`l` key handler runs |
+| execution | `execution.started` exactly once, `step.started` present, `SETTLED` |
+| authorization | a named grant exists, permits `file.write`, and covers **only** the requested destination |
+| invocation | `capability.invoked` for `file.exists` **and** `file.write`, each naming the exact target |
+| mutation | the bytes are re-read from disk by the test's own `os.ReadFile` |
+| evidence | `FILE_WRITTEN` attributed to a declared step, from `file.write`, verdict `PASS`, correct byte count; `FILE_PRESENT` from a second capability; presence observed **before** `mutation.applied` |
+| state | mutation axis `APPLIED`, `mutation.applied` exactly once |
+| verification | axis `PASSED` (never a skip), and `mutation.applied → verification.started → verification.passed` in that order |
+| outcome | `PROVEN`, `Landed`, `Created`, contract `PATCH` and non-forbidding |
+| replay | `kernel.Fold` rebuilds the reported state from the log, with the same outcome |
+
+The creation semantics are pinned separately, because they are what the deleted
+heuristic got wrong: `TestToolCallWrite_CreatesATargetAndSaysSo` creates the target
+*after* buffering (a buffer-time answer would now be stale),
+`TestToolCallWrite_AnEmptyExistingFileIsNotACreation` covers the zero-byte file, and
+`TestToolCallRead_AnUnreadableTargetIsRefusedNotSilentlyEmpty` covers the data-loss
+case.
+
+### Files
+
+| File | Change |
+|---|---|
+| `internal/kernelbridge/apply.go` | new — the mutating direction |
+| `internal/kernelbridge/read.go` | new — the reading direction |
+| `internal/kernelbridge/kernelbridge.go` | presence projection widened to `file.read` / `file.write`; package doc states what the seam must never become |
+| `internal/kernelbridge/apply_test.go`, `read_test.go` | new — seam-level proof |
+| `internal/execution/toolcalls.go` | read and write routed through the seam; old paths deleted |
+| `internal/ui/model.go` | the kernel execution rides along on `applyAllResultMsg` |
+| `internal/ui/view.go` | the approval icon derives from the diff, not a stale flag |
+| `internal/ui/toolcall_write_kernel_test.go` | new — user-facing proof |
+| `runtime/capabilities/filesystem/filesystem.go` | confinement completed (see finding below) |
+| `test/architecture/kernel_lock_test.go` | fourth lock added |
+
+---
+
+## 6. Remaining work, in order
 
 Each line is an allowlist entry in `test/architecture/kernel_lock_test.go` marked
 `target-existence`. Delete the entry in the same change that strands the site.
 
 | # | Site | What it decides |
 |---|---|---|
-| 2 | `internal/runtime/autonomy/adapter.go:777` | `TargetExists` / `TargetAbsent` evidence — literally the kernel's `FILE_PRESENT` / `FILE_ABSENT` concepts, implemented with a bare stat |
-| 3 | `internal/runtime/autonomy/adapter.go:800` | `TargetExistence` pre-dispatch evidence for the IDEMPOTENT contract |
-| 4 | `internal/runtime/handlers/handlers.go:605` | filters `@file` references by existence |
-| 5 | `internal/ui/utils.go:63,74` | `@file` expansion in the composer |
-| 6 | `internal/runtime/autonomy/preflight.go:526` | local-dependency feasibility |
-| 7 | `internal/execution/executor.go:1069` | workspace evidence for context compilation |
+| 4 | `internal/runtime/autonomy/adapter.go:777` | `TargetExists` / `TargetAbsent` evidence — literally the kernel's `FILE_PRESENT` / `FILE_ABSENT` concepts, implemented with a bare stat |
+| 5 | `internal/runtime/autonomy/adapter.go:800` | `TargetExistence` pre-dispatch evidence for the IDEMPOTENT contract |
+| 6 | `internal/runtime/handlers/handlers.go:605` | filters `@file` references by existence |
+| 7 | `internal/ui/utils.go:63,74` | `@file` expansion in the composer |
+| 8 | `internal/runtime/autonomy/preflight.go:526` | local-dependency feasibility |
+| 9 | `internal/execution/executor.go:1069` | workspace evidence for context compilation |
 
-Slices 2 and 3 are next for a reason: they are the runtime's own existence
-evidence, they feed the IDEMPOTENT contract, and a post-hoc reading of them is
-exactly the "already done" vs "done by this run" ambiguity the kernel's evidence
-model exists to remove.
+Entries 2 and 3 — the ones slice 1's author marked as next — were **not** taken,
+because slices 2 and 3 went somewhere else. They are the runtime's own existence
+evidence and they feed the IDEMPOTENT contract, and both of those need an
+IDEMPOTENT contract the kernel does not have yet. Choosing them would have meant
+deriving a contract, which is out of scope. They remain the next candidates once
+the IDEMPOTENT obligation exists.
+
+Mutation sites NOT taken, and why:
+
+| Site | Why not yet |
+|---|---|
+| `internal/runtime/executor/file_executor.go` — `PrepareSnapshot` / `Commit` / `atomicWrite` / `Rollback` | transactional: snapshot, staged write, symbol baseline, use-time confinement, automatic rollback. Migrating it means recovery, which is out of scope. |
+| `internal/execution/patch.go` — `ApplyContext`, `os.WriteFile` at :475/:661/:793 | SEARCH/REPLACE materialisation and fuzzy matching. Migrating it means moving patch derivation, which is out of scope. |
+| `internal/execution/boundary.go:76`, `internal/patch/applicator.go:44`, `internal/infrastructure/capabilities/osfile.go:179` | other write authorities, each with its own approval and transaction machinery. |
 
 ### Out of scope until the strangler completes
 
@@ -241,12 +450,66 @@ Per the migration decision, these are untouched and must stay untouched:
 
 - provider integration
 - recovery
+- resume
+- retry
 - contract derivation
 - planner architecture
+- intent heuristics
+- command.run
+- UI redesign
 
 ---
 
-## 6. Findings
+## 7. Findings
+
+### The filesystem capability's confinement was lexical only
+
+Found while proving slice 2, and fixed in the same change because slice 2 makes
+`file.write` reachable from a user-facing path for the first time.
+
+`Capability.resolve` refused absolute targets and targets climbing out with `..`,
+and then re-checked that the joined absolute path was textually under the root. That
+is not confinement. A symlink **inside** the workspace pointing at a directory
+outside it satisfies every one of those checks — the cleaned relative path has no
+`..`, and the joined path is textually under the root — while the bytes land
+somewhere else.
+
+Verified before the fix: `kernelbridge.Apply` on `link/escaped.go`, with `link` a
+symlink to a sibling of the workspace root, returned **PROVEN**
+(`target_delta_applied, verification_satisfied`) with the file written outside the
+root. The verifier confirmed the escape, because it followed the same symlink and
+re-read the same bytes.
+
+That defeats the point of a grant. A grant names workspace-relative paths; a
+capability that can be redirected out of the workspace through one symlink is a
+capability no grant can reason about. The `TestConfinementRefusesEscapingTargets`
+test called itself "the security contract" and enumerated "every traversal shape"
+while covering four lexical shapes and no symlink.
+
+`resolve` now has a second half: the target's symlink-resolved path must stay under
+the root's symlink-resolved path, comparing resolved to resolved so a root reached
+through a symlink (`/var` → `/private/var` on macOS) does not false-positive. The
+deepest existing ancestor is resolved and the not-yet-created components appended,
+because the creation case is exactly where a symlinked parent redirects the write.
+Symlinks resolving **inside** the root stay permitted —
+`TestConfinementAllowsSymlinksResolvingInsideTheRoot` — because refusing those would
+be theatre, and a check that has to be disabled routinely is not a check.
+
+### A read's verification compares lengths, not bytes
+
+The kernel's evidence vocabulary records observations — a kind, a target, a byte
+count — and deliberately not payloads. `readMeasurement` therefore re-reads each
+target and compares the **length** against the length the capability recorded, so
+two independent reads of the same path returning the same length but different bytes
+would pass.
+
+This is a real TOCTOU window, not a closed one, and it is stated rather than papered
+over: closing it needs content-bearing evidence in the kernel, which is a kernel
+change and therefore out of scope for these slices. The bytes the seam returns are
+the verifier's re-read, so the caller receives the reading that was independently
+re-checked rather than the one the capability reported. The write verifier does not
+have this limitation — it compares content, because the request gives it content to
+compare against.
 
 ### The neighbouring negative-rules audit is vacuous
 
@@ -275,3 +538,27 @@ editing provider and plan budget configuration. It needs its own change.
 The kernel subtree was added to the negative audit in the change that created it.
 This document's locks extend that: they constrain `internal/` against the kernel,
 which nothing did before.
+
+### The write verifier's failure branch is not reachable from outside the seam
+
+`contentVerifier` fails when a destination's on-disk bytes differ from the request.
+That branch is the check that gives a mutation its meaning, and it is deliberately
+not faked in a test: producing it requires the file to change between the write and
+the re-read, which from outside the seam needs a hook the seam does not expose and
+should not — a caller able to interpose between a capability and its verifier could
+also interpose between a mutation and its verification. In production it is
+reachable by exactly the thing it exists to catch: a concurrent writer. A runtime
+that cannot survive that should fail loudly, and this one does.
+
+### Dead write authorities are easy to miss and expensive to leave
+
+`DispatchToolCalls` / `dispatchWriteFile` / `dispatchApplyPatch` were a complete
+second `write_file` implementation in the same file as the live one: no approval
+gate, no grant, no confinement, no evidence, no verification — and **no callers at
+all**. Nothing fails for an exported function nobody calls, and nothing in the
+linter flags a duplicate implementation either. It would have survived indefinitely
+and been the obvious thing for the next person to call.
+
+Deleting it was not tidiness; it was the "do not leave two competing
+implementations" obligation. The new lock checks for it by name, because a deleted
+implementation that can be re-added verbatim is not deleted.

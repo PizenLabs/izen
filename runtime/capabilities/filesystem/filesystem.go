@@ -135,10 +135,22 @@ func (c *Capability) Registry() (*kernel.Registry, error) {
 // resolve maps a workspace-relative target onto an absolute path inside the
 // root, refusing anything that escapes.
 //
-// The check is done on the cleaned relative path rather than on the joined
-// absolute one, so a symlinked directory cannot be used to widen the root. A
-// target containing ".." that does not escape is still allowed, because it names
-// a real file inside the workspace.
+// Confinement is established in two halves, because either one alone is
+// defeatable:
+//
+//  1. Lexically. The cleaned relative path may not be absolute and may not climb
+//     out with "..", and the joined absolute path is re-checked against the root.
+//     A target containing ".." that does not escape is still allowed, because it
+//     names a real file inside the workspace.
+//  2. Really. The target's symlink-resolved path must stay under the root's
+//     symlink-resolved path. A symlink inside the workspace pointing at a
+//     directory outside it passes every lexical check — the joined path is
+//     lexically under the root — while the bytes land somewhere the grant cannot
+//     name. A grant names workspace-relative paths, so a target whose real path
+//     is elsewhere is not a path the grant can reason about at all.
+//
+// Symlinks that resolve INSIDE the root stay permitted. They name a real file in
+// the workspace, which is a legitimate way to organise one.
 func (c *Capability) resolve(target string) (string, error) {
 	if strings.TrimSpace(target) == "" {
 		return "", kernel.Block{
@@ -161,7 +173,67 @@ func (c *Capability) resolve(target string) (string, error) {
 			Reason: fmt.Sprintf("target %q resolves outside the workspace root", target),
 		}
 	}
+	if err := c.confinesRealPath(abs, target); err != nil {
+		return "", err
+	}
 	return abs, nil
+}
+
+// confinesRealPath refuses a target whose symlink-resolved path leaves the root.
+//
+// The deepest EXISTING ancestor is resolved and the remaining, not-yet-created
+// components are appended, because a destination that has not been created yet
+// cannot be resolved — and it is exactly the creation case where a symlinked
+// parent would redirect the write.
+func (c *Capability) confinesRealPath(abs, target string) error {
+	rootReal, err := filepath.EvalSymlinks(c.root)
+	if err != nil {
+		return kernel.Block{
+			Class:  kernel.FailureCapability,
+			Reason: fmt.Sprintf("workspace root %q could not be resolved: %v", c.root, err),
+		}
+	}
+
+	probe := abs
+	var pending []string
+	for {
+		if _, lstatErr := os.Lstat(probe); lstatErr == nil {
+			break
+		} else if !errors.Is(lstatErr, fs.ErrNotExist) {
+			return kernel.Block{
+				Class:  kernel.FailureCapability,
+				Reason: fmt.Sprintf("target %q could not be examined: %v", target, lstatErr),
+			}
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			// Reached the filesystem root without finding anything that exists.
+			// The lexical check already refused anything outside the workspace, so
+			// this cannot be an escape; treat it as confined rather than inventing
+			// a refusal for an unreachable shape.
+			return nil
+		}
+		pending = append(pending, filepath.Base(probe))
+		probe = parent
+	}
+
+	real, err := filepath.EvalSymlinks(probe)
+	if err != nil {
+		return kernel.Block{
+			Class:  kernel.FailureCapability,
+			Reason: fmt.Sprintf("target %q could not be resolved: %v", target, err),
+		}
+	}
+	for i := len(pending) - 1; i >= 0; i-- {
+		real = filepath.Join(real, pending[i])
+	}
+	if !underRoot(rootReal, real) {
+		return kernel.Block{
+			Class:  kernel.FailureAuthorization,
+			Reason: fmt.Sprintf("target %q resolves to %s, which is outside the workspace root", target, real),
+		}
+	}
+	return nil
 }
 
 func underRoot(root, abs string) bool {

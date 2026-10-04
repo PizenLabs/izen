@@ -1,14 +1,14 @@
 package execution
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/PizenLabs/izen/internal/ai"
+	"github.com/PizenLabs/izen/internal/kernelbridge"
 )
 
 // ── ToolCallBuffer ────────────────────────────────────────────────────────────
@@ -18,6 +18,13 @@ import (
 // and the user must explicitly approve before any disk mutation occurs.
 
 // BufferedToolCall holds a single intercepted tool call with its computed diff.
+//
+// It no longer records whether the target is new. It used to, as `IsNew`, decided
+// by comparing the baseline against the empty string — which reports an existing
+// zero-byte file as new, and goes stale the moment anything touches the workspace
+// between buffering and approval. Whether a write CREATED its destination is now
+// established by the kernel observing the destination immediately before
+// committing, and reported back on ToolCallResult.
 type BufferedToolCall struct {
 	ID       string
 	Name     string
@@ -25,12 +32,16 @@ type BufferedToolCall struct {
 	Original string
 	Modified string
 	Diff     string
-	IsNew    bool
 	Approved bool
 }
 
 // ToolCallBuffer intercepts and buffers tool calls, generating diff previews.
-// Zero value is ready to use.
+//
+// It performs no filesystem mutation and no filesystem read of its own any more.
+// Both directions are adjudicated kernel executions: reads while buffering, so
+// the diff a human approves is computed from proven content, and the write on
+// approval, so what reaches disk is written under an explicit grant and
+// re-verified from disk afterwards.
 type ToolCallBuffer struct {
 	mu      sync.Mutex
 	calls   []BufferedToolCall
@@ -43,10 +54,10 @@ func NewToolCallBuffer(cwd string) *ToolCallBuffer {
 	return &ToolCallBuffer{cwd: cwd}
 }
 
-// Buffer parses tool call arguments, reads original file content from disk,
-// computes the modified content and a unified diff, and stores everything
-// in memory without touching the filesystem. Returns an error if the tool
-// call arguments cannot be parsed.
+// Buffer parses tool call arguments, reads the destination's current content
+// through the Runtime Kernel, computes the modified content and a unified diff,
+// and stores everything in memory. Returns an error if the arguments cannot be
+// parsed or if the runtime could not establish the baseline.
 func (b *ToolCallBuffer) Buffer(tc ai.ToolCall) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -125,9 +136,25 @@ func (b *ToolCallBuffer) Reject() {
 	b.calls = nil
 }
 
-// ApplyApproved writes all approved buffered calls to disk.
-// Returns ToolCallResults describing what was applied.
-func (b *ToolCallBuffer) ApplyApproved() (*ToolCallResults, error) {
+// ApplyApproved writes all approved buffered calls to disk, through the Runtime
+// Kernel, and returns the results describing what actually landed.
+//
+// The write does not happen here any more. It used to be a bare os.WriteFile per
+// approved call: no event, no state, no evidence and no verification, written in
+// place so a failure mid-write left a truncated target, unconfinement to the
+// working directory, and a hardcoded 0644 that discarded the mode of the file it
+// was replacing. It is now a single MUTATE execution — observed, authorized,
+// written by the filesystem capability, and re-read from disk by a verifier that
+// did not write it — whose verdict is adjudicated from evidence.
+//
+// A destination the kernel could not prove landed is reported as an error, never
+// as a result. "The runtime could not prove this file was written" and "this file
+// was written" must not read the same way to the human who approved it.
+//
+// Destinations that DID land are reported alongside the failure, because a
+// partial write is a partial write and the caller has to be able to reconcile
+// what reached disk.
+func (b *ToolCallBuffer) ApplyApproved(ctx context.Context) (*ToolCallResults, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -135,34 +162,79 @@ func (b *ToolCallBuffer) ApplyApproved() (*ToolCallResults, error) {
 		return &ToolCallResults{}, nil
 	}
 
-	var results []ToolCallResult
+	approved := make([]int, 0, len(b.calls))
 	for i := range b.calls {
-		if !b.calls[i].Approved {
+		if b.calls[i].Approved {
+			approved = append(approved, i)
+		}
+	}
+	if len(approved) == 0 {
+		b.applied = true
+		return &ToolCallResults{}, nil
+	}
+
+	// The contract is DECLARED here, and it is always PATCH: "the named
+	// destinations end up holding this content". That is the one obligation this
+	// path can state truthfully for every call in the batch, whether it creates a
+	// file or replaces one.
+	//
+	// The tempting alternative is to declare CREATE for calls that look like
+	// creations, and it is wrong twice over. It cannot be decided here at all,
+	// because the only honest answer is a filesystem observation and this function
+	// runs before the kernel has observed anything. And CREATE's obligations are a
+	// strict superset of PATCH's, so declaring it for a call that turns out to
+	// overwrite an existing file would assert the creation of a file that was
+	// already there.
+	//
+	// Whether a write CREATED its destination is not an obligation here — it is a
+	// fact, and it is read back from the kernel's own pre-write observation below.
+	writes := make([]kernelbridge.Write, 0, len(approved))
+	for _, i := range approved {
+		writes = append(writes, kernelbridge.Write{
+			Target:   b.calls[i].Path,
+			Content:  b.calls[i].Modified,
+			Contract: kernelbridge.ContractPatch,
+		})
+	}
+
+	applied := kernelbridge.Apply(ctx, b.cwd, writes)
+
+	results := make([]ToolCallResult, 0, len(approved))
+	for _, i := range approved {
+		if !applied.Landed(b.calls[i].Path) {
 			continue
-		}
-		absPath := resolvePath(b.cwd, b.calls[i].Path)
-		dir := filepath.Dir(absPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return &ToolCallResults{Results: results}, fmt.Errorf("mkdir %s: %w", dir, err)
-		}
-		if err := os.WriteFile(absPath, []byte(b.calls[i].Modified), 0644); err != nil {
-			return &ToolCallResults{Results: results}, fmt.Errorf("write %s: %w", b.calls[i].Path, err)
 		}
 		results = append(results, ToolCallResult{
 			File:     b.calls[i].Path,
 			Original: b.calls[i].Original,
 			Modified: b.calls[i].Modified,
-			IsNew:    b.calls[i].IsNew,
+			// IsNew is now evidence, not a guess carried over from buffering
+			// time. The kernel observed the destination before and after the
+			// write; "created" is what those two observations jointly establish.
+			// A buffer-time guess gets this wrong for an existing empty file,
+			// which it reports as newly created.
+			IsNew: applied.Created(b.calls[i].Path),
 		})
 	}
+
+	if !applied.Proven() {
+		// applied is deliberately NOT set. Nothing here claims the remaining
+		// calls were written, and a later attempt must stay free to try again
+		// rather than being told the batch already ran.
+		return &ToolCallResults{Results: results, Execution: applied}, fmt.Errorf(
+			"tool call write under %s did not reach a proven terminal state: %s (%s), execution %s, %d/%d destination(s) proven written",
+			applied.Contract, applied.Outcome, applied.Reason, applied.ExecutionID,
+			len(results), len(approved))
+	}
+
 	b.applied = true
-	return &ToolCallResults{Results: results}, nil
+	return &ToolCallResults{Results: results, Execution: applied}, nil
 }
 
 // ApplyPending approves all pending calls and applies them in one step.
-func (b *ToolCallBuffer) ApplyPending() (*ToolCallResults, error) {
+func (b *ToolCallBuffer) ApplyPending(ctx context.Context) (*ToolCallResults, error) {
 	b.ApproveAll()
-	return b.ApplyApproved()
+	return b.ApplyApproved(ctx)
 }
 
 // Reset clears the buffer for reuse.
@@ -195,14 +267,12 @@ func bufferWriteFile(tc ai.ToolCall, cwd string) (*BufferedToolCall, error) {
 		return nil, fmt.Errorf("parse write_file arguments: %w", err)
 	}
 
-	absPath := resolvePath(cwd, params.Path)
-	var orig string
-	if data, err := os.ReadFile(absPath); err == nil {
-		orig = string(data)
+	orig, _, err := readThroughKernel(cwd, params.Path)
+	if err != nil {
+		return nil, err
 	}
 
 	diff := buildDiff(orig, params.Content, params.Path)
-	isNew := orig == ""
 
 	return &BufferedToolCall{
 		ID:       tc.ID,
@@ -211,7 +281,6 @@ func bufferWriteFile(tc ai.ToolCall, cwd string) (*BufferedToolCall, error) {
 		Original: orig,
 		Modified: params.Content,
 		Diff:     diff,
-		IsNew:    isNew,
 	}, nil
 }
 
@@ -221,12 +290,16 @@ func bufferApplyPatch(tc ai.ToolCall, cwd string) (*BufferedToolCall, error) {
 		return nil, fmt.Errorf("parse apply_patch arguments: %w", err)
 	}
 
-	absPath := resolvePath(cwd, params.Path)
-	data, err := os.ReadFile(absPath)
+	orig, absent, err := readThroughKernel(cwd, params.Path)
 	if err != nil {
-		return nil, fmt.Errorf("read file %s: %w", params.Path, err)
+		return nil, err
 	}
-	orig := string(data)
+	if absent {
+		// A patch has nothing to patch. This is a refusal rather than a
+		// substitution: reading some other file's content to compute a diff would
+		// be inventing the baseline the mutation is supposed to change.
+		return nil, fmt.Errorf("apply_patch target %s does not exist; a patch needs existing content to modify", params.Path)
+	}
 
 	// Use the whitespace/indentation-tolerant matcher shared with the LLM
 	// SEARCH/REPLACE pipeline so a search block with minor whitespace drift
@@ -245,8 +318,32 @@ func bufferApplyPatch(tc ai.ToolCall, cwd string) (*BufferedToolCall, error) {
 		Original: orig,
 		Modified: modified,
 		Diff:     diff,
-		IsNew:    false,
 	}, nil
+}
+
+// readThroughKernel returns one workspace file's content, read as adjudicated
+// kernel truth rather than as a syscall answer.
+//
+// Absence is a reported FACT, not a failure and not an empty string. The caller
+// receives a genuinely proven-absent signal and decides what that means for its
+// own tool — write_file treats it as a creation, apply_patch refuses — because
+// only the caller knows which of the two it is asking for.
+//
+// A read that could not reach a verdict is an error. Returning "" for it would
+// make an unreadable file indistinguishable from an empty one, which is how a
+// permission error becomes a silent overwrite.
+func readThroughKernel(root, target string) (content string, absent bool, err error) {
+	read := kernelbridge.ReadFiles(context.Background(), root, []string{target})
+	switch {
+	case read.Absent(target):
+		return "", true, nil
+	case read.Found(target):
+		return read.Content(target), false, nil
+	default:
+		return "", false, fmt.Errorf(
+			"read %s under %s: the runtime could not answer (%s): %s",
+			target, read.Outcome, read.Class, read.Reason)
+	}
 }
 
 // buildDiff generates a minimal unified diff between old and new content.
@@ -285,8 +382,14 @@ func addPlusPrefix(content string) string {
 	return strings.Join(lines, "\n")
 }
 
-// ── Existing ToolCallResult / Dispatch (kept for backward compatibility) ──────
+// ── Results ─────────────────────────────────────────────────────────────────
 
+// ToolCallResult is what one buffered call turned into on disk.
+//
+// IsNew is not a flag this package sets from a guess. It is read back from the
+// kernel's own evidence — the destination was observed absent immediately before
+// the write committed — so "created" means the runtime looked and found nothing
+// there, not that a buffer happened to hold an empty string.
 type ToolCallResult struct {
 	File     string
 	Original string
@@ -296,6 +399,18 @@ type ToolCallResult struct {
 
 type ToolCallResults struct {
 	Results []ToolCallResult
+
+	// Execution is the kernel execution that produced these results.
+	//
+	// It is carried for the same reason the autonomy target resolution carries its
+	// observations: a caller reporting what changed to a human has to be able to
+	// say what PROVED it. "wrote 3 files" is not an answer a reader can check,
+	// and the whole point of the migration is that the answer is checkable.
+	//
+	// It is the zero value when no write was attempted, in which case Results is
+	// empty too — the two cannot disagree, because Results is only ever populated
+	// from this execution's evidence.
+	Execution kernelbridge.Applied
 }
 
 func (r ToolCallResults) Summary() string {
@@ -329,97 +444,4 @@ func (r ToolCallResults) FirstResult() *ToolCallResult {
 		return nil
 	}
 	return &r.Results[0]
-}
-
-func DispatchToolCalls(tcs []ai.ToolCall, cwd string) (*ToolCallResults, error) {
-	if len(tcs) == 0 {
-		return &ToolCallResults{}, nil
-	}
-
-	results := make([]ToolCallResult, 0, len(tcs))
-	for _, tc := range tcs {
-		result, err := dispatchToolCall(tc, cwd)
-		if err != nil {
-			return &ToolCallResults{Results: results}, fmt.Errorf("tool call %q (%s): %w", tc.Function.Name, tc.ID, err)
-		}
-		results = append(results, *result)
-	}
-	return &ToolCallResults{Results: results}, nil
-}
-
-func dispatchToolCall(tc ai.ToolCall, cwd string) (*ToolCallResult, error) {
-	switch tc.Function.Name {
-	case ai.ToolWriteFile:
-		return dispatchWriteFile(tc, cwd)
-	case ai.ToolApplyPatch:
-		return dispatchApplyPatch(tc, cwd)
-	default:
-		return nil, fmt.Errorf("unknown tool: %s", tc.Function.Name)
-	}
-}
-
-func dispatchWriteFile(tc ai.ToolCall, cwd string) (*ToolCallResult, error) {
-	var params ai.WriteFileParams
-	if err := json.Unmarshal([]byte(tc.Function.Arguments), &params); err != nil {
-		return nil, fmt.Errorf("parse write_file arguments: %w", err)
-	}
-
-	absPath := resolvePath(cwd, params.Path)
-
-	var orig string
-	if data, err := os.ReadFile(absPath); err == nil {
-		orig = string(data)
-	}
-
-	if err := os.WriteFile(absPath, []byte(params.Content), 0644); err != nil {
-		return nil, fmt.Errorf("write file %s: %w", params.Path, err)
-	}
-
-	return &ToolCallResult{
-		File:     params.Path,
-		Original: orig,
-		Modified: params.Content,
-		IsNew:    orig == "",
-	}, nil
-}
-
-func dispatchApplyPatch(tc ai.ToolCall, cwd string) (*ToolCallResult, error) {
-	var params ai.ApplyPatchParams
-	if err := json.Unmarshal([]byte(tc.Function.Arguments), &params); err != nil {
-		return nil, fmt.Errorf("parse apply_patch arguments: %w", err)
-	}
-
-	absPath := resolvePath(cwd, params.Path)
-
-	data, err := os.ReadFile(absPath)
-	if err != nil {
-		return nil, fmt.Errorf("read file %s: %w", params.Path, err)
-	}
-	orig := string(data)
-
-	// Use the whitespace/indentation-tolerant matcher shared with the LLM
-	// SEARCH/REPLACE pipeline so a search block with minor whitespace drift
-	// still applies cleanly instead of failing with a context mismatch.
-	modified, ok := ApplySearchReplace(orig, params.Search, params.Replace)
-	if !ok || modified == orig {
-		return nil, fmt.Errorf("search text not found in %s", params.Path)
-	}
-
-	if err := os.WriteFile(absPath, []byte(modified), 0644); err != nil {
-		return nil, fmt.Errorf("write file %s: %w", params.Path, err)
-	}
-
-	return &ToolCallResult{
-		File:     params.Path,
-		Original: orig,
-		Modified: modified,
-		IsNew:    false,
-	}, nil
-}
-
-func resolvePath(cwd, target string) string {
-	if filepath.IsAbs(target) {
-		return target
-	}
-	return filepath.Join(cwd, target)
 }

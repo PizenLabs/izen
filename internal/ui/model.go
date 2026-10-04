@@ -41,6 +41,7 @@ import (
 	runtimegraph "github.com/PizenLabs/izen/internal/execution/graph"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 	"github.com/PizenLabs/izen/internal/git"
+	"github.com/PizenLabs/izen/internal/kernelbridge"
 	"github.com/PizenLabs/izen/internal/lea"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
@@ -686,6 +687,15 @@ func (r mutationResultMsg) outcome() execution.MutationOutcome {
 
 type applyAllResultMsg struct {
 	results []mutationResultMsg
+
+	// execution is the Runtime Kernel execution that produced these results.
+	//
+	// It is the record behind the statuses: which destinations were observed,
+	// which were written, what adjudication concluded, and what the independent
+	// verifier found when it re-read the bytes from disk. Nothing in this struct
+	// is asserted independently of it, so a reader can always get from "created
+	// src/app.go" back to the evidence that made it true.
+	execution kernelbridge.Applied
 }
 
 type shellOutputMsg struct {
@@ -2677,7 +2687,18 @@ func planToTrace(plan *planner.ContextPlan) *ctxpkg.CodebaseTrace {
 }
 
 // applyToolCallBuffer applies approved tool calls to disk and flushes the buffer.
+//
+// The write itself is a Runtime Kernel MUTATE execution now — observed,
+// authorized, written by the filesystem capability, and re-verified from disk by
+// a verifier that did not write it. What this function does is unchanged: hand the
+// approved set to the seam, and turn the adjudicated outcome into the message the
+// UI renders.
+//
+// The context is captured here rather than inside the command so the write is
+// cancelled by the same operation context that owns the turn, exactly as it was
+// when the write was a bare syscall inside this goroutine.
 func (m *model) applyToolCallBuffer() tea.Cmd {
+	ctx := m.operationContext()
 	return func() (msg tea.Msg) {
 		// ── GUARANTEED LIFECYCLE PATTERN ────────────────────────────────
 		// A panic inside the tool-call disk write must still produce a
@@ -2691,7 +2712,7 @@ func (m *model) applyToolCallBuffer() tea.Cmd {
 		if m.toolCallBuffer == nil {
 			return mutationResultMsg{err: fmt.Errorf("no tool call buffer")}
 		}
-		results, err := m.toolCallBuffer.ApplyApproved()
+		results, err := m.toolCallBuffer.ApplyApproved(ctx)
 		if err != nil {
 			return mutationResultMsg{err: err}
 		}
@@ -2708,6 +2729,11 @@ func (m *model) applyToolCallBuffer() tea.Cmd {
 				}
 				return msgs
 			}(),
+			// The execution rides along so the user-facing write is auditable:
+			// every status above is derived from its evidence, and a reader who
+			// wants to know WHY "created" was reported can read the record that
+			// established it.
+			execution: results.Execution,
 		}
 	}
 }

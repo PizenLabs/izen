@@ -14,25 +14,47 @@
 // else is a bypass, and test/architecture/kernel_lock_test.go fails the build
 // when one appears.
 //
+// # What this package must never become
+//
+// It is a migration seam, not a layer. It holds no execution state between calls,
+// no planning, no provider, no recovery, no retry and no mutation policy. It
+// composes a Spec, a Grant and a verifier, and returns whatever the kernel
+// adjudicated. If it ever needs to know what to DO rather than only how to ask —
+// if it starts choosing destinations, narrowing or widening a grant, or deciding
+// that a second attempt is warranted — it has become a second runtime, and the
+// strangler has stopped strangling.
+//
 // # The rule this package enforces
 //
 //	question in, evidence-backed verdict out
 //
 // A caller may not learn whether a workspace target exists except by receiving a
-// terminal Outcome that adjudication derived from a capability's evidence. There
-// is deliberately no cheaper API here — no bool-returning helper, no
-// "convenience" existence predicate — because a convenience API is exactly how a
-// kernel gets bypassed one release later.
+// terminal Outcome that adjudication derived from a capability's evidence, and
+// may not place bytes on disk except by receiving an Applied whose destinations
+// were written under an explicit grant and re-read afterwards by code that did
+// not write them. There is deliberately no cheaper API here — no bool-returning
+// helper, no "convenience" existence predicate, no error-returning write
+// shorthand — because a convenience API is exactly how a kernel gets bypassed one
+// release later.
+//
+// The three directions are separate files with separate entry points:
+// Observe asks a question, Apply performs a mutation, Read returns bytes.
+// Each one owns its own contract and its own verifier, and none of them can be
+// used in place of another.
 //
 // # Failure is a first-class answer
 //
-// When the outcome is not PROVEN, the answer is UNKNOWN. It is never "absent".
+// When the outcome is not PROVEN, the answer is UNKNOWN. It is never "absent",
+// and it is never "written".
 //
 // Collapsing "I could not prove it" into "it does not exist" is the precise
 // defect the kernel exists to remove, so the bridge refuses to perform that
 // collapse on a caller's behalf: Observation.Exists reports false for an
 // unproven target, and Observed distinguishes "proven absent" from "not proven"
 // so a caller can tell the two apart and refuse to proceed on the latter.
+// Applied.Landed makes the identical distinction on the mutating side: write
+// evidence beside an unproven outcome is a workspace the runtime cannot vouch
+// for, and it is not reported as a completed write.
 package kernelbridge
 
 import (
@@ -113,6 +135,12 @@ type Observation struct {
 	// Events is the durable event log, in sequence order.
 	Events []kernel.Event
 	// State is the authoritative state the verdict was derived from.
+	//
+	// It is the ZERO value when the request was refused before admission, because
+	// no execution exists to describe. Its axes then carry no meaning at all — not
+	// "NONE", which would be a claim — so a consumer must decide from Proven() and
+	// the evidence, never from an axis on a refusal. Verify above is set explicitly
+	// even then, because callers read it directly.
 	State kernel.State
 }
 
@@ -368,11 +396,70 @@ func confined(root, target string) (string, error) {
 	return abs, nil
 }
 
+// diskFact is the three-way answer an independent re-read of one destination can
+// give.
+//
+// The three outcomes are named because the difference between them is the whole
+// point of checking. "It is not there" and "I could not read it" are different
+// facts about the filesystem, and only one of them can ever be a pass. A helper
+// returning ([]byte, error) cannot express that without forcing every caller to
+// either propagate an unreadable destination as an engine failure or throw the
+// error away — and throwing it away is the move this package exists to stop
+// making.
+type diskFact int
+
+const (
+	// diskReadable: the destination exists and its bytes were read.
+	diskReadable diskFact = iota
+	// diskAbsent: the destination is not there. A real observed fact.
+	diskAbsent
+	// diskUnreadable: the destination could not be read for any reason other than
+	// absence — a permission error, a directory, an I/O failure.
+	diskUnreadable
+)
+
+// reRead derives one workspace fact about a destination independently of the
+// filesystem capability.
+//
+// It deliberately does not reuse the capability, and it performs its own
+// confinement check for the same reason: an independent derivation has to be
+// independent all the way down, or it is not a check at all.
+//
+// It takes no context. Both verifiers check cancellation themselves before
+// consulting it, so a withdrawn execution stops with CANCELLED rather than
+// settling on a verdict derived from a half-finished read.
+//
+// cause is non-nil for every outcome other than a clean answer, including a
+// destination that is simply not there. "Permission denied" is the difference
+// between a runtime that cannot verify and a workspace nobody may read, and
+// losing that string makes two unrelated failures look like one bug.
+func reRead(root, target string) (data []byte, fact diskFact, cause error) {
+	abs, err := confined(root, target)
+	if err != nil {
+		return nil, diskUnreadable, err
+	}
+	content, err := os.ReadFile(abs)
+	switch {
+	case err == nil:
+		return content, diskReadable, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, diskAbsent, err
+	default:
+		return nil, diskUnreadable, err
+	}
+}
+
 // ── Result assembly ─────────────────────────────────────────────────────────
 
 // collect projects a kernel Result into an Observation, reading presence from the
 // evidence log rather than from any intermediate the caller could have
 // influenced.
+//
+// Presence is projected from both file.exists and file.write evidence, because a
+// mutation re-observes its destination after committing and that second
+// observation is exactly what a CREATE contract's existence obligation is
+// satisfied by. Last record wins: a destination observed before and after a write
+// has a current truth, and using the first would let a stale observation decide.
 func collect(result kernel.Result, events []kernel.Event, executionID string, targets []string) Observation {
 	obs := Observation{
 		ExecutionID: executionID,
@@ -391,20 +478,43 @@ func collect(result kernel.Result, events []kernel.Event, executionID string, ta
 		obs.Presence[target] = Presence{Target: target}
 	}
 	for _, e := range obs.Evidence {
-		if e.Capability != kernel.FileExists || e.Target == "" {
+		if e.Target == "" || !presenceCapable(e.Capability) {
 			continue
 		}
 		if _, declared := obs.Presence[e.Target]; !declared {
 			continue
 		}
 		switch e.Kind {
-		case kernel.EvidenceFilePresent:
+		case kernel.EvidenceFilePresent, kernel.EvidenceFileRead:
+			// FILE_READ counts as presence for the same reason it counts for the
+			// kernel's own existence obligations: the capability opened and read
+			// the target, which is a stronger observation than a stat.
 			obs.Presence[e.Target] = Presence{Target: e.Target, Present: true, Observed: true}
 		case kernel.EvidenceFileAbsent:
 			obs.Presence[e.Target] = Presence{Target: e.Target, Present: false, Observed: true}
 		}
 	}
 	return obs
+}
+
+// presenceCapable reports whether a capability's evidence is a real observation
+// of one specific target, and therefore belongs in the presence projection.
+//
+// file.read counts, and so does file.write. Reading a file is an observation that
+// it was there, and the kernel's own CREATE and PATCH obligations already treat
+// FILE_READ as satisfying an existence requirement — a projection that disagreed
+// with adjudication would report "unknown" for a target the contract accepted.
+//
+// file.search is deliberately excluded. Its FILE_READ evidence records a match
+// count over content it loaded, not a reading of the target as a file, so letting
+// it populate presence would let a search answer a question it was not asked.
+func presenceCapable(id kernel.CapabilityID) bool {
+	switch id {
+	case kernel.FileRead, kernel.FileExists, kernel.FileWrite:
+		return true
+	default:
+		return false
+	}
 }
 
 // refused builds an Observation for a request that never reached the kernel.

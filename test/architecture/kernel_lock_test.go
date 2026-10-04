@@ -49,7 +49,7 @@ func repoRoot(t *testing.T) string {
 // one convenience helper, one "temporary" direct syscall, and the kernel is
 // advisory again while every document still claims it is authoritative.
 //
-// So there are three locks here, and each one closes a different way back in:
+// So there are four locks here, and each one closes a different way back in:
 //
 //  1. TestKernelLock_SingleKernelEntryPoint — only internal/kernelbridge may
 //     import the kernel. This stops a NEW caller from reaching past the bridge,
@@ -67,6 +67,12 @@ func repoRoot(t *testing.T) string {
 //  3. TestKernelLock_MigratedResolutionRoutesThroughKernel — the first slice
 //     cannot regress. The deleted os.Stat must not come back, and the file must
 //     stay wired to the bridge.
+//
+//  4. TestKernelLock_MigratedToolCallsOwnNoFilesystemOfTheirOwn — the native
+//     tool-call path cannot grow a syscall back. This one is deliberately
+//     stronger than the other two per-slice locks: it does not forbid specific
+//     calls, it forbids ALL of them, because after slices 2 and 3 this file has
+//     no business touching the filesystem at all.
 
 // kernelImportPaths are the kernel modules a legacy caller must reach through the
 // bridge rather than importing directly.
@@ -106,6 +112,38 @@ var lockedExecutionDirs = []string{
 var existencePrimitives = map[string]string{
 	"os.Stat":  "os.Stat",
 	"os.Lstat": "os.Lstat",
+}
+
+// workspacePrimitives are every call that touches the workspace filesystem
+// directly: deciding that a path exists, reading its bytes, or putting bytes
+// there.
+//
+// The existence lock above cannot be widened to this set without becoming noise —
+// os.WriteFile appears in dozens of places that write runtime bookkeeping, and a
+// lock that fires on all of them gets deleted rather than satisfied. That is why
+// this vocabulary is enforced against ONE file instead of a package tree.
+//
+// The file it is enforced against is internal/execution/toolcalls.go, and that is
+// not arbitrary. Slices 2 and 3 moved the native tool-call path's read and write
+// onto the kernel, which leaves it with no filesystem access of its own: it asks
+// the seam for content, and it asks the seam to commit. A file in that state has
+// exactly one correct future — keep asking — so any direct syscall appearing there
+// is a regression to the old runtime, whatever its intent.
+var workspacePrimitives = map[string]string{
+	"os.Stat":        "os.Stat",
+	"os.Lstat":       "os.Lstat",
+	"os.ReadFile":    "os.ReadFile",
+	"os.WriteFile":   "os.WriteFile",
+	"os.Create":      "os.Create",
+	"os.CreateTemp":  "os.CreateTemp",
+	"os.OpenFile":    "os.OpenFile",
+	"os.Rename":      "os.Rename",
+	"os.Remove":      "os.Remove",
+	"os.RemoveAll":   "os.RemoveAll",
+	"os.MkdirAll":    "os.MkdirAll",
+	"os.Mkdir":       "os.Mkdir",
+	"os.Open":        "os.Open",
+	"io/fs.ReadFile": "fs.ReadFile",
 }
 
 // knownExistenceBypasses is the strangler's remaining work list.
@@ -271,6 +309,133 @@ func TestKernelLock_MigratedResolutionRoutesThroughKernel(t *testing.T) {
 		t.Errorf("%s no longer references %s; the resolution is not routed through the kernel any more",
 			migrated, kernelBridgePackage)
 	}
+}
+
+// TestKernelLock_MigratedToolCallsOwnNoFilesystemOfTheirOwn pins slices 2 and 3.
+//
+// Slices 2 and 3 moved the native LLM tool-call path onto the kernel: buffering a
+// `write_file` call now reads its baseline through an adjudicated read execution,
+// and approving it now commits through an adjudicated mutation execution. The old
+// os.ReadFile / os.WriteFile pair in that file is gone.
+//
+// The assertions below are what make the deletion permanent. Each one fails when
+// violated:
+//
+//   - a direct workspace syscall in the file, because the whole point of the
+//     slice was that the kernel owns that capability. The runtime would still
+//     behave identically on a cooperative filesystem, which is exactly why the
+//     deletion needs a lock rather than a reviewer;
+//   - the file no longer importing the bridge, because that is what a "temporary
+//     direct read while we migrate" looks like once the migration is called done;
+//   - the removed second write_file implementation coming back, because two
+//     implementations of one tool is how a deletion quietly un-deletes itself.
+//
+// It also asserts the seam the migrated path actually uses is reachable, so this
+// lock cannot be satisfied by removing the migration instead of preserving it.
+func TestKernelLock_MigratedToolCallsOwnNoFilesystemOfTheirOwn(t *testing.T) {
+	root := repoRoot(t)
+	const migrated = "internal/execution/toolcalls.go"
+
+	source, err := os.ReadFile(filepath.Join(root, migrated))
+	if err != nil {
+		t.Fatalf("reading %s: %v", migrated, err)
+	}
+	text := string(source)
+
+	if sites := scanDirectWorkspacePrimitives(filepath.Join(root, migrated)); len(sites) > 0 {
+		t.Errorf("%s reaches the filesystem directly: %s.\n"+
+			"Reads and writes on the native tool-call path are kernel executions routed\n"+
+			"through %s: a read is an OBSERVE contract adjudicated from file.read\n"+
+			"evidence, and the approved write is a CREATE/PATCH execution adjudicated\n"+
+			"from file.write evidence and re-read from disk by a verifier that did not\n"+
+			"write it. A syscall here has no event, no state, no evidence and no\n"+
+			"verification behind it, and it reaches the filesystem with no grant at all.",
+			migrated, strings.Join(sites, ", "), kernelBridgePackage)
+	}
+
+	if !strings.Contains(text, kernelBridgePackage) {
+		t.Errorf("%s no longer imports %s; the tool-call path is not routed through the kernel any more",
+			migrated, kernelBridgePackage)
+	}
+
+	// The deleted second implementation. DispatchToolCalls wrote straight to disk
+	// with no grant, no evidence and no verification, and nothing called it. It was
+	// deleted as part of the slice precisely because leaving it would have left two
+	// competing write_file implementations in one file, and a future reader would
+	// have had no way to know which one the product used.
+	for _, dead := range []string{"func DispatchToolCalls", "func dispatchWriteFile", "func dispatchApplyPatch"} {
+		if strings.Contains(text, dead) {
+			t.Errorf("%s reintroduces %s.\n"+
+				"That path wrote to the workspace with no grant, no evidence and no\n"+
+				"verification, and had no callers. If a direct write is genuinely needed,\n"+
+				"add it to the kernel as a capability instead.", migrated, dead)
+		}
+	}
+
+	// The seam must still exist. A lock that can be satisfied by deleting the
+	// migration is not a lock; it is a way of declaring the old path unreachable
+	// by removing the new one.
+	for _, required := range []string{
+		filepath.Join("internal", "kernelbridge", "apply.go"),
+		filepath.Join("internal", "kernelbridge", "read.go"),
+	} {
+		if _, err := os.Stat(filepath.Join(root, required)); err != nil {
+			t.Errorf("the mutation/read seam is missing: %v\n"+
+				"%s is the only sanctioned path from the legacy tree to the kernel, so\n"+
+				"losing it would leave the migrated call sites unable to compile rather\n"+
+				"than restoring a safe path.", err, required)
+		}
+	}
+}
+
+// scanDirectWorkspacePrimitives returns every direct workspace syscall in one
+// file, as "file:line" sites, with the call name recorded.
+func scanDirectWorkspacePrimitives(path string) []string {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		// An unparseable file cannot be shown to be clean, so it is reported as a
+		// site rather than skipped. A lock that passes because it could not read
+		// its subject is worse than no lock.
+		return []string{fmt.Sprintf("%s (unparseable: %v)", path, err)}
+	}
+
+	sites := map[string]struct{}{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name := qualifiedCallName(call)
+		if workspacePrimitives[name] != "" {
+			line := fset.Position(call.Pos()).Line
+			sites[fmt.Sprintf("%s:%d (%s)", path, line, name)] = struct{}{}
+		}
+		return true
+	})
+
+	out := make([]string, 0, len(sites))
+	for site := range sites {
+		out = append(out, site)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// qualifiedCallName renders a call's callee path, so `os.Stat` and `fs.ReadFile`
+// are both nameable. It deliberately walks the full selector chain rather than
+// only its last segment: `os.Remove` and `self.Remove` must not be conflated, and
+// the receiver name is what makes that distinction.
+func qualifiedCallName(call *ast.CallExpr) string {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return ""
+	}
+	receiver, ok := selector.X.(*ast.Ident)
+	if !ok {
+		return ""
+	}
+	return receiver.Name + "." + selector.Sel.Name
 }
 
 // ── scanning ────────────────────────────────────────────────────────────────
