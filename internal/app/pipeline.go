@@ -934,30 +934,3 @@ func validateArtifactPaths(root string, artifacts []ir.Artifact) error {
 	}
 	return nil
 }
-
-// ensureParentDirs creates the parent directories of every file artifact
-// path under root. Paths that escape the workspace root are rejected before
-// any directory is created. It also ensures the root itself exists.
-func ensureParentDirs(root string, artifacts []ir.Artifact) error {
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(absRoot, 0o755); err != nil {
-		return err
-	}
-	for _, a := range artifacts {
-		if a.Kind != ir.ArtifactFile || a.Path == "" {
-			continue
-		}
-		clean := filepath.Clean(a.Path)
-		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("app: artifact path %q escapes workspace root %q", a.Path, root)
-		}
-		dir := filepath.Dir(filepath.Join(absRoot, clean))
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("app: create parent directory for %q: %w", a.Path, err)
-		}
-	}
-	return nil
-}

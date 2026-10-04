@@ -1128,3 +1128,182 @@ func declaredFuncNames(path string) []string {
 	}
 	return out
 }
+
+// functionChainCalls returns the full selector chains of every call inside the
+// named top-level function or method. Unlike functionCalls it uses
+// selectorChain, so a call through a field (`t.exec.Execute`) is nameable
+// rather than reduced to a bare selector that matches nothing.
+func functionChainCalls(t *testing.T, path, name string) map[string]bool {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+	out := map[string]bool{}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || fn.Name.Name != name {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if chain := selectorChain(call); chain != "" {
+				out[chain] = true
+			}
+			return true
+		})
+	}
+	return out
+}
+
+// brownfieldExecutionFiles are the files that make up the brownfield execution
+// path: `izen run`'s brownfield branch through the planner into the Core
+// authority. The lock is scoped to exactly these files (plus the shared graph
+// dispatch below), because that is the architectural execution path being
+// pinned — not the package, not the repository, and not the resource
+// infrastructure that legitimately reads and snapshots.
+var brownfieldExecutionFiles = []string{
+	"internal/planner/brownfield/brownfield.go",
+	"internal/planner/brownfield/coremutation.go",
+}
+
+// TestKernelLock_BrownfieldMutationRoutesThroughKernel pins the brownfield
+// mutation path to the Core authority and forbids it from regressing to a
+// direct mutation primitive.
+//
+// Before this lock, every brownfield write node called
+// file.FileResource.Write, a bare os.WriteFile: no Core authorization, no
+// transaction owner, no snapshot, no rollback, no kernel grant, no primitive
+// evidence and no verification. The workspace mutation came straight out of
+// the graph/resource layer on any `izen run` against an existing workspace.
+//
+// The assertions fail in both directions. A direct primitive or a FilePort
+// write reappearing in the execution files fails as a bypass. The graph
+// dispatch stopping to prefer the context-aware contract, the planner
+// stopping to route through coreMutationTarget, the pipeline dropping the
+// authority binding, or the seam stopping to call Execute all fail as a
+// migration that was deleted rather than preserved — because a lock
+// satisfiable by removing the new path is just a declaration that the old path
+// is unreachable.
+func TestKernelLock_BrownfieldMutationRoutesThroughKernel(t *testing.T) {
+	root := repoRoot(t)
+	const planner = "internal/planner/brownfield/brownfield.go"
+	const seam = "internal/planner/brownfield/coremutation.go"
+	const pipeline = "internal/app/plan.go"
+	const dispatch = "internal/graph/node.go"
+
+	// ── The seam exists and reaches the Core authority ───────────────────
+	seamAbs := filepath.Join(root, seam)
+	if _, err := os.Stat(seamAbs); err != nil {
+		t.Fatalf("%s is missing: %v\n"+
+			"That file is where the brownfield graph hands its intent to the Core\n"+
+			"execution authority. Without it the write has no sanctioned route to %s.",
+			seam, err, kernelBridgePackage)
+	}
+	source, err := os.ReadFile(seamAbs)
+	if err != nil {
+		t.Fatalf("reading %s: %v", seam, err)
+	}
+	if !strings.Contains(string(source), "internal/runtime/substrate") {
+		t.Errorf("%s no longer binds the brownfield write to the Core substrate authority", seam)
+	}
+	// The chain WriteContext → submit → exec.Execute is what makes the effect
+	// Core's rather than the graph's.
+	if calls := functionChainCalls(t, seamAbs, "WriteContext"); !calls["t.submit"] {
+		t.Errorf("%s: coreMutationTarget.WriteContext no longer calls t.submit; the write does not reach Core", seam)
+	}
+	if calls := functionChainCalls(t, seamAbs, "DeleteContext"); !calls["t.submit"] {
+		t.Errorf("%s: coreMutationTarget.DeleteContext no longer calls t.submit; the delete does not reach Core", seam)
+	}
+	if calls := functionChainCalls(t, seamAbs, "submit"); !calls["t.exec.Execute"] {
+		t.Errorf("%s: coreMutationTarget.submit no longer calls the Core authority's Execute", seam)
+	}
+
+	// The seam must still exist in both directions. A missing method means the
+	// migration was removed rather than preserved.
+	seamFuncs := map[string]bool{}
+	for _, fn := range declaredFuncNames(seamAbs) {
+		seamFuncs[fn] = true
+	}
+	for _, fn := range []string{"WriteContext", "DeleteContext", "submit"} {
+		if !seamFuncs[fn] {
+			t.Errorf("%s no longer defines %s.\n"+
+				"That method is the brownfield write's only route to the Core authority.\n"+
+				"If it was removed deliberately, the mutation has no authority at all.", seam, fn)
+		}
+	}
+
+	// ── The planner routes every file target through the seam ────────────
+	plannerAbs := filepath.Join(root, planner)
+	planCalls := functionCalls(t, plannerAbs, "Plan")
+	if !planCalls["p.fileTarget"] {
+		t.Errorf("%s: BrownfieldPlanner.Plan no longer lowers artifacts through p.fileTarget;\n"+
+			"it would bind write nodes to a raw resource again", planner)
+	}
+	if calls := functionCalls(t, plannerAbs, "defaultRepair"); !calls["p.fileTarget"] {
+		t.Errorf("%s: BrownfieldPlanner.defaultRepair no longer routes repairs through p.fileTarget", planner)
+	}
+	plannerSource, err := os.ReadFile(plannerAbs)
+	if err != nil {
+		t.Fatalf("reading %s: %v", planner, err)
+	}
+	if !strings.Contains(string(plannerSource), "coreMutationTarget{") {
+		t.Errorf("%s: fileTarget no longer wraps the file resource in coreMutationTarget", planner)
+	}
+	if !strings.Contains(string(plannerSource), "ErrNoMutationAuthority") {
+		t.Errorf("%s: fileTarget no longer fails closed without a Core authority", planner)
+	}
+
+	// ── The pipeline binds the authority ─────────────────────────────────
+	pipelineAbs := filepath.Join(root, pipeline)
+	if calls := functionCalls(t, pipelineAbs, "plan"); !calls["brownfield.WithMutationExecutor"] {
+		t.Errorf("%s: Pipeline.plan no longer binds the Core substrate to the brownfield planner;\n"+
+			"brownfield writes would fail closed (or, worse, if the check were removed, bypass Core)",
+			pipeline)
+	}
+
+	// ── The graph dispatch prefers the context-aware Core contract ───────
+	dispatchAbs := filepath.Join(root, dispatch)
+	if calls := functionCalls(t, dispatchAbs, "executeWriteFile"); !calls["w.WriteContext"] {
+		t.Errorf("%s: OpNode.executeWriteFile no longer prefers the context-aware Core contract;\n"+
+			"a Core-routed target would be written through the contextless fileWriter fallback",
+			dispatch)
+	}
+	if calls := functionCalls(t, dispatchAbs, "executeDeleteFile"); !calls["d.DeleteContext"] {
+		t.Errorf("%s: OpNode.executeDeleteFile no longer prefers the context-aware Core contract", dispatch)
+	}
+
+	// ── The execution path owns no direct mutation ───────────────────────
+	//
+	// None of these files may reach the workspace filesystem directly. Reads
+	// for derivation and snapshots are not in this vocabulary; what is
+	// forbidden is placing bytes without crossing Core.
+	for _, rel := range brownfieldExecutionFiles {
+		abs := filepath.Join(root, rel)
+		if _, err := os.Stat(abs); err != nil {
+			t.Fatalf("%s is missing: %v; the lock is silently covering nothing", rel, err)
+		}
+		if sites := scanDirectWorkspacePrimitives(abs); len(sites) > 0 {
+			t.Errorf("%s reaches the filesystem directly: %s.\n"+
+				"The brownfield path's final filesystem primitive is the Core authority.\n"+
+				"A direct write or removal here carries no grant, no event, no state, no\n"+
+				"evidence and no verification, and a destination a symlink redirects out of\n"+
+				"the workspace is followed by the syscall rather than refused. Reach %s\n"+
+				"through %s instead.", rel, strings.Join(sites, ", "), kernelBridgePackage, seam)
+		}
+	}
+
+	// Restoring through the adapter would call file.FileResource.Restore, which
+	// writes with a bare os.WriteFile. Assert the adapter refuses to restore
+	// instead of delegating, so the seam file owns no mutation capable call.
+	if strings.Contains(string(source), ".base.Restore(") {
+		t.Errorf("%s delegates Restore to the base file resource, reintroducing a direct writer", seam)
+	}
+	if strings.Contains(string(source), ".base.Write(") {
+		t.Errorf("%s delegates Write to the base file resource, reintroducing the original bypass", seam)
+	}
+}

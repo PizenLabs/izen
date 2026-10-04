@@ -81,7 +81,6 @@ var workspaceWriteOwners = map[string][]string{
 	// and cache blobs. They are frozen here so the distinction from a workspace
 	// mutation is explicit and so a new writer inside them shows up in the diff.
 	"cmd/izen":                             {"os.WriteFile("},
-	"internal/app":                         {"os.MkdirAll("},
 	"internal/app/model":                   {"os.MkdirAll(", "os.WriteFile("},
 	"internal/audit":                       {"os.MkdirAll(", "os.OpenFile("},
 	"internal/checkpoint":                  {"os.MkdirAll(", "os.Remove(", "os.RemoveAll(", "os.WriteFile("},
@@ -143,24 +142,33 @@ var workspaceWriteOwners = map[string][]string{
 	"internal/boundary":           nil, // delegates to internal/execution
 	"internal/runtime/autonomy":   nil, // the DAG rollback seam
 	"internal/runtime/scopeguard": nil,
-	"internal/autonomy":           nil,
-	"internal/policy":             nil,
-	"internal/modes":              nil,
-	"internal/verification":       nil,
-	"internal/contextspec":        nil,
-	"internal/protocol":           nil,
-	"internal/understanding":      nil,
-	"internal/changesurface":      nil,
-	"internal/presentation":       nil,
-	"internal/contextcompiler":    nil,
-	"internal/domain":             nil,
-	"internal/core":               nil,
-	"internal/continuation":       nil,
-	"internal/hotfix":             nil,
-	"internal/tui":                nil,
-	"internal/events":             nil,
-	"internal/ai":                 nil,
-	"internal/llmstep":            nil,
+	// internal/app used to own os.MkdirAll(: the brownfield branch created
+	// artifact parent directories eagerly before the graph ran. Those writes
+	// now disappear with the brownfield mutation migration — the kernel's
+	// file.write capability creates parents as part of the authorized,
+	// evidence-backed mutation — so internal/app holds no workspace-write
+	// primitive and is recorded clean. A primitive reappearing here fails the
+	// build, which is what stops the eager directory creation from quietly
+	// returning.
+	"internal/app":             nil,
+	"internal/autonomy":        nil,
+	"internal/policy":          nil,
+	"internal/modes":           nil,
+	"internal/verification":    nil,
+	"internal/contextspec":     nil,
+	"internal/protocol":        nil,
+	"internal/understanding":   nil,
+	"internal/changesurface":   nil,
+	"internal/presentation":    nil,
+	"internal/contextcompiler": nil,
+	"internal/domain":          nil,
+	"internal/core":            nil,
+	"internal/continuation":    nil,
+	"internal/hotfix":          nil,
+	"internal/tui":             nil,
+	"internal/events":          nil,
+	"internal/ai":              nil,
+	"internal/llmstep":         nil,
 }
 
 // TestPhase12_WorkspaceWriteOwnershipIsFrozen pins the mutation-boundary

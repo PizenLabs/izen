@@ -19,9 +19,23 @@ type (
 	fileWriter interface {
 		Write([]byte) error
 	}
+	// contextFileWriter writes raw content onto a file target with the
+	// operation's context. It is the preferred contract: a target that routes
+	// its mutation to a Core execution authority must observe cancellation and
+	// deadlines, and a signature without a context cannot carry them. It is
+	// deliberately separate from fileWriter so the legacy staging resources
+	// (file.FileResource, txfs.TxResource) keep their existing shape.
+	contextFileWriter interface {
+		WriteContext(ctx context.Context, data []byte) error
+	}
 	// fileDeleter removes a file target.
 	fileDeleter interface {
 		Delete() error
+	}
+	// contextFileDeleter removes a file target with the operation's context.
+	// See contextFileWriter for why the context-bearing variant exists.
+	contextFileDeleter interface {
+		DeleteContext(ctx context.Context) error
 	}
 	// commandRunner executes a shell command on a terminal target.
 	commandRunner interface {
@@ -92,12 +106,21 @@ func (n *OpNode) executeWriteFile(ctx context.Context) domaintask.TaskResult {
 	if !ok {
 		return failedResult(errors.New("graph: write operation requires an ir.Artifact payload"))
 	}
+	if err := ctx.Err(); err != nil {
+		return canceledResult(err)
+	}
+	// Prefer a target that routes the mutation through a Core execution
+	// authority with the operation's context. Falling back to the contextless
+	// fileWriter keeps staging resources working unchanged.
+	if w, ok := n.op.TargetResource.(contextFileWriter); ok {
+		if err := w.WriteContext(ctx, artifact.Content); err != nil {
+			return failedResult(fmt.Errorf("graph: write %q: %w", artifact.Path, err))
+		}
+		return domaintask.TaskResult{Status: domaintask.ExecStatusCompleted}
+	}
 	w, ok := n.op.TargetResource.(fileWriter)
 	if !ok {
 		return failedResult(errors.New("graph: write operation target does not support file writes"))
-	}
-	if err := ctx.Err(); err != nil {
-		return canceledResult(err)
 	}
 	if err := w.Write(artifact.Content); err != nil {
 		return failedResult(fmt.Errorf("graph: write %q: %w", artifact.Path, err))
@@ -106,12 +129,18 @@ func (n *OpNode) executeWriteFile(ctx context.Context) domaintask.TaskResult {
 }
 
 func (n *OpNode) executeDeleteFile(ctx context.Context) domaintask.TaskResult {
+	if err := ctx.Err(); err != nil {
+		return canceledResult(err)
+	}
+	if d, ok := n.op.TargetResource.(contextFileDeleter); ok {
+		if err := d.DeleteContext(ctx); err != nil {
+			return failedResult(fmt.Errorf("graph: delete operation: %w", err))
+		}
+		return domaintask.TaskResult{Status: domaintask.ExecStatusCompleted}
+	}
 	d, ok := n.op.TargetResource.(fileDeleter)
 	if !ok {
 		return failedResult(errors.New("graph: delete operation target does not support file deletion"))
-	}
-	if err := ctx.Err(); err != nil {
-		return canceledResult(err)
 	}
 	if err := d.Delete(); err != nil {
 		return failedResult(fmt.Errorf("graph: delete operation: %w", err))

@@ -1,7 +1,7 @@
 # Kernel Integration Map
 
-**Status:** current as of the FileExecutor slice (the `izen orchestrate` /
-`izen prompt` commit and rollback path).
+**Status:** current as of the brownfield mutation slice (the `izen run`
+brownfield path).
 **Companion:** `docs/architecture/STRANGLER_MIGRATION.md`.
 
 This document is the audit that precedes the integration. Every line was
@@ -116,14 +116,15 @@ created the destination directory before the grant was checked.
 | `restoreFromShadowBackup`, `MutationSet.RollbackTo` | EXEMPT | recovery/rollback, out of scope |
 | `os.ReadFile` in `apply`, fresh-context retry | KEEP | patch derivation against live bytes |
 | `internal/runtime/executor/file_executor.go` `atomicWrite`/`Rollback` | REPLACED (FileExecutor slice) | the transaction stayed in Core; only the final filesystem effect moved. See §7 |
-| `internal/app/plan.go` brownfield branch → `internal/resource/file.FileResource.Write` | **OPEN — live bypass** | `izen run` on any existing workspace takes this branch, writes through a bare `os.WriteFile`, and never reaches the substrate, so no kernel, no `ExecutionProof` and no rollback. Highest-priority remaining item. See §4.1 |
-| `internal/app/pipeline.go` `ensureParentDirs` | OPEN | same brownfield branch; `os.MkdirAll` for artifact parents |
+| `internal/app/plan.go` brownfield branch → `internal/resource/file.FileResource.Write` | **REPLACED (brownfield slice)** | the graph/resource layer no longer owns the effect. The planner lowers each artifact to a `coreMutationTarget`, which submits a `substrate.Proposal` to the same Core authority Path A uses. See §8 |
+| `internal/app/pipeline.go` `ensureParentDirs` | REMOVED | the eager `os.MkdirAll` is gone; the kernel's `file.write` capability creates parent directories as part of the authorized, evidence-backed mutation |
 | `internal/fs/txfs.go` `TxFS.Commit` | EXEMPT | zero production callers; dead. Its rollback siblings are recovery |
 | `internal/substrate/patch.go` `ApplyPatch` | EXEMPT | zero production callers; dead |
 | `internal/runtime/substrate` `Substrate.ExecuteUnit` | EXEMPT | belongs to `internal/runtime/executor.RuntimeExecutor`, which has no production constructor; dead |
 | `internal/execution/boundary.go` `RollbackAndVerify` | EXEMPT | recovery: restores a caller-supplied `originals` map after a DAG abort. Never places a new mutation |
 | `internal/patch/applicator.go` `FileApplicator.Apply` | EXEMPT | DI-wired but never invoked; `Engine.Apply` has no production caller. Dead |
 | `internal/infrastructure/capabilities/osfile.go` `OSFile.Write`/`Remove` | EXEMPT | every production call site writes a `.izen/` bookkeeping path; `main.go`'s instance is stored in `compose.Capabilities.File` and never read |
+| `internal/resource/file/file.go` `Write`/`Delete`/`Restore` | EXEMPT | no longer on the production brownfield path; the brownfield planner binds `coreMutationTarget`, and the adapter refuses `Restore` rather than delegating. Remains a capability primitive for callers that hold it directly |
 | `internal/runtime/substrate` `ConcreteSubstrate.commitWrite`/`commitDelete` | REPLACED (slice 6) | stack A's commit path now crosses `internal/kernelbridge` |
 | `internal/runtime/substrate` rollback (`writeForRecovery`/`removeForRecovery`) | EXEMPT | recovery; Core owns undo and it never migrates |
 | `internal/runtime/substrate` `writeEvidenceProof` | KEEP | `.izen` bookkeeping, not a mutation target |
@@ -135,40 +136,48 @@ created the destination directory before the grant was checked.
 > Can any authorized IZEN operation currently mutate a workspace without
 > crossing `internal/kernelbridge`?
 
-**Yes.** `izen run` on any workspace `defaultDetector` classifies as brownfield —
-which is any workspace containing a non-hidden directory, source file, or
-manifest — takes `internal/app/plan.go:316-340`. That branch builds raw
-`*file.FileResource` targets (`internal/planner/brownfield/brownfield.go:218`),
-lowers them to `op.OpWriteFile`, and executes them through
-`internal/graph/node.go:102` → `internal/resource/file/file.go:213`, which is a
-bare `os.WriteFile`.
+**Not via `izen run`.** The brownfield branch used to be the counterexample:
+`izen run` on any workspace `defaultDetector` classifies as brownfield — which
+is any workspace containing a non-hidden directory, source file, or manifest —
+took `internal/app/plan.go:316-340`, built raw `*file.FileResource` targets
+(`internal/planner/brownfield/brownfield.go:218`), lowered them to
+`op.OpWriteFile`, and executed them through `internal/graph/node.go:102` →
+`internal/resource/file/file.go:213`, a bare `os.WriteFile`. No transaction
+owner, no Core authorization, no kernel, no evidence.
 
-The consequence is structural, not incidental. The greenfield branch stages
-through `TxFS` and only reaches the substrate when `p.tx.StagedPaths()` is
-non-empty (`internal/app/pipeline.go:499`). The brownfield branch never stages,
-so `ConcreteSubstrate.Execute` is never called and the kernel is never crossed
-on that run at all — no grant, no event, no evidence, no verification, and no
-transaction to roll the write back.
+That branch now routes through Core (§8). The mutation the planner describes
+becomes a `substrate.Proposal` submitted to the same `ProposalExecutor` Path A
+uses; the final effect crosses `internal/kernelbridge` under an explicit grant
+and is adjudicated into `MutationEvidence`. The remaining process-execution
+surface (`OpExecCmd` → `ShellPort`) is a different capability and is recorded
+in §4, not claimed here.
 
-This is the strangler's next slice, and it is larger than the one just
-completed: the mutation is dispatched through a graph operation layer rather
-than through a transaction owner, so there is no rollback to preserve and no
-existing seam to widen — the path has to be given one.
+The greenfield branch stages through `TxFS` and only reaches the substrate when
+`p.tx.StagedPaths()` is non-empty (`internal/app/pipeline.go:499`). The
+brownfield branch no longer needs to stage: each described write is submitted
+to the substrate directly, because its verify command must run against the live
+workspace.
 
 ## 5. The seams, stated once
 
-There are three, and they are the same shape because they are the same decision
-taken on three paths.
+There are four now, and they share a shape because they are the same decision
+taken on four paths. The brownfield seam delegates one level further: it hands
+a proposal to Core's existing authority (the Path A seam) rather than reaching
+the bridge itself, so the final filesystem effect still crosses exactly one
+door.
 
 | Path | Seam | Delegates to |
 |---|---|---|
 | C — `RuntimeExecutor` | `internal/execution/patch.go : commitThroughKernel` | `kernelbridge.Apply` |
 | A — `izen run` | `internal/runtime/substrate/kernelcommit.go : commitWrite` / `commitDelete` | `kernelbridge.Apply` / `kernelbridge.Delete` |
 | O — `izen orchestrate` | `internal/runtime/executor/kernelcommit.go : placeThroughKernel` / `removeThroughKernel` | `kernelbridge.Apply` / `kernelbridge.Delete` |
+| BF — `izen run` brownfield | `internal/planner/brownfield/coremutation.go : submit` | `substrate.ConcreteSubstrate.Execute` → Path A seam → `kernelbridge.Apply` / `kernelbridge.Delete` |
 
-Each is authoritative because it is the only place on its path that places
-resolved bytes on disk, and each delegates that placement to `internal/kernelbridge`,
-the only sanctioned path from the legacy tree to `runtime/kernel`.
+The brownfield seam is authoritative for the same reason the others are: it is
+the only place on its path that hands the graph's described mutation to a Core
+authority, and it owns no filesystem primitive of its own. Core's authority is
+the only component that places the bytes, and it delegates that final effect to
+`internal/kernelbridge`.
 
 
 ## 6. Stack A call graph (as built, slice 6)
@@ -313,3 +322,104 @@ outside the workspace through a symlink is refused and the file beyond the
 boundary is byte-for-byte unchanged; a confined target is still written with
 the resolved bytes; both rollback directions still work; and an unbound
 executor mutates nothing.
+
+## 8. The brownfield path (as built, brownfield slice)
+
+```
+izen run                              cmd/izen/runtime.go
+  → app.Pipeline.Run                  internal/app/pipeline.go
+  → app.Pipeline.plan                 internal/app/plan.go (brownfield branch)
+  → brownfield.BrownfieldPlanner.Plan internal/planner/brownfield/brownfield.go
+  → p.fileTarget                      GRAPH/RESOURCE: target + desired content + intent
+  → coreMutationTarget                internal/planner/brownfield/coremutation.go
+  → substrate.ProposalExecutor.Execute ← THE CORE BOUNDARY (existing authority)
+  → ConcreteSubstrate.Execute         Core: admission, transaction, rollback, verification
+  → commitWrite / commitDelete        ← THE SEAM
+  → kernelbridge.Apply / Delete
+  → runtime/kernel                    Engine.Open → Run → dispatch → verify → adjudicate
+  → runtime/capabilities/filesystem   file.write / file.delete
+  → MutationEvidence + ExecutionProof Core evidence (.izen/substrate/<id>.proof)
+  → bf-verify command node            Core-side command verification
+```
+
+### 8.1 What the graph layer owns, and what it does not
+
+The graph still sequences the plan and drives the closed-loop repair: write
+nodes in dependency order, a verify command node depending on every write, and
+`InjectRepairOps` when the verify command fails. What it no longer owns is the
+filesystem effect. Each write node targets a `coreMutationTarget`, which
+describes exactly one mutation — a workspace-relative target, the desired
+content, and the operation intent — and submits it to the Core authority. The
+resource layer is a request shaper, not an executor; it never calls a
+filesystem primitive and never constructs or widens a kernel Grant.
+
+### 8.2 The operation is truthful
+
+Brownfield planning lowers file artifacts to whole-content writes, so the
+intent is `op.OpWriteFile` and the substrate maps it to `substrate.OpFileWrite`.
+Core declares that under the same `kernelbridge.ContractPatch` Path A uses: a
+whole-content replace does not distinguish creation from overwrite, and PATCH
+is the honest under-claim. The kernel still reports creation truthfully through
+`Applied.Created`, derived from its own pre-write observation rather than from
+anything the planner asserted. A delete intent maps to `substrate.OpFileDelete`
+and is refused if it is not a durable removal.
+
+### 8.3 Authorization, transaction, verification, evidence
+
+All four are Core's and none of them moved into the graph or the kernel.
+
+- **Authorization / admission.** `ConcreteSubstrate.Execute` → `confinedTarget`
+  applies lexical containment (`substrateRel`) and the use-time
+  FD-anchored `scope.Root.Verify`, so a symlink swapped in after planning fails
+  closed with `ErrWorkspaceEscape` before the kernel is asked. The kernel then
+  re-checks confinement independently from its own root handle and admits the
+  execution under a grant naming exactly the requested destination.
+- **Transaction.** The substrate snapshots the target before the mutation and
+  rolls the whole proposal back on any failure; the kernel owns no transaction
+  state. This is the same transaction owner Path A uses, not a second one.
+- **Verification.** `verifyProposal` re-anchors the payload by AST symbol
+  extraction before commit, and the kernel's independent content verifier
+  re-reads the bytes from disk through code that did not write them.
+- **Evidence.** Each mutation produces `MutationEvidence` carrying the kernel
+  execution id, contract, outcome, verification axis and landing verdict, and
+  the transaction writes a durable `.izen/substrate/<id>.proof` plus a stored
+  evidence record. A write that reached disk and failed its re-read is reported
+  as unproven and rolled back, never as a completed mutation.
+
+### 8.4 Removed byproducts
+
+- `internal/app/plan.go`'s eager `ensureParentDirs` (`os.MkdirAll`) is gone.
+  The kernel's `file.write` capability creates parent directories as part of
+  the authorized mutation, so the brownfield path no longer opens a directory
+  before the grant is checked.
+- `internal/resource/file/file.go` is no longer a production workspace
+  mutation authority. The brownfield planner binds `coreMutationTarget`; the
+  adapter delegates only read/validate/snapshot and refuses `Restore` rather
+  than delegating to `FileResource.Restore`.
+
+### 8.5 Architecture lock
+
+`TestKernelLock_BrownfieldMutationRoutesThroughKernel` in
+`test/architecture/kernel_lock_test.go`. It pins the execution files, asserts
+the planner routes every file target through `p.fileTarget` and that
+`fileTarget` wraps it in `coreMutationTarget` (failing closed with
+`ErrNoMutationAuthority`), asserts the seam's `WriteContext`/`DeleteContext` →
+`submit` → authority `Execute` chain, asserts the pipeline binds the substrate,
+and asserts the graph dispatch prefers the context-aware Core contract. It
+fails in both directions: a direct primitive reappearing in the execution files
+is a bypass, and deleting the seam (or its `Execute` call) fails as a migration
+removed rather than preserved. It is scoped to the brownfield execution path;
+reads, snapshots and recovery elsewhere remain legitimate.
+
+### 8.6 Behavioural proof
+
+`internal/planner/brownfield/coremutation_test.go` asserts the observable
+consequences against a real `*substrate.ConcreteSubstrate`: a truthful proposal
+shape, the delete intent, fail-closed without an authority, an authority
+refusal that is inert and produces no proof, context cancellation propagation,
+an authorized mutation that changes the target and produces PROVEN primitive
+and committed Core evidence, a symlink escape that mutates nothing beyond the
+boundary, and kernel-created parent directories. The end-to-end `izen run`
+smoke test is `TestPipelineBrownfieldMutationCrossesKernelAuthority` in
+`internal/app/brownfield_kernel_test.go`: it begins with an existing workspace
+and asserts the file changed and a PROVEN proof was written.

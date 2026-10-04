@@ -314,13 +314,12 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 	}
 
 	if useBrownfield {
-		// Brownfield writes and its verify command run against the live
-		// workspace, so parent directories are created eagerly here. The
-		// greenfield path defers directory creation to TxFS.Commit, letting a
-		// failed run roll the workspace back to a completely pristine state.
-		if err := ensureParentDirs(p.root, artifacts); err != nil {
-			return nil, ModeAuto, nil, err
-		}
+		// Brownfield writes run against the live workspace, but the planner no
+		// longer writes to it directly. Every mutation it plans is submitted to
+		// the pipeline's Core execution authority (the same substrate Path A
+		// uses), which authorizes, snapshots, transacts, kernel-executes and
+		// records evidence. Parent directories are created by the kernel's
+		// file.write capability, so no eager os.MkdirAll runs here.
 		verify := p.verify
 		if verify == nil {
 			verify = detectVerifyCommand
@@ -329,6 +328,7 @@ func (p *Pipeline) plan(ctx context.Context, intent string, artifacts []ir.Artif
 			p.root,
 			brownfield.WithVerifyCommand(func(string) string { return verify(p.root) }),
 			brownfield.WithTimeout(2*time.Minute),
+			brownfield.WithMutationExecutor(p.substrate),
 		)
 		if err != nil {
 			return nil, ModeBrownfield, nil, err
