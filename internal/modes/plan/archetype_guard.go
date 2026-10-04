@@ -178,17 +178,28 @@ func ValidateShellExecCommandsForArchetype(tasks []Task, ledgerContent string, a
 
 // archetypeFallbackTarget chooses a target that is meaningful for a fallback
 // task instead of defaulting every failed plan to main.go.
+//
+// NEITHER BRANCH MAY FABRICATE A FILENAME. This used to fall back to the literal
+// "index.html" for VANILLA_WEB and REACT_NEXT when the allowed set contained no
+// eligible file. That is markup-specific target fabrication in a general planning
+// component: it invented a file the workspace had not been shown to contain, and
+// it did so from a family classification rather than from evidence. §11 of the
+// runtime constitution forbids the archetype guard from ever substituting a
+// guessed target for an evidenced one.
+//
+// An empty return is the truthful outcome: no eligible file, no target. The
+// caller resolves the real target from the change surface or asks the human.
 func archetypeFallbackTarget(archetype recon.ProjectArchetype, allowed []string, problem, ledger string) string {
-	if archetype == recon.VANILLA_WEB {
+	switch archetype {
+	case recon.VANILLA_WEB:
 		for _, file := range allowed {
 			lower := strings.ToLower(file)
 			if strings.HasSuffix(lower, ".html") || strings.HasSuffix(lower, ".css") || strings.HasSuffix(lower, ".js") {
 				return file
 			}
 		}
-		return "index.html"
-	}
-	if archetype == recon.REACT_NEXT {
+		return ""
+	case recon.REACT_NEXT:
 		for _, file := range allowed {
 			lower := strings.ToLower(file)
 			if strings.HasSuffix(lower, ".html") || strings.HasSuffix(lower, ".css") ||
@@ -197,7 +208,7 @@ func archetypeFallbackTarget(archetype recon.ProjectArchetype, allowed []string,
 				return file
 			}
 		}
-		return "index.html"
+		return ""
 	}
 	if target := detectDirectMutation(problem, ledger); target != nil && target.Target != "" {
 		return target.Target

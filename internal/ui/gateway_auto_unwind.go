@@ -98,6 +98,18 @@ func (m *model) casualDirectResponse(content string) string {
 // ZERO PIPELINE PROPAGATION: this path performs no Gateway.Gate call, no
 // ScopeGuard proposal, no WorkerEngine dispatch, no plan synthesis, and no
 // provider invocation.
+//
+// A PARKED RUN IS NOT A STUCK PHASE. The unwind exists to rescue a session
+// trapped in a live execution phase; a run parked at a human boundary is not
+// trapped, it is WAITING, and it still holds a candidate a human has not ruled
+// on. Resetting it was destroying live execution state through a door nobody
+// was looking at: typing "hi" at a mutation review took the lifecycle from
+// `awaiting_authorization` to `idle` and released the boundary — which is the
+// same signature as the reported defect (a run that was waiting, reported as
+// idle), arriving by a different route.
+//
+// So a casual message while parked is answered WITHOUT unwinding. Conversation
+// is not a decision, and it must not stand in for one.
 func (m *model) handleCasualAutoUnwind(line string) bool {
 	if m == nil || m.workflowSM == nil {
 		return false
@@ -110,14 +122,31 @@ func (m *model) handleCasualAutoUnwind(line string) bool {
 	}
 	content := stripCasualDirectives(line)
 
+	// Answer, touch nothing.
+	if m.workflowSM.Parked() || m.autonomousParked() {
+		m.answerCasualLocally(content)
+		if m.autonomousBoundary != nil {
+			m.push(roleSystem, infoStyle.Render(
+				"  A run is parked at a human boundary — the runtime is waiting for your decision. Chatting did not resolve it."))
+			m.refreshViewportContent()
+			m.gotoBottomIfAllowed()
+		}
+		return true
+	}
+
 	// GENERATION EPOCH ISOLATION: invalidate all pending background worker
 	// callbacks. Any async payload arriving with Epoch < generationEpoch is
 	// silently dropped so stale state can never corrupt the reset UI.
 	m.generationEpoch++
 
-	// 1. Unwind the WorkflowStateMachine to StateIdle. EventReset is valid
-	// from every non-idle workflow state.
-	if err := m.workflowSM.SendEvent(workflow.EventReset, workflow.TransitionContext{}); err != nil {
+	// 1. Unwind to the interactive resting position through the ONE authority
+	// that owns both the logical phase and the state machine. EventReset is
+	// valid from every non-idle workflow state.
+	if m.orch != nil {
+		if err := m.orch.ResetToAsk(workflow.TransitionContext{}); err != nil {
+			m.appendSystemError(fmt.Errorf("failed to auto-unwind orchestrator on casual prompt: %w", err))
+		}
+	} else if err := m.workflowSM.SendEvent(workflow.EventReset, workflow.TransitionContext{}); err != nil {
 		m.appendSystemError(fmt.Errorf("failed to auto-unwind state machine on casual prompt: %w", err))
 	}
 	// Keep the application-layer domain runtime reachable: a stale Build /
@@ -125,14 +154,6 @@ func (m *model) handleCasualAutoUnwind(line string) bool {
 	// "moving to a previous phase is not permitted".
 	if m.workflowRT != nil {
 		m.workflowRT.Reset()
-	}
-	// Keep the orchestrator projection consistent with the reset machine.
-	// Force(PhaseAsk) maps onto StateIdle (no-op on the SM) and re-anchors
-	// the orchestrator's current/history without touching the phase graph.
-	if m.orch != nil {
-		if err := m.orch.Force(domainorch.PhaseAsk, workflow.TransitionContext{}); err != nil {
-			m.appendSystemError(fmt.Errorf("failed to auto-unwind orchestrator on casual prompt: %w", err))
-		}
 	}
 
 	// 2. Clear any active execution / streaming state so no spinner, tick
@@ -161,6 +182,19 @@ func (m *model) handleCasualAutoUnwind(line string) bool {
 	m.ti.Focus()
 
 	// 4. Direct response immediately, without entering pipeline dispatch.
+	m.answerCasualLocally(content)
+	m.refreshViewportContent()
+	m.gotoBottomIfAllowed()
+	return true
+}
+
+// answerCasualLocally delivers the direct response and records it in the
+// conversation, without touching any execution state. It is the part of the
+// casual lane that is safe to run while a run is parked.
+func (m *model) answerCasualLocally(content string) {
+	if m == nil {
+		return
+	}
 	if m.sess != nil {
 		// Stage 1 titling also applies to the casual first turn: the session
 		// must never surface with a raw timestamp title.
@@ -170,9 +204,6 @@ func (m *model) handleCasualAutoUnwind(line string) bool {
 		m.persistSession("gateway-auto-unwind")
 	}
 	m.push(roleAI, m.casualDirectResponse(content))
-	m.refreshViewportContent()
-	m.gotoBottomIfAllowed()
-	return true
 }
 
 // isBackwardTransitionError reports whether err is a phase-transition

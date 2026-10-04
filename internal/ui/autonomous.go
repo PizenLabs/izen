@@ -82,6 +82,10 @@ type autonomousDriver interface {
 	Termination() *autonomy.LoopTermination
 	SetStreamCallback(cb execution.StreamCallback)
 	AggregatedUsage() (input, output int, known bool)
+	// RunID is the runtime's stable identity for the current execution run. It
+	// is what a human is told when asked "which run is parked?" — a parked
+	// boundary is only actionable if the operator can name it.
+	RunID() string
 }
 
 // autonomousRunMsg carries a driver Run/Resume/Abort outcome back into the
@@ -257,9 +261,14 @@ func (m *model) resumeAutonomousApprove() tea.Cmd {
 			m.Viewport.GotoBottom()
 			return nil
 		}
-		m.push(roleError, "[autonomous] authorization: "+err.Error())
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		// The refusal has already been reported and the gate closed by
+		// convergeAutonomousApproval; a second line here would only stack noise
+		// on a boundary that no longer exists.
+		if m.autonomousBoundary != nil {
+			m.push(roleError, "[autonomous] authorization: "+err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+		}
 		return nil
 	}
 	m.autonomousBoundary = nil
@@ -363,9 +372,13 @@ func (m *model) resumeAutonomousProposalApprove() tea.Cmd {
 			m.Viewport.GotoBottom()
 			return nil
 		}
-		m.push(roleError, "[autonomous] proposal authorization: "+err.Error())
-		m.refreshViewportContent()
-		m.Viewport.GotoBottom()
+		// convergeAutonomousAuthorization already stated the refusal and closed
+		// the gate; a duplicate line here would only stack noise.
+		if m.autonomousBoundary != nil {
+			m.push(roleError, "[autonomous] proposal authorization: "+err.Error())
+			m.refreshViewportContent()
+			m.Viewport.GotoBottom()
+		}
 		return nil
 	}
 	m.autonomousBoundary = nil
@@ -509,9 +522,10 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 		}
 		m.autonomousBoundary = nil
 		m.finalizeOperation(OpOutcomeFailure, msg.err)
-		// A terminal driver failure must release the workflow phase: without
-		// this the header would keep rendering BUILDING after the loop halted.
-		m.unwindBuildFailure()
+		// A terminal driver failure releases the workflow phase through the ONE
+		// sanctioned unwind, so the BUILDING header cannot survive the loop. The
+		// unwind is idempotent against an already-terminal machine.
+		m.unwindTerminalExecution()
 		m.push(roleError, "[autonomous] "+msg.err.Error())
 		m.refreshViewportContent()
 		m.Viewport.GotoBottom()
@@ -553,7 +567,15 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 				m.finalizeOperation(OpOutcomeFailure, nil)
 				m.renderAutonomousInformBoundary(b)
 			}
-			m.enterApprovalState()
+			// Only a boundary that actually asks a human for a DECISION arms the
+			// pending-approval workflow override. An informational park has no
+			// resume decision, so freezing the workflow as "awaiting
+			// authorization" would report a pause as a permission request.
+			if b.Resumable {
+				m.enterApprovalState()
+			} else {
+				m.resolveApprovalState()
+			}
 		} else {
 			m.finalizeOperation(OpOutcomeFailure, nil)
 		}
@@ -572,6 +594,11 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 	switch msg.term.State {
 	case autonomy.RuntimeCompleted:
 		m.finalizeOperation(OpOutcomeSuccess, nil)
+		// Terminal for this run. The unwind is what stops the lifecycle reading
+		// `building` after the change has already landed: a PROVEN completion is
+		// not still executing, and reporting it as such leaves the next prompt
+		// judged against a run that no longer exists.
+		m.unwindTerminalExecution()
 		m.push(roleSystem, infoStyle.Render("[autonomous] "+greenStyle.Render("completed")+" — "+msg.term.Reason))
 	case autonomy.RuntimeUnsubstantiated:
 		// ── PHASE 14: THE OBJECTIVE WAS NOT PROVEN ─────────────────────
@@ -581,14 +608,19 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 		// hit the same wall; reporting it as "completed" would be the false
 		// completion this phase exists to prevent.
 		m.finalizeOperation(OpOutcomeAmbiguous, nil)
-		m.unwindBuildFailure()
+		// Terminal for this run (see RuntimeUnsubstantiated: a terminal position).
+		// The unwind releases the phase and the human boundary together.
+		m.unwindTerminalExecution()
 		m.push(roleSystem, infoStyle.Render("[autonomous] "+orangeStyle.Render("objective was not proven")+" — "+msg.term.Reason))
 		m.push(roleSystem, infoStyle.Render(ObjectiveUnprovenMessage("")))
 	default:
 		m.finalizeOperation(OpOutcomeFailure, nil)
-		// An aborted autonomous run is terminal: release the workflow phase
-		// so the BUILDING header status cannot survive the abort.
-		m.unwindBuildFailure()
+		// The run reached a TERMINAL state. The unwind is the abort transition: it
+		// releases the live execution phase AND the human boundary the terminated
+		// run was parked at. Leaving `awaiting_authorization` behind would report a
+		// finished run as waiting for a decision and block the next execution for an
+		// answer nobody can now give.
+		m.unwindTerminalExecution()
 		m.push(roleError, "[autonomous] aborted — "+msg.term.Reason)
 		m.push(roleSystem, infoStyle.Render("Interrupted."))
 	}
@@ -609,9 +641,70 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 // authorizeAutonomousApproval issues a MutationAuthorization over the parked
 // approval boundary's target files and attaches it to the executor the driver
 // shares, so ResumeApprove applies the held patch under governance.
+//
+// The token is bound to the boundary's MutationCandidate identity AND to the
+// content digest the human's MUTATION REVIEW was rendered from. Authorization is
+// therefore a statement about ONE concrete change: a token opened for one
+// candidate can never apply another, a candidate replaced in place can never be
+// applied under an older review, and a boundary whose candidate the execution
+// authority no longer holds is refused here instead of at the mutation boundary.
+//
+// CONVERGENCE. Every refusal is terminal for this boundary. The parked approval
+// state is dropped so the same impossible authorization can never be requested
+// twice: human approval is the final authorization gate, not a retry loop around
+// a proposal the runtime already knows it cannot authorize.
 func (m *model) authorizeAutonomousApproval() error {
 	if m.executor == nil || m.authEngine == nil {
 		return nil
+	}
+	b := m.autonomousBoundary
+	// ── CANDIDATE FRESHNESS (lineage, re-checked at the release seam) ───
+	// The runtime's admission gate already refused an approval boundary whose
+	// candidate was not held at park time; this is the same read taken again at
+	// the moment of release, because a human answer takes unbounded time.
+	if b != nil && b.Action == autonomy.HumanBoundaryApproval && !m.executor.CandidateHeld(b.PatchID) {
+		m.convergeAutonomousAuthorization("mutation candidate " + b.PatchID +
+			" is no longer held by the execution authority — the computation that produced it failed, " +
+			"was superseded or was cancelled. No files were modified.")
+		return fmt.Errorf("candidate %s is no longer executable", b.PatchID)
+	}
+	// ── CANDIDATE CONTENT FRESHNESS ────────────────────────────────────
+	// Identity alone answers "is this the same computation?". Content answers
+	// "is this the same CHANGE?". A candidate whose bytes were replaced in place
+	// under a stable identity would otherwise be applied under a review a human
+	// never saw, so the digest the review was rendered from is re-read here and
+	// carried on the token.
+	digest := ""
+	if b != nil && b.Action == autonomy.HumanBoundaryApproval && (b.CandidateDigest != "" || b.CandidateID != "") {
+		preview, ok := m.executor.CandidatePreview(b.PatchID)
+		if !ok {
+			m.convergeAutonomousAuthorization("mutation candidate " + b.PatchID +
+				" could not be re-read at authorization time. No files were modified; a new mutation review is required.")
+			return fmt.Errorf("candidate %s is no longer reviewable", b.PatchID)
+		}
+		// ── IDENTITY RE-CHECK ─────────────────────────────────────────
+		// The boundary names the candidate a human reviewed. If the executor is
+		// holding a different one under that handle, the authorization would be
+		// issued for a computation the human never saw.
+		if b.CandidateID != "" && preview.CandidateID != b.CandidateID {
+			m.convergeAutonomousAuthorization("authorization invalidated: candidate " + b.PatchID +
+				" is no longer the candidate that was reviewed (reviewed " + b.CandidateID +
+				", held " + preview.CandidateID + "). No files were modified; a new mutation review is required.")
+			return fmt.Errorf("candidate %s is not the reviewed candidate", b.PatchID)
+		}
+		// ── CONTENT RE-CHECK ──────────────────────────────────────────
+		// Same identity, different bytes: the change the human judged is not the
+		// change the runtime would apply. Both digests are shown so the difference
+		// is inspectable rather than merely refused.
+		if b.CandidateDigest != "" {
+			if current := preview.Digest(); current != b.CandidateDigest {
+				m.convergeAutonomousAuthorization("authorization invalidated: candidate " + b.PatchID +
+					" changed since it was reviewed (reviewed " + shortCandidateDigest(b.CandidateDigest) +
+					", now " + shortCandidateDigest(current) + "). No files were modified; a new mutation review is required.")
+				return fmt.Errorf("candidate %s changed since review", b.PatchID)
+			}
+			digest = b.CandidateDigest
+		}
 	}
 	// ── STAGED DAG HANDSHAKE (planning → building guard) ────────────────
 	// An approved DECOMPOSITION_PROPOSAL IS an authorized plan: the staged
@@ -620,7 +713,6 @@ func (m *model) authorizeAutonomousApproval() error {
 	// is requested — otherwise the guard rejects planning → building with
 	// "no authorized plan or micro-plan" even though the human just approved
 	// every sub-task.
-	b := m.autonomousBoundary
 	if m.orch != nil && b != nil && b.Action == autonomy.HumanBoundaryDecomposition && b.Proposal != nil {
 		if err := m.orch.BindAuthorizedMicroPlan(context.Background(), b.Proposal); err != nil {
 			return fmt.Errorf("micro-plan binding failed: %w", err)
@@ -660,22 +752,63 @@ func (m *model) authorizeAutonomousApproval() error {
 		return fmt.Errorf("workflow transition to building failed: %w", err)
 	}
 	var targets []string
+	candidateID := ""
 	if b != nil {
 		targets = b.Targets
+		// The authorization is bound to the candidate IDENTITY THE HUMAN REVIEWED.
+		// CandidateID is that identity; PatchID is the handle the executor applies
+		// through. They coincide for a healthy boundary, and when they do NOT the
+		// divergence is exactly the stale-authorization case — so binding the
+		// reviewed identity is what makes the mismatch detectable at the mutation
+		// boundary instead of silently writing the wrong bytes.
+		candidateID = b.CandidateID
+		if candidateID == "" {
+			candidateID = b.PatchID
+		}
 	}
-	auth, err := m.authEngine.AuthorizeBuild(
+	auth, err := m.authEngine.AuthorizeBuildCandidateContent(
 		targets,
 		m.caps,
 		m.mutationBudget,
 		m.microBudget,
 		false,
 		true, // human-approved: the developer pressed Alt+A on the boundary
+		candidateID,
+		digest,
 	)
 	if err != nil {
+		m.convergeAutonomousAuthorization("authorization refused: " + err.Error() +
+			". No files were modified; start a fresh run after resolving the refusal.")
 		return err
 	}
 	m.executor.SetAuthorization(auth)
 	return nil
+}
+
+// shortCandidateDigest renders a candidate fingerprint compactly for a
+// human-readable refusal. Two digests must be tellable apart; a full sha256 would
+// dominate the message.
+func shortCandidateDigest(d string) string {
+	if len(d) <= 12 {
+		return d
+	}
+	return d[:12]
+}
+
+// convergeAutonomousAuthorization is the terminal outcome of a refused
+// authorization: the parked approval state is released so the operator is not
+// invited to press Approve again for a mutation the runtime has already refused,
+// and the truthful reason is stated.
+func (m *model) convergeAutonomousAuthorization(reason string) {
+	m.autonomousBoundary = nil
+	m.autonomousActive = false
+	m.resolveApprovalState()
+	m.finalizeOperation(OpOutcomeFailure, nil)
+	m.unwindTerminalExecution()
+	m.push(roleError, "[autonomous] "+reason)
+	m.push(roleSystem, infoStyle.Render("  The approval gate is closed. Start a fresh run (Ctrl+C to dismiss)."))
+	m.refreshViewportContent()
+	m.Viewport.GotoBottom()
 }
 
 // navigateAutonomousBoundary moves the clarify-candidate highlight. delta is
@@ -698,17 +831,124 @@ func (m *model) clearAutonomousRun() {
 	m.autonomousObjective = ""
 }
 
-// renderAutonomousApprovalBoundary renders the parked approval gate status.
+// renderAutonomousApprovalBoundary renders the parked boundary as a MUTATION
+// REVIEW: the concrete held change a human is being asked to authorize, with the
+// runtime's own evidence checklist.
+//
+// The title is the semantic correction the previous UI needed. "AUTONOMY
+// APPROVAL" over a target list asked for a permission without showing what was
+// being permitted; the runtime is not asking for permission in the abstract, it
+// is asking the human to authorize THIS change to THIS target. Nothing here
+// asserts that anything has been applied — the mutation row is present and
+// unsatisfied, because it has not.
 func (m *model) renderAutonomousApprovalBoundary(b *autonomy.HumanBoundary) {
-	var targets string
-	if len(b.Targets) > 0 {
-		targets = strings.Join(b.Targets, ", ")
+	var sb strings.Builder
+	sb.WriteString(permissionTitleStyle.Render(Icon.Warning + " MUTATION REVIEW"))
+	sb.WriteString("\n")
+	writeMutationReviewBody(&sb, b, m.autonomousObjective, 0)
+	m.push(roleStatus, sb.String())
+	m.push(roleSystem, infoStyle.Render("  Alt+A apply mutation · Alt+R reject · Ctrl+C aborts"))
+	m.push(roleSystem, infoStyle.Render("  Enter/Esc mirror those only while nothing is typed — a command you are typing is never read as an authorization"))
+}
+
+// writeMutationReviewBody renders the shared body of the mutation review: the
+// concrete candidate plus the runtime's evidence checklist. Every fact comes
+// from the boundary — the runtime's own read of the held candidate — so the
+// review and the apply cannot disagree.
+//
+// indent spaces every line, which lets the same body render both in the log
+// (indent 0) and inside the framed boundary modal.
+func writeMutationReviewBody(sb *strings.Builder, b *autonomy.HumanBoundary, objective string, indent int) {
+	if b == nil {
+		return
 	}
-	m.push(roleStatus, fmt.Sprintf(
-		"%s AUTONOMY APPROVAL — mutation awaiting authorization: %s",
-		boldSapphireStyle.Render(Icon.Blueprint), targets))
-	m.push(roleSystem, mutedStyle.Render("  "+b.Reason))
-	m.push(roleSystem, infoStyle.Render("  Alt+A / Enter approve · Alt+R / Esc reject · Ctrl+C aborts"))
+	pad := strings.Repeat(" ", indent)
+	row := func(label, value string) {
+		if value == "" {
+			return
+		}
+		sb.WriteString(pad + permissionDescStyle.Render(label) + " " + permissionTargetStyle.Render(value) + "\n")
+	}
+	targets := b.CandidateTargets
+	if len(targets) == 0 {
+		targets = b.Targets
+	}
+	row("Target:", strings.Join(targets, ", "))
+	row("Operation:", b.CandidateOperation)
+	if b.CandidateOperationEvidence != "" {
+		row("Why:", b.CandidateOperationEvidence)
+	}
+	row("Objective:", objective)
+	if b.CandidateContractID != "" {
+		row("Contract:", b.CandidateContractID)
+	}
+	row("Reason:", b.Reason)
+
+	if len(b.CandidateEvidence) > 0 {
+		sb.WriteString(pad + permissionDescStyle.Render("Evidence") + "\n")
+		for _, e := range b.CandidateEvidence {
+			mark := Icon.Error
+			if e.Satisfied {
+				mark = Icon.Success
+			}
+			sb.WriteString(pad + "  " + mark + " " + e.Label)
+			if e.Detail != "" {
+				sb.WriteString(" — " + mutedStyle.Render(e.Detail))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	if b.CandidateDiff != "" {
+		sb.WriteString(pad + permissionDescStyle.Render("Proposed change") + "\n")
+		for _, line := range mutationReviewDiffLines(b.CandidateDiff, mutationReviewMaxDiffLines) {
+			sb.WriteString(pad + "  " + diffLineStyle(line) + "\n")
+		}
+	}
+	// The one sentence that must never be omitted at this boundary: the
+	// authorization has not happened, so nothing has happened.
+	sb.WriteString(pad + "  " + orangeStyle.Render("Mutation has NOT occurred.") + "\n")
+}
+
+// mutationReviewMaxDiffLines bounds how much of the compiled diff the review
+// card inlines. A full diff belongs behind the explicit [D] view; the card shows
+// enough for the human to recognise the change and states plainly that the
+// remainder exists.
+const mutationReviewMaxDiffLines = 12
+
+// mutationReviewDiffLines returns the first n non-empty diff lines plus an
+// explicit truncation marker naming how much was elided. It never silently drops
+// the rest: a review that hides the tail of a diff is still a partial review.
+func mutationReviewDiffLines(diff string, n int) []string {
+	all := make([]string, 0, n+1)
+	elided := 0
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if len(all) < n {
+			all = append(all, line)
+			continue
+		}
+		elided++
+	}
+	if elided > 0 {
+		all = append(all, fmt.Sprintf("… %d more diff line(s) — press [D] for the full diff", elided))
+	}
+	return all
+}
+
+// diffLineStyle colourises one diff line by its kind so a mutation review reads
+// as a change rather than as a wall of text.
+func diffLineStyle(line string) string {
+	switch {
+	case strings.HasPrefix(line, "+"):
+		return greenStyle.Render(line)
+	case strings.HasPrefix(line, "-"):
+		return redStyle.Render(line)
+	default:
+		return mutedStyle.Render(line)
+	}
 }
 
 // renderAutonomousClarifyBoundary renders the parked target-ambiguity status.
@@ -840,19 +1080,11 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 	var sb strings.Builder
 	switch b.Action {
 	case autonomy.HumanBoundaryApproval:
-		sb.WriteString(permissionTitleStyle.Render(Icon.Warning + " AUTONOMY APPROVAL"))
+		// MUTATION REVIEW: the human is authorizing a concrete change, so the
+		// card shows the concrete change. Nothing is asserted as applied.
+		sb.WriteString(permissionTitleStyle.Render(Icon.Warning + " MUTATION REVIEW"))
 		sb.WriteString("\n\n")
-		sb.WriteString(permissionDescStyle.Render("Mutation:"))
-		sb.WriteString(" " + permissionTargetStyle.Render(m.autonomousObjective))
-		sb.WriteString("\n")
-		if len(b.Targets) > 0 {
-			sb.WriteString(permissionDescStyle.Render("Targets:"))
-			sb.WriteString(" " + permissionTargetStyle.Render(strings.Join(b.Targets, ", ")))
-			sb.WriteString("\n")
-		}
-		sb.WriteString(permissionDescStyle.Render("Reason:"))
-		sb.WriteString(" " + infoStyle.Render(b.Reason))
-		sb.WriteString("\n")
+		writeMutationReviewBody(&sb, b, m.autonomousObjective, 1)
 	case autonomy.HumanBoundaryClarify:
 		sb.WriteString(permissionTitleStyle.Render(Icon.Warning + " AUTONOMY TARGET SELECTION"))
 		sb.WriteString("\n\n")
@@ -910,7 +1142,9 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 	sb.WriteString(" " + boundRule(width, permissionBoxStyle, 2) + "\n")
 
 	if b.Action == autonomy.HumanBoundaryApproval {
-		sb.WriteString(" " + mutedStyle.Render("Alt+A / Enter approve · Alt+R / Esc reject · Ctrl+C abort") + "\n")
+		// The verb is "apply", not "approve": approving is a permission, applying
+		// is the mutation this authorization permits — and it has not happened.
+		sb.WriteString(" " + mutedStyle.Render("Alt+A apply mutation · Alt+R reject · Ctrl+C abort · Enter/Esc mirror these while the input is empty") + "\n")
 	} else {
 		sb.WriteString(" " + mutedStyle.Render("↑/↓ navigate · Enter select · Esc cancel · Ctrl+C abort") + "\n")
 	}

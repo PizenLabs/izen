@@ -10,7 +10,6 @@ import (
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	intentdomain "github.com/PizenLabs/izen/internal/core/domain"
-	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes"
 )
 
@@ -69,6 +68,13 @@ func (m *model) runAutonomyRoutedCmdExplicit(objective string) tea.Cmd {
 // intent → capability → workspace → decision, and the decided BUILD workspace
 // executes with hotfix semantics.
 func (m *model) routeHotfixThroughAutonomy(objective string) tea.Cmd {
+	// ── AUTHORITATIVE ADMISSION (before any work) ─────────────────────
+	// Same contract as $prompt: a new execution run cannot start while another
+	// is active or parked. The refusal lands before the autonomy decision is
+	// rendered and before the workflow phase moves to build.
+	if !m.admitNewExecutionRun() {
+		return nil
+	}
 	m.bindScopeProvenance(intentdomain.ScopeDeclared)
 	if m.autonomy == nil {
 		// Legacy compatibility: no decision runtime wired — fall back to the
@@ -199,33 +205,30 @@ func (m *model) executeAutonomyWorkspace(trace autonomy.Trace) tea.Cmd {
 }
 
 // compileAutonomyBuildEvidence compiles the deterministic structural evidence
-// for the resolved mutation target: the general Context Evidence Ledger
-// (orphan text, invalid regions) plus, for HTML targets, the redundancy ledger
-// (exact redundant blocks with line ranges). The model reasons over this
-// ledger — it never re-discovers structural facts or redundant content from
+// for the resolved mutation target: the general Context Evidence Ledger. The
+// model reasons over this ledger — it never re-discovers structural facts from
 // raw text (§9/§10). Returns "" when the target cannot be read.
+//
+// GENERIC BY CONSTRUCTION. This used to append a second, HTML-only ledger for
+// targets whose name ended in .html/.htm/.xhtml, sourced from
+// hotfix.ResolveRedundantTargets. That made the evidence a build decision sees
+// depend on the target's FILE EXTENSION — markup-specific runtime intelligence
+// living on the canonical $prompt path, applied to a workspace the runtime had
+// not classified. It is removed.
+//
+// The generic Context Evidence Ledger remains and is what every target gets.
+// Markup-specific analysis belongs to a markup adapter (internal/adapters/web),
+// which is where the web detection already lives and where GEN-02 pins it.
 func (m *model) compileAutonomyBuildEvidence(target string) string {
 	content, err := os.ReadFile(target)
 	if err != nil {
 		return ""
 	}
-	var parts []string
-	if m.autonomy != nil {
-		if ledger := m.autonomy.CompileContext(target, string(content)).FormatEvidenceLedger(); ledger != "" {
-			parts = append(parts, ledger)
-		}
-	}
-	if isHTMLTarget(target) {
-		if redundant, ok := hotfix.ResolveRedundantTargets(string(content)); ok && len(redundant) > 0 {
-			if ledger := formatRedundancyLedger(target, redundant); ledger != "" {
-				parts = append(parts, ledger)
-			}
-		}
-	}
-	if len(parts) == 0 {
+	if m.autonomy == nil {
 		return ""
 	}
-	return strings.Join(parts, "\n\n")
+	ledger := m.autonomy.CompileContext(target, string(content)).FormatEvidenceLedger()
+	return strings.TrimSpace(ledger)
 }
 
 // renderAutonomyDecision presents the runtime's decision before execution so

@@ -274,6 +274,31 @@ func (m *model) finishStage(outcome OperationOutcome) {
 	}
 }
 
+// mutationStageState maps a sealed mutation outcome onto the stage marker the
+// dock may render for it.
+//
+// The stage dock is the most visible claim surface in the UI: stageDone renders
+// a green check. A mutation that was skipped, rejected, rolled back or never
+// applied therefore may NEVER reach it — "the runtime reached the apply stage"
+// is not "the apply succeeded", and only the sealed outcome distinguishes them.
+//
+// An unrecognised outcome is treated as FAILED, not as done: unknown is a valid
+// state and it is never a success.
+func mutationStageState(outcome string) execStageState {
+	switch execution.MutationOutcome(outcome) {
+	case execution.OutcomeChanged, execution.OutcomeCreated, execution.OutcomeNoChange:
+		// The three outcomes that mean the boundary actually ran and committed.
+		return stageDone
+	case execution.OutcomeCancelled:
+		return stageCancelled
+	default:
+		// apply_failed, verify_failed, skipped, rejected, occ_aborted,
+		// artifact_rejected, truncated, no_artifact, preflight_infeasible,
+		// no_op_* — and anything the runtime adds later.
+		return stageFailed
+	}
+}
+
 // stageSnapshot returns a consistent lock-free snapshot of the authoritative
 // stage.
 func (m *model) stageSnapshot() stageView {

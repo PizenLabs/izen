@@ -87,8 +87,21 @@ func isControlSequence(runes []rune) bool {
 // printable character (or character run). This is the canonical test for
 // "text the user is typing": Alt-modified keys and control keys are
 // keybinding mechanisms, never text.
+//
+// THE SPACE IS TEXT. Bubble Tea delivers a bare space as its own key type
+// (`tea.KeySpace`, carrying `Runes: []rune{' '}`) rather than as `tea.KeyRunes`,
+// so a `Type == tea.KeyRunes` test alone silently excludes it. That turned the
+// "a printable character typed into the focused input is ALWAYS text" guarantee
+// into "every printable character except the space", and the space is the one
+// that separates a command from its argument: with an approval or boundary card
+// on screen, `/session execution` arrived as `/sessionexecution`, silently, for
+// every operator. The runes are still checked, so a synthetic or control rune
+// on a space key cannot sneak through as text.
 func isPrintableRunes(msg tea.KeyMsg) bool {
-	if msg.Type != tea.KeyRunes || len(msg.Runes) == 0 {
+	if msg.Type != tea.KeyRunes && msg.Type != tea.KeySpace {
+		return false
+	}
+	if len(msg.Runes) == 0 {
 		return false
 	}
 	if msg.Alt {
@@ -100,6 +113,18 @@ func isPrintableRunes(msg tea.KeyMsg) bool {
 		}
 	}
 	return true
+}
+
+// boundaryInputEmpty reports whether the operator has typed nothing. While a
+// human boundary is parked, a bare Enter or Esc means "take the card's action";
+// as soon as anything is typed, those keys belong to the text, because a command
+// the operator can see in the buffer must never be reinterpreted as an
+// irreversible mutation authorization.
+func (m *model) boundaryInputEmpty() bool {
+	if m == nil {
+		return true
+	}
+	return strings.TrimSpace(m.ti.Value()) == ""
 }
 
 // forwardToInput routes a printable keystroke into the focused text input,
@@ -639,6 +664,30 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// ── ACTIVE TEXT INPUT PRECEDES EVERY LOCKED-STATE SHORTCUT ───────────
+	//
+	// "A printable character typed into the focused input is ALWAYS text" has to
+	// be evaluated BEFORE the viewport-scroll shortcuts below, not after them.
+	//
+	// The shortcuts are written as `msg.String() == "j"`, `== "k"` and
+	// `msg.Type == tea.KeySpace` because those are the conventional keys for
+	// scrolling. But a KeyMsg carries no notion of intent: a typed `j` and a
+	// pressed `j` are the same message. Evaluating the shortcuts first meant
+	// that with ANY card up — approval, boundary, processing — the characters
+	// `j`, `k` and the space were consumed as navigation and never reached the
+	// buffer.
+	//
+	// The cost was silent and total: `/session execution` arrived as
+	// `/sessionexecution`, and the parser answered `unknown command`. Every
+	// argument-taking command became untypable at exactly the moment an operator
+	// is most likely to want to ask what the system is doing.
+	//
+	// Text wins while the input is focused and actually holds the keystroke
+	// intent. Scrolling is still available the moment focus is elsewhere.
+	if m.ti.Focused() && isPrintableRunes(msg) {
+		return m, m.forwardToInput(msg)
+	}
+
 	// ── StateProcessing: block input but allow viewport navigation ──────
 	if m.state == StateProcessing {
 		if m.Ready {
@@ -779,24 +828,34 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── Awaiting approval / hotfix ambiguity ─────────────────────────
 	// Both states hard-intercept the keyboard: the proposal/approval gate and
 	// the actionable ambiguity card (Clarify / Inspect candidates / Cancel).
+	// Card/chip actions (Clarify, Inspect, Select, Accept, Reject) use explicit
+	// keybinding mechanisms (alt+…, Enter, Esc), so they can never hijack normal
+	// typing — the developer can compose the next command while an approval or
+	// ambiguity card is on screen. (The active-text-input precedence that
+	// guarantees this is evaluated at the top of the locked-state region, before
+	// the viewport shortcuts, so it covers this gate too.)
 	if m.state == StateAwaitingApproval || m.state == StateHotfixAmbiguous {
-		// ── PRIORITY 1: ACTIVE TEXT INPUT ───────────────────────────
-		// A printable character typed into the focused input is ALWAYS text.
-		// Card/chip actions (Clarify, Inspect, Select, Accept, Reject) use
-		// explicit keybinding mechanisms (alt+…, Enter, Esc) so they can never
-		// hijack normal typing — the developer can compose the next command
-		// while an approval or ambiguity card is on screen.
-		if m.ti.Focused() && isPrintableRunes(msg) {
-			return m, m.forwardToInput(msg)
-		}
 
 		// ── PRODUCTION AUTONOMOUS DRIVER BOUNDARY (Phase 6) ─────────
 		// A parked autonomous run holds one human decision: approve the held
 		// mutation (Alt+A / Enter), reject it (Alt+R / Esc), pick a clarify
 		// candidate (↑/↓ + Enter), or abort the parked run (Ctrl+C). The
 		// driver owns the loop; the UI only decides and resumes.
+		//
+		// A TYPED COMMAND IS NOT A DECISION. Enter and Esc are the convenient
+		// aliases for the card's primary and secondary actions, which means they
+		// must mean that ONLY while the input is empty. Otherwise an operator who
+		// types `/new` — or `/session execution`, or `/help` — to look around
+		// while a review is open presses Enter and irreversibly writes to the
+		// workspace. That was reproduced in the real TUI: the mutation was applied
+		// and `/new` was never submitted.
+		//
+		// Alt+A / Alt+R are unaffected and remain unconditional, so the decision
+		// is always reachable explicitly. The original `[Enter] approve` path is
+		// unchanged for the empty-buffer case.
 		if m.autonomousParked() {
 			b := m.autonomousBoundary
+			bare := m.boundaryInputEmpty()
 			switch {
 			case b.Action == autonomy.HumanBoundaryProposal && msg.Type == tea.KeyUp:
 				if m.proposalTUI != nil {
@@ -808,30 +867,47 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.proposalTUI.Navigate(1)
 				}
 				return m, nil
-			case b.Action == autonomy.HumanBoundaryProposal && msg.Type == tea.KeyEnter:
+			case b.Action == autonomy.HumanBoundaryProposal && msg.Type == tea.KeyEnter && bare:
 				intent := proposaltui.ProposalCancel
 				if m.proposalTUI != nil {
 					intent = m.proposalTUI.Select()
 				}
-				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Recovery selected — "+string(intent)+"..."))
+				m.push(roleSystem, infoStyle.Render("  Recovery intent selected ("+string(intent)+") — the runtime will re-plan."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousProposal(string(intent))
-			case b.Action == autonomy.HumanBoundaryProposal && msg.Type == tea.KeyEscape:
+			case b.Action == autonomy.HumanBoundaryProposal && msg.Type == tea.KeyEscape && bare:
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — autonomous run aborted."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousProposal("cancel")
 			case b.Action == autonomy.HumanBoundaryApproval &&
-				(msg.String() == "alt+a" || msg.Type == tea.KeyEnter):
-				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Approved — runtime applying patch..."))
+				(msg.String() == "alt+a" || (msg.Type == tea.KeyEnter && bare)):
+				// STATE-ACCURATE TRANSITION LANGUAGE.
+				//
+				// At the moment of this keystroke the authorization is a REQUEST.
+				// Nothing has been applied, verified, or proven — the runtime may
+				// still refuse the mutation, and the objective may still end
+				// unproven. The old wording ("Approved — the runtime will apply the
+				// held patch") read as a completed fact and collapsed three
+				// distinct transitions into one.
+				//
+				// The three transitions are now separate sentences, each emitted at
+				// the boundary that actually observes it:
+				//
+				//	here          → authorization accepted, execution resuming
+				//	mutation      → mutation applied
+				//	verifier      → mutation verified
+				m.push(roleSystem, infoStyle.Render("  Authorization accepted — resuming mutation execution…"))
+				m.push(roleSystem, infoStyle.Render("  No files have been modified yet."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousApprove()
-			case b.Action == autonomy.HumanBoundaryDecomposition && msg.Type == tea.KeyEnter:
+			case b.Action == autonomy.HumanBoundaryDecomposition && msg.Type == tea.KeyEnter && bare:
 				// Authorize the WHOLE staged DAG: every sub-task executes as
 				// one atomic transaction under the plan's own preflight scopes.
-				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Plan authorized — running the staged DAG..."))
+				// The plan is authorized; the DAG has NOT run yet.
+				m.push(roleSystem, infoStyle.Render("  Plan authorized — the runtime will run the staged DAG."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousProposalApprove()
@@ -841,34 +917,53 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyDown:
 				m.navigateAutonomousBoundary(1)
 				return m, nil
-			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyEnter:
+			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyEnter && bare:
 				m.push(roleSystem, infoStyle.Render("  target selected — resuming the run..."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousClarify()
 			case b.Action == autonomy.HumanBoundaryApproval &&
-				(msg.String() == "alt+r" || msg.Type == tea.KeyEscape):
+				(msg.String() == "alt+r" || (msg.Type == tea.KeyEscape && bare)):
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Rejected — runtime finalizing. No files were modified."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousReject("rejected by operator")
 			case b.Action == autonomy.HumanBoundaryInform &&
-				(msg.String() == "alt+r" || msg.Type == tea.KeyEscape):
+				(msg.String() == "alt+r" || (msg.Type == tea.KeyEscape && bare)):
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Dismissed — autonomous run aborted."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.abortAutonomousRun("dismissed by operator")
-			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyEscape:
+			case b.Action == autonomy.HumanBoundaryClarify && msg.Type == tea.KeyEscape && bare:
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — autonomous run aborted."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.abortAutonomousRun("cancelled by operator")
-			case b.Action == autonomy.HumanBoundaryDecomposition && msg.Type == tea.KeyEscape:
+			case b.Action == autonomy.HumanBoundaryDecomposition && msg.Type == tea.KeyEscape && bare:
 				// Cancel the whole staged plan: nothing executed, nothing mutated.
 				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — decomposition plan discarded. No files were modified."))
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousProposalReject("cancelled by operator")
+
+			// ── A TYPED COMMAND IS SUBMITTED, NEVER SWALLOWED ────────────
+			//
+			// Every decision above requires an empty buffer, so this case is
+			// reached only when the operator has typed something. That text must
+			// go where they meant it to go.
+			//
+			// Returning nil here instead — the previous behaviour — stranded the
+			// prompt in the input bar forever, because the boundary owned the
+			// keyboard and nothing else would ever submit it. The operator had no
+			// way to reach `/new`, `/session execution` or `/help`, and a new build
+			// prompt never met the admission check that exists precisely to stop it.
+			//
+			// Submitting routes it to the normal handler: a command runs, and a new
+			// build prompt is refused at admission with EXECUTION BLOCKED and the
+			// parked run left intact. Only Enter submits — an Alt-modified key with
+			// text in the buffer stays a no-op rather than being reinterpreted.
+			case msg.Type == tea.KeyEnter:
+				return m.submitEnter()
 			}
 			return m, nil
 		}
@@ -946,8 +1041,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if executorPatchID != "" {
 					m.executorPendingPatchID = ""
 					m.executorPendingTargets = nil
+					// Authorization is a PERMISSION, not a fact. Nothing has been
+					// applied yet, so the line states the request and carries no
+					// success glyph: the authoritative apply/verify/commit verdict
+					// arrives later as runtime lifecycle events.
 					m.push(roleSystem, infoStyle.Render(
-						fmt.Sprintf("  "+Icon.Success+" Approved — runtime applying patch to %s...", patch.File)))
+						fmt.Sprintf("  Approved — asking the runtime to apply the patch to %s.", patch.File)))
 					return m, tea.Batch(
 						func() tea.Msg { return agentStartMsg{label: "runtime hotfix apply"} },
 						m.runExecutorApproveCmd(executorPatchID),
@@ -966,7 +1065,8 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.followTail()
 					return m, nil
 				}
-				m.appliedHotfixFile = patch.File
+				m.push(roleSystem, infoStyle.Render(
+					fmt.Sprintf("  Approved — asking the runtime to apply the patch to %s.", patch.File)))
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "hotfix apply"} },
 					m.runExecutorApproveCmd(patch.ID),
@@ -1017,7 +1117,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.ti.Focus()
 				m.refreshViewportContent()
 				m.followTail()
-				m.push(roleSystem, infoStyle.Render("  "+Icon.Success+" Approved — executing shell command..."))
+				m.push(roleSystem, infoStyle.Render("  Approved — the runtime will run the command."))
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),
@@ -1035,7 +1135,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.refreshViewportContent()
 				m.followTail()
 				m.push(roleSystem, infoStyle.Render(
-					"  "+Icon.Success+" Approved (always) — executing shell command..."))
+					"  Approved (always) — the runtime will run the command."))
 				return m, tea.Batch(
 					func() tea.Msg { return agentStartMsg{label: "shell exec"} },
 					m.runBuildShellExec(task),

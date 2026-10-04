@@ -134,15 +134,63 @@ func TestConsume_MultipleDeltasInOneCall(t *testing.T) {
 	}
 }
 
+// TestConsume_ExecutionTime pins the wall-clock bound as what it is: a bound on
+// ONE authorized mutation operation.
+//
+// The earlier version of this test asserted that a time breach latches
+// IsExhausted(). That is exactly the production defect: the clock ran from the
+// budget's CONSTRUCTION time (process start) while nothing ever called Reset(), so
+// once a session had been open longer than the bound, EVERY subsequent mutation
+// authorization in that session failed permanently with
+// "mutation budget already exhausted" — no matter how little work had been done.
+//
+// The refusal is still enforced; only its SCOPE changed. A breach refuses the
+// current operation, and BeginOperation re-arms it. Cumulative spend is
+// IsExhausted()'s job alone.
 func TestConsume_ExecutionTime(t *testing.T) {
 	b := NewBudget(10, 100, 1000, 2, 50*time.Millisecond, 10)
 	time.Sleep(60 * time.Millisecond)
 	err := b.Consume(BudgetDelta{})
 	if err == nil {
-		t.Fatal("Consume after execution time limit: expected error")
+		t.Fatal("Consume after the operation window elapsed: expected refusal")
 	}
-	if !b.IsExhausted() {
-		t.Error("IsExhausted() = false after time exhaustion")
+	if !b.OperationTimeExceeded() {
+		t.Error("OperationTimeExceeded() = false after a wall-clock breach")
+	}
+	if b.IsExhausted() {
+		t.Error("IsExhausted() = true after a wall-clock breach: a per-operation clock must not latch the cumulative budget")
+	}
+	// A fresh operation re-arms the window; the cumulative counters are untouched.
+	b.BeginOperation()
+	if b.OperationTimeExceeded() {
+		t.Error("BeginOperation did not re-arm the operation window")
+	}
+	if err := b.Consume(BudgetDelta{Files: 1}); err != nil {
+		t.Fatalf("Consume in a fresh operation: %v", err)
+	}
+	if b.IsExhausted() {
+		t.Error("IsExhausted() = true after a legal operation window")
+	}
+}
+
+// TestExecutionTimeDoesNotLockOutASession is the regression for the reported
+// production failure: a session that has simply been OPEN for longer than the
+// bound must still be able to authorize a mutation.
+func TestExecutionTimeDoesNotLockOutASession(t *testing.T) {
+	b := NewBudget(100, 5000, 1_000_000, 10, 30*time.Second, 5)
+	// Simulate an idle session ageing past the bound without spending anything.
+	b.BeginOperation()
+	time.Sleep(5 * time.Millisecond)
+	// The authorization boundary arms the window it is about to admit.
+	b.BeginOperation()
+	if b.IsExhausted() {
+		t.Fatal("an aged but unspent budget reports exhausted")
+	}
+	if err := b.Consume(BudgetDelta{Files: 3}); err != nil {
+		t.Fatalf("a fresh operation must be admitted: %v", err)
+	}
+	if got := b.RemainingFiles(); got != 97 {
+		t.Errorf("RemainingFiles = %d, want 97 (only the authorized work is charged)", got)
 	}
 }
 

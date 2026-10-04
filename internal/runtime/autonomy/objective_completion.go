@@ -31,12 +31,16 @@ package autonomy
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/contextcompiler"
+	"github.com/PizenLabs/izen/internal/core/domain"
 	"github.com/PizenLabs/izen/internal/events"
 	"github.com/PizenLabs/izen/internal/execution"
+	"github.com/PizenLabs/izen/internal/execution/capability"
 	"github.com/PizenLabs/izen/internal/execution/strategy"
 )
 
@@ -188,12 +192,20 @@ func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
 		return
 	}
 	contract := d.taskContract()
-	evidence := d.objectiveEvidence()
+	// The evidence bundle the authority judges is the SAME bundle the objective
+	// progress reducer and the trace read. One computation of "what holds",
+	// consulted from three places — a projection that could disagree with the
+	// verdict would reintroduce exactly the ambiguity this seam removes.
+	evidence := d.objectiveEvidenceWithContract()
 	evaluation := d.objectiveAuthority.Authorize(contract, evidence)
 	d.lastObjective = evaluation
 	d.lastContract = contract
 
 	if evaluation.Outcome.Proves() {
+		// The authority proved the objective: the workspace work it
+		// authorized is committed, and that is a truth boundary the journal
+		// must hold before the loop is allowed to move on.
+		d.ledgerExecutionCommitted()
 		decision.Reason = strings.TrimSpace(decision.Reason + "; objective PROVEN by evidence")
 		return
 	}
@@ -217,6 +229,123 @@ func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
 		decision.Action = autonomy.LoopUnsubstantiate
 		decision.Reason = reason
 	}
+}
+
+// authorizeBehavioralCompletion gates a proposed completion on REAL behavioral
+// evidence.
+//
+// It is a MUTATION of the decision, never a source of completion, and that
+// ordering is the whole point:
+//
+//   - it runs after authorizeObjectiveCompletion, so it can only downgrade;
+//   - it runs the behavioral stage, which OBSERVES the workspace's real runtime
+//     (serve → readiness → fetch → probe subresources → structural audit) and
+//     drives evidence-driven repair through the same execution authority;
+//   - PROVEN is set only from a real observation in which every observed
+//     requirement held.
+//
+// When the objective does not demand behavioral proof, or no stage is wired, the
+// decision is returned untouched — so a read-only objective, and every existing
+// caller, keeps exactly the behaviour it had.
+func (d *Driver) authorizeBehavioralCompletion(ctx context.Context, decision *autonomy.LoopDecision) {
+	if d == nil || decision == nil || decision.Action != autonomy.LoopComplete {
+		return
+	}
+	if d.behavior == nil || !BehaviorRequired(d.prompt) {
+		return
+	}
+
+	result := d.behavior.Stage(ctx, d.prompt, d.scopeProvenance())
+	d.lastBehavior = result
+	if result.Proven {
+		decision.Reason = strings.TrimSpace(decision.Reason +
+			"; behavioral requirements PROVEN by runtime observation (" +
+			strconv.Itoa(result.Repairs) + " repair(s) applied, evidence: " +
+			boundedReason(result.EvidenceLine) + ")")
+		return
+	}
+
+	// The objective demanded a verifiable result and the workspace could not
+	// prove one. Route it the way the truthful outcome demands rather than
+	// completing on a mutation alone.
+	reason := "objective BEHAVIORALLY UNPROVEN: " + behavioralStopReason(result)
+	d.emitBehaviorUnproven(reason)
+	switch {
+	case result.Block != nil && result.Block.Class == capability.FailureAuthorizationBlocked:
+		decision.Action = autonomy.LoopAskHuman
+		decision.PatchID = ""
+		decision.Reason = reason
+	case result.Block != nil:
+		// A capability that could not run is a hard block, not a retry: the fix
+		// is an authorization or capability change, never another attempt.
+		decision.Action = autonomy.LoopUnsubstantiate
+		decision.PatchID = ""
+		decision.Reason = reason
+	default:
+		// The workspace ran and was observed defective after bounded repair
+		// rounds. Park for a human rather than spin: the evidence is retained and
+		// the decision belongs to the operator.
+		decision.Action = autonomy.LoopAskHuman
+		decision.PatchID = ""
+		decision.Reason = reason
+	}
+}
+
+// scopeProvenance returns the scope provenance this run executes under. The
+// driver records it on dispatch; a run that never dispatched one is read-only.
+func (d *Driver) scopeProvenance() domain.ScopeProvenance {
+	if d == nil || d.req.Scope == "" {
+		return domain.ScopeNone
+	}
+	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$prompt") {
+		return domain.ScopeDynamic
+	}
+	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$hot") {
+		return domain.ScopeDeclared
+	}
+	return domain.ScopeNone
+}
+
+// emitBehaviorUnproven records the behavioral refusal as infrastructure
+// telemetry so the trace retains WHY the run stopped.
+func (d *Driver) emitBehaviorUnproven(reason string) {
+	if d == nil || d.bus == nil {
+		return
+	}
+	d.bus.Publish(events.NewActivity("[behavior] " + reason))
+}
+
+// behavioralStopReason renders the attributable reason for an unproven
+// behavioral result, preferring the capability block's class over a defect
+// summary because the class is what tells an operator what to change.
+func behavioralStopReason(r BehaviorResult) string {
+	if r.Block != nil {
+		return r.Block.Error()
+	}
+	if r.DefectLine != "" {
+		return r.DefectLine
+	}
+	return "the workspace could not be observed to satisfy the objective"
+}
+
+// boundedReason caps a reason string so a long evidence log can never become an
+// unbounded UI payload.
+// boundedReasonCaps the total size of a bounded reason, marker included, so the
+// bound is the number a caller can actually rely on.
+const boundedReasonCaps = 600
+
+func boundedReason(s string) string {
+	if len(s) <= boundedReasonCaps {
+		return s
+	}
+	const marker = "…"
+	cut := boundedReasonCaps - len(marker)
+	// Do not split a UTF-8 rune: a half-rune in an evidence string renders as a
+	// replacement character in the trace, which looks like a corrupt payload.
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + marker
 }
 
 // objectiveEvidence assembles the evidence bundle the authority judges. The

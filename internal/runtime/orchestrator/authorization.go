@@ -240,9 +240,28 @@ func (o *PhaseManager) ClearAuthorizedPlan() {
 
 // authorizeContextLocked upgrades the transition context with the bound plan
 // authorization. Caller must hold o.mu (write).
+//
+// HasCapabilities is derived the same way, from the capability vector the plan
+// authorization was bound with. That derivation is what makes the RESUME edge
+// (awaiting_authorization → building, which guards on capabilities but not on a
+// plan) reachable: the human who approved this exact run is the capability
+// authority for it, and the grant is already recorded on the bound plan. It is
+// read from the record, never assumed — a session with no plan authorization and
+// no capabilities is still refused.
 func (o *PhaseManager) authorizeContextLocked(tctx workflow.TransitionContext) workflow.TransitionContext {
 	if !tctx.HasPlan && o.planAuthorized {
 		tctx.HasPlan = true
+	}
+	if !tctx.HasCapabilities {
+		switch {
+		case o.synthetic != nil && len(o.synthetic.Capabilities) > 0:
+			tctx.HasCapabilities = true
+		case o.ephemeral != nil, o.microPlan != nil:
+			// A staged decomposition DAG is executed sub-task by sub-task; each
+			// sub-task carries its own capability scope, so the plan itself is
+			// the authorization for the resume hop.
+			tctx.HasCapabilities = true
+		}
 	}
 	return tctx
 }

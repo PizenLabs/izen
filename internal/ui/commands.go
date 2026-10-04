@@ -32,7 +32,6 @@ import (
 	domainorch "github.com/PizenLabs/izen/internal/domain/orchestration"
 	objengine "github.com/PizenLabs/izen/internal/engine"
 	"github.com/PizenLabs/izen/internal/gateway"
-	"github.com/PizenLabs/izen/internal/hotfix"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/modes/investigate"
 	"github.com/PizenLabs/izen/internal/modes/plan"
@@ -2588,21 +2587,53 @@ func (m *model) CleanContextTransitions(targetMode modes.Mode) {
 
 // transitionToBuilding attempts to move the WorkflowStateMachine into
 // StateBuilding before any build execution begins. It handles the
-// idempotent case (already Building) and gracefully falls through
+// idempotent case (already Building/Repairing) and gracefully falls through
 // when plan guards prevent the transition (e.g. missing plan from
 // StateIdle). Callers must not invoke authorizeBuildExecution when
 // this returns an error.
+//
+// RESUME FROM A PARK. A run parked at a human authorization boundary resumes
+// through the SAME edge a fresh build takes: EventBuild out of
+// StateAwaitingAuthorization. It is not a reset, not a re-plan and not a new
+// run — the candidate, the targets, the run identity and the objective all
+// survive, and only the lifecycle position changes.
+//
+// VERIFICATION IS PART OF THE CONTRACT. The function returns nil only when the
+// shared state machine actually READS StateBuilding or StateRepairing. That read
+// is what the AuthorizationEngine consults, so accepting the orchestrator's
+// projection as proof is what allowed a parked-then-resumed run to be refused
+// with "expected Building or Repairing … got idle" while the caller believed
+// the transition had succeeded.
 func (m *model) transitionToBuilding() error {
 	if m.workflowSM == nil {
 		return nil
 	}
-	state := m.workflowSM.State()
-	if state == workflow.StateBuilding || state == workflow.StateRepairing {
+	if m.workflowSM.State().Executable() {
 		return nil
 	}
 	tctx := workflow.TransitionContext{
 		HasPlan:         m.sess != nil && len(m.sess.CurrentTasks) > 0,
 		HasCapabilities: m.caps != nil,
+	}
+	// ── RESUME FROM A PARK IS AN AUTHORIZATION EVENT, NOT A PHASE HOP ──
+	// A parked run is resumed by the human who just authorized it. It goes
+	// through the lifecycle's own resume edge (EventBuild out of
+	// awaiting_authorization) rather than through a phase transition, because a
+	// phase transition is user mode-switch intent and would treat the park as
+	// something to route around.
+	if m.workflowSM.Parked() {
+		if m.orch != nil {
+			if err := m.orch.ResumeParkedRun(tctx); err != nil {
+				return err
+			}
+			return m.requireExecutableState()
+		}
+		// No orchestrator (headless harness): the shared machine is then the only
+		// authority, and its resume edge is the whole operation.
+		if err := m.workflowSM.SendEvent(workflow.EventBuild, tctx); err != nil {
+			return err
+		}
+		return m.requireExecutableState()
 	}
 	// ── ORCHESTRATOR-DRIVEN TRANSITION ──────────────────────────────
 	// The orchestrator owns the workflow SM. It drives the canonical
@@ -2612,7 +2643,7 @@ func (m *model) transitionToBuilding() error {
 	if m.orch != nil {
 		err := m.orch.Transition(domainorch.PhaseBuild, tctx)
 		if err == nil {
-			return nil
+			return m.requireExecutableState()
 		}
 		// ── ILLEGAL PHASE-HOP FALLBACK (e.g. $hot from Idle) ─────────
 		// A $hot urgent fix skips the plan phase: the orchestrator may sit at
@@ -2624,20 +2655,43 @@ func (m *model) transitionToBuilding() error {
 		// never triggering automated rollback of an applied hotfix.
 		var te *domainorch.TransitionError
 		if errors.As(err, &te) {
-			return m.orch.Force(domainorch.PhaseBuild, tctx)
+			if ferr := m.orch.Force(domainorch.PhaseBuild, tctx); ferr != nil {
+				return ferr
+			}
+			return m.requireExecutableState()
 		}
 		return err
 	}
 	// Legacy raw-SM fallback (headless/test harnesses without an orchestrator).
+	state := m.workflowSM.State()
 	if state == workflow.StateIdle {
 		if err := m.workflowSM.SendEvent(workflow.EventPlan, workflow.TransitionContext{}); err != nil {
 			return err
 		}
+		state = m.workflowSM.State()
 	}
-	if m.workflowSM.State() == workflow.StatePlanning {
-		return m.workflowSM.SendEvent(workflow.EventBuild, tctx)
+	if state == workflow.StatePlanning || state == workflow.StateAwaitingAuthorization {
+		if err := m.workflowSM.SendEvent(workflow.EventBuild, tctx); err != nil {
+			return err
+		}
+		return m.requireExecutableState()
 	}
 	return fmt.Errorf("workflow: cannot transition to building from %s", state)
+}
+
+// requireExecutableState is the post-transition invariant check: the shared state
+// machine must READ an executable position. Anything else — most importantly
+// `idle` — is reported to the caller instead of being papered over, so a
+// refused resume can never be mistaken for an authorized one.
+func (m *model) requireExecutableState() error {
+	if m.workflowSM == nil {
+		return nil
+	}
+	if st := m.workflowSM.State(); !st.Executable() {
+		return fmt.Errorf("workflow: execution is %s after a transition to building was requested; "+
+			"no mutation may be authorized from this state", st)
+	}
+	return nil
 }
 
 // hasStagedBuildWork reports whether the session carries any executable build
@@ -2648,33 +2702,6 @@ func (m *model) hasStagedBuildWork() bool {
 	return (m.sess != nil && len(m.sess.CurrentTasks) > 0) ||
 		len(m.handoffCtx.PendingTodos) > 0 ||
 		(m.sess != nil && m.sess.ContextLedger != nil && len(m.sess.ContextLedger.Tasks) > 0)
-}
-
-// formatRedundancyLedger renders the deterministic redundant-content findings
-// as a compact Context Evidence Ledger the model reasons over — it never
-// re-discovers structural facts (requirement §8: context evidence precedes
-// model reasoning).
-func formatRedundancyLedger(target string, redundant []hotfix.RedundantTarget) string {
-	if len(redundant) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "Context Evidence Ledger\nTarget: %s\nRedundant content findings:\n", target)
-	for i, r := range redundant {
-		if i >= 6 {
-			b.WriteString("* ... more findings omitted\n")
-			break
-		}
-		fmt.Fprintf(&b, "* %s — %s\n", r.Kind, r.Describe())
-	}
-	return strings.TrimSpace(b.String())
-}
-
-// isHTMLTarget reports whether the target file is an HTML document eligible for
-// the deterministic target-resolution stage.
-func isHTMLTarget(target string) bool {
-	ext := strings.ToLower(filepath.Ext(target))
-	return ext == ".html" || ext == ".htm" || ext == ".xhtml"
 }
 
 // a single, unambiguous full-creation contract.
@@ -4647,7 +4674,10 @@ func (m *model) handleChipActivation(action Action) tea.Cmd {
 		// Without this explicit approval, /build remains blocked.
 		if action.ID == "approve-plan" {
 			m.planApproved = true
-			m.push(roleSystem, infoStyle.Render("✓ Plan approved. Transitioning to /build for execution..."))
+			// The plan is AUTHORIZED; nothing has been executed yet. The mode
+			// transition is a request the workspace handler performs, and the
+			// execution verdict — if any — comes from runtime lifecycle events.
+			m.push(roleSystem, infoStyle.Render("Plan approved. Moving to /build; execution has not started."))
 		}
 
 		// ── PLAN REJECTION ─────────────────────────────────────────────

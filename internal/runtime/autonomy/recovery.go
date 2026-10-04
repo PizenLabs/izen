@@ -246,10 +246,15 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 	if isHallucinatedAnchor(o) {
 		if o.AttemptNum < 1 {
 			return autonomy.LoopDecision{Action: autonomy.LoopRepair,
-				Reason: "strict line-anchor recovery: one automatic re-prompt"}
+				Reason: "strict line-anchor recovery: one automatic re-prompt against current workspace evidence"}
 		}
+		// The reason names the ANCHOR failure. It previously read "Physical
+		// Output Budget Breach", which is a statement about a different boundary
+		// entirely and sent an operator looking for a token-budget problem the run
+		// never had.
 		return autonomy.LoopDecision{Action: autonomy.LoopAbort,
-			Reason: "Physical Output Budget Breach: strict line-anchor recovery exhausted"}
+			Reason: "ANCHOR_NOT_FOUND: strict line-anchor recovery exhausted — " +
+				"the patch anchored on content that does not exist in the authoritative target"}
 	}
 	// ── CIRCUIT BREAKER: NonRetryableArtifactError (ambiguous anchors N>1) ───
 	if isNonRetryableAmbiguous(o) {
@@ -268,11 +273,21 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 	if RecoverySubtype(o) == SubtypeZeroArtifacts {
 		return zeroArtifactDecision(o, b)
 	}
-	// HARD-BLOCK: FormatFailureCount >=2 or Ambiguous == true → park at DecisionSurface awaiting_human
-	// Do NOT issue a re-scoped [bounded_patch] retry. Immediately park.
+	// HARD-BLOCK: the bounded recovery budget is spent → park at DecisionSurface
+	// awaiting_human. Do NOT issue another re-scoped retry.
+	//
+	// TRUTH. The old reason named "format failures >=2" unconditionally, so an
+	// output-exhausted run reported a FORMAT problem it never had — the operator
+	// was told to fix an artifact contract when the real cause was that the
+	// provider kept cutting the generation. The block is unchanged; only the
+	// reason now names the condition that actually fired and the subtype that
+	// reached it.
 	if o.AttemptNum >= 2 || o.RecoveryCycle >= 2 {
 		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
-			Reason: "hard-block: format failures >=2 — park at DecisionSurface awaiting_human, no bounded_patch retry"}
+			Reason: fmt.Sprintf(
+				"hard-block: bounded recovery exhausted for %s (attempt %d, recovery cycle %d, subtype %q) — "+
+					"park at DecisionSurface awaiting_human, no further automatic retry",
+				recoverySubject(o), o.AttemptNum, o.RecoveryCycle, RecoverySubtype(o))}
 	}
 	if o.ClarificationRequired || strings.Contains(strings.ToLower(o.Diagnostic), "ambiguous") {
 		return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
@@ -409,7 +424,7 @@ func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.Loo
 	// CIRCUIT BREAKER: Hallucinated (N=0) — distinct options.
 	if isHallucinatedAnchor(o) {
 		if o.AttemptNum >= 1 {
-			return req, fmt.Errorf("%w: Physical Output Budget Breach after strict line-anchor retry for %s", ErrRecoveryHalted, o.Target)
+			return req, fmt.Errorf("%w: ANCHOR_NOT_FOUND — the strict line-anchor re-prompt for %s also produced an unresolvable anchor", ErrRecoveryHalted, o.Target)
 		}
 		req.RecoveryStrategy = autonomy.StrategyBoundedPatch
 		req.RecoveryAttempt = 1
@@ -561,6 +576,16 @@ func recoveryTarget(o autonomy.Observation, req autonomy.LoopRequest) string {
 		return target
 	}
 	return req.Target
+}
+
+// recoverySubject is the target a recovery-matrix decision names when it has no
+// request to fall back on. It never renders an empty subject: an unnamed failure
+// reads as a mystery, and the whole point of a park is that a human can act on it.
+func recoverySubject(o autonomy.Observation) string {
+	if target := strings.TrimSpace(o.Target); target != "" {
+		return target
+	}
+	return "the requested artifact"
 }
 
 // recoveryAttempt derives the child attempt number for a continuation. The

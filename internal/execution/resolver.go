@@ -378,6 +378,22 @@ func (r *TargetResolver) Discover() WorkspaceEvidence {
 	return r.discovery().Discover().Evidence()
 }
 
+// DiscoverProfile returns the FULL structured discovery record, including the
+// manifests and source roots that the compact evidence projection drops.
+//
+// It exists for the scope-derivation path, which needs to distinguish "this
+// workspace has a package.json" from "this workspace has three loose .js files"
+// — a distinction that decides whether a derived scope is a real project surface
+// or a directory of unrelated snippets. The compact WorkspaceEvidence record
+// carries neither manifests nor source roots, so a caller that needs them must
+// ask for the profile explicitly rather than infer them.
+func (r *TargetResolver) DiscoverProfile() WorkspaceProfile {
+	if r == nil {
+		return WorkspaceProfile{}
+	}
+	return r.discovery().Discover()
+}
+
 // discovery returns the isolated discovery pass bound to this resolver's root
 // and depth.
 func (r *TargetResolver) discovery() *WorkspaceDiscovery {

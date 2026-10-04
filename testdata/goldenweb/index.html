@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Task Board</title>
+  <!-- DEFECT 1 (runtime-only): the served document requests a stylesheet path
+       that no file in this workspace provides. Nothing in the static sources
+       reveals this: the reference parses cleanly, the CSS is valid, and the
+       defect only exists once the runtime actually resolves the URL. -->
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- DEFECT 2 (structural): <main> is never closed, so the served document
+       does not reconcile. Detected by parsing the DELIVERED bytes. -->
+  <main id="board">
+    <h1>Task Board</h1>
+    <section class="column">
+      <h2>Backlog</h2>
+      <ul>
+        <li class="card">Ship runtime observation</li>
+        <li class="card">Wire evidence-driven repair</li>
+      </ul>
+    </section>
+    <section class="column">
+      <h2>Done</h2>
+      <ul>
+        <li class="card">Authorize capabilities</li>
+      </ul>
+    </section>
+  <script src="board.js"></script>
+</body>
+</html>

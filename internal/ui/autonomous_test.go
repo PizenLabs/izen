@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -28,7 +30,10 @@ import (
 // Run/Resume/Abort outcomes. parkOnRun makes the initial Run park (nil term) so
 // Resume*/Abort can later return the programmed terminal outcome.
 type fakeAutonomousDriver struct {
-	state         autonomy.RuntimeState
+	state autonomy.RuntimeState
+	// runID is the stable execution-run identity the driver publishes. It is what
+	// a human is told when asked which run is parked.
+	runID         string
 	boundary      *autonomy.HumanBoundary
 	term          *autonomy.LoopTermination
 	parkOnRun     bool
@@ -42,10 +47,23 @@ type fakeAutonomousDriver struct {
 	resumeClarify int
 	lastClarify   string
 
+	// rejectCandidate is the executor seam the real driver drains on reject. Nil
+	// leaves the held candidate in place, which is correct for a test that only
+	// cares about the driver call count.
+	rejectCandidate func(ctx context.Context, patchID, reason string)
+	rejectPatchID   string
+
 	resumeApproveProposal int
 	resumeRejectProposal  int
 	resumeProposal        int
 	lastProposalIntent    string
+
+	// aggInput/aggOutput/aggKnown are the run's spent-token account as the real
+	// driver reports it. The zero value means "unknown", which is the honest
+	// default for a fake that was never told what it spent.
+	aggInput  int
+	aggOutput int
+	aggKnown  bool
 }
 
 func (f *fakeAutonomousDriver) Run(_ context.Context, _ string) (*autonomy.LoopTermination, error) {
@@ -61,8 +79,16 @@ func (f *fakeAutonomousDriver) ResumeApprove(_ context.Context) (*autonomy.LoopT
 	return f.term, f.resumeErr
 }
 
-func (f *fakeAutonomousDriver) ResumeReject(_ context.Context, _ string) (*autonomy.LoopTermination, error) {
+// ResumeReject mirrors the REAL driver's reject path: the human decision is
+// resolved by RELEASING the held candidate through the executor, then the loop
+// terminates. A fake that only counted the call would let a test assert
+// "the candidate was released" while nothing released it — so the drain is
+// performed here against the same executor the run is holding a candidate in.
+func (f *fakeAutonomousDriver) ResumeReject(ctx context.Context, reason string) (*autonomy.LoopTermination, error) {
 	f.resumeReject++
+	if f.rejectCandidate != nil {
+		f.rejectCandidate(ctx, f.rejectPatchID, reason)
+	}
 	return f.term, f.resumeErr
 }
 
@@ -102,7 +128,25 @@ func (f *fakeAutonomousDriver) Termination() *autonomy.LoopTermination { return 
 
 func (f *fakeAutonomousDriver) SetStreamCallback(cb execution.StreamCallback) {}
 
-func (f *fakeAutonomousDriver) AggregatedUsage() (int, int, bool) { return 0, 0, false }
+// AggregatedUsage reports what the run actually spent, in the same shape the real
+// driver does: counts plus a KNOWN flag. The flag is what lets the UI distinguish
+// "nothing was spent" from "the provider never told us", and a fake that always
+// reported a false flag could never catch the runtime losing a real bill.
+func (f *fakeAutonomousDriver) AggregatedUsage() (int, int, bool) {
+	return f.aggInput, f.aggOutput, f.aggKnown
+}
+
+// RunID is the driver's stable execution-run identity — the identity a human is
+// given when asked which parked run they are looking at.
+func (f *fakeAutonomousDriver) RunID() string {
+	if f == nil {
+		return ""
+	}
+	if f.runID != "" {
+		return f.runID
+	}
+	return "run-1"
+}
 
 // extractAutonomousRunMsg extracts an autonomousRunMsg from either a batch message
 // or a direct autonomousRunMsg.
@@ -130,6 +174,36 @@ func autonomousTestModel(drv *fakeAutonomousDriver) *model {
 	m := readyChatModel(newTestModel())
 	m.autonomousDriver = drv
 	return m
+}
+
+// holdRealCandidate puts a GENUINE approval-held candidate on the executor under
+// the model and returns its patch identity.
+//
+// Approval boundaries in this package must name a candidate the execution
+// authority actually holds: the UI refuses an approval whose candidate is not
+// held (see authorizeAutonomousApproval), because a proposal whose producing
+// computation is gone is not an executable artifact. A fabricated PatchID would
+// therefore test the refusal path, not the approval path.
+func holdRealCandidate(t *testing.T, m *model, root, target, original, replacement string) string {
+	t.Helper()
+	provider := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< SEARCH\n" + original + "=======\n" + replacement + ">>>>>>>",
+		Usage:   ai.ProviderUsage{Known: true, PromptTokens: 40, CompletionTokens: 20, FinishReason: "stop"},
+	}}}
+	m.executor = execution.NewRuntimeExecutor(root, m.cfg, provider, nil, "")
+	res, err := m.executor.Execute(context.Background(), execution.ExecuteRequest{
+		Mode: "build", Prompt: "update @" + target, Target: target,
+	})
+	if err != nil {
+		t.Fatalf("seeding a held candidate: %v", err)
+	}
+	if res == nil || res.PendingPatchID == "" {
+		t.Fatalf("seeding a held candidate: outcome=%v", res)
+	}
+	if !m.executor.CandidateHeld(res.PendingPatchID) {
+		t.Fatalf("candidate %s is not held by the executor", res.PendingPatchID)
+	}
+	return res.PendingPatchID
 }
 
 // TestAutonomousRunParksAtApproval proves a driver run that parks at an
@@ -189,8 +263,14 @@ func TestAutonomousRunParksAtApproval(t *testing.T) {
 	if m.autonomousBoundary == nil || m.autonomousBoundary.PatchID != "p1" {
 		t.Fatalf("boundary = %+v, want p1", m.autonomousBoundary)
 	}
-	if got := m.renderAutonomousBoundaryBlock(120); !strings.Contains(got, "AUTONOMY APPROVAL") {
-		t.Fatalf("boundary block missing approval title: %q", got)
+	// The boundary is a MUTATION REVIEW, not a generic "autonomy approval": the
+	// human is being asked to authorize a concrete change, so the card names that
+	// review and states plainly that nothing has been applied.
+	if got := m.renderAutonomousBoundaryBlock(120); !strings.Contains(got, "MUTATION REVIEW") {
+		t.Fatalf("boundary block missing mutation-review title: %q", got)
+	}
+	if got := m.renderAutonomousBoundaryBlock(120); !strings.Contains(got, "Mutation has NOT occurred") {
+		t.Fatalf("the mutation review must state that nothing has been applied: %q", got)
 	}
 }
 
@@ -252,11 +332,19 @@ func TestAutonomousRunParksAtClarify(t *testing.T) {
 // boundary issues a MutationAuthorization over the boundary targets and
 // attaches it to the executor BEFORE the driver resumes.
 func TestAutonomousResumeApproveAuthorizesExecutor(t *testing.T) {
+	root := t.TempDir()
+	const note = "foo\nbar\nbaz\n"
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte(note), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := autonomousTestModel(&fakeAutonomousDriver{})
+	patchID := holdRealCandidate(t, m, root, "note.txt", "bar\n", "qux\n")
+
 	drv := &fakeAutonomousDriver{
 		state:     autonomy.RuntimeAwaitingHuman,
 		parkOnRun: true,
 		boundary: &autonomy.HumanBoundary{
-			PatchID:   "p1",
+			PatchID:   patchID,
 			Reason:    "ready",
 			Action:    autonomy.HumanBoundaryApproval,
 			Resumable: true,
@@ -268,7 +356,7 @@ func TestAutonomousResumeApproveAuthorizesExecutor(t *testing.T) {
 			Class:  autonomy.FailureRecoverable,
 		},
 	}
-	m := autonomousTestModel(drv)
+	m.autonomousDriver = drv
 	// Set workflow to Building state so authorization succeeds.
 	m.workflowSM = workflow.NewWorkflowStateMachine()
 	_ = m.workflowSM.SendEvent(workflow.EventPlan, workflow.TransitionContext{})
@@ -288,7 +376,6 @@ func TestAutonomousResumeApproveAuthorizesExecutor(t *testing.T) {
 	caps.Grant(capability.CapabilityWrite)
 	caps.Grant(capability.CapabilityPatch)
 	m.caps = caps
-	m.executor = execution.NewRuntimeExecutor(".", m.cfg, &mockProvider{responses: []*ai.Response{}}, nil, "")
 
 	// Park the boundary first.
 	cmd := m.runAutonomousDriver("change bar to qux @note.txt")

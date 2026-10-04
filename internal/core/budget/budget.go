@@ -50,7 +50,40 @@ type MutationBudget struct {
 	currentMutations int
 	startTime        time.Time
 	exhausted        bool
+	// timeExceeded latches a MaxExecutionTime breach for the CURRENT OPERATION
+	// ONLY. It is cleared by BeginOperation and is deliberately NOT folded into
+	// `exhausted`.
+	//
+	// WHY. MaxExecutionTime is a per-operation wall-clock bound ("how long may one
+	// authorized mutation run"), not a session quota. It used to be measured from
+	// the budget's CONSTRUCTION time — i.e. from process start — and a breach set
+	// the cumulative `exhausted` latch. Because nothing in production ever called
+	// Reset(), every mutation authorization in a session became permanently
+	// refused ("mutation budget already exhausted") once the process had been open
+	// longer than the bound, regardless of how little work had actually been done.
+	// A cumulative counter that reaches its ceiling is spent; a clock that has been
+	// running is not.
+	timeExceeded bool
 }
+
+// BeginOperation opens a fresh MaxExecutionTime window for ONE authorized
+// mutation operation. It does not touch any cumulative counter: the session
+// totals are unaffected, and only the wall-clock bound is re-armed.
+//
+// Every authorization boundary calls this before it reads the wall clock, so the
+// bound is measured against the operation that is actually being authorized
+// rather than against the age of the process.
+func (b *MutationBudget) BeginOperation() {
+	if b == nil {
+		return
+	}
+	b.startTime = time.Now()
+	b.timeExceeded = false
+}
+
+// OperationTimeExceeded reports whether the CURRENT operation's wall-clock bound
+// was breached. It is per-operation state: a fresh BeginOperation clears it.
+func (b *MutationBudget) OperationTimeExceeded() bool { return b != nil && b.timeExceeded }
 
 // NewMutationBudget creates a MutationBudget with the given limits.
 func NewBudget(maxFiles, maxDiffLines, maxTokens, maxAttempts int,
@@ -124,8 +157,12 @@ func (b *MutationBudget) Consume(delta BudgetDelta) error {
 		return err
 	}
 
+	// ── OPERATION WALL-CLOCK BOUND ──────────────────────────────────────
+	// Per-OPERATION state: a breach refuses THIS authorization and re-arms on
+	// the next BeginOperation. It must never latch the cumulative budget — see
+	// the timeExceeded field for the full argument.
 	if b.MaxExecutionTime > 0 && time.Since(b.startTime) > b.MaxExecutionTime {
-		b.exhausted = true
+		b.timeExceeded = true
 		return &BudgetExhaustedError{
 			Field:   "execution_time",
 			Limit:   int64(b.MaxExecutionTime.Seconds()),
@@ -232,8 +269,11 @@ func (b *MutationBudget) consumeShellCmds(n int) error {
 	return nil
 }
 
-// IsExhausted returns true if the budget has been exhausted.
-func (b *MutationBudget) IsExhausted() bool { return b.exhausted }
+// IsExhausted reports whether the CUMULATIVE budget has been spent. It reflects
+// real consumption only — a per-operation wall-clock breach is reported by
+// OperationTimeExceeded and never folds into this flag, so an idle session can
+// not become permanently unauthorized.
+func (b *MutationBudget) IsExhausted() bool { return b != nil && b.exhausted }
 
 // RemainingFiles returns the remaining file budget (0 if unlimited).
 func (b *MutationBudget) RemainingFiles() int {
@@ -308,9 +348,11 @@ func (b *MutationBudget) RemainingMutations() int {
 	return r
 }
 
-// RemainingTime returns the remaining execution time budget.
+// RemainingTime returns the remaining wall-clock budget for the CURRENT
+// operation (the window BeginOperation last opened), never the remaining uptime
+// of the process.
 func (b *MutationBudget) RemainingTime() time.Duration {
-	if b.MaxExecutionTime <= 0 {
+	if b == nil || b.MaxExecutionTime <= 0 {
 		return 0
 	}
 	r := b.MaxExecutionTime - time.Since(b.startTime)
@@ -330,6 +372,7 @@ func (b *MutationBudget) Reset() {
 	b.currentMutations = 0
 	b.startTime = time.Now()
 	b.exhausted = false
+	b.timeExceeded = false
 }
 
 // MicroBudget defines the strict limits for a micro-plan ($hot) pre-approval.

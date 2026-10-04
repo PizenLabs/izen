@@ -1831,7 +1831,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// "Human-Centered / Reversible": an execution failure must never
 			// trap the user in the build phase. Unwind back to interactive
 			// StateChat so the next prompt routes normally.
-			m.unwindBuildFailure()
+			m.unwindTerminalExecution()
 		}
 		if msg.output != "" {
 			for _, line := range strings.Split(msg.output, "\n") {
@@ -3922,7 +3922,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the workflow in the build phase. Unwind the state machine back to
 		// StateChat/interactive so the next prompt routes normally instead of
 		// failing with "transition from build to ask".
-		m.unwindBuildFailure()
+		m.unwindTerminalExecution()
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()
@@ -5553,28 +5553,24 @@ func sanitizeFinalContent(content string) string {
 // from /investigate to /build. Each todo is a FILE_MUTATE task that
 // the build engine can execute immediately without a separate /plan step.
 // Returns nil when the content is empty or does not contain mutation intent.
+//
+// GENERIC BY CONSTRUCTION. This used to branch on the objective's wording and,
+// for a "static website" request, synthesize a hardcoded trio of targets named
+// index.html, styles.css and script.js. That is `html -> index.html` target
+// mapping: benchmark-specific intelligence living in production presentation code,
+// and a guess about a workspace it had not inspected. It is removed.
+//
+// One domain-neutral task is emitted instead, whose target is left to the build
+// engine's existing resolver. Deciding WHAT to create is the runtime's job; the
+// runtime decides it from resolved targets and evidence, never from substrings.
 func synthesizeBuildTodosFromMutation(content string) []string {
 	if strings.TrimSpace(content) == "" {
 		return nil
 	}
-	lower := strings.ToLower(content)
-	var todos []string
-
-	// Detect static website creation requests and create the standard
-	// trio of files (HTML, CSS, JS).
-	if strings.Contains(lower, "static website") ||
-		strings.Contains(lower, "html") && strings.Contains(lower, "css") && strings.Contains(lower, "js") {
-		todos = append(todos, "\uf05c [FILE_MUTATE] index.html — Create main HTML page with semantic structure, meta tags, and linked CSS/JS")
-		todos = append(todos, "\uf05c [FILE_MUTATE] styles.css — Create responsive stylesheet with modern CSS layout and styling")
-		todos = append(todos, "\uf05c [FILE_MUTATE] script.js — Create JavaScript file for interactive functionality")
-		return todos
-	}
-
 	// Generic fallback: single FILE_MUTATE task captures the full mutation intent.
 	// NOTE: target is intentionally a descriptive label, NOT a file path — the
 	// build engine will resolve the actual file path via LLM synthesis. Using
 	// placeholder strings like "workspace" as the target is FORBIDDEN because
 	// the build parser would interpret it as a literal file path.
-	todos = append(todos, "\uf05c [FILE_MUTATE] [resolve] — Create or modify files as described: "+strings.TrimSpace(content))
-	return todos
+	return []string{"\uf05c [FILE_MUTATE] [resolve] — Create or modify files as described: " + strings.TrimSpace(content)}
 }

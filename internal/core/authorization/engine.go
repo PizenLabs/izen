@@ -65,6 +65,9 @@ func (e *AuthorizationEngine) delegatePolicy(
 	if e.policy == nil {
 		return nil
 	}
+	// READ-ONLY: the budget is consulted for its remaining capacity only. The
+	// per-operation wall-clock window is armed by the authorization entry point
+	// (Evaluate / AuthorizeBuildCandidate), never by a reader.
 	var remainingTokens int
 	if b != nil {
 		remainingTokens = b.RemainingTokens()
@@ -97,10 +100,10 @@ func (e *AuthorizationEngine) Evaluate(
 	humanApproved bool,
 ) (*MutationAuthorization, error) {
 	state := e.getState()
-	if state != workflow.StateBuilding && state != workflow.StateRepairing {
+	if !state.Executable() {
 		return nil, &AuthorizationDenied{
 			Step:    StepWorkflowState,
-			Message: fmt.Sprintf("expected Building or Repairing, got %s", state),
+			Message: executableStateRefusal(state),
 		}
 	}
 
@@ -172,7 +175,16 @@ func (e *AuthorizationEngine) Evaluate(
 		}
 	}
 
-	if b.IsExhausted() {
+	if b == nil {
+		return nil, &AuthorizationDenied{
+			Step:    StepBudgetSufficiency,
+			Message: "no mutation budget is bound to this authorization engine",
+		}
+	}
+	// Each authorization attempt is ONE mutation operation: arm the wall-clock
+	// bound against it rather than against the age of the process.
+	b.BeginOperation()
+	if b.IsExhausted() || b.OperationTimeExceeded() {
 		return nil, &AuthorizationDenied{
 			Step:    StepBudgetSufficiency,
 			Message: "mutation budget already exhausted",
@@ -240,22 +252,59 @@ func (e *AuthorizationEngine) AuthorizeBuild(
 	isMicroPlan bool,
 	humanApproved bool,
 ) (*MutationAuthorization, error) {
+	return e.AuthorizeBuildCandidate(targetFiles, caps, mutBudget, microBudget, isMicroPlan, humanApproved, "")
+}
+
+// AuthorizeBuildCandidate is AuthorizeBuild bound to a MutationCandidate
+// identity. candidateID is stored on the issued token, and the mutation boundary
+// refuses a token whose CandidateID is not the candidate it is applying — so an
+// approval opened for one computation cannot carry another one's bytes across the
+// mutation boundary. An empty candidateID preserves the unbound behaviour of a
+// direct build execution.
+func (e *AuthorizationEngine) AuthorizeBuildCandidate(
+	targetFiles []string,
+	caps *capability.CapabilitySet,
+	mutBudget *budget.MutationBudget,
+	microBudget *budget.MicroBudget,
+	isMicroPlan bool,
+	humanApproved bool,
+	candidateID string,
+) (*MutationAuthorization, error) {
+	return e.AuthorizeBuildCandidateContent(targetFiles, caps, mutBudget, microBudget, isMicroPlan, humanApproved, candidateID, "")
+}
+
+// AuthorizeBuildCandidateContent is AuthorizeBuildCandidate bound to the
+// candidate's CONTENT as well as its identity.
+//
+// candidateDigest is the fingerprint the human's mutation review was rendered
+// from. Carrying it on the token makes the authorization a statement about one
+// concrete change: if the held candidate is ever replaced in place, the digest no
+// longer matches and the mutation boundary refuses, forcing a new review rather
+// than writing bytes nobody saw.
+//
+// WORKFLOW STATE IS AN EXECUTABLE-POSITION GATE, NOT A COMPLETION SIGNAL.
+// The check refuses any position from which no mutation may be applied, and names
+// the parked position explicitly when one is what blocked it — so "awaiting human
+// authorization" is never reported as an inexplicable `idle`.
+func (e *AuthorizationEngine) AuthorizeBuildCandidateContent(
+	targetFiles []string,
+	caps *capability.CapabilitySet,
+	mutBudget *budget.MutationBudget,
+	microBudget *budget.MicroBudget,
+	isMicroPlan bool,
+	humanApproved bool,
+	candidateID string,
+	candidateDigest string,
+) (*MutationAuthorization, error) {
 	state := e.getState()
 
-	// Auto-transition to Building if in an allowed pre-build state.
-	if state != workflow.StateBuilding && state != workflow.StateRepairing {
+	// A mutation may only be authorized from an executable position. A run
+	// parked at a human boundary has not reached one: the control plane must
+	// RESUME it first, and that resume is itself an explicit event.
+	if !state.Executable() {
 		return nil, &AuthorizationDenied{
 			Step:    StepWorkflowState,
-			Message: fmt.Sprintf("expected Building or Repairing for build execution, got %s; approve the plan via /build first", state),
-		}
-	}
-
-	for _, path := range targetFiles {
-		if !caps.CanMutateFile(path) {
-			return nil, &AuthorizationDenied{
-				Step:    StepScopeContainment,
-				Message: fmt.Sprintf("file %q not covered by capability scope", path),
-			}
+			Message: executableStateRefusal(state),
 		}
 	}
 
@@ -270,29 +319,13 @@ func (e *AuthorizationEngine) AuthorizeBuild(
 		}
 	}
 
-	if mutBudget != nil && mutBudget.IsExhausted() {
-		return nil, &AuthorizationDenied{
-			Step:    StepBudgetSufficiency,
-			Message: "mutation budget already exhausted",
-		}
-	}
+	// Every authorization attempt is ONE mutation operation, so the wall-clock
+	// bound is armed against this operation rather than against the age of the
+	// process. See budget.MutationBudget.BeginOperation.
+	mutBudget.BeginOperation()
 
-	if !e.checkpoint.HasCheckpoint() {
-		return nil, &AuthorizationDenied{
-			Step:    StepCheckpointVerification,
-			Message: "no valid checkpoint exists — ensure a checkpoint is created before build execution",
-		}
-	}
-	ref, err := e.checkpoint.LatestCheckpoint()
+	ref, err := e.admitBuild(targetFiles, caps, mutBudget, humanApproved)
 	if err != nil {
-		return nil, &AuthorizationDenied{
-			Step:    StepCheckpointVerification,
-			Message: fmt.Sprintf("cannot retrieve checkpoint: %s", err),
-		}
-	}
-
-	// Unified PolicyEngine consultation for the build execution path.
-	if err := e.delegatePolicy(targetFiles, mutBudget, humanApproved); err != nil {
 		return nil, err
 	}
 
@@ -300,19 +333,114 @@ func (e *AuthorizationEngine) AuthorizeBuild(
 	singleUse := !mutBudget.IsMultiStepPlan()
 
 	auth := &MutationAuthorization{
-		ID:            NewAuthorizationID(),
-		ProposalHash:  "",
-		CheckpointRef: ref,
-		ExpiresAt:     time.Now().Add(5 * time.Minute),
-		SingleUse:     singleUse,
-		IssuedAt:      time.Now(),
+		ID:              NewAuthorizationID(),
+		ProposalHash:    "",
+		CandidateID:     candidateID,
+		CandidateDigest: candidateDigest,
+		CheckpointRef:   ref,
+		ExpiresAt:       time.Now().Add(5 * time.Minute),
+		SingleUse:       singleUse,
+		IssuedAt:        time.Now(),
 	}
 
-	if mutBudget != nil && !mutBudget.IsMultiStepPlan() {
-		_ = mutBudget.Consume(budget.BudgetDelta{Files: len(targetFiles)})
+	if !mutBudget.IsMultiStepPlan() {
+		// The spend is REPORTED, never discarded: a budget that refuses the
+		// mutation must not also silently swallow the accounting.
+		if consumeErr := mutBudget.Consume(budget.BudgetDelta{Files: len(targetFiles)}); consumeErr != nil {
+			return nil, &AuthorizationDenied{
+				Step:    StepBudgetSufficiency,
+				Message: consumeErr.Error(),
+			}
+		}
 	}
 
 	return auth, nil
+}
+
+// executableStateRefusal names the state that blocked a mutation authorization.
+// A parked run gets the actionable sentence — the control plane must RESUME it —
+// because "got idle" for a run that is demonstrably waiting on a human is exactly
+// the misleading diagnostic this lifecycle exists to remove.
+func executableStateRefusal(state workflow.WorkflowState) string {
+	if state.Parked() {
+		return fmt.Sprintf("execution is parked at %s awaiting human authorization; resume the parked run before authorizing a mutation (no candidate was applied)", state)
+	}
+	return fmt.Sprintf("expected Building or Repairing for build execution, got %s; approve the plan via /build first", state)
+}
+
+// AdmissibleBuild answers ONE question: could a mutation over targetFiles be
+// authorized at all, if the human pressed Approve? It evaluates every
+// NON-HUMAN admission clause — scope containment, mutation budget sufficiency,
+// checkpoint availability and the unified PolicyEngine — and consumes nothing.
+//
+// It exists so the approval boundary can be gated on the runtime's own authority
+// BEFORE a human is asked. Human approval is the FINAL gate, not a UI
+// placeholder for a proposal the runtime already knows it cannot authorize.
+//
+// The clause list is the same one AuthorizeBuildCandidate runs, through the same
+// admitBuild helper, so the probe and the real authorization cannot disagree.
+func (e *AuthorizationEngine) AdmissibleBuild(
+	targetFiles []string,
+	caps *capability.CapabilitySet,
+	mutBudget *budget.MutationBudget,
+) error {
+	// Re-arm the per-operation window so the probe reads the same clock the
+	// authorization would read.
+	mutBudget.BeginOperation()
+	_, err := e.admitBuild(targetFiles, caps, mutBudget, true)
+	return err
+}
+
+// admitBuild is the shared NON-HUMAN admission clause list of the build path:
+// scope containment, mutation budget sufficiency, checkpoint verification and the
+// unified PolicyEngine, in that order.
+//
+// humanApproved selects how the PolicyEngine's approval requirement is read.
+// AuthorizeBuild passes the caller's real answer; the admission probe passes true
+// because the approval gate is precisely what it is about to open — the probe
+// answers "is anything ELSE going to refuse this?", never "does a human still
+// need to say yes?".
+func (e *AuthorizationEngine) admitBuild(
+	targetFiles []string,
+	caps *capability.CapabilitySet,
+	mutBudget *budget.MutationBudget,
+	humanApproved bool,
+) (workflow.CheckpointRef, error) {
+	for _, path := range targetFiles {
+		if caps == nil || !caps.CanMutateFile(path) {
+			return checkpointRefZero, &AuthorizationDenied{
+				Step:    StepScopeContainment,
+				Message: fmt.Sprintf("file %q not covered by capability scope", path),
+			}
+		}
+	}
+
+	if mutBudget != nil && (mutBudget.IsExhausted() || mutBudget.OperationTimeExceeded()) {
+		return checkpointRefZero, &AuthorizationDenied{
+			Step:    StepBudgetSufficiency,
+			Message: "mutation budget already exhausted",
+		}
+	}
+
+	if e.checkpoint == nil || !e.checkpoint.HasCheckpoint() {
+		return checkpointRefZero, &AuthorizationDenied{
+			Step:    StepCheckpointVerification,
+			Message: "no valid checkpoint exists — ensure a checkpoint is created before build execution",
+		}
+	}
+	ref, err := e.checkpoint.LatestCheckpoint()
+	if err != nil {
+		return checkpointRefZero, &AuthorizationDenied{
+			Step:    StepCheckpointVerification,
+			Message: fmt.Sprintf("cannot retrieve checkpoint: %s", err),
+		}
+	}
+
+	// Unified PolicyEngine consultation for the build execution path.
+	if err := e.delegatePolicy(targetFiles, mutBudget, humanApproved); err != nil {
+		return checkpointRefZero, err
+	}
+	return ref, nil
 }
 
 func stateInList(s artifact.LifecycleState, list []artifact.LifecycleState) bool {
@@ -323,3 +451,7 @@ func stateInList(s artifact.LifecycleState, list []artifact.LifecycleState) bool
 	}
 	return false
 }
+
+// checkpointRefZero is the empty checkpoint reference an admission refusal
+// carries. It is never issued: a refusal returns an error, not a token.
+var checkpointRefZero workflow.CheckpointRef

@@ -285,6 +285,19 @@ func hasDirective(ast *parser.IntentAST, name string) bool {
 // compatibility path when the decision runtime is not wired (headless/test
 // harnesses).
 func (m *model) routePromptDirective(rawInput string) tea.Cmd {
+	// ── AUTHORITATIVE ADMISSION (before any work) ─────────────────────
+	// A new execution run may not start while another is active or parked. The
+	// check is HERE — before intent parsing, before the autonomy decision is
+	// rendered, before the workflow phase moves to build — so a refusal costs no
+	// provider call, no planning, no mutation, and shows no autonomy trace that
+	// would imply work began.
+	//
+	// This is the reported defect: the conflict used to be discovered deep inside
+	// the execution pipeline, after a full AUTONOMY DECISION trace and a BUILDING
+	// header had already told the operator the runtime was working.
+	if !m.admitNewExecutionRun() {
+		return nil
+	}
 	m.bindScopeProvenance(intentdomain.ScopeDynamic)
 	m.cancelStaleAgentOps()
 	rawInput = strings.TrimSpace(rawInput)

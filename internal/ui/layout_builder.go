@@ -466,24 +466,38 @@ func isQuietTraceText(s string) bool {
 
 // buildQuietTraceLine renders the single per-turn muted summary line:
 //
-//	▸ Trace: direct_response (21ms) · Alt+E to toggle
+//	▸ Trace: auto_continue (412ms) · Alt+E to toggle
 //
-// The decision label and duration are extracted from the raw trace when
-// available; otherwise conservative defaults keep the line stable.
+// Both the decision label and the duration are REPORTED, never defaulted.
+//
+// This function used to fall back to a hardcoded "direct_response (21ms)" when
+// the collapsed trace text mentioned no decision keyword. That default made
+// every turn without an explicit autonomy verdict — including a turn that
+// dispatched a real mutation and parked at an approval gate — render as
+//
+//	▸ Trace: direct_response (21ms)
+//
+// which is a fabricated execution fact in the one place a reader trusts the
+// runtime to be summarising itself. It is also where the reported
+// "Trace: direct_response / intent parsed: ask" pairing came from: the label
+// was never a decision at all.
+//
+// So: report the decision the runtime actually recorded, or say plainly that it
+// recorded none. Report the measured duration, or omit it.
 func buildQuietTraceLine(s string) string {
 	lower := strings.ToLower(s)
-	decision := "direct_response"
+	decision := "no verdict recorded"
 	for _, d := range []string{"direct_response", "auto_continue", "ask_user", "block"} {
 		if strings.Contains(lower, d) {
 			decision = d
 			break
 		}
 	}
-	dur := "21ms"
+	line := "▸ Trace: " + decision
 	if m := traceDurationRe.FindString(s); m != "" {
-		dur = m
+		line += " (" + m + ")"
 	}
-	return "▸ Trace: " + decision + " (" + dur + ") · Alt+E to toggle"
+	return line + " · Alt+E to toggle"
 }
 
 // buildQuietTraceLineWithTokens is the Turn-aware variant. When TurnTokens >0
@@ -839,7 +853,12 @@ func buildDocumentLayoutWithTurns(records []record, wrapWidth int, username stri
 			if kind == LineKindEngineTrace {
 				if !TraceVerbose {
 					if !renderedTurns[turnID] {
-						summary := buildQuietTraceLine(ll)
+						// Summarize the WHOLE collapsed trace, not this one line.
+						// The verdict is one line among many, and the line that
+						// happens to come first is almost never the one carrying
+						// it — so a per-line summary could only ever report a
+						// default, never an observed decision.
+						summary := buildQuietTraceLine(text)
 						rawSummary := summary
 						renderedSummary := dimmedStyle.Render(rawSummary)
 						if renderedSummary == rawSummary {

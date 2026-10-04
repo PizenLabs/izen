@@ -2379,17 +2379,20 @@ func SanitizeTasksForArchetype(tasks []Task, archetype recon.ProjectArchetype) [
 		filtered = append(filtered, t)
 	}
 	if len(filtered) == 0 {
-		// All tasks filtered out — use a safe, archetype-aligned target. An
-		// empty target would merely defer the same domain mismatch downstream.
-		return []Task{{
-			StepNum:     1,
-			Status:      "idle",
-			Type:        "FILE_MUTATE",
-			Target:      "index.html",
-			Description: "Inspecting and fixing static HTML/CSS/JS files",
-			Rationale:   "All LLM-generated tasks were filtered out by VANILLA_WEB archetype guard",
-			IsHardcoded: true,
-		}}
+		// Every candidate task was filtered out. The truthful outcome is NO task
+		// list, not a fabricated one.
+		//
+		// This used to synthesize a single hardcoded Task targeting "index.html"
+		// and described as "Inspecting and fixing static HTML/CSS/JS files". That
+		// is markup-specific target fabrication inside a general planner: it
+		// invented a file the workspace had not been shown to contain, from an
+		// archetype label rather than from evidence. §11 of the runtime
+		// constitution forbids substituting a guessed target for an evidenced one.
+		//
+		// Returning nothing lets the existing downstream seams report the
+		// unresolved plan truthfully (and re-scope or ask), which is the outcome
+		// the constitution actually wants.
+		return nil
 	}
 	return filtered
 }

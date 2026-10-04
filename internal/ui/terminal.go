@@ -93,10 +93,10 @@ func (m *model) handleTerminalExecution(msg TerminalExecutionMsg) (tea.Model, te
 	// owns the workflow state; without this reset the header would keep
 	// rendering BUILDING after the engine halted. EventReset is valid from
 	// every state and returns to StateIdle, from which all modes are reachable.
-	m.unwindBuildFailure()
+	m.unwindTerminalExecution()
 
 	// 5. RESTORE INTERACTIVE PROMPT CONTROL.
-	// unwindBuildFailure focuses the input and re-derives the presentation;
+	// unwindTerminalExecution focuses the input and re-derives the presentation;
 	// recalc/sync keep the viewport geometry and derived state truthful after
 	// the stage and loading rows collapse.
 	m.recalcViewportHeight()
@@ -220,7 +220,7 @@ func (m *model) forceDetachExecution() (tea.Model, tea.Cmd) {
 	m.finalizeOperation(OpOutcomeCancelled, nil)
 
 	// 4. Unwind the workflow phase and restore prompt control.
-	m.unwindBuildFailure()
+	m.unwindTerminalExecution()
 	m.recalcViewportHeight()
 	m.syncUIState()
 

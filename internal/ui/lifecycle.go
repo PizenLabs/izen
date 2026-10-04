@@ -176,7 +176,6 @@ func (m *model) resetTransientInteraction() {
 	m.pendingHotfixTask = nil
 	m.pendingHotfixPatch = nil
 	m.hotfixCandidatesMode = false
-	m.appliedHotfixFile = ""
 	m.clearAutonomyProposal()
 	m.denyPendingPermission("cleared")
 	if m.permissionWhitelist != nil {
@@ -209,7 +208,17 @@ func (m *model) resetTransientInteraction() {
 	// so a genuinely running operation keeps running (its remaining events are
 	// simply not projected while the surface is sealed).
 	m.clearBusyFlags()
-	m.resolveApprovalState()
+	// The pending-approval gate is TRANSIENT PRESENTATION state, so clearing the
+	// conversation clears it — UNLESS a live execution run is parked at a human
+	// boundary. Releasing that gate would leave a run waiting on a decision no
+	// surface offers, which is how a live mutation became invisible and then
+	// mysteriously "blocked" a later prompt. The runtime's own boundary is the
+	// authority here, not a UI flag.
+	if m.parkedExecutionPresent() {
+		m.enterApprovalState()
+	} else {
+		m.resolveApprovalState()
+	}
 	m.syncUIState()
 	m.ti.Focus()
 	m.recalcViewportHeight()
@@ -316,7 +325,6 @@ func (m *model) discardPendingAction() {
 	m.pendingHotfixTask = nil
 	m.pendingHotfixPatch = nil
 	m.hotfixCandidatesMode = false
-	m.appliedHotfixFile = ""
 	// Discard the multi-file execution graph (Phase 9B). The MutationSet it
 	// owned was rolled back above.
 	m.activeGraph = nil

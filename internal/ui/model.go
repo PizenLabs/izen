@@ -1457,6 +1457,11 @@ type model struct {
 	// the TUI can surface it and route directly to the model picker.
 	bootErr error
 
+	// interrupted is the unfinished durable task recovered at startup from the
+	// execution ledger (§9/§15). Nil when the previous process left no open
+	// work. It is surfaced, never auto-resumed.
+	interrupted *interruptedTask
+
 	investigateInvocationCount int
 
 	// Command history
@@ -1694,11 +1699,6 @@ type model struct {
 	// hotfixCandidatesMode toggles the read-only candidate-inspection sub-view
 	// of the ambiguous card. Inspecting candidates never mutates the file.
 	hotfixCandidatesMode bool
-	// appliedHotfixFile records the target file of an APPROVED hotfix so the
-	// terminal buildResultMsg handler can dispatch the runtime approve_patch
-	// projection ONLY after the authoritative apply (budget/authorization
-	// gated) actually succeeded. Cleared on the terminal result.
-	appliedHotfixFile string
 
 	// ── Multi-file hotfix (Phase 9B): deterministic execution graph ──
 	// activeGraph is the single ExecutionGraph owned by the active multi-file
@@ -3356,10 +3356,17 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 		m.finalizeSkeleton(states.StateWorkspacePatch, "")
 		m.logRuntimeDetail("[runtime] mutation started: %d target(s)", len(p.Targets))
 	case events.MutationCompletedPayload:
-		m.setStage("apply", p.Target, stageDone)
+		m.setStage("apply", p.Target, mutationStageState(p.Outcome))
 		m.logRuntimeDetail("[runtime] mutation completed: %s (%s)", p.Target, p.Outcome)
 	case events.VerificationCompletedPayload:
-		m.setStage("validate", "", stageDone)
+		// A stage marker is a CLAIM about what happened. `✓ Validate` after a
+		// FAILED verification is a false claim rendered at the most visible
+		// surface in the UI, so the marker is derived from the verdict.
+		if p.Passed {
+			m.setStage("validate", "", stageDone)
+		} else {
+			m.setStage("validate", "", stageFailed)
+		}
 		m.logRuntimeDetail("[runtime] verification %s: %d step(s)", verificationTick(p.Passed), len(p.Steps))
 	case events.ExecutionFinishedPayload:
 		m.logRuntimeDetail("[runtime] execution finished: success=%t (%s)", p.Success, p.Outcome)
@@ -3598,16 +3605,63 @@ func (m *model) clearExecutionLoading(outcome OperationOutcome) {
 // enterApprovalState freezes the workflow pending-approval gate and derives the
 // UI state from it. The WorkflowStateMachine is the single source of truth for
 // proposals awaiting human approval.
+//
+// It also moves the lifecycle into the explicit NON-TERMINAL parked position
+// (awaiting_authorization) so a run holding a mutation candidate can never be
+// observed as idle, completed or failed. The flag and the state move together
+// on purpose: a park remembered only by a boolean is observably the same fact as
+// an idle workflow, which is what let "plan step completed" read as "the
+// execution is over".
 func (m *model) enterApprovalState() {
+	if m.orch != nil {
+		// The orchestrator owns both copies of the truth, so it performs the
+		// park; a failure here leaves the gate flag to carry the boundary.
+		_ = m.orch.ParkAtAuthorization(workflow.TransitionContext{})
+	} else if m.workflowSM != nil {
+		m.workflowSM.ParkFromState()
+	}
+	m.markApprovalPending()
+	m.syncUIState()
+}
+
+// markApprovalPending records the pending-approval gate on the canonical source.
+// It is separated from the lifecycle transition so a caller that already parked
+// (e.g. a restored run) can arm the gate without re-driving the machine.
+func (m *model) markApprovalPending() {
 	if m.workflowSM != nil {
 		m.workflowSM.MarkApprovalPending()
 	}
-	m.syncUIState()
+}
+
+// parkExecutionAtBoundary parks a live run at its human boundary through the
+// orchestrator, and reports whether the lifecycle now reads parked.
+//
+// A refusal is surfaced rather than swallowed: a run that believes it is parked
+// while the machine says idle is the exact defect this whole lifecycle exists to
+// remove.
+func (m *model) parkExecutionAtBoundary() bool {
+	if m.orch != nil {
+		if err := m.orch.ParkAtAuthorization(workflow.TransitionContext{}); err != nil {
+			m.logActivity("[execution] park at human boundary refused: %v", err)
+			return false
+		}
+	} else if m.workflowSM != nil {
+		m.workflowSM.ParkFromState()
+	}
+	if m.workflowSM != nil {
+		return m.workflowSM.Parked()
+	}
+	return true
 }
 
 // resolveApprovalState clears the workflow pending-approval gate and re-derives
 // the presentation state. Approve/reject/cancel all funnel here so no path can
 // leave the canonical gate and the UI state out of sync.
+//
+// It deliberately does NOT move the lifecycle position: resolving the gate is not
+// a lifecycle transition. The next real transition (resume, reset, failure)
+// decides where the run goes, and an authorized resume reads the parked
+// position to do it.
 func (m *model) resolveApprovalState() {
 	if m.workflowSM != nil {
 		m.workflowSM.MarkApprovalResolved()
@@ -3618,23 +3672,48 @@ func (m *model) resolveApprovalState() {
 	m.syncUIState()
 }
 
-// unwindBuildFailure releases a failed build execution back to interactive
-// state. It is the "Human-Centered / Reversible" guarantee for failed commands:
+// unwindTerminalExecution releases a FINISHED execution back to interactive
+// state. It is the "Human-Centered / Reversible" guarantee for ended commands:
 // a stream/engine failure (HTTP 400/500, network error) must never trap the
 // user in the build phase — every later prompt would then be rejected with
 // "workflow: transition from build to ask: moving to a previous phase is not
 // permitted" and the session would be unrecoverable.
 //
+// It applies to EVERY terminal run state, not only to failures. A run whose
+// objective was PROVEN is finished too: leaving the lifecycle reading `building`
+// after the workspace already carries the change reports a finished run as
+// still executing, which is the same unrecoverable confusion in the other
+// direction.
+//
 // It performs a deterministic recovery:
-//  1. Release any outstanding approval gate (build failures can arrive while a
-//     proposal freeze is pending).
+//  1. Release any outstanding approval gate (a run can end while a proposal
+//     freeze or a human boundary is pending).
 //  2. Reset the core WorkflowStateMachine to StateIdle so /ask, /plan and
 //     /build are all reachable again.
 //  3. Reset the Application-layer domain WorkflowRuntime to PhaseAsk so
 //     submit_prompt / switch_mode handlers never reject a recovery prompt.
 //  4. Re-derive the presentation state to interactive StateChat and restore
 //     keyboard focus.
-func (m *model) unwindBuildFailure() {
+//
+// PHASE AUTHORITY: the unwind goes through the orchestrator (PhaseManager), not
+// straight at the state machine. Resetting the SM behind the orchestrator's back
+// used to leave its logical phase reading "build" while the machine read "idle",
+// after which every Transition(PhaseBuild) was a silent no-op and the next
+// mutation authorization was refused with "expected Building or Repairing … got
+// idle". One authority now owns both copies of the truth.
+func (m *model) unwindTerminalExecution() {
+	// THE UNWIND IS THE END OF THE RUN.
+	//
+	// `unwindTerminalExecution` is the single sanctioned transition out of a live
+	// execution phase, and it is only ever called for a run that has reached a
+	// TERMINAL state: a driver failure, an aborted run, an unsubstantiated
+	// objective, a PROVEN completion, a detached worker. It must therefore also release the human
+	// boundary — a run that has terminated is not still waiting for a decision, and
+	// leaving `awaiting_authorization` behind would report a finished run as parked
+	// and block the next execution for a decision nobody can now give.
+	//
+	// It is deliberately NOT called on the park path: a run waiting for a human is
+	// alive, and this unwind is what would wrongly end it.
 	m.resolveApprovalState()
 	// Drop any in-flight approval/patch state so the viewport returns to chat.
 	m.awaitingConfirmation = false
@@ -3648,9 +3727,16 @@ func (m *model) unwindBuildFailure() {
 
 	m.clearAutonomyProposal()
 	m.denyPendingPermission("unwound")
-	if m.workflowSM != nil {
+	if m.orch != nil {
 		// From StateBuilding/StateFailed/StateRepairing the canonical exit is
 		// a reset back to StateIdle, from which every forward phase is reachable.
+		if err := m.orch.ResetToAsk(workflow.TransitionContext{}); err != nil {
+			m.appendSystemError(fmt.Errorf("workflow reset rejected: %w", err))
+		}
+	} else if m.workflowSM != nil {
+		// Legacy raw-SM fallback (headless/test harnesses without an orchestrator):
+		// the SM is the only authority left, so resetting it directly IS the
+		// sanctioned path here.
 		if err := m.workflowSM.SendEvent(workflow.EventReset, workflow.TransitionContext{}); err != nil {
 			m.appendSystemError(fmt.Errorf("workflow reset rejected: %w", err))
 		}
@@ -3766,9 +3852,17 @@ func (m *model) handleEmergencyInterrupt(reason string) (tea.Model, tea.Cmd) {
 	m.resolveApprovalState()
 	// Project the interrupt onto the canonical workflow state machine so
 	// m.state (via syncUIState) can never drift from workflowSM. The
-	// interrupt event unwinds Building/Planning/Reviewing/Repairing to
-	// Idle; failures are surfaced, never swallowed.
-	if m.workflowSM != nil {
+	// interrupt event unwinds Building/Planning/Reviewing/Repairing/awaiting
+	// authorization to Idle; failures are surfaced, never swallowed.
+	//
+	// The orchestrator owns the logical phase as well as the machine, so an
+	// interrupt must re-anchor BOTH. Routing the SM alone left the projection
+	// reading a live phase over an idle machine.
+	if m.orch != nil {
+		if err := m.orch.ResetToAsk(workflow.TransitionContext{}); err != nil {
+			m.appendSystemError(fmt.Errorf("workflow SM rejected emergency interrupt event: %w", err))
+		}
+	} else if m.workflowSM != nil {
 		if err := m.workflowSM.SendEvent(workflow.EventUserInterrupt, workflow.TransitionContext{}); err != nil {
 			m.appendSystemError(fmt.Errorf("workflow SM rejected emergency interrupt event: %w", err))
 		}
