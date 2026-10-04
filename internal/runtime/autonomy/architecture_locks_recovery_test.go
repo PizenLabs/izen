@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/autonomy"
@@ -485,32 +486,34 @@ func TestLock10_ProgressAndTelemetryAgree(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	var sawIntent bool
-	for {
+	// The bus dispatches on its own goroutine, so Run returning does NOT mean the
+	// intent record has been delivered yet. A non-blocking drain would therefore
+	// assert on a race: under load the record simply had not arrived. Wait for it
+	// (bounded), then validate its contents.
+	deadline := time.After(5 * time.Second)
+	sawIntent := false
+	for !sawIntent {
 		select {
 		case msg := <-activities:
-			if strings.Contains(msg, "[intent]") {
-				sawIntent = true
-				if strings.Contains(msg, "user_intent=unknown") {
-					t.Fatalf("the published intent record reports an unknown axis for a resolved objective:\n%s", msg)
-				}
-				if strings.Contains(msg, "scope=unknown") {
-					t.Fatalf("the published intent record reports an unknown scope:\n%s", msg)
-				}
-				if !strings.Contains(msg, "scope_state=") {
-					t.Fatalf("the published intent record omits the scope resolution state:\n%s", msg)
-				}
-				if !strings.Contains(msg, "objective=run-1") {
-					t.Fatalf("the published intent record omits the objective identity:\n%s", msg)
-				}
+			if !strings.Contains(msg, "[intent]") {
+				continue
 			}
-			continue
-		default:
+			sawIntent = true
+			if strings.Contains(msg, "user_intent=unknown") {
+				t.Fatalf("the published intent record reports an unknown axis for a resolved objective:\n%s", msg)
+			}
+			if strings.Contains(msg, "scope=unknown") {
+				t.Fatalf("the published intent record reports an unknown scope:\n%s", msg)
+			}
+			if !strings.Contains(msg, "scope_state=") {
+				t.Fatalf("the published intent record omits the scope resolution state:\n%s", msg)
+			}
+			if !strings.Contains(msg, "objective=run-1") {
+				t.Fatalf("the published intent record omits the objective identity:\n%s", msg)
+			}
+		case <-deadline:
+			t.Fatal("no four-axis intent record was published")
 		}
-		break
-	}
-	if !sawIntent {
-		t.Fatal("no four-axis intent record was published")
 	}
 }
 

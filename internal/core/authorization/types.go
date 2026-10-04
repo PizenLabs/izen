@@ -65,6 +65,60 @@ type MutationAuthorization struct {
 	// Empty means "unbound": the caller had no candidate identity to bind (a
 	// direct build execution), and the historical behaviour is preserved.
 	CandidateID string
+	// CandidateDigest is the CONTENT fingerprint of the candidate this token was
+	// issued for: a digest over the artifact bytes, the compiled diffs and the
+	// target identity.
+	//
+	// CandidateID alone answers "is this the same computation?" — which is not
+	// the same question as "is this the same CHANGE?". If the held artifact were
+	// ever replaced in place under a stable identity, an authorization would
+	// survive the substitution and write bytes a human never saw. Binding the
+	// content makes that structurally impossible: the mutation boundary recomputes
+	// the digest and refuses a token whose candidate no longer matches, which is
+	// the "authorization invalidated: candidate changed" outcome.
+	//
+	// Empty means "not content-bound" and preserves the historical behaviour for
+	// callers that hold no candidate content.
+	CandidateDigest string
+}
+
+// Binds reports whether this token is bound to a specific candidate identity.
+// It is the predicate the mutation boundary uses to decide whether a lineage
+// comparison is meaningful at all.
+func (a *MutationAuthorization) Binds() bool {
+	return a != nil && a.CandidateID != ""
+}
+
+// Authorizes reports whether this token may be used to apply `candidateID`
+// carrying `digest`.
+//
+// The identity is the primary key: a different candidate is a different
+// computation. The digest is the content key: the same identity with different
+// content is a changed candidate and equally unapproved. Both comparisons are
+// fail-closed — a bound token that cannot be matched is refused, never ignored.
+func (a *MutationAuthorization) Authorizes(candidateID, digest string) error {
+	if !a.Binds() {
+		return nil
+	}
+	if a.CandidateID != candidateID {
+		return fmt.Errorf("%w: authorization %s is bound to candidate %q, refusing %q",
+			ErrAuthorizationCandidateMismatch, a.ID, a.CandidateID, candidateID)
+	}
+	if a.CandidateDigest != "" && digest != "" && a.CandidateDigest != digest {
+		return fmt.Errorf("%w: authorization %s was issued for candidate content %s but the held candidate is now %s — the authorization is invalidated and a new mutation review is required",
+			ErrAuthorizationCandidateChanged, a.ID, shortDigest(a.CandidateDigest), shortDigest(digest))
+	}
+	return nil
+}
+
+// shortDigest renders a fingerprint compactly for a human-readable refusal.
+// A full sha256 would dominate the message; the first 12 hex chars are enough to
+// tell two digests apart.
+func shortDigest(d string) string {
+	if len(d) <= 12 {
+		return d
+	}
+	return d[:12]
 }
 
 func (a *MutationAuthorization) IsExpired() bool {
@@ -124,6 +178,13 @@ func (e *AuthorizationDenied) Error() string {
 // applied. It is a lineage failure, not a permission failure: the human gate was
 // opened for one artifact and a different one is being written.
 var ErrAuthorizationCandidateMismatch = errors.New("authorization: candidate identity mismatch")
+
+// ErrAuthorizationCandidateChanged is returned when the authorization's candidate
+// identity still matches but its CONTENT no longer does. It is a distinct failure
+// from a lineage mismatch: the run is the same run, the proposal a human reviewed
+// is simply not the proposal the runtime would apply. The remedy is a new
+// mutation review, never a silent re-authorization.
+var ErrAuthorizationCandidateChanged = errors.New("authorization: candidate changed since review")
 
 type CapabilityFlags int
 

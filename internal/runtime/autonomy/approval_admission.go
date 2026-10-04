@@ -1,10 +1,12 @@
 package autonomy
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/execution/planner"
 )
 
@@ -69,6 +71,27 @@ import (
 // runtime's own authorities, invoked before a human is asked.
 type ApprovalAdmissionFunc func(targets []string, candidateID string) error
 
+// CandidateReviewFunc is the runtime's read of the held candidate a human is
+// being asked to authorize. It returns the concrete change — operation, targets,
+// compiled diff, content digest — or ok=false when nothing previewable is held.
+//
+// It exists so the mutation review boundary presents the ACTUAL candidate instead
+// of a target name. Like ApprovalAdmissionFunc it is a pure read: it consumes no
+// budget and mutates nothing, because REVIEWING a candidate is not authorizing
+// it.
+type CandidateReviewFunc func(candidateID string) (execution.CandidatePreview, bool)
+
+// WithCandidateReview overrides the candidate-preview authority.
+//
+// The DEFAULT is the adapter's own read of the executor's held-candidate record —
+// the same map Approve consumes — so the reviewed bytes and the applied bytes are
+// the same object by construction. There is deliberately no "unwired" mode: a
+// driver always has a preview source, and if that source cannot show the change
+// the boundary is refused rather than presented as a bare approval.
+func WithCandidateReview(f CandidateReviewFunc) Option {
+	return func(d *Driver) { d.review = f }
+}
+
 // WithApprovalAdmission binds the runtime's approval-admission authority.
 //
 // Passing nil leaves the driver's historical behaviour (an approval boundary
@@ -108,13 +131,105 @@ func (d *Driver) admitHeldCandidate(b *autonomy.HumanBoundary) {
 			"the computation that produced it failed, was superseded or was cancelled, so its artifact is not executable")
 		return
 	}
-	// ── 2. AUTHORIZATION ADMISSIBILITY ─────────────────────────────────
+	// ── 2. THE CONCRETE CANDIDATE, so the review is answerable ─────────
+	// A human cannot authorize a change they cannot see. The preview is the
+	// runtime's own read of the held record, so the review and the apply are
+	// guaranteed to describe the same bytes.
+	d.attachCandidateReview(b)
+	// ── 3. AUTHORIZATION ADMISSIBILITY ─────────────────────────────────
 	if d.admission == nil {
 		return
 	}
 	if err := d.admission(append([]string(nil), b.Targets...), b.PatchID); err != nil {
 		d.refuseApproval(b, "mutation is not admissible: "+err.Error())
 	}
+}
+
+// attachCandidateReview copies the held candidate's own facts onto the boundary
+// and records the runtime's evidence checklist.
+//
+// Two things are load-bearing here:
+//
+//  1. The evidence checklist is built from what the runtime OBSERVED. The
+//     "mutation applied" row is present and NOT satisfied, because nothing has
+//     been applied — rendering it as a success is precisely the optimistic UI
+//     this boundary exists to replace.
+//  2. When nothing is previewable the boundary is refused. An approval surface
+//     with no candidate to review is a ceremonial yes/no, not an authorization.
+func (d *Driver) attachCandidateReview(b *autonomy.HumanBoundary) {
+	// A boundary the runtime cannot preview must not be presented as an
+	// authorization at all. The preview authority defaults to the adapter, so
+	// this is unreachable in a correctly wired production composition; it stays
+	// as a fail-closed guard rather than an optimistic default.
+	if d.review == nil {
+		d.refuseApproval(b, "the held mutation candidate could not be projected for review; "+
+			"the runtime will not ask a human to authorize a change it cannot show")
+		return
+	}
+	preview, ok := d.review(b.PatchID)
+	if !ok {
+		d.refuseApproval(b, "the held mutation candidate "+b.PatchID+" produced no reviewable change; "+
+			"the runtime will not ask a human to authorize a change it cannot show")
+		return
+	}
+	b.CandidateCandidateID = preview.CandidateID
+	b.CandidateID = preview.CandidateID
+	b.CandidateDigest = preview.Digest()
+	b.CandidateOperation = preview.Operation
+	b.CandidateOperationEvidence = preview.OperationEvidence
+	b.CandidateTargets = append([]string(nil), preview.Targets...)
+	b.CandidateDiff = preview.Diff
+	b.CandidateAddedLines = preview.AddedLines
+	b.CandidateRemovedLines = preview.RemovedLines
+	b.CandidateContractID = preview.ContractID
+	if len(b.Targets) == 0 {
+		b.Targets = append([]string(nil), preview.Targets...)
+	}
+	b.CandidateEvidence = MutationReviewEvidence(preview)
+}
+
+// MutationReviewEvidence is the runtime's own checklist for a mutation review.
+//
+// Every row is a fact the runtime observed. The final row is present and
+// deliberately UNSATISFIED: nothing has been written to the workspace yet, and a
+// review that showed it as a green check would be reporting a mutation that has
+// not occurred.
+//
+// It is exported and PURE so the presentation layer and the runtime agree on one
+// checklist — a UI that rendered its own version could drift from the runtime's
+// evidence, which is the very failure this boundary exists to prevent.
+func MutationReviewEvidence(preview execution.CandidatePreview) []autonomy.BoundaryEvidence {
+	rows := make([]autonomy.BoundaryEvidence, 0, 5)
+	if len(preview.Targets) > 0 {
+		rows = append(rows, autonomy.BoundaryEvidence{
+			Label:     "target resolved",
+			Satisfied: true,
+			Detail:    strings.Join(preview.Targets, ", "),
+		})
+	}
+	if preview.OperationEvidence != "" {
+		rows = append(rows, autonomy.BoundaryEvidence{
+			Label:     "operation classified",
+			Satisfied: true,
+			Detail:    preview.Operation + " — " + preview.OperationEvidence,
+		})
+	}
+	rows = append(rows, autonomy.BoundaryEvidence{
+		Label:     "artifact parsed",
+		Satisfied: preview.ArtifactDigest != "",
+		Detail:    "candidate fingerprint " + preview.ArtifactDigest,
+	})
+	rows = append(rows, autonomy.BoundaryEvidence{
+		Label:     "change compiled",
+		Satisfied: preview.Diff != "",
+		Detail:    fmt.Sprintf("+%d / -%d lines", preview.AddedLines, preview.RemovedLines),
+	})
+	rows = append(rows, autonomy.BoundaryEvidence{
+		Label:     "mutation applied",
+		Satisfied: false,
+		Detail:    "nothing has been written to the workspace",
+	})
+	return rows
 }
 
 // admitStagedPlan gates a DECOMPOSITION_PROPOSAL boundary. The proposal is a

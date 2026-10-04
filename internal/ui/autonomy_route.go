@@ -68,6 +68,13 @@ func (m *model) runAutonomyRoutedCmdExplicit(objective string) tea.Cmd {
 // intent → capability → workspace → decision, and the decided BUILD workspace
 // executes with hotfix semantics.
 func (m *model) routeHotfixThroughAutonomy(objective string) tea.Cmd {
+	// ── AUTHORITATIVE ADMISSION (before any work) ─────────────────────
+	// Same contract as $prompt: a new execution run cannot start while another
+	// is active or parked. The refusal lands before the autonomy decision is
+	// rendered and before the workflow phase moves to build.
+	if !m.admitNewExecutionRun() {
+		return nil
+	}
 	m.bindScopeProvenance(intentdomain.ScopeDeclared)
 	if m.autonomy == nil {
 		// Legacy compatibility: no decision runtime wired — fall back to the

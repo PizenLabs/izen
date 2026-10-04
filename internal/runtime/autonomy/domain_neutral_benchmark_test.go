@@ -165,7 +165,10 @@ func TestDomainNeutralBenchmark_TruthfulTermination(t *testing.T) {
 	}
 
 	// 5. The canonical loop actually transitioned (evidence exists at all).
-	if collector.loopTransitions() == 0 {
+	//    The bus dispatches on its own goroutine, so Run returning does not mean
+	//    the transitions have been delivered; wait for the evidence rather than
+	//    racing it.
+	if !collector.waitTransitions(1, 5*time.Second) {
 		t.Fatal("no loop.transition evidence was published: the run is unobservable")
 	}
 	// 6. THE AUTHORIZED SECOND HALF: the human approval boundary is the runtime's
@@ -199,6 +202,9 @@ func TestDomainNeutralBenchmark_TruthfulTermination(t *testing.T) {
 	if term != nil {
 		state = string(term.State)
 	}
+	// The resumed half publishes on the same async bus; settle before reporting
+	// the transition count so the number describes the whole run.
+	collector.waitTransitions(1, 5*time.Second)
 	t.Logf("domain-neutral benchmark verdict: pre-approval=%s post-approval=completed providerCalls=%d transitions=%d",
 		state, mock.calls(), collector.loopTransitions())
 }

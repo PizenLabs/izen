@@ -191,6 +191,22 @@ func (a *ExecutorAdapter) CandidateHeld(patchID string) bool {
 	return a.executor.CandidateHeld(patchID)
 }
 
+// CandidateReview projects the held candidate a human is being asked to
+// authorize.
+//
+// It is a READ of the executor's own pending-candidate record — the same object
+// Approve consumes — so the review a human sees and the mutation the runtime
+// performs are provably the same bytes. Routing it through the adapter rather
+// than a second injected function means a driver cannot be wired to review a
+// candidate from one source while applying another: the two are the same map by
+// construction.
+func (a *ExecutorAdapter) CandidateReview(patchID string) (execution.CandidatePreview, bool) {
+	if a == nil || a.executor == nil {
+		return execution.CandidatePreview{}, false
+	}
+	return a.executor.CandidatePreview(patchID)
+}
+
 // InvalidatePendingCandidates drops every approval-held candidate from the
 // executor behind this adapter, returning how many were dropped.
 //

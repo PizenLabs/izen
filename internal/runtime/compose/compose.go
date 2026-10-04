@@ -934,6 +934,12 @@ func Wire(opts ...Option) (*Application, error) {
 			}
 			return a.Auth.AdmissibleBuild(targets, a.Caps, a.Budget)
 		}),
+		// MUTATION REVIEW FACTS: the boundary a human answers must show the
+		// concrete held change. The preview defaults to the adapter's own read of
+		// the executor's held-candidate record — the same map Approve consumes —
+		// so the review cannot describe bytes the mutation would not write, and its
+		// digest is what the authorization is later bound to (a candidate replaced
+		// in place forces a new review rather than a silent re-authorization).
 		runtimeAutonomy.WithPreflightBarrier(loopBarrier),
 		runtimeAutonomy.WithPreflightState(preflightState),
 		// PHASE 15: the grant-gated workspace context barrier. The session grant

@@ -2,6 +2,8 @@ package execution
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -616,6 +619,20 @@ type RuntimeExecutor struct {
 	pending map[string]*pendingMutation
 	counter atomic.Int64
 
+	// appliedTargets is the set of targets this executor has actually WRITTEN.
+	//
+	// It exists because "a held candidate is still pending" and "a mutation has
+	// happened" are different questions, and only the second one is what an
+	// operator is asking when they ask whether anything changed. Answering it
+	// from the absence of pending work would be a guess: a rejected candidate, an
+	// aborted run and a never-generated one all leave the pending map empty while
+	// nothing whatsoever was written.
+	//
+	// It is populated from the PatchManager's own mutation seam — the callback
+	// that fires after a file is written — so it records only bytes that reached
+	// disk, never bytes that were proposed.
+	appliedTargets map[string]struct{}
+
 	// observeSnapshot is the Observation-phase memory cache: target → content.
 	// It is populated ONCE per Execute via observeTargets and is the single
 	// byte source for compileContext, invokeMutation, and verification — no
@@ -742,6 +759,7 @@ func NewRuntimeExecutor(root string, cfg *config.Config, provider ai.Provider, b
 	// disk.
 	x.patches.SetOnMutation(func(target string, _ []byte) {
 		x.invalidateSnapshot(target)
+		x.recordAppliedMutation(target)
 	})
 	if langID != "" {
 		x.verifier = NewLanguageVerifier(root, langID)
@@ -989,6 +1007,23 @@ func (x *RuntimeExecutor) MutationBoundary() MutationBoundary {
 // the runtime never applies without an authorization token.
 func (x *RuntimeExecutor) SetAuthorization(a *authorization.MutationAuthorization) {
 	x.auth = a
+}
+
+// AttachedAuthorization returns the authorization token currently gating this
+// executor's applies, or nil.
+//
+// It is a READ of the governance state, exposed so a consumer can verify WHICH
+// mutation was authorized rather than inferring it from an outcome. The token
+// carries the candidate identity and content digest the authorization was issued
+// for, so answering "was this the candidate a human reviewed?" is a comparison,
+// not a reconstruction from log strings.
+func (x *RuntimeExecutor) AttachedAuthorization() *authorization.MutationAuthorization {
+	if x == nil {
+		return nil
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.auth
 }
 
 // SetSessionResolver wires the active-session correlation source
@@ -2382,17 +2417,25 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 // a graph transition.
 func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*ExecutionResult, error) {
 	// ── CANDIDATE LINEAGE GATE ─────────────────────────────────────────
-	// A MutationAuthorization may be bound to ONE MutationCandidate identity. If
-	// the bound authorization names a different candidate than the one being
-	// applied, the human gate was opened for a different artifact and this apply
-	// would write bytes nobody approved.
+	// A MutationAuthorization is a statement about ONE concrete candidate.
+	// Two things can invalidate it, and they are different failures:
 	//
-	// The check runs BEFORE the candidate is removed from `pending`, so a
-	// mismatched token leaves the held candidate exactly as it was: a refused
-	// lineage is not a consumed approval.
-	if x.auth != nil && x.auth.CandidateID != "" && x.auth.CandidateID != patchID {
-		return nil, fmt.Errorf("executor: %w: authorization %s is bound to candidate %q, refusing to apply %q",
-			authorization.ErrAuthorizationCandidateMismatch, x.auth.ID, x.auth.CandidateID, patchID)
+	//	identity mismatch — the gate was opened for a DIFFERENT computation
+	//	content changed  — the gate was opened for a candidate whose bytes
+	//	                   have since been replaced
+	//
+	// Both are checked through the token's own Authorizes predicate, and both
+	// run BEFORE the candidate is removed from `pending`, so a refused
+	// authorization is never a consumed approval.
+	if x.auth != nil {
+		preview, held := x.CandidatePreview(patchID)
+		if err := x.auth.Authorizes(patchID, preview.Digest()); err != nil {
+			return nil, fmt.Errorf("executor: %w", err)
+		}
+		if x.auth.CandidateDigest != "" && held && preview.CandidateID != patchID {
+			return nil, fmt.Errorf("executor: %w: authorization %s names candidate %q, refusing %q",
+				authorization.ErrAuthorizationCandidateMismatch, x.auth.ID, x.auth.CandidateID, patchID)
+		}
 	}
 
 	x.mu.Lock()
@@ -2776,12 +2819,54 @@ func (x *RuntimeExecutor) Reject(ctx context.Context, patchID, reason string) (*
 
 // PendingPatchIDs returns the approval-held patch IDs (observability).
 func (x *RuntimeExecutor) PendingPatchIDs() []string {
+	if x == nil {
+		return nil
+	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	out := make([]string, 0, len(x.pending))
 	for id := range x.pending {
 		out = append(out, id)
 	}
+	return out
+}
+
+// recordAppliedMutation notes that bytes for target reached disk.
+//
+// This is fed exclusively by the PatchManager's post-write seam, so it can only
+// record a mutation that actually happened. That is the whole point: an
+// execution-truth surface that has to guess whether a change landed will be
+// wrong in the direction that matters most — reporting "nothing changed" about a
+// change that shipped.
+func (x *RuntimeExecutor) recordAppliedMutation(target string) {
+	if x == nil || target == "" {
+		return
+	}
+	x.mu.Lock()
+	if x.appliedTargets == nil {
+		x.appliedTargets = make(map[string]struct{})
+	}
+	x.appliedTargets[target] = struct{}{}
+	x.mu.Unlock()
+}
+
+// AppliedMutations returns the targets this executor has actually written,
+// sorted for a stable reading. It is observability, not authority: it exists so
+// the UI can answer "has anything been mutated?" from evidence.
+func (x *RuntimeExecutor) AppliedMutations() []string {
+	if x == nil {
+		return nil
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if len(x.appliedTargets) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(x.appliedTargets))
+	for target := range x.appliedTargets {
+		out = append(out, target)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -2838,6 +2923,171 @@ func (x *RuntimeExecutor) CandidateHeld(patchID string) bool {
 	defer x.mu.Unlock()
 	_, ok := x.pending[patchID]
 	return ok
+}
+
+// CandidatePreview is the READ-ONLY projection of one approval-held mutation
+// candidate: everything a human needs to see before authorizing it, and nothing
+// that would let a consumer decide whether it is valid.
+//
+// It exists because the mutation review boundary used to ask a human to authorize
+// a concrete change while showing only a target name. "You are authorizing a
+// mutation, here is the file" is not a review — the human cannot tell whether the
+// proposed change is what they wanted. Every field below is read from the SAME
+// held record Approve will apply, so the review and the mutation cannot disagree.
+type CandidatePreview struct {
+	// CandidateID is the held candidate's identity.
+	CandidateID string
+	// Targets is the authoritative target set the mutation covers.
+	Targets []string
+	// Operation is the semantic operation (create / update / delete), derived
+	// from the candidate's own target pre-state — never from the prompt, the
+	// filename or the artifact type.
+	Operation string
+	// OperationEvidence states why the operation was classified as it was.
+	OperationEvidence string
+	// ArtifactDigest is the content fingerprint of the held artifact.
+	ArtifactDigest string
+	// Diff is the runtime's own compiled unified diff.
+	Diff string
+	// AddedLines / RemovedLines are the compiled diff metrics.
+	AddedLines   int
+	RemovedLines int
+	// ContractID identifies the immutable execution contract the candidate
+	// belongs to.
+	ContractID string
+	// RunRequestID is the logical invocation that produced the candidate.
+	RunRequestID string
+}
+
+// Digest is the candidate's content fingerprint: a stable sha256 over the
+// candidate identity, its targets, the held artifact bytes and the compiled
+// diffs. It is what an authorization is bound to, so a candidate that is ever
+// replaced in place cannot be applied under an older review.
+func (p CandidatePreview) Digest() string {
+	h := sha256.New()
+	h.Write([]byte(p.CandidateID))
+	for _, t := range p.Targets {
+		h.Write([]byte(t))
+		h.Write([]byte{0})
+	}
+	h.Write([]byte(p.Operation))
+	h.Write([]byte{0})
+	h.Write([]byte(p.ArtifactDigest))
+	h.Write([]byte{0})
+	h.Write([]byte(p.Diff))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// CandidatePreview projects one approval-held candidate for human review. It
+// returns false when the identity is not (or no longer) held, so a caller can
+// never render a review for an artifact that could not be applied.
+//
+// The read is side-effect free: it consumes no budget, mutates nothing and does
+// not touch the authorization state. Reviewing a candidate is not authorizing it.
+func (x *RuntimeExecutor) CandidatePreview(patchID string) (CandidatePreview, bool) {
+	var out CandidatePreview
+	if x == nil || patchID == "" {
+		return out, false
+	}
+	x.mu.Lock()
+	pm, ok := x.pending[patchID]
+	x.mu.Unlock()
+	if !ok || pm == nil {
+		return out, false
+	}
+
+	targets := append([]string(nil), pm.targets...)
+	artifactDigest := ""
+	artifactBody := ""
+	if len(pm.patches) > 0 && pm.patches[0] != nil {
+		artifactDigest = pm.patches[0].Modified
+		artifactBody = pm.patches[0].Modified
+	}
+	// The compiled diff is the runtime's OWN measurement of the proposed change,
+	// so the metrics the review shows are the metrics the apply will record.
+	added, removed := countDiffLines(pm.diffs)
+	diff := strings.Join(pm.diffs, "\n")
+	if diff == "" {
+		// A CREATE has no prior content, so the executor compiles no unified diff —
+		// yet the human is still authorizing a concrete body of bytes. Deriving the
+		// whole-file diff here keeps the review honest: the mutation boundary will
+		// record exactly these added lines, and a review that showed nothing for a
+		// file creation would be the "authorize something you cannot see" defect
+		// this projection exists to remove.
+		diff, added = wholeFileAdditionDiff(artifactBody)
+	}
+	operation, evidence := classifyPreviewOperation(pm.target, pm.original, targets)
+
+	out = CandidatePreview{
+		CandidateID:       patchID,
+		Targets:           targets,
+		Operation:         operation,
+		OperationEvidence: evidence,
+		ArtifactDigest:    sha256Hex(artifactDigest),
+		Diff:              diff,
+		AddedLines:        added,
+		RemovedLines:      removed,
+		RunRequestID:      pm.requestID,
+	}
+	if pm.contract != nil {
+		out.ContractID = pm.contract.ID().String()
+	}
+	return out, true
+}
+
+// classifyPreviewOperation derives the mutation's semantic operation from the
+// candidate's OWN target pre-state. It is deliberately the only input: a prompt
+// keyword, a filename or an artifact extension is never evidence of what the
+// mutation will do to the workspace.
+func classifyPreviewOperation(target, original string, targets []string) (string, string) {
+	_ = targets
+	switch {
+	case target != "" && original == "":
+		return "CREATE", "target did not exist before this mutation"
+	case target != "":
+		return "UPDATE", "target existed before this mutation"
+	default:
+		return "MUTATE", "mutation covers an already-resolved target set"
+	}
+}
+
+// wholeFileAdditionDiff renders a create as the unified diff it will actually
+// produce: every line of the new file added against an empty baseline.
+//
+// It is derived from the SAME artifact bytes the apply writes, so the review shows
+// the mutation rather than a description of it.
+func wholeFileAdditionDiff(body string) (string, int) {
+	if body == "" {
+		return "", 0
+	}
+	lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+	var sb strings.Builder
+	sb.WriteString("@@ -0,0 +1," + strconv.Itoa(len(lines)) + " @@\n")
+	for _, line := range lines {
+		sb.WriteString("+" + line + "\n")
+	}
+	return sb.String(), len(lines)
+}
+
+// countDiffLines measures the compiled diff for the preview when the patch record
+// carries no own metrics (a bounded SEARCH/REPLACE artifact has no hunk header).
+func countDiffLines(diffs []string) (added, removed int) {
+	for _, d := range diffs {
+		for _, line := range strings.Split(d, "\n") {
+			switch {
+			case strings.HasPrefix(line, "+"):
+				added++
+			case strings.HasPrefix(line, "-"):
+				removed++
+			}
+		}
+	}
+	return added, removed
+}
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
 }
 
 // supersedePendingCandidates rejects every approval-held candidate a SUPERSEDED
@@ -3646,6 +3896,9 @@ func artifactDiagnostic(target string, gateErr error, retryable bool) Diagnostic
 }
 
 func populateInvocationTelemetry(inv *ModelInvocation, req ai.Request, usage ai.ProviderUsage, metadata ai.ResponseMetadata) {
+	if globalActivityLog != nil {
+		globalActivityLog("[zzdebug] populate usage known=%v in=%d out=%d est=%v mdUsageKnown=%v", usage.Known, usage.PromptTokens, usage.CompletionTokens, usage.Estimated, metadata.Usage.Known)
+	}
 	if inv == nil {
 		return
 	}

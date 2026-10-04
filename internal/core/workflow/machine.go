@@ -43,10 +43,43 @@ func (m *WorkflowStateMachine) State() WorkflowState {
 // MarkApprovalPending records that the workflow is blocked on an explicit
 // human approval gate. It is the canonical signal the presentation layer
 // projects onto its AwaitingApproval UI state.
+//
+// The boolean flag is the gate signal; the STATE it also drives is the
+// lifecycle truth. Both move together, because a parked run that is only
+// remembered by a boolean is observably indistinguishable from an idle one —
+// which is exactly how a plan step completing could masquerade as an execution
+// reaching its end.
+//
+// ParkFromState drives the state transition without touching the flag. It
+// exists so the lifecycle owner can park a run that never went through the
+// legacy proposal gate, and vice versa.
 func (m *WorkflowStateMachine) MarkApprovalPending() {
-	if m != nil {
-		m.pendingApproval = true
+	if m == nil {
+		return
 	}
+	m.pendingApproval = true
+	m.ParkFromState()
+}
+
+// ParkFromState moves a live workflow into the non-terminal parked position.
+// It is idempotent and fail-open: if a transition is refused the pending-approval
+// flag remains the authoritative gate signal, because refusing a park must never
+// make an unauthenticated mutation look authorized — nor strand a parked run in
+// a position the resume edge cannot reach.
+func (m *WorkflowStateMachine) ParkFromState() {
+	if m == nil || m.current == StateAwaitingAuthorization {
+		return
+	}
+	_ = m.SendEvent(EventAwaitAuthorization, TransitionContext{})
+}
+
+// Parked reports whether the workflow holds a live execution run blocked on a
+// human authorization decision. A parked run is never idle and never terminal.
+func (m *WorkflowStateMachine) Parked() bool {
+	if m == nil {
+		return false
+	}
+	return m.current == StateAwaitingAuthorization
 }
 
 // MarkApprovalResolved clears the pending-approval gate.
@@ -106,6 +139,15 @@ func (m *WorkflowStateMachine) lookup(from WorkflowState, event WorkflowEvent, c
 	// remains in Building/Planning.
 	if event == EventUserInterrupt {
 		return StateIdle, nil
+	}
+	// ── THE PARK IS AN EXPLICIT EVENT, NEVER A SIDE EFFECT ─────────────
+	// Every live position may park at a human authorization boundary (an
+	// execution run holding a mutation candidate), and re-parking is
+	// idempotent. Crucially this is the ONLY producer of
+	// StateAwaitingAuthorization, so "the workflow went idle" and "the run
+	// parked awaiting a human" can never be the same observable fact.
+	if event == EventAwaitAuthorization {
+		return StateAwaitingAuthorization, nil
 	}
 	switch from {
 	case StateIdle:
@@ -173,6 +215,23 @@ func (m *WorkflowStateMachine) lookup(from WorkflowState, event WorkflowEvent, c
 		}
 	case StateFailed:
 		if event == EventReset {
+			return StateIdle, nil
+		}
+	case StateAwaitingAuthorization:
+		// ── THE RESUME EDGE ───────────────────────────────────────────
+		// A human authorization is a control-plane EVENT that resumes the
+		// SAME parked run into the executable position. It is not a reset,
+		// not a re-plan and not a new run: the candidate, the targets, the
+		// run identity and the objective all survive untouched.
+		switch event {
+		case EventBuild:
+			if !ctx.HasCapabilities {
+				return from, &GuardError{From: from, Event: event, Msg: "no authorized capabilities", Err: ErrInvalidTransition}
+			}
+			return StateBuilding, nil
+		case EventFailureIdentified:
+			return m.failureTarget(ctx.FailureClass)
+		case EventReset:
 			return StateIdle, nil
 		}
 	}

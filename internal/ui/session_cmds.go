@@ -18,15 +18,32 @@ import (
 // atomically switches the active pointer through the SessionManager. Execution
 // state drains through the RuntimeExecutor boundary hook — the UI never touches
 // a second execution engine.
+//
+// CONVERSATION AND EXECUTION ARE SEPARATE ENTITIES. `/new` owns the CONVERSATION
+// (messages, context revisions, history, token metrics). It does not own the
+// EXECUTION RUN (objective, scope, targets, candidate, workflow state, failure
+// ledger, authorization state). Creating a conversation therefore never silently
+// terminates, inherits, or merges an execution.
+//
+// The consequence is that a parked run survives `/new` and MUST be reported. The
+// previous implementation printed "New conversation session started" and nothing
+// else, so the operator was left believing a clean slate while a live run sat at
+// a human boundary — and the next prompt then failed deep inside the execution
+// pipeline with "a run is already active or parked".
 func (m *model) runNewSessionCmd() tea.Cmd {
 	if m.sessionManager == nil {
 		m.push(roleError, "/new unavailable: no session manager wired")
 		return nil
 	}
-	if m.state == StateProcessing || m.state == StateAwaitingApproval || m.streaming || m.agentRunning {
+	if m.state == StateProcessing || m.streaming || m.agentRunning {
 		m.push(roleError, "/new cannot start a session boundary while an execution is in flight. Wait for it to finish or /drop it first.")
 		return nil
 	}
+
+	// Read the parked-run facts BEFORE the session switch so the report is about
+	// the run the operator is actually leaving, not about a fresh model whose
+	// transient state was just cleared.
+	parked, wasParked := m.parkedExecutionSummary()
 
 	sess, err := m.sessionManager.NewSession(context.Background())
 	if err != nil {
@@ -40,10 +57,12 @@ func (m *model) runNewSessionCmd() tea.Cmd {
 	m.unsealActivitySurface()
 	m.resetTitlePipeline()
 	m.clearResumeBriefing()
-	// MANDATORY: Reset all Token Metrics and UI Counters
+	// MANDATORY: Reset conversation-scoped token metrics and UI counters.
 	m.resetTokenMetrics()
 	m.push(roleSystem, infoStyle.Render("New conversation session started. Context and token metrics reset."))
-	m.push(roleSystem, infoStyle.Render("/new: started a fresh session · previous session preserved, resumable via /session resume A|B"))
+	// The parked execution is NOT conversation state: report it rather than
+	// letting it surface later as an unexplained admission refusal.
+	m.reportParkedExecutionAfterNew(parked, wasParked)
 	return nil
 }
 
@@ -112,6 +131,9 @@ func (m *model) runSessionCmd(cmd string) tea.Cmd {
 		}
 		return m.runSessionCompactCmd(target)
 
+	case len(parts) == 2 && parts[1] == "execution":
+		return m.renderExecutionTruthCmd()
+
 	default:
 		m.push(roleError, "usage:\n"+
 			"  /session                  list sessions\n"+
@@ -120,9 +142,73 @@ func (m *model) runSessionCmd(cmd string) tea.Cmd {
 			"  /session rename <A|B> <t> retitle a session\n"+
 			"  /session archive <A|B>    archive a session\n"+
 			"  /session delete <A|B>     purge session-owned state\n"+
-			"  /session compact <A|B>    run the Generational Compactor")
+			"  /session compact <A|B>    run the Generational Compactor\n"+
+			"  /session execution        show the live execution truth")
 		return nil
 	}
+}
+
+// renderExecutionTruthCmd answers the questions the runtime must always be able to
+// answer from AUTHORITATIVE state — never from a cached label or an optimistic
+// assumption:
+//
+//	What conversation am I in?  What execution run exists?  What state is it in?
+//	What candidate exists?  What exactly am I authorizing?  Has anything been
+//	mutated?  What remains to be done?
+//
+// It is read-only and changes nothing: every field comes from the session manager
+// (conversation), the workflow state machine (lifecycle), the driver (run identity
+// and human boundary) and the executor (held candidate).
+func (m *model) renderExecutionTruthCmd() tea.Cmd {
+	truth := m.Truth()
+	var sb strings.Builder
+	sb.WriteString(permissionTitleStyle.Render(Icon.Blueprint + " EXECUTION TRUTH"))
+	sb.WriteString("\n\n")
+	row := func(label, value string) {
+		if value == "" {
+			return
+		}
+		sb.WriteString("  " + permissionDescStyle.Render(label) + " " + permissionTargetStyle.Render(value) + "\n")
+	}
+	row("Conversation:", truth.ConversationID+"  (slot "+truth.ConversationSlot+")")
+	row("Run:", orNone(truth.ExecutionRunID))
+	row("Lifecycle:", truth.ExecutionState)
+	row("Boundary:", truth.PendingBoundary)
+	row("Candidate:", truth.CandidateID)
+	if truth.CandidateDigest != "" {
+		row("Fingerprint:", shortCandidateDigest(truth.CandidateDigest))
+	}
+	if len(truth.Targets) > 0 {
+		row("Targets:", strings.Join(truth.Targets, ", "))
+	}
+	// The mutation question is answered from evidence, never from optimism. The
+	// wording claims exactly what the record proves — bytes reached these targets
+	// — and does NOT claim verification, which is a separate fact owned by the
+	// verifier and absent from this record.
+	if truth.MutationApplied {
+		sb.WriteString("  " + permissionDescStyle.Render("Mutated:") + " " + greenStyle.Render("yes — written to: "+strings.Join(truth.AppliedTargets, ", ")) + "\n")
+	} else {
+		sb.WriteString("  " + permissionDescStyle.Render("Mutated:") + " " + orangeStyle.Render("no — nothing has been written by this run") + "\n")
+	}
+	switch {
+	case len(truth.Remaining) > 0:
+		row("Remaining:", strings.Join(truth.Remaining, "; "))
+	case truth.Parked:
+		row("Remaining:", "a human decision")
+	default:
+		row("Remaining:", "nothing — no run is active or parked")
+	}
+	m.push(roleStatus, sb.String())
+	m.refreshViewportContent()
+	m.gotoBottomIfAllowed()
+	return nil
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
 }
 
 func (m *model) sessionUsageError(sub, arg string) tea.Cmd {

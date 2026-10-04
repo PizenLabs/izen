@@ -409,7 +409,7 @@ func (m *model) executionResultUpdate(msg executionResultMsg) (tea.Model, tea.Cm
 		// operation is finalized, but the phase machine still owns the header
 		// status. Without this reset the TUI would keep rendering BUILDING
 		// after the engine halted (the reported state-desync defect).
-		m.unwindBuildFailure()
+		m.unwindTerminalExecution()
 		// A cancellation is a clean stop; every other terminal failure is
 		// reported verbatim. There is no model reversion on this path — the
 		// only model switch is the explicit role fallback chain, which happens

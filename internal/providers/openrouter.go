@@ -458,11 +458,10 @@ func (p *OpenRouterProvider) ExecuteStream(ctx context.Context, req ai.Request) 
 		if loopErr != nil {
 			return nil, loopErr
 		}
-		content := ""
-		if resp != nil {
-			content = resp.Content
-		}
-		return newSynthesizedStream(content), nil
+		// The COMPLETE response is wrapped, not just its content: its usage,
+		// finish_reason and metadata are the provider's billing evidence and must
+		// reach the executor exactly as the SSE path delivers them.
+		return newSynthesizedStream(resp), nil
 	}
 	requestStarted := time.Now()
 	key := p.resolveAPIKey()
@@ -1124,14 +1123,76 @@ func (u *openrouterUsage) ProviderUsage() ai.ProviderUsage {
 // synthesizedStream presents already-complete content as an io.ReadCloser. It
 // is used by the adaptive tool loop (ExecuteStream) so the caller-visible
 // streaming contract is preserved once the model has produced its final answer.
+//
+// IT CARRIES THE RESPONSE'S CAPABILITIES, NOT JUST ITS BYTES.
+//
+// The tool loop answers the same request the SSE path would have, so its response
+// carries the same provider-reported usage, finish_reason and metadata. Wrapping
+// only the CONTENT therefore threw away facts the provider had already billed —
+// and the executor, seeing a bare io.ReadCloser with no usage seam, recorded
+// "usage unknown" so the footer rendered a fabricated `↑0 · ↓0` for a run that
+// had spent thousands of tokens.
+//
+// This is the one place a synthesized stream is built, so restoring the
+// capabilities here makes the whole telemetry chain truthful again: a truncation
+// is visible as `length`, and the bill reaches the session counters.
 type synthesizedStream struct {
 	*strings.Reader
+	usage  ai.ProviderUsage
+	reason string
+	meta   ai.ResponseMetadata
 }
 
 func (s *synthesizedStream) Close() error { return nil }
 
-func newSynthesizedStream(content string) io.ReadCloser {
-	return &synthesizedStream{Reader: strings.NewReader(content)}
+// Usage reports the provider-reported usage of the completed tool-loop invocation.
+// It is the same seam (`ai.UsageProvider`) the SSE reader exposes, so the executor
+// treats this path identically to a natively streamed one.
+func (s *synthesizedStream) Usage() ai.ProviderUsage { return s.usage }
+
+// FinishReason reports the terminal finish_reason of the completed invocation, so
+// an output-ceiling truncation is observable on this path exactly as it is on the
+// streaming one.
+func (s *synthesizedStream) FinishReason() string {
+	if s == nil || s.reason == "" {
+		return ""
+	}
+	return NormalizeFinishReason(s.reason)
+}
+
+// ResponseMetadata returns the standardized contract/finish-reason wrapper, so
+// consumers see the same contract provenance on this path as on the SSE one.
+func (s *synthesizedStream) ResponseMetadata() ai.ResponseMetadata { return s.meta }
+
+// newSynthesizedStream wraps a COMPLETED response as a stream, preserving every
+// capability the response carries. A nil response yields an empty, unknown-usage
+// stream — which renders as "usage unknown", never as a fabricated zero.
+func newSynthesizedStream(resp *ai.Response) io.ReadCloser {
+	if resp == nil {
+		return &synthesizedStream{Reader: strings.NewReader("")}
+	}
+	usage := resp.Usage
+	if !usage.Known && (resp.TokenInput > 0 || resp.TokenOutput > 0) {
+		// Legacy usage transport: some adapters report on the response fields
+		// rather than the ProviderUsage record.
+		usage = ai.ProviderUsage{
+			PromptTokens:     resp.TokenInput,
+			CompletionTokens: resp.TokenOutput,
+			Known:            true,
+		}
+	}
+	if usage.FinishReason == "" {
+		usage.FinishReason = resp.FinishReason
+	}
+	if usage.TotalTokens == 0 && usage.Known {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens + usage.ReasoningTokens
+	}
+	return &synthesizedStream{
+		Reader: strings.NewReader(resp.Content),
+		usage:  usage,
+		reason: resp.FinishReason,
+		meta:   resp.Metadata(),
+	}
 }
 
 type OpenRouterStreamResult struct {

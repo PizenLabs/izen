@@ -499,6 +499,66 @@ type HumanBoundary struct {
 	// Resumable reports whether a Resume* decision exists for this boundary.
 	// An inform boundary is not resumable; only a fresh bounded run continues.
 	Resumable bool
+
+	// ── MUTATION REVIEW FACTS ─────────────────────────────────────────
+	//
+	// An approval boundary asks a human to authorize a CONCRETE mutation. It
+	// is therefore not answerable from a target name alone: the operator must
+	// be shown the operation and the proposed change before saying yes.
+	//
+	// These fields are the runtime's own read of the held candidate — never a
+	// projection guess, never derived from the prompt, the filename or the
+	// artifact type. They are the same record Approve will apply, so the review
+	// and the mutation cannot disagree. A boundary that cannot populate them
+	// (nothing held, nothing previewable) is not an approval surface at all:
+	// admitting it is the runtime's job (see the driver's approval admission).
+	CandidateCandidateID string
+	// CandidateID is the identity an authorization must name to apply this
+	// candidate. The runtime sets it to the held candidate's own identity when it
+	// previews the record, so every consumer reads ONE field for "which candidate
+	// does this authorization cover?" instead of guessing between the boundary's
+	// PatchID and the preview's identity.
+	CandidateID string
+	// CandidateDigest is the content fingerprint the review was rendered from.
+	// An authorization is bound to it, so a candidate replaced in place can
+	// never be applied under an older review.
+	CandidateDigest string
+	// CandidateOperation is the semantic operation (CREATE / UPDATE / DELETE /
+	// MUTATE) derived from the target's own pre-state.
+	CandidateOperation string
+	// CandidateOperationEvidence states why that classification holds, so the
+	// operator can check the runtime's reasoning instead of trusting it.
+	CandidateOperationEvidence string
+	// CandidateTargets is the authoritative target set this candidate mutates.
+	CandidateTargets []string
+	// CandidateDiff is the runtime's own compiled unified diff — the exact
+	// object the mutation boundary will record its evidence from.
+	CandidateDiff string
+	// CandidateAddedLines / CandidateRemovedLines are the compiled diff metrics.
+	CandidateAddedLines   int
+	CandidateRemovedLines int
+	// CandidateContractID is the immutable execution contract the candidate
+	// belongs to, so the review names which computation it is reviewing.
+	CandidateContractID string
+	// CandidateEvidence is the runtime's own checklist of what HAS and HAS NOT
+	// happened at this boundary. Every entry is a fact the runtime observed;
+	// an entry is never asserted for work that has not occurred.
+	CandidateEvidence []BoundaryEvidence
+}
+
+// BoundaryEvidence is one checklist row of a human boundary: a statement about
+// the runtime's own state, which the human is entitled to read before deciding.
+//
+// Satisfied is a FACT, not an assessment. A row for work that has not happened is
+// never rendered as satisfied — which is the difference between "authorize a
+// mutation" and "watch a success being reported before it occurred".
+type BoundaryEvidence struct {
+	// Label names the check in plain language.
+	Label string
+	// Satisfied reports whether the runtime observed it.
+	Satisfied bool
+	// Detail is the observed evidence (empty when satisfied with nothing to add).
+	Detail string
 }
 
 // DeriveBoundaryAction computes the canonical Action/Resumable from a

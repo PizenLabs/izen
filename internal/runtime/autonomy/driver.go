@@ -268,6 +268,18 @@ type Driver struct {
 	// candidate identity alone is an approval boundary).
 	admission ApprovalAdmissionFunc
 
+	// review is the runtime's CANDIDATE PREVIEW authority: the read that turns
+	// an approval boundary into an answerable MUTATION REVIEW by showing the
+	// actual held change instead of a target name.
+	//
+	// It DEFAULTS to the adapter's own read of the executor's held-candidate
+	// record — the same map Approve consumes — so the reviewed bytes and the
+	// applied bytes are the same object by construction. When the preview cannot
+	// produce a reviewable change the boundary is REFUSED rather than presented as
+	// a bare approval: asking a human to authorize a change nobody can see is not
+	// a review, it is a ceremonial yes/no.
+	review CandidateReviewFunc
+
 	// ── Durable execution ledger ───────────────────────────────────────
 	// ledger is the append-only execution record the run is witnessed into
 	// (see ledger.go). It is nil unless a store was bound, and every write
@@ -485,6 +497,14 @@ func NewDriver(adapter *ExecutorAdapter, bus *events.Bus, opts ...Option) *Drive
 	}
 	for _, o := range opts {
 		o(d)
+	}
+	// The candidate-preview authority defaults to the ADAPTER — the same object
+	// that holds the executor Approve will use — rather than to a separate
+	// injection. A driver therefore cannot be wired to review one candidate while
+	// applying another, and no composition root can forget the seam: the only way
+	// to have no preview is to have no adapter, which Run already refuses.
+	if d.review == nil && adapter != nil {
+		d.review = adapter.CandidateReview
 	}
 	return d
 }
@@ -1247,6 +1267,38 @@ func (d *Driver) RunRequestID() string {
 		return ""
 	}
 	return d.runRequestID
+}
+
+// RunID returns the stable EXECUTION RUN identity: the objective-scoped
+// identity that survives every attempt, every recovery and every park.
+//
+// It is deliberately distinct from runRequestID (which gains an "-attempt-N"
+// suffix per dispatch) and from the objective's contract ID. When a human is
+// asked "which execution is parked?", this is the answer — and it must survive a
+// conversation boundary, because a conversation is not an execution.
+//
+// Empty means no run has started yet.
+func (d *Driver) RunID() string {
+	if d == nil || d.loop == nil {
+		return ""
+	}
+	return d.runRequestID
+}
+
+// Parked reports whether a run exists and is parked at a human boundary — i.e.
+// it is alive, resumable work, and NOT terminal.
+//
+// This is the runtime's own answer to the admission question. It is the
+// authoritative input to "may a new execution start?" and it is read BEFORE any
+// work is dispatched, so a refusal costs no provider call and no planning.
+func (d *Driver) Parked() bool {
+	if d == nil || d.loop == nil {
+		return false
+	}
+	if d.loop.State().IsTerminal() {
+		return false
+	}
+	return d.loop.Boundary() != nil
 }
 
 // ContractRecoveryState reports the circuit breaker's accounting for the current
@@ -2250,6 +2302,12 @@ func (d *Driver) enrichBoundary() {
 			b.Action = autonomy.HumanBoundaryInform
 			b.Resumable = false
 		}
+	}
+	// A held candidate IS the candidate identity. Seeding it here means an
+	// approval boundary always names the identity an authorization must carry,
+	// even when no candidate-preview authority is wired to enrich the boundary.
+	if b.CandidateID == "" {
+		b.CandidateID = b.PatchID
 	}
 	if len(b.Targets) == 0 {
 		b.Targets = append([]string(nil), d.req.Targets...)

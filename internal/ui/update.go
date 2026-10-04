@@ -1831,7 +1831,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 			// "Human-Centered / Reversible": an execution failure must never
 			// trap the user in the build phase. Unwind back to interactive
 			// StateChat so the next prompt routes normally.
-			m.unwindBuildFailure()
+			m.unwindTerminalExecution()
 		}
 		if msg.output != "" {
 			for _, line := range strings.Split(msg.output, "\n") {
@@ -3922,7 +3922,7 @@ func (m *model) Update(msg tea.Msg) (model tea.Model, cmd tea.Cmd) {
 		// the workflow in the build phase. Unwind the state machine back to
 		// StateChat/interactive so the next prompt routes normally instead of
 		// failing with "transition from build to ask".
-		m.unwindBuildFailure()
+		m.unwindTerminalExecution()
 		m.refreshViewportContent()
 		m.gotoBottomIfAllowed()
 		flush := m.flushPendingRecords()

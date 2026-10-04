@@ -67,6 +67,32 @@ func workflowStateFor(p Phase) workflow.WorkflowState {
 	}
 }
 
+// phaseForWorkflowState is the INVERSE of workflowStateFor. It lets the
+// orchestrator RE-ANCHOR its own projection when the shared SM has moved —
+// which is the repair for a split-brain where `current` and `sm.State()`
+// disagreed and every subsequent Transition became a silent no-op.
+func phaseForWorkflowState(s workflow.WorkflowState) (Phase, bool) {
+	switch s {
+	case workflow.StateIdle:
+		return PhaseAsk, true
+	case workflow.StateInvestigating:
+		return PhaseInvestigate, true
+	case workflow.StatePlanning:
+		return PhasePlan, true
+	case workflow.StateBuilding:
+		return PhaseBuild, true
+	case workflow.StateReviewing:
+		return PhaseReview, true
+	case workflow.StateRepairing, workflow.StateVerified, workflow.StateFailed:
+		// Repairing is a failure-routing sub-position of Build; the two terminal
+		// positions have no phase of their own and project onto Build, from
+		// which the canonical exits remain reachable.
+		return PhaseBuild, true
+	default:
+		return PhaseIdle, false
+	}
+}
+
 // Orchestrator drives the workflow state machine across execution phases while
 // keeping a single persistent RuntimeContext. It is safe for concurrent use.
 //
@@ -322,6 +348,142 @@ func (o *PhaseManager) CurrentWorkflowState() workflow.WorkflowState {
 	return o.sm.State()
 }
 
+// ParkedAtAuthorization reports whether a live execution run is blocked on a
+// human authorization decision. The shared SM is the authority: the logical
+// phase can still read Build while the run is parked inside it, and only the SM
+// distinguishes "building" from "building, waiting for a human".
+func (o *PhaseManager) ParkedAtAuthorization() bool {
+	if o == nil || o.sm == nil {
+		return false
+	}
+	return o.sm.Parked()
+}
+
+// ParkAtAuthorization parks a live execution run at its human authorization
+// boundary. It is the orchestrator's OWN spelling of the transition: the shared
+// SM moves to the non-terminal parked position and the logical phase is
+// re-anchored so `current` can never claim Build while the SM says idle.
+//
+// A run that parks is NOT finished. Nothing here may be read as completion.
+func (o *PhaseManager) ParkAtAuthorization(tctx workflow.TransitionContext) error {
+	if o == nil || o.sm == nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if err := o.sm.SendEvent(workflow.EventAwaitAuthorization, tctx); err != nil {
+		return err
+	}
+	if !o.sm.Parked() {
+		return fmt.Errorf("orchestrator: %s refused to park the run", o.sm.State())
+	}
+	o.reanchorLocked()
+	return nil
+}
+
+// ResumeParkedRun resumes a run parked at a human authorization boundary into
+// the executable position.
+//
+// This is the HUMAN-AUTHORIZATION EVENT of the execution lifecycle, and it is
+// deliberately distinct from Transition/Force:
+//
+//   - it takes the lifecycle's own resume edge (EventBuild out of
+//     awaiting_authorization), which a human decision is entitled to;
+//   - it preserves the run, its candidate, its targets and its objective
+//     verbatim — a resume is never a reset, a re-plan or a new run;
+//   - it refuses anything but PhaseBuild, because the only question an
+//     authorization answers is "may this mutation be applied?".
+//
+// Without it, resuming a parked run meant forcing a phase hop, which either
+// refused with an illegal-edge error or — once the machine had been reset behind
+// the projection's back — silently left the machine idle while the caller
+// believed the resume had succeeded.
+func (o *PhaseManager) ResumeParkedRun(tctx workflow.TransitionContext) error {
+	if o == nil {
+		return fmt.Errorf("orchestrator: nil receiver")
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.sm == nil {
+		return fmt.Errorf("orchestrator: no workflow state machine bound")
+	}
+	if !o.sm.Parked() {
+		return fmt.Errorf("orchestrator: no run is parked awaiting human authorization (state=%s)", o.sm.State())
+	}
+	tctx = o.authorizeContextLocked(tctx)
+	if err := o.sm.SendEvent(workflow.EventBuild, tctx); err != nil {
+		return fmt.Errorf("orchestrator: resume from the parked position refused: %w", err)
+	}
+	if !o.sm.State().Executable() {
+		return fmt.Errorf("orchestrator: resume did not reach an executable position (now %s)", o.sm.State())
+	}
+	o.reanchorLocked()
+	return nil
+}
+
+// ResetToAsk is the ONE sanctioned unwind of a live execution phase back to the
+// interactive resting position.
+//
+// It replaces the direct `sm.SendEvent(EventReset)` calls that used to reset the
+// shared state machine from behind the orchestrator's back. Those calls left
+// `current` stale, so a later Transition(PhaseBuild) was a no-op while the SM
+// sat at idle — and every mutation authorization issued afterwards was refused
+// with "expected Building or Repairing ... got idle".
+//
+// The reset is durable lineage like any other hop: fail-closed, never
+// half-applied.
+func (o *PhaseManager) ResetToAsk(tctx workflow.TransitionContext) error {
+	if o == nil {
+		return fmt.Errorf("orchestrator: nil receiver")
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.sm != nil && o.sm.State() != workflow.StateIdle {
+		if err := o.sm.SendEvent(workflow.EventReset, tctx); err != nil {
+			return err
+		}
+	}
+	from := o.current
+	if from == PhaseAsk {
+		return nil
+	}
+	if err := RecordPhaseTransitionForced(o.ledger, o.ledgerTaskID, from, PhaseAsk); err != nil {
+		return err
+	}
+	o.current = PhaseAsk
+	o.history = append(o.history, PhaseAsk)
+	if o.bus != nil {
+		o.bus.Publish(events.NewPhaseChanged(from.String(), PhaseAsk.String()))
+	}
+	return nil
+}
+
+// reanchorLocked recomputes the logical phase from the shared state machine so
+// the projection can never drift away from the authority the rest of the runtime
+// reads. It is deliberately unexported and lock-held: every caller is already
+// inside a transition that just moved the SM.
+func (o *PhaseManager) reanchorLocked() {
+	if o.sm == nil {
+		return
+	}
+	state := o.sm.State()
+	if state == workflow.StateAwaitingAuthorization {
+		// A parked run still belongs to the phase it parked inside; there is no
+		// distinct phase for it and inventing one would fork the phase graph.
+		return
+	}
+	phase, ok := phaseForWorkflowState(state)
+	if !ok || phase == o.current {
+		return
+	}
+	from := o.current
+	o.current = phase
+	o.history = append(o.history, phase)
+	if o.bus != nil {
+		o.bus.Publish(events.NewPhaseChanged(from.String(), phase.String()))
+	}
+}
+
 // Transition advances the workflow to the given logical phase. It preserves
 // the shared RuntimeContext and emits a PhaseChanged event when the phase
 // actually changes. A transition to the current phase is a no-op.
@@ -342,6 +504,21 @@ func (o *PhaseManager) Transition(next Phase, tctx workflow.TransitionContext) e
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	// ── DRIFT REPAIR BEFORE EDGE VALIDATION ─────────────────────────────
+	// The shared state machine is the authority the AuthorizationEngine reads;
+	// `current` is a projection of it. When the two disagree the projection is
+	// stale, and validating an edge against a stale projection produces a refusal
+	// that names a phase the runtime never held ("ask -> build: no valid
+	// transition" while the machine actually sat at planning).
+	//
+	// Reconciling FIRST means the edge check judges the real position, and an
+	// equal-phase request still repairs the machine instead of silently
+	// succeeding on a lie — which is the exact shape of the reported defect:
+	// "expected Building or Repairing ... got idle" immediately after a transition
+	// that had reported success.
+	if err := o.reconcileLocked(next, tctx); err != nil {
+		return err
+	}
 	if next == o.current {
 		return nil
 	}
@@ -354,10 +531,13 @@ func (o *PhaseManager) Transition(next Phase, tctx workflow.TransitionContext) e
 	// satisfies it even when the caller supplies no session-task evidence.
 	tctx = o.authorizeContextLocked(tctx)
 
-	if o.sm != nil {
-		if err := driveSM(o.sm, next, tctx); err != nil {
-			return err
-		}
+	// Atomicity scope: the machine may be left advanced only while the hop is still
+	// being committed (durable lineage). A persistence failure rolls it back so
+	// the machine and the projection never disagree; a SUCCESSFUL hop keeps the
+	// machine where it was driven.
+	restore, err := o.driveAtomicLocked(next, tctx)
+	if err != nil {
+		return err
 	}
 
 	// Adapter delegation: persist the authorized hop as durable lineage
@@ -365,6 +545,9 @@ func (o *PhaseManager) Transition(next Phase, tctx workflow.TransitionContext) e
 	// failure rejects the hop and leaves current/history untouched.
 	from := o.current
 	if err := RecordPhaseTransition(o.ledger, o.ledgerTaskID, from, next); err != nil {
+		if restore != nil {
+			restore()
+		}
 		return err
 	}
 	o.current = next
@@ -374,6 +557,113 @@ func (o *PhaseManager) Transition(next Phase, tctx workflow.TransitionContext) e
 		o.bus.Publish(events.NewPhaseChanged(from.String(), next.String()))
 	}
 	return nil
+}
+
+// reconcileLocked repairs drift between the logical phase and the shared state
+// machine. It is a no-op when they agree.
+//
+// It runs BEFORE edge validation, so the projection is re-anchored from the
+// authority first: an edge check against a stale projection rejects a legal hop
+// (or blesses an illegal one), and both outcomes are lies about where the runtime
+// actually is.
+//
+// A PARKED run is never path-found here. Parking is a control-plane decision, not
+// a routing hop: the machine is left parked and the projection re-anchored, and
+// only the caller's explicit resume (driveAtomicLocked's parked branch) may leave
+// it. That keeps "a human authorized this" from ever being inferred from a
+// phase request.
+func (o *PhaseManager) reconcileLocked(next Phase, tctx workflow.TransitionContext) error {
+	if o.sm == nil {
+		return nil
+	}
+	want := workflowStateFor(next)
+	if o.sm.State() == want {
+		return nil
+	}
+	tctx = o.authorizeContextLocked(tctx)
+	// A parked run resumes through its own edge (driveAtomicLocked owns that
+	// case). Here we only need to re-anchor a projection that drifted behind a
+	// machine already sitting at the target.
+	if o.sm.Parked() {
+		o.reanchorLocked()
+		return nil
+	}
+	if err := driveSM(o.sm, next, tctx); err != nil {
+		return err
+	}
+	if o.sm.State() != want {
+		return fmt.Errorf("orchestrator: phase %q could not be reconciled onto the workflow state machine (now %s)", next, o.sm.State())
+	}
+	o.reanchorLocked()
+	return nil
+}
+
+// driveAtomicLocked drives the shared SM onto the phase's workflow state and
+// returns a restore function that puts it back exactly as it was when the
+// transition cannot be completed.
+//
+// Every SM mutation is therefore all-or-nothing. Driving the machine forward and
+// returning on the first error — what this file used to do — left the SM in a
+// half-advanced position (e.g. `planning` after a refused build guard) while
+// `current` still read the OLD phase: the same split brain, reached from the
+// other direction.
+func (o *PhaseManager) driveAtomicLocked(next Phase, tctx workflow.TransitionContext) (restore func(), err error) {
+	if o.sm == nil {
+		return nil, nil
+	}
+	// From a parked position the only forward move is the resume edge, not a
+	// driveSM path search: EventBuild out of awaiting_authorization is the
+	// sanctioned resume and preserves the run's identity.
+	if o.sm.Parked() {
+		if next != PhaseBuild {
+			return nil, fmt.Errorf("orchestrator: run is parked awaiting human authorization; %q requires the run to be resumed or aborted first", next)
+		}
+		tctx = o.authorizeContextLocked(tctx)
+		if err := o.sm.SendEvent(workflow.EventBuild, tctx); err != nil {
+			return nil, err
+		}
+		if o.sm.State() != workflowStateFor(next) {
+			_ = o.sm.SendEvent(workflow.EventAwaitAuthorization, tctx)
+			return nil, fmt.Errorf("orchestrator: resume from the parked position did not reach building (now %s)", o.sm.State())
+		}
+		o.reanchorLocked()
+		return nil, nil
+	}
+	before := o.sm.State()
+	if before == workflowStateFor(next) {
+		return nil, nil
+	}
+	if err := driveSM(o.sm, next, tctx); err != nil {
+		// Undo the partial advance so the SM and the projection stay in step.
+		o.rewindLocked(before, tctx)
+		return nil, err
+	}
+	if o.sm.State() != workflowStateFor(next) {
+		o.rewindLocked(before, tctx)
+		return nil, fmt.Errorf("orchestrator: phase %q did not reach the workflow state machine (now %s)", next, o.sm.State())
+	}
+	return func() { o.rewindLocked(before, tctx) }, nil
+}
+
+// rewindLocked puts the shared SM back on a previously observed state using the
+// canonical reset-and-drive path, and re-anchors the projection from it.
+func (o *PhaseManager) rewindLocked(want workflow.WorkflowState, tctx workflow.TransitionContext) {
+	if o.sm == nil || o.sm.State() == want {
+		o.reanchorLocked()
+		return
+	}
+	if err := o.sm.SendEvent(workflow.EventReset, tctx); err != nil {
+		return
+	}
+	phase, ok := phaseForWorkflowState(want)
+	if !ok || phase == PhaseIdle {
+		// A non-phase position (the parked state, or a terminal one) is reached
+		// directly; there is no logical phase to drive through.
+		o.reanchorLocked()
+		return
+	}
+	_ = driveSM(o.sm, phase, o.authorizeContextLocked(tctx))
+	o.reanchorLocked()
 }
 
 // Force advances the workflow to the given logical phase even when the phase
@@ -394,27 +684,57 @@ func (o *PhaseManager) Force(next Phase, tctx workflow.TransitionContext) error 
 	defer o.mu.Unlock()
 
 	if next == o.current {
-		return nil
+		// Same reconciliation contract as Transition: the shared state machine
+		// is the authority, so an equal phase is a request to make it agree,
+		// not a licence to skip the drive.
+		return o.reconcileLocked(next, tctx)
 	}
 
-	if o.sm != nil {
-		// Reset to idle first so any phase hop becomes reachable, then drive
-		// forward along the canonical path. Guards are still evaluated through
-		// the provided context (e.g. EventBuild requires HasPlan).
-		if o.sm.State() != workflow.StateIdle {
-			if err := o.sm.SendEvent(workflow.EventReset, tctx); err != nil {
-				return err
-			}
-		}
-		tctx = o.authorizeContextLocked(tctx)
-		if err := driveSM(o.sm, next, tctx); err != nil {
+	// The SM is reset to idle first so any phase hop becomes reachable, then
+	// driven forward along the canonical path. Guards are still evaluated
+	// through the provided context (e.g. EventBuild requires HasPlan) — but
+	// atomically: a refusal restores the machine instead of stranding it
+	// half-advanced.
+	//
+	// A PARKED run is never reset here. The reset exists to make a phase hop
+	// reachable; a parked run's only legitimate exit is the human's decision
+	// (resume via the resume edge, abort via reset). Force is user-mode-switch
+	// intent, and a mode switch must not silently discard a run that is waiting
+	// on a human — the caller must resolve that boundary explicitly.
+	if o.sm != nil && !o.sm.Parked() {
+		if err := o.sm.SendEvent(workflow.EventReset, tctx); err != nil {
 			return err
 		}
 	}
+	tctx = o.authorizeContextLocked(tctx)
+	if o.sm != nil {
+		// Atomicity scope: the machine may be left advanced ONLY while the hop is
+		// still being committed (durable lineage). A persistence failure must roll
+		// it back so the machine and the projection never disagree — but a
+		// SUCCESSFUL hop must keep the machine where it was driven.
+		restore, err := o.driveAtomicLocked(next, tctx)
+		if err != nil {
+			return err
+		}
+		from := o.current
+		// Adapter delegation: persist the forced hop as durable lineage BEFORE
+		// the in-memory projection mutates (forced skips edge validation but
+		// never skips lineage). Fail-closed on persistence failure.
+		if err := RecordPhaseTransitionForced(o.ledger, o.ledgerTaskID, from, next); err != nil {
+			if restore != nil {
+				restore()
+			}
+			return err
+		}
+		o.current = next
+		o.history = append(o.history, next)
+		if o.bus != nil {
+			o.bus.Publish(events.NewPhaseChanged(from.String(), next.String()))
+		}
+		return nil
+	}
 
-	// Adapter delegation: persist the forced hop as durable lineage BEFORE
-	// the in-memory projection mutates (forced skips edge validation but
-	// never skips lineage). Fail-closed on persistence failure.
+	// No shared machine: the projection is the whole truth.
 	from := o.current
 	if err := RecordPhaseTransitionForced(o.ledger, o.ledgerTaskID, from, next); err != nil {
 		return err
@@ -492,6 +812,12 @@ func smPath(from, want workflow.WorkflowState) ([]workflow.WorkflowEvent, error)
 		if cur.state == want {
 			return cur.path, nil
 		}
+		// EventAwaitAuthorization is deliberately ABSENT. Parking at a human
+		// boundary is a control-plane decision, never a routing hop: allowing it
+		// here would let pathfinding reach Building THROUGH a park, silently
+		// inventing a human authorization that never happened. The parked position
+		// is reached only via ParkAtAuthorization, and left only via the resume
+		// edge the caller drives explicitly.
 		for _, ev := range []workflow.WorkflowEvent{
 			workflow.EventReset,
 			workflow.EventInvestigate,
@@ -513,6 +839,12 @@ func smPath(from, want workflow.WorkflowState) ([]workflow.WorkflowEvent, error)
 
 // edge mirrors the workflow SM's unguarded transition lookup for pathfinding.
 func edge(from workflow.WorkflowState, ev workflow.WorkflowEvent) (workflow.WorkflowState, bool) {
+	// The park is reachable from every live position and from itself, so
+	// pathfinding must see it: a resume out of the parked position must not be
+	// routed through a reset.
+	if ev == workflow.EventAwaitAuthorization {
+		return workflow.StateAwaitingAuthorization, true
+	}
 	switch from {
 	case workflow.StateIdle:
 		switch ev {
@@ -557,6 +889,16 @@ func edge(from workflow.WorkflowState, ev workflow.WorkflowEvent) (workflow.Work
 		}
 	case workflow.StateFailed:
 		if ev == workflow.EventReset {
+			return workflow.StateIdle, true
+		}
+	case workflow.StateAwaitingAuthorization:
+		// The resume edge: a human authorization returns the SAME run to the
+		// executable position in one step. A pathfinding route that reset first
+		// would silently lose the parked identity.
+		switch ev {
+		case workflow.EventBuild:
+			return workflow.StateBuilding, true
+		case workflow.EventReset:
 			return workflow.StateIdle, true
 		}
 	}

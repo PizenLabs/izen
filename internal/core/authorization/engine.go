@@ -100,10 +100,10 @@ func (e *AuthorizationEngine) Evaluate(
 	humanApproved bool,
 ) (*MutationAuthorization, error) {
 	state := e.getState()
-	if state != workflow.StateBuilding && state != workflow.StateRepairing {
+	if !state.Executable() {
 		return nil, &AuthorizationDenied{
 			Step:    StepWorkflowState,
-			Message: fmt.Sprintf("expected Building or Repairing, got %s", state),
+			Message: executableStateRefusal(state),
 		}
 	}
 
@@ -270,13 +270,41 @@ func (e *AuthorizationEngine) AuthorizeBuildCandidate(
 	humanApproved bool,
 	candidateID string,
 ) (*MutationAuthorization, error) {
+	return e.AuthorizeBuildCandidateContent(targetFiles, caps, mutBudget, microBudget, isMicroPlan, humanApproved, candidateID, "")
+}
+
+// AuthorizeBuildCandidateContent is AuthorizeBuildCandidate bound to the
+// candidate's CONTENT as well as its identity.
+//
+// candidateDigest is the fingerprint the human's mutation review was rendered
+// from. Carrying it on the token makes the authorization a statement about one
+// concrete change: if the held candidate is ever replaced in place, the digest no
+// longer matches and the mutation boundary refuses, forcing a new review rather
+// than writing bytes nobody saw.
+//
+// WORKFLOW STATE IS AN EXECUTABLE-POSITION GATE, NOT A COMPLETION SIGNAL.
+// The check refuses any position from which no mutation may be applied, and names
+// the parked position explicitly when one is what blocked it — so "awaiting human
+// authorization" is never reported as an inexplicable `idle`.
+func (e *AuthorizationEngine) AuthorizeBuildCandidateContent(
+	targetFiles []string,
+	caps *capability.CapabilitySet,
+	mutBudget *budget.MutationBudget,
+	microBudget *budget.MicroBudget,
+	isMicroPlan bool,
+	humanApproved bool,
+	candidateID string,
+	candidateDigest string,
+) (*MutationAuthorization, error) {
 	state := e.getState()
 
-	// Auto-transition to Building if in an allowed pre-build state.
-	if state != workflow.StateBuilding && state != workflow.StateRepairing {
+	// A mutation may only be authorized from an executable position. A run
+	// parked at a human boundary has not reached one: the control plane must
+	// RESUME it first, and that resume is itself an explicit event.
+	if !state.Executable() {
 		return nil, &AuthorizationDenied{
 			Step:    StepWorkflowState,
-			Message: fmt.Sprintf("expected Building or Repairing for build execution, got %s; approve the plan via /build first", state),
+			Message: executableStateRefusal(state),
 		}
 	}
 
@@ -305,13 +333,14 @@ func (e *AuthorizationEngine) AuthorizeBuildCandidate(
 	singleUse := !mutBudget.IsMultiStepPlan()
 
 	auth := &MutationAuthorization{
-		ID:            NewAuthorizationID(),
-		ProposalHash:  "",
-		CandidateID:   candidateID,
-		CheckpointRef: ref,
-		ExpiresAt:     time.Now().Add(5 * time.Minute),
-		SingleUse:     singleUse,
-		IssuedAt:      time.Now(),
+		ID:              NewAuthorizationID(),
+		ProposalHash:    "",
+		CandidateID:     candidateID,
+		CandidateDigest: candidateDigest,
+		CheckpointRef:   ref,
+		ExpiresAt:       time.Now().Add(5 * time.Minute),
+		SingleUse:       singleUse,
+		IssuedAt:        time.Now(),
 	}
 
 	if !mutBudget.IsMultiStepPlan() {
@@ -326,6 +355,17 @@ func (e *AuthorizationEngine) AuthorizeBuildCandidate(
 	}
 
 	return auth, nil
+}
+
+// executableStateRefusal names the state that blocked a mutation authorization.
+// A parked run gets the actionable sentence — the control plane must RESUME it —
+// because "got idle" for a run that is demonstrably waiting on a human is exactly
+// the misleading diagnostic this lifecycle exists to remove.
+func executableStateRefusal(state workflow.WorkflowState) string {
+	if state.Parked() {
+		return fmt.Sprintf("execution is parked at %s awaiting human authorization; resume the parked run before authorizing a mutation (no candidate was applied)", state)
+	}
+	return fmt.Sprintf("expected Building or Repairing for build execution, got %s; approve the plan via /build first", state)
 }
 
 // AdmissibleBuild answers ONE question: could a mutation over targetFiles be

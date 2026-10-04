@@ -268,8 +268,20 @@ func TestAutonomousApprovalBoundaryDoesNotRenderSuccessBeforeExecution(t *testin
 	if strings.Contains(out, Icon.Success) || strings.Contains(out, "\u2713") {
 		t.Fatalf("the approval boundary rendered a success glyph before the runtime applied anything:\n%s", out)
 	}
-	if !strings.Contains(out, "Approved") {
-		t.Fatalf("the approval boundary stated nothing about the decision:\n%s", out)
+	// The authorization was ACCEPTED — that is the only fact available at this
+	// point. The old wording ("Approved — the runtime will apply the held patch")
+	// read as a completed mutation, collapsing authorization, application and
+	// verification into one sentence.
+	if !strings.Contains(out, "Authorization accepted") {
+		t.Fatalf("the approval boundary did not state the authorization was accepted:\n%s", out)
+	}
+	if !strings.Contains(out, "No files have been modified yet") {
+		t.Fatalf("the approval boundary implied a mutation had occurred:\n%s", out)
+	}
+	for _, overclaim := range []string{"Mutation applied", "Mutation verified", "Objective proven"} {
+		if strings.Contains(out, overclaim) {
+			t.Fatalf("the approval boundary claimed %q before the runtime observed it:\n%s", overclaim, out)
+		}
 	}
 }
 
