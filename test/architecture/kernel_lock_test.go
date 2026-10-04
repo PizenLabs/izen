@@ -717,3 +717,240 @@ func scanFunctionMutationPrimitives(t *testing.T, path, name string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// pathAExecutionFiles are the files that make up Path A: the workspace mutation
+// route `izen run` takes through the app pipeline into the substrate's proposal
+// executor. The lock is scoped to exactly these files, because that is the
+// architectural execution path being pinned — not the package, not the
+// repository, and not the rest of the substrate.
+var pathAExecutionFiles = []string{
+	"internal/runtime/substrate/engine.go",
+	"internal/runtime/substrate/kernelcommit.go",
+	"internal/runtime/substrate/snapshot.go",
+}
+
+// pathARecoverySites are the only functions in Path A permitted to write to the
+// workspace outside the kernel, with the reason each one is allowed to.
+//
+// This is the classification the migration was built on, made executable. The
+// substrate package still contains os.WriteFile, and it always will: it owns the
+// recovery path and the proof artifact, neither of which is an execution
+// authority. What must never happen is one of them growing a second way to place
+// bytes a proposal asked for — so the list is exact in both directions. A new
+// direct writer fails as an unregistered site; deleting one of these fails as a
+// missing recovery path, which would mean rollback had quietly stopped working.
+var pathARecoverySites = map[string]string{
+	"writeEvidenceProof": "bookkeeping: records what the transaction did under .izen",
+	"writeForRecovery":   "recovery: restores an original the transaction overwrote",
+	"removeForRecovery":  "recovery: deletes a file the transaction itself created",
+}
+
+// TestKernelLock_PathAMutationRoutesThroughKernel pins Path A to the kernel and
+// forbids it from regressing to a direct mutation primitive.
+//
+// Path A used to place a committed FILE_WRITE and FILE_DELETE through the
+// substrate's FilePort adapter, which was a bare os.WriteFile and os.Remove: no
+// grant, no event, no state, no evidence and no verification. It behaves
+// identically to a kernel execution on a cooperative filesystem, which is exactly
+// why the deletion needs a lock rather than a reviewer — nothing in the product
+// would look different if it came back.
+//
+// The assertions fail in both directions. A direct primitive or a FilePort write
+// reappearing in the operation loop or in the seam fails as a bypass. The
+// operation loop stopping to call the seam, or the seam stopping to call the
+// bridge, fails as a migration that was deleted rather than preserved — because a
+// lock satisfiable by removing the new path is just a declaration that the old
+// path is unreachable.
+func TestKernelLock_PathAMutationRoutesThroughKernel(t *testing.T) {
+	root := repoRoot(t)
+	const engine = "internal/runtime/substrate/engine.go"
+	const seam = "internal/runtime/substrate/kernelcommit.go"
+	engineAbs := filepath.Join(root, engine)
+	seamAbs := filepath.Join(root, seam)
+
+	// ── The seam exists, and the loop still routes through it ─────────────
+	if _, err := os.Stat(seamAbs); err != nil {
+		t.Fatalf("%s is missing: %v\n"+
+			"That file is where Path A crosses the kernel. Without it the committed\n"+
+			"write and delete have no sanctioned route back to %s.", seam, err, kernelBridgePackage)
+	}
+
+	loop := functionCalls(t, engineAbs, "Execute")
+	if !loop["s.commitWrite"] {
+		t.Errorf("%s: ConcreteSubstrate.Execute no longer calls s.commitWrite; the\n"+
+			"committed write does not reach the kernel", engine)
+	}
+	if !loop["s.commitDelete"] {
+		t.Errorf("%s: ConcreteSubstrate.Execute no longer calls s.commitDelete; the\n"+
+			"committed delete does not reach the kernel", engine)
+	}
+
+	// ── The seam reaches the bridge ───────────────────────────────────────
+	if calls := functionCalls(t, seamAbs, "commitWrite"); !calls["kernelbridge.Apply"] {
+		t.Errorf("%s: commitWrite no longer calls kernelbridge.Apply", seam)
+	}
+	if calls := functionCalls(t, seamAbs, "commitDelete"); !calls["kernelbridge.Delete"] {
+		t.Errorf("%s: commitDelete no longer calls kernelbridge.Delete", seam)
+	}
+
+	// ── The execution path owns no direct mutation ───────────────────────
+	//
+	// These four functions are Path A's whole execution surface: the operation
+	// loop and the two commit helpers. None of them may reach the filesystem.
+	// Snapshot reads and rollback writes live elsewhere on purpose, so this
+	// assertion is about the commit path rather than about the package.
+	for _, site := range []struct{ file, fn string }{
+		{engine, "Execute"},
+		{seam, "commitWrite"},
+		{seam, "commitDelete"},
+	} {
+		if offenders := scanFunctionDirectMutation(t, root, site.file, site.fn); len(offenders) > 0 {
+			t.Errorf("%s: %s places bytes on the workspace directly: %s.\n"+
+				"Path A's final filesystem primitive is the Runtime Kernel. A write or a\n"+
+				"removal here carries no grant, no event, no state, no evidence and no\n"+
+				"verification, and a destination a symlink redirects out of the workspace\n"+
+				"is followed by the syscall rather than refused. Reach %s instead:\n"+
+				"commitWrite / commitDelete for an effect a proposal asked for,\n"+
+				"writeForRecovery / removeForRecovery for undoing one, and\n"+
+				"writeEvidenceProof for the .izen proof artifact.",
+				site.file, site.fn, strings.Join(offenders, ", "), kernelBridgePackage)
+		}
+	}
+
+	// ── Recovery and bookkeeping sites are exact, in both directions ─────
+	//
+	// Without this the assertion above could be satisfied by deleting the
+	// recovery path entirely, which would leave the transaction unable to undo a
+	// partial batch while looking perfectly clean to every other check.
+	found := map[string]string{}
+	for _, rel := range pathAExecutionFiles {
+		abs := filepath.Join(root, rel)
+		if _, err := os.Stat(abs); err != nil {
+			t.Fatalf("%s is missing: %v; the lock is silently covering nothing", rel, err)
+		}
+		for _, fn := range functionsUsingPortMutation(t, abs) {
+			found[fn] = rel
+		}
+	}
+	for fn := range found {
+		if _, ok := pathARecoverySites[fn]; !ok {
+			t.Errorf("%s: %s writes to the workspace through the substrate FilePort and is\n"+
+				"not a registered recovery or bookkeeping site.\n"+
+				"If it places a byte a proposal asked for, it is a second execution\n"+
+				"authority and must go through kernelbridge. If it genuinely undoes or\n"+
+				"records one, add it to pathARecoverySites with that reason.",
+				found[fn], fn)
+		}
+	}
+	for fn, reason := range pathARecoverySites {
+		if _, ok := found[fn]; !ok {
+			t.Errorf("%s no longer writes through the FilePort (%s).\n"+
+				"That site is registered as recovery or bookkeeping. If it was removed\n"+
+				"deliberately, delete its entry here too; if not, the rollback or the\n"+
+				"proof artifact has stopped working and the lock above would not notice.",
+				fn, reason)
+		}
+	}
+}
+
+// selectorChain renders a call's full callee path, so `s.delegate.file.Write` is
+// nameable as `s.delegate.file.Write` rather than as a bare `Write`.
+//
+// qualifiedCallName deliberately reads only the last selector, which is right
+// for distinguishing `os.Remove` from `self.Remove`. It is not enough here: a
+// bypass reintroduced through the substrate's own port field is three selectors
+// deep, and a check that stopped at the last segment would see an unqualified
+// `Write` and match nothing.
+func selectorChain(call *ast.CallExpr) string {
+	var parts []string
+	expr := call.Fun
+	for {
+		sel, ok := expr.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		parts = append([]string{sel.Sel.Name}, parts...)
+		expr = sel.X
+	}
+	ident, ok := expr.(*ast.Ident)
+	if !ok {
+		return ""
+	}
+	return ident.Name + "." + strings.Join(parts, ".")
+}
+
+// portMutationCall reports whether a callee path is a mutating method on the
+// substrate's FilePort.
+func portMutationCall(chain string) bool {
+	return strings.HasSuffix(chain, ".file.Write") || strings.HasSuffix(chain, ".file.Remove")
+}
+
+// scanFunctionDirectMutation returns every call in one named function that would
+// place or remove bytes on the workspace without going through the kernel —
+// either a direct os primitive or a mutating FilePort method.
+func scanFunctionDirectMutation(t *testing.T, root, rel, name string) []string {
+	t.Helper()
+	abs := filepath.Join(root, rel)
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, abs, nil, 0)
+	if err != nil {
+		return []string{fmt.Sprintf("%s (unparseable: %v)", rel, err)}
+	}
+	var out []string
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || fn.Name.Name != name {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			chain := selectorChain(call)
+			if chain == "" {
+				return true
+			}
+			if kernelMutationPrimitives[chain] == "" && !portMutationCall(chain) {
+				return true
+			}
+			out = append(out, fmt.Sprintf("%s:%d (%s)", rel, fset.Position(call.Pos()).Line, chain))
+			return true
+		})
+	}
+	sort.Strings(out)
+	return out
+}
+
+// functionsUsingPortMutation names every function in one file that calls a
+// mutating FilePort method.
+func functionsUsingPortMutation(t *testing.T, abs string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, abs, nil, 0)
+	if err != nil {
+		// A file this lock cannot read is a file it cannot clear. Failing is the
+		// only honest answer: a silent nil would report "no direct writers" for a
+		// file it never parsed.
+		t.Fatalf("parsing %s: %v", abs, err)
+	}
+	var out []string
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		hits := false
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			if call, ok := node.(*ast.CallExpr); ok && portMutationCall(selectorChain(call)) {
+				hits = true
+			}
+			return true
+		})
+		if hits {
+			out = append(out, fn.Name.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}

@@ -175,6 +175,42 @@ func absenceVerifier(root string) kernel.Verifier {
 	})
 }
 
+// Vanished reports whether a DELETE execution found target already absent.
+//
+// It is deliberately separate from Deleted, because the two answer different
+// questions and collapsing them is how a no-op becomes a claimed removal.
+// Deleted answers "did this execution durably remove it and was the whole
+// execution adjudicated". Vanished answers "is it gone" — which is true in
+// exactly the case Deleted refuses to claim: nothing was there to remove.
+//
+// A caller whose operation is "make sure this is gone" needs both. One that
+// only reads Vanished would report success for a target the kernel never
+// touched; one that only reads Deleted would report failure for a destination
+// that is verifiably absent. Neither reading is the whole truth, so the seam
+// offers both and leaves the choice to the Control Plane that owns the intent.
+func (a Applied) Vanished(target string) bool {
+	want := canonical(target)
+	if want == "" {
+		return false
+	}
+	if a.Deleted(want) {
+		// It was removed by this execution; that is a deletion, not a no-op.
+		return false
+	}
+	// The capability records FILE_ABSENT for a destination that was not there,
+	// and records it under file.delete only. Requiring the capability keeps a
+	// pre-write observation from standing in for the removal step's own verdict.
+	for _, e := range a.Evidence {
+		if e.Capability != kernel.FileDelete || e.Kind != kernel.EvidenceFileAbsent {
+			continue
+		}
+		if canonical(e.Target) == want {
+			return true
+		}
+	}
+	return false
+}
+
 // recordedAbsence indexes the absence observations by destination. A target
 // observed more than once has a current truth, so the LAST record wins.
 func recordedAbsence(evidence []kernel.Evidence) map[string]bool {

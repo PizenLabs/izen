@@ -66,6 +66,78 @@ type ExecutionProof struct {
 	Status        string
 	EvidencePath  string
 	Error         error
+	// Mutations carries one record per workspace mutation the proposal
+	// performed, in operation order, each holding the kernel evidence that
+	// decided whether that one effect landed.
+	//
+	// It is kept separate from Status on purpose. Status is Core's claim about
+	// the transaction; Outcome inside each record is the kernel's claim about a
+	// single primitive effect. A PROVEN outcome for one file is not a PROVEN
+	// objective, and a struct that forced them into one field would make that
+	// distinction unrepresentable.
+	Mutations []MutationEvidence
+}
+
+// MutationEvidence is the substrate's own record of one workspace mutation the
+// proposal performed, carrying the kernel evidence that produced it.
+//
+// The shape mirrors internal/kernelbridge.Applied deliberately: the substrate
+// does not invent a parallel evidence vocabulary, it projects the kernel's
+// adjudicated result into Core's proof so a reader can follow
+//
+//	primitive result → kernel evidence → Core evidence → verification → state
+//
+// without a translation layer that could quietly disagree with either side.
+// Every field is derived from what the kernel adjudicated, so a caller cannot
+// assert "committed" that the evidence does not carry.
+type MutationEvidence struct {
+	// Target is the workspace-relative destination, in the canonical spelling
+	// the kernel's evidence log uses.
+	Target string
+	// Op is the proposal operation this evidence came from.
+	Op OperationType
+	// ExecutionID names the kernel execution, so a log line is correlatable
+	// with the adjudication that produced this verdict.
+	ExecutionID string
+	// Contract is the obligation set the verdict was judged against.
+	Contract string
+	// Outcome is the kernel's terminal verdict for this one primitive effect:
+	// PROVEN, FAILED, UNSUBSTANTIATED, REQUIRES_AUTHORIZATION, CANCELLED or
+	// INTERRUPTED.
+	//
+	// It is deliberately NOT the same field as ExecutionProof.Status. The
+	// kernel proves that one filesystem effect landed; only the surrounding
+	// transaction, its rollback and its own verification may claim the
+	// proposal committed. Collapsing the two is the mistake this field is
+	// shaped to prevent.
+	Outcome string
+	// Class is the kernel's failure class behind a non-PROVEN Outcome.
+	Class string
+	// Verify is the verification axis the kernel recorded: PASSED, FAILED,
+	// NOT_RUN or NOT_APPLICABLE. It is carried separately from Outcome because
+	// "the check ran and passed" and "the contract was satisfied" are different
+	// facts, and a projection that inferred one from the other would be lying.
+	Verify string
+	// Reason is the kernel's deterministic explanation of the verdict.
+	Reason string
+	// Landed reports durable write evidence for Target on a PROVEN execution.
+	Landed bool
+	// Deleted reports durable deletion evidence for Target on a PROVEN
+	// execution.
+	Deleted bool
+	// Vanished reports that the deletion found the destination already absent.
+	// Nothing was removed, so a DELETE contract demanding a durable change was
+	// NOT satisfied by it — this is a tolerated no-op, not a proven removal.
+	Vanished bool
+}
+
+// Format renders one mutation record as a single stable line, so the durable
+// proof artifact records the same fields the struct does rather than a
+// hand-copied subset that can drift from it.
+func (m MutationEvidence) Format() string {
+	return fmt.Sprintf("mutation op=%s target=%s execution=%s contract=%s outcome=%s verify=%s landed=%t deleted=%t vanished=%t class=%s reason=%s",
+		m.Op, m.Target, m.ExecutionID, m.Contract, m.Outcome, m.Verify,
+		m.Landed, m.Deleted, m.Vanished, m.Class, m.Reason)
 }
 
 // ProposalExecutor is the legacy single-proposal execution contract.
