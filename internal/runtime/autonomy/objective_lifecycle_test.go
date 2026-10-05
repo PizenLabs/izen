@@ -799,11 +799,25 @@ func TestDriverCaseL_ScopeResolutionIsTyped(t *testing.T) {
 	}
 	// The vocabulary is total: every state is distinct and renderable.
 	seen := map[string]bool{}
-	for _, s := range []ScopeResolutionState{ScopeUnresolved, ScopeDiscovered, ScopeResolved, ScopeRefused} {
+	for _, s := range AllScopeResolutionStates() {
 		if s.String() == "" || seen[s.String()] {
 			t.Fatalf("scope-resolution states are not distinct: %q", s)
 		}
 		seen[s.String()] = true
+	}
+	// Exactly one position authorizes mutation. AMBIGUOUS holds a candidate set
+	// and still must not.
+	authorized := 0
+	for _, s := range AllScopeResolutionStates() {
+		if s.AuthorizesMutation() {
+			authorized++
+			if s != ScopeResolved {
+				t.Errorf("%s claims mutation authority; only RESOLVED may", s)
+			}
+		}
+	}
+	if authorized != 1 {
+		t.Errorf("%d scope positions authorize mutation, want exactly 1", authorized)
 	}
 }
 

@@ -32,6 +32,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/execution/strategy"
 )
 
 // ── The four independent lifecycle states ───────────────────────────────────
@@ -464,21 +466,12 @@ type TaskClassification struct {
 	StructuralNoOpConfirmed bool
 }
 
-// creationVerbs are the objective verbs that ask for a NEW artifact. They are
-// only consulted when the target has no durable pre-existing content, so
-// "rewrite the docs" against an existing file is a PATCH, never a CREATE.
-var creationVerbs = []string{
-	"create ", "add ", "write ", "generate ", "implement ", "scaffold ", "new file",
-}
-
-// deletionVerbs are the objective verbs that can ask for a removal. A verb alone
-// never selects the DELETE contract — see requestsDeletionOf for the binding
-// rule — because "remove every deprecated comment from @big.go" removes CONTENT
-// from a file that must survive, and judging it as DELETE would demand the
-// absence of a file the objective explicitly keeps.
-var deletionVerbs = map[string]bool{
-	"delete": true, "remove": true, "erase": true, "drop": true, "unlink": true,
-}
+// The creation and deletion verb vocabularies are owned by the strategy layer
+// (semantics.go), which is the canonical semantic boundary. They used to be
+// declared here as a SECOND copy, and the two had already drifted: "implement"
+// was a creation verb here and unknown to the operation classifier, so the same
+// request could be judged a mutation by the contract and read as unreadable by
+// the gateway. One owner is the whole fix.
 
 // deletionLookahead is how many tokens after the verb a declared target may
 // appear and still bind the verb to it. It admits the natural object phrases
@@ -504,7 +497,7 @@ func requestsDeletionOf(objective string, targets []string) bool {
 	fields := strings.Fields(lower)
 	for i, f := range fields {
 		verb := strings.Trim(f, ".,:;!?\"'()")
-		if !deletionVerbs[verb] {
+		if !strategy.DeletionVerbs()[verb] {
 			continue
 		}
 		for j := i + 1; j < len(fields) && j <= i+deletionLookahead; j++ {
@@ -576,8 +569,10 @@ func DeriveTaskContract(in TaskClassification) TaskContract {
 	targets := append([]string(nil), in.Targets...)
 	contract := TaskContract{Targets: targets}
 	// The verb scan reads the OBJECTIVE, not the intent label; an unclassified
-	// label must not silently decide the contract kind.
-	objective := " " + strings.ToLower(strings.TrimSpace(in.Objective)) + " "
+	// label must not silently decide the contract kind. Matching goes through
+	// the canonical token matcher so "write" cannot be read inside "rewrite" —
+	// that boundary used to be re-implemented locally here and hand-rolled there
+	// in the classifier, and two hand-rolled boundaries eventually disagree.
 
 	// 1 — DELETE.
 	if in.RequiresMutation && (in.DeleteRequested || requestsDeletionOf(in.Objective, targets)) {
@@ -607,7 +602,7 @@ func DeriveTaskContract(in TaskClassification) TaskContract {
 			// an unresolved target as new, one layer down.
 			noExistingContent := in.TargetsExistedBefore != nil &&
 				!anyTargetExisted(in.TargetsExistedBefore, targets)
-			askedForNewFile := containsAnyWord(objective, creationVerbs) &&
+			askedForNewFile := strategy.ContainsPhrase(in.Objective, strategy.CreationVerbs()) &&
 				!allTargetsExisted(in.TargetsExistedBefore, targets)
 			if noExistingContent || askedForNewFile {
 				contract.Kind = TaskCreate
@@ -665,23 +660,6 @@ func DeriveTaskContract(in TaskClassification) TaskContract {
 // a bounded patch, so it stays a CREATE for the whole lifecycle.
 func creationShape(shape string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(shape)), "create")
-}
-
-// containsAnyWord reports whether the padded lowercased text carries any of the
-// space-delimited markers AS A WORD. The leading-space requirement is
-// load-bearing: without it "write " matches inside "rewrite ", so a REWRITE of an
-// existing file would be misread as asking for a NEW artifact's creation verb.
-func containsAnyWord(paddedLower string, markers []string) bool {
-	for _, marker := range markers {
-		word := strings.TrimLeft(marker, " ")
-		if word == "" {
-			continue
-		}
-		if strings.Contains(paddedLower, " "+word) {
-			return true
-		}
-	}
-	return false
 }
 
 func anyTargetExisted(before map[string]bool, targets []string) bool {

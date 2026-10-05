@@ -123,7 +123,7 @@ func TestRunAllFor_IdentityLessContractIsNotApplicableNotTheWorkspaceContract(t 
 				t.Fatalf("precondition: the %s workspace declares a verification contract", tc.workspace)
 			}
 
-			report := v.RunAllFor(tc.target)
+			report := v.RunAllFor(t.Context(), tc.target)
 			if report.Skipped != tc.wantSkipped {
 				t.Fatalf("RunAllFor(%q) Skipped = %t, want %t (reason %q)",
 					tc.target, report.Skipped, tc.wantSkipped, report.Reason)
@@ -149,7 +149,7 @@ func TestRunAllFor_ExplicitContractIsNeverOverriddenByIdentityResolution(t *test
 	v := NewLanguageVerifier(t.TempDir(), language.Go)
 	v.SetCustomSteps([]VerificationStep{{Name: "injected-gate", Command: "true"}})
 
-	report := v.RunAllFor("styles.css")
+	report := v.RunAllFor(t.Context(), "styles.css")
 	if report.Skipped {
 		t.Fatalf("an explicitly injected contract was discarded for a css target: %q", report.Reason)
 	}
@@ -184,7 +184,7 @@ func TestRunAllFor_UsesTheTargetsOwnContractWhenItHasOne(t *testing.T) {
 	if len(goSteps) == 0 {
 		t.Fatal("precondition: the go language definition declares verification commands")
 	}
-	report := v.RunAllFor("cmd/server/main.go")
+	report := v.RunAllFor(t.Context(), "cmd/server/main.go")
 	if report.Skipped {
 		t.Fatalf("a go target under an html workspace was reported not-applicable: %q", report.Reason)
 	}
@@ -211,10 +211,10 @@ func TestRunAllFor_UsesTheTargetsOwnContractWhenItHasOne(t *testing.T) {
 // meaning.
 func TestRunAllStillAnswersForTheEnclosingWorkspace(t *testing.T) {
 	v := NewLanguageVerifier(t.TempDir(), language.HTML)
-	if !v.RunAll().Skipped {
+	if !v.RunAll(t.Context(), ).Skipped {
 		t.Fatal("an html workspace with no contract must remain not-applicable on RunAll")
 	}
-	if v.RunAllFor("styles.css").Skipped != true {
+	if v.RunAllFor(t.Context(), "styles.css").Skipped != true {
 		t.Fatal("a css target must be not-applicable on RunAllFor as well")
 	}
 }

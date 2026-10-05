@@ -88,7 +88,7 @@ func TestPatchManagerLedgerNoOpWithoutTaskID(t *testing.T) {
 func TestRunnerBasic(t *testing.T) {
 	r := NewRunner(".", false, false)
 	r.SetAuthorization(testAuth())
-	result, err := r.Run("echo hello")
+	result, err := r.Run(t.Context(), "echo hello")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestRunnerBasic(t *testing.T) {
 func TestRunnerExitCode(t *testing.T) {
 	r := NewRunner(".", false, false)
 	r.SetAuthorization(testAuth())
-	result, err := r.Run("exit 42")
+	result, err := r.Run(t.Context(), "exit 42")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestRunnerExitCode(t *testing.T) {
 func TestRunnerSandboxBlocksDangerous(t *testing.T) {
 	r := NewRunner(".", true, false)
 	r.SetAuthorization(testAuth())
-	_, err := r.Run("rm -rf /")
+	_, err := r.Run(t.Context(), "rm -rf /")
 	if err == nil {
 		t.Fatal("expected sandbox to block dangerous command")
 	}
@@ -124,7 +124,7 @@ func TestRunnerSandboxBlocksDangerous(t *testing.T) {
 func TestRunnerSandboxAllowsSafe(t *testing.T) {
 	r := NewRunner(".", true, false)
 	r.SetAuthorization(testAuth())
-	result, err := r.Run("echo safe")
+	result, err := r.Run(t.Context(), "echo safe")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestIsDangerous(t *testing.T) {
 func TestRunnerStderr(t *testing.T) {
 	r := NewRunner(".", false, false)
 	r.SetAuthorization(testAuth())
-	result, err := r.Run("echo error >&2")
+	result, err := r.Run(t.Context(), "echo error >&2")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestRunInDir(t *testing.T) {
 
 	r := NewRunner(dir, false, false)
 	r.SetAuthorization(testAuth())
-	result, err := r.RunInDir("cat marker.txt", ".")
+	result, err := r.RunInDir(t.Context(), "cat marker.txt", ".")
 	if err != nil {
 		t.Fatalf("RunInDir: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestPatchLoadNotFound(t *testing.T) {
 func TestRunnerCommand(t *testing.T) {
 	r := NewRunner(".", false, false)
 	r.SetAuthorization(testAuth())
-	result, err := r.Run("printf 'line1\nline2'")
+	result, err := r.Run(t.Context(), "printf 'line1\nline2'")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -484,7 +484,7 @@ func TestRunnerCommand(t *testing.T) {
 func TestRunnerDir(t *testing.T) {
 	r := &Runner{}
 	r.SetAuthorization(testAuth())
-	result, err := r.run("pwd", "/tmp")
+	result, err := r.run(context.Background(), "pwd", "/tmp")
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}

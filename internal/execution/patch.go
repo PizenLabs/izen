@@ -900,7 +900,7 @@ func (pm *PatchManager) apply(ctx context.Context, patch *Patch) error {
 		// JS target in a portfolio task must not be compiled with the language
 		// contract of whatever the workspace primary happened to be, and a Go
 		// target must not be skipped because the workspace primary was HTML.
-		report := pm.verifier.RunAllFor(patch.File)
+		report := pm.verifier.RunAllFor(ctx, patch.File)
 		// The gate report is captured on the mutation boundary unconditionally
 		// so the execution result reads the REAL gate outcome — including the
 		// not-applicable (Skipped) case — and never re-runs verification.

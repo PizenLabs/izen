@@ -23,7 +23,28 @@ const (
 	OperationArchitect
 	// OperationExplain is a read-only understanding request.
 	OperationExplain
+	// OperationUndetermined: the request did not say what it wants done to the
+	// workspace. It is deliberately NOT the zero value — OperationContent is,
+	// and a zero value that silently means "a localized content change was
+	// determined" is what let an unreadable request reach mutation authority as
+	// the catch-all of a substring scan.
+	//
+	// It is appended rather than inserted so no existing kind changes value.
+	OperationUndetermined
 )
+
+// RequiresMutation reports whether this operation family writes the workspace.
+// UNDETERMINED does not: an unread request is a question for the human, never a
+// licence to guess a change. A strategy projected from it must fail closed
+// rather than pick a family.
+func (o OperationKind) RequiresMutation() bool {
+	switch o {
+	case OperationCreate, OperationFix, OperationRefactor, OperationContent, OperationArchitect:
+		return true
+	default:
+		return false
+	}
+}
 
 // String returns the canonical operation label.
 func (o OperationKind) String() string {
@@ -42,6 +63,8 @@ func (o OperationKind) String() string {
 		return "architect"
 	case OperationExplain:
 		return "explain"
+	case OperationUndetermined:
+		return "undetermined"
 	default:
 		return "unknown"
 	}

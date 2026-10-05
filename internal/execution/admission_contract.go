@@ -110,15 +110,20 @@ type admissionAction struct {
 	command   string
 }
 
+// operationForStrategy projects a strategy onto the protocol operation the
+// contract gate infers for it.
+//
+// It is a PROJECTION of strategy.MutationSemanticsOf, not a second strategy
+// list: PROPOSAL and APPLIED both map to FILE_MUTATE on purpose. A planning
+// strategy is treated as an ATTEMPTED file mutation so a contract that cannot
+// carry a proposal rejects it rather than executing it — see
+// planningAdmissionActions for the one case where a structured contract
+// legitimately reads it back as a read-only proposal turn.
 func operationForStrategy(profile strategy.ExecutionStrategyProfile) protocol.Operation {
-	switch profile.Strategy {
-	case strategy.TargetedMutation, strategy.DirectDeterministic, strategy.MultiFilePlanning:
+	if strategy.MutationSemanticsOf(profile.Strategy).RequiresMutationContract() {
 		return protocol.OperationFileMutate
-	case strategy.RepositoryInvestigation, strategy.TargetedReasoning, strategy.DirectResponse, strategy.HumanClarification:
-		return protocol.OperationRead
-	default:
-		return protocol.OperationRead
 	}
+	return protocol.OperationRead
 }
 
 func normalizedAdmissionOperation(raw string) protocol.Operation {

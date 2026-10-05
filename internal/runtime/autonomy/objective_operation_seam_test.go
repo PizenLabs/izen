@@ -108,10 +108,9 @@ func TestSeamDiscoveryResolvesAndContractFollowsEvidence(t *testing.T) {
 
 	d.deriveEvidenceScope()
 
-	var got []string
-	for _, tgt := range d.resolved.Targets {
-		got = append(got, tgt)
-	}
+	// A SNAPSHOT, not a view: the assertions below must not see a later rewrite
+	// of the resolved set.
+	got := append([]string(nil), d.resolved.Targets...)
 	for _, want := range []string{"index.html", "styles.css"} {
 		if !contains(got, want) {
 			t.Fatalf("discovery bound %v, want %s among the observed evidence", got, want)

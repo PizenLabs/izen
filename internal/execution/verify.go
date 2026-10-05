@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -269,7 +270,7 @@ func NewLanguageVerifier(root string, langID language.ID) *Verifier {
 // micro-fix loop. It returns a VerificationReport with parsed SyntaxErrors on
 // failures. This is faster than a full RunAll and is designed for the tight
 // micro-fix loop.
-func (v *Verifier) RunSyntaxQuickCheck() VerificationReport {
+func (v *Verifier) RunSyntaxQuickCheck(ctx context.Context) VerificationReport {
 	steps := SyntaxQuickCheckSteps
 	if v.steps != nil {
 		steps = v.steps
@@ -285,7 +286,7 @@ func (v *Verifier) RunSyntaxQuickCheck() VerificationReport {
 		if step.Optional {
 			continue
 		}
-		result := v.runStep(step)
+		result := v.runStep(ctx, step)
 		if !result.Passed {
 			result.SyntaxErrors = ParseSyntaxErrors(result.Output)
 		}
@@ -419,7 +420,7 @@ func (v *Verifier) languageOf(target string) language.ID {
 // contract is chosen per artifact instead of per workspace. A target with no
 // determinable language falls back to the workspace contract, exactly like
 // RunAll.
-func (v *Verifier) RunAllFor(target string) VerificationReport {
+func (v *Verifier) RunAllFor(ctx context.Context, target string) VerificationReport {
 	if v == nil {
 		return VerificationReport{Skipped: true, Reason: "no verifier configured"}
 	}
@@ -427,26 +428,26 @@ func (v *Verifier) RunAllFor(target string) VerificationReport {
 	if !determinate {
 		// No language identity on the target itself: answer for the enclosing
 		// workspace, because that is the only identity available.
-		return v.runSteps(v.steps, v.langID)
+		return v.runSteps(ctx, v.steps, v.langID)
 	}
-	return v.runSteps(steps, langID)
+	return v.runSteps(ctx, steps, langID)
 }
 
 // RunAll runs the verification gate for the verifier's bound language. Prefer
 // RunAllFor whenever the target being written is known: RunAll cannot choose a
 // per-artifact contract and therefore answers for the ENCLOSING workspace.
-func (v *Verifier) RunAll() VerificationReport {
+func (v *Verifier) RunAll(ctx context.Context) VerificationReport {
 	if v == nil {
 		return VerificationReport{Skipped: true, Reason: "no verifier configured"}
 	}
-	return v.runSteps(v.steps, v.langID)
+	return v.runSteps(ctx, v.steps, v.langID)
 }
 
 // runSteps executes one resolved verification contract and reports the outcome.
 // An empty contract is NOT APPLICABLE — semantically distinct from a pass and
 // from a failure: nothing ran, nothing claimed, nothing rolled back (Phase 7
 // P1). Go verification is NEVER an implicit fallback.
-func (v *Verifier) runSteps(steps []VerificationStep, langID language.ID) VerificationReport {
+func (v *Verifier) runSteps(ctx context.Context, steps []VerificationStep, langID language.ID) VerificationReport {
 	if len(steps) == 0 {
 		// No verification contract exists for this target (unknown language or
 		// a language definition with an empty Verification config). Report the
@@ -463,7 +464,7 @@ func (v *Verifier) runSteps(steps []VerificationStep, langID language.ID) Verifi
 	report.Passed = true
 
 	for _, step := range steps {
-		result := v.runStep(step)
+		result := v.runStep(ctx, step)
 		// Populate SyntaxErrors for the micro-fix loop.
 		if !result.Passed {
 			result.SyntaxErrors = ParseSyntaxErrors(result.Output)
@@ -478,13 +479,13 @@ func (v *Verifier) runSteps(steps []VerificationStep, langID language.ID) Verifi
 	return report
 }
 
-func (v *Verifier) runStep(step VerificationStep) VerificationResult {
+func (v *Verifier) runStep(ctx context.Context, step VerificationStep) VerificationResult {
 	runner := NewRunner(v.root, false, false)
 	if v.auth != nil {
 		runner.SetAuthorization(v.auth)
 	}
 
-	rawResult, err := runner.Run(step.Command)
+	rawResult, err := runner.Run(ctx, step.Command)
 
 	result := VerificationResult{Step: step}
 

@@ -28,6 +28,27 @@ package execution
 // The one thing it deliberately does NOT do: pick a subset. If the objective
 // declares three kinds and the workspace holds two files for one of them, the
 // ambiguity is real and is reported, not resolved by preferring the first.
+//
+// ── WHY THE VERDICT IS STRUCTURED ───────────────────────────────────────────
+//
+// The first version of this file returned a NON-EMPTY TARGET LIST for the
+// ambiguous case and reported the ambiguity in Reason. The caller then read the
+// list as a scope:
+//
+//	ambiguous evidence → non-empty Targets → ScopeResolved → mutation
+//
+// A non-empty target list is not a resolved scope. `a.html b.html index.html`
+// says the workspace holds three html files; it does not say the objective is
+// about all three. So the verdict is now a TYPED FIELD, and it is the field the
+// caller branches on:
+//
+//	UNRESOLVED  no target could be derived
+//	UNIQUE      the observed evidence determines the target set
+//	AMBIGUOUS   several observed files satisfy the objective and NONE of them is
+//	            proven to be the intended one
+//
+// The three cases are mutually exclusive and a caller can no longer collapse the
+// last two. Reason remains, verbatim, for humans; it is no longer load-bearing.
 
 import (
 	"fmt"
@@ -132,18 +153,113 @@ type DerivationRequest struct {
 	StatedTargets []string
 }
 
+// DerivationStatus is the closed, three-valued verdict of one evidence-bound
+// derivation pass. It exists because the SIZE of a derived target set is not a
+// verdict:
+//
+//	DerivationUnresolved  nothing could be derived, and nothing was proven
+//	DerivationUnique      exactly the observed evidence determines the target set
+//	DerivationAmbiguous   the objective matched SEVERAL observed files and the
+//	                      evidence does not establish which one(s) it is about
+//
+// The third value is the one a non-empty target list used to hide. Callers must
+// branch on this field (or the predicates below) and never on len(Targets).
+type DerivationStatus string
+
+const (
+	// DerivationUnresolved: no target was derived. The derivation may have been
+	// refused outright (no declared kind, or a proven target already exists) or
+	// attempted and found nothing; Derivable distinguishes the two.
+	DerivationUnresolved DerivationStatus = "UNRESOLVED"
+	// DerivationUnique: the derived target set is deterministic given the
+	// observation. This is the ONLY status that may become a mutation scope.
+	DerivationUnique DerivationStatus = "UNIQUE"
+	// DerivationAmbiguous: evidence exists and candidates exist, but the
+	// objective did not establish which candidate(s) it means. The candidates
+	// are carried as evidence — never as authority.
+	DerivationAmbiguous DerivationStatus = "AMBIGUOUS"
+)
+
+// AllDerivationStatuses returns the closed vocabulary. It exists so a test can
+// assert the three values are the whole set: a caller branches on this field, so
+// adding a fourth meaning is an architectural decision rather than something a
+// call site may do locally.
+func AllDerivationStatuses() []DerivationStatus {
+	return []DerivationStatus{DerivationUnresolved, DerivationUnique, DerivationAmbiguous}
+}
+
+// String returns the canonical derivation-status label.
+func (s DerivationStatus) String() string { return string(s) }
+
+// KindResolution is the per-declared-kind outcome of one derivation pass. It is
+// the structured record of WHERE the ambiguity is: a kind with several observed
+// matches is ambiguous, a kind with exactly one is not, and a kind with none is
+// simply absent from the objective's scope.
+type KindResolution struct {
+	// Kind is the canonical artifact-kind label the objective declared.
+	Kind string
+	// Matches are the observed paths whose extension satisfies the kind, in
+	// deterministic order. They are CANDIDATES.
+	Matches []string
+	// Ambiguous reports that the evidence offers more than one file for this
+	// kind and therefore does not establish the intended one.
+	Ambiguous bool
+}
+
 // Derivation is the complete, evidence-carrying outcome of one derivation pass.
 type Derivation struct {
-	// Targets is the derived, existing-file set. Empty means "no derivation was
-	// possible", which is a valid and common outcome — never an error.
+	// Targets is the derived, existing-file set. It is populated for UNIQUE
+	// (where it IS the candidate mutation scope) and for AMBIGUOUS (where it is
+	// the DISAMBIGUATION CANDIDATE SET and never a scope). Status is the field
+	// that distinguishes the two; Targets alone must never be read as a scope.
 	Targets []string
 	// Kinds are the artifact kinds the objective declared, in canonical order.
 	Kinds []string
+	// Resolutions is the per-kind breakdown that produced Status.
+	Resolutions []KindResolution
+	// Status is the typed verdict. A zero Derivation is UNRESOLVED, never
+	// UNIQUE: an unconstructed result can never read as a resolved scope.
+	Status DerivationStatus
 	// Reason explains the verdict in runtime vocabulary, never prompt vocabulary.
+	// It is evidence for humans; Status is what callers branch on.
 	Reason string
 	// Derivable reports whether derivation was ATTEMPTED. A caller can tell
 	// "nothing to derive" from "derivation refused", which matter differently.
 	Derivable bool
+}
+
+// status normalizes the zero value, so an unconstructed or legacy Derivation is
+// UNRESOLVED and can never be mistaken for a resolved scope.
+func (d Derivation) status() DerivationStatus {
+	if d.Status == "" {
+		return DerivationUnresolved
+	}
+	return d.Status
+}
+
+// StatusOrUnresolved returns the normalized typed verdict of the derivation.
+func (d Derivation) StatusOrUnresolved() DerivationStatus { return d.status() }
+
+// IsUnique reports whether the evidence determines the target set. Only a UNIQUE
+// derivation may become a mutation scope.
+func (d Derivation) IsUnique() bool { return d.status() == DerivationUnique }
+
+// IsAmbiguous reports whether candidates exist without a proven choice among
+// them. An ambiguous derivation MUST NOT produce a resolved scope.
+func (d Derivation) IsAmbiguous() bool { return d.status() == DerivationAmbiguous }
+
+// IsUnresolved reports that no target could be derived.
+func (d Derivation) IsUnresolved() bool { return !d.IsUnique() && !d.IsAmbiguous() }
+
+// AmbiguousKinds names the declared kinds whose observed matches are ambiguous.
+func (d Derivation) AmbiguousKinds() []string {
+	var out []string
+	for _, r := range d.Resolutions {
+		if r.Ambiguous {
+			out = append(out, r.Kind)
+		}
+	}
+	return out
 }
 
 // DeriveScope binds an objective that names no file to the observed workspace
@@ -155,12 +271,14 @@ type Derivation struct {
 func DeriveScope(req DerivationRequest) Derivation {
 	if len(nonBlank(req.StatedTargets)) > 0 {
 		return Derivation{
+			Status: DerivationUnresolved,
 			Reason: "the caller already proved a target set; derivation never overrides a stated target",
 		}
 	}
 	kinds := DeclareArtifactKinds(req.Prompt)
 	if len(kinds) == 0 {
 		return Derivation{
+			Status: DerivationUnresolved,
 			Reason: "the objective declares no artifact kind, so there is nothing to derive a target from; naming a file is the only way to proceed",
 		}
 	}
@@ -171,6 +289,7 @@ func DeriveScope(req DerivationRequest) Derivation {
 		// "I looked and the workspace is empty" apart from "I never looked" —
 		// two states that must never be reported the same way.
 		return Derivation{
+			Status:    DerivationUnresolved,
 			Kinds:     kinds,
 			Derivable: true,
 			Reason:    "bounded workspace discovery observed no file at all; the workspace is empty or fully ignored",
@@ -194,6 +313,7 @@ func DeriveScope(req DerivationRequest) Derivation {
 
 	var derived []string
 	seen := map[string]bool{}
+	var resolutions []KindResolution
 	var ambiguousKinds []string
 	for _, k := range kinds {
 		var matches []string
@@ -206,39 +326,57 @@ func DeriveScope(req DerivationRequest) Derivation {
 				matches = append(matches, c)
 			}
 		}
-		switch len(matches) {
-		case 0:
-			// No observed file satisfies this kind. Not fatal on its own.
-		case 1:
-			derived = append(derived, matches[0])
-		default:
+		sort.Strings(matches)
+		ambiguous := len(matches) > 1
+		resolutions = append(resolutions, KindResolution{
+			Kind:      k,
+			Matches:   matches,
+			Ambiguous: ambiguous,
+		})
+		if ambiguous {
 			ambiguousKinds = append(ambiguousKinds, k)
-			derived = append(derived, matches...)
 		}
+		derived = append(derived, matches...)
 	}
+	sort.Strings(derived)
 
+	// ── AMBIGUOUS ───────────────────────────────────────────────────────
+	// The pass found candidates and could not prove which of them the objective
+	// is about. The candidate set travels with the verdict as EVIDENCE, and the
+	// verdict is AMBIGUOUS so no caller can read the non-empty list as a scope.
+	//
+	// It deliberately does not narrow: binding the unambiguous kinds and
+	// dropping the ambiguous ones would silently rewrite the objective into the
+	// subset the runtime happened to be sure about.
 	if len(ambiguousKinds) > 0 {
-		sort.Strings(derived)
 		return Derivation{
-			Targets:   derived,
-			Kinds:     kinds,
-			Derivable: true,
+			Status:      DerivationAmbiguous,
+			Targets:     derived,
+			Kinds:       kinds,
+			Resolutions: resolutions,
+			Derivable:   true,
 			Reason: "the objective declares artifact kind(s) " + strings.Join(ambiguousKinds, ",") +
 				" and the workspace holds several files for each; the human must name the intended file(s)",
 		}
 	}
 	if len(derived) == 0 {
 		return Derivation{
-			Kinds: kinds,
+			Status:      DerivationUnresolved,
+			Kinds:       kinds,
+			Resolutions: resolutions,
 			Reason: "the objective declares artifact kind(s) " + strings.Join(kinds, ",") +
 				" but the bounded discovery pass observed no file with a matching extension; the runtime will not invent a target",
 		}
 	}
-	sort.Strings(derived)
+	// ── UNIQUE ─────────────────────────────────────────────────────────
+	// Every declared kind matched at most one observed file, so the evidence
+	// determines the target set and the caller may bind it.
 	return Derivation{
-		Targets:   derived,
-		Kinds:     kinds,
-		Derivable: true,
+		Status:      DerivationUnique,
+		Targets:     derived,
+		Kinds:       kinds,
+		Resolutions: resolutions,
+		Derivable:   true,
 		Reason: "derived from observed workspace evidence: kind(s) " + strings.Join(kinds, ",") +
 			" matched " + describePaths(derived) + " by extension; every path was read from disk by bounded discovery",
 	}
