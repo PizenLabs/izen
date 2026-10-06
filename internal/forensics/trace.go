@@ -394,6 +394,15 @@ func (t *Trace) add(ev events.DomainEvent) {
 			e.Summary = fmt.Sprintf("continuation evaluated: proposed %s", orNone(p.ProposedAction))
 			put(d, "proposed_reason", p.ProposedReason, "from", p.PreviousState, "outcome", p.Outcome)
 		}
+		// R5: the authoritative progress classification and what changed
+		// between this attempt and the previous one. The transition flags are
+		// only rendered when true, so an absent flag reads as "not observed",
+		// never as a negative observation.
+		put(d, "progress", p.Progress, "prev_progress", p.PreviousProgress,
+			"new_evidence", boolLabel(p.NewEvidence), "new_artifact", boolLabel(p.NewArtifact),
+			"mutation_applied", boolLabel(p.MutationApplied),
+			"verification_advanced", boolLabel(p.VerificationAdvanced),
+			"objective_advanced", boolLabel(p.ObjectiveAdvanced))
 	case events.ObjectiveEvaluatedPayload:
 		e.Summary = fmt.Sprintf("objective evaluated: %s (granted=%t)", orNone(p.State), p.Granted)
 		put(d, "clause", p.UnmetClause, "reason", p.Reason)
@@ -895,6 +904,29 @@ func (t *Trace) Render() string {
 			orNone(d.Outcome), orNone(d.FailureClass), d.Attempt, d.RecoveryCycle)
 		if d.ObjectiveState != "" || d.PendingWork != "" {
 			fmt.Fprintf(&b, "    objective:  %s   pending: %s\n", orNone(d.ObjectiveState), orNone(d.PendingWork))
+		}
+		// R5: the authoritative progress at this decision point and what
+		// changed since the previous one. Rendered only when the runtime
+		// published it, so an older record does not render a phantom line.
+		if d.Progress != "" {
+			flags := make([]string, 0, 5)
+			if d.NewEvidence {
+				flags = append(flags, "new_evidence")
+			}
+			if d.NewArtifact {
+				flags = append(flags, "new_artifact")
+			}
+			if d.MutationApplied {
+				flags = append(flags, "mutation_applied")
+			}
+			if d.VerificationAdvanced {
+				flags = append(flags, "verification_advanced")
+			}
+			if d.ObjectiveAdvanced {
+				flags = append(flags, "objective_advanced")
+			}
+			fmt.Fprintf(&b, "    progress:   %s (prev %s)  [%s]\n",
+				d.Progress, orNone(d.PreviousProgress), strings.Join(flags, ", "))
 		}
 	}
 

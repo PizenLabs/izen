@@ -545,6 +545,34 @@ type ContinuationDecisionPayload struct {
 	PendingWork    string   `json:"pending_work,omitempty"`
 	Targets        []string `json:"targets,omitempty"`
 	Evidence       string   `json:"evidence,omitempty"`
+
+	// ── R5: authoritative progress at this decision point ────────────────
+	//
+	// Progress is the runtime-owned objective progress classification
+	// (execution.ObjectiveProgress: DISCOVERED … PROVEN / FAILED /
+	// UNSUBSTANTIATED). It is a function of OBSERVED completion conditions,
+	// never of model output, so a decision that only re-issued tokens can be
+	// told apart from one that advanced the objective.
+	//
+	// PreviousProgress is the same classification at the PREVIOUS decision
+	// point, so a reader can answer "what changed between attempt N and
+	// N+1?" by comparing the two without replaying the contract. Empty on the
+	// first decision of a run — absence of a previous point is stated, not
+	// invented.
+	Progress         string `json:"progress,omitempty"`
+	PreviousProgress string `json:"previous_progress,omitempty"`
+
+	// The transition flags below are per-attempt facts about the
+	// authoritative state, relative to the previous decision point. They are
+	// derived from runtime-observed evidence only. A flag is false when the
+	// fact is absent; a reader must never read a false flag as a negative
+	// observation, only as "not observed here".
+	NewEvidence          bool `json:"new_evidence,omitempty"`
+	NewArtifact          bool `json:"new_artifact,omitempty"`
+	MutationApplied      bool `json:"mutation_applied,omitempty"`
+	VerificationAdvanced bool `json:"verification_advanced,omitempty"`
+	ObjectiveAdvanced    bool `json:"objective_advanced,omitempty"`
+
 	ProtocolTelemetry
 }
 

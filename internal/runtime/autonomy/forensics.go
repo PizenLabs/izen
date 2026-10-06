@@ -83,6 +83,113 @@ type decisionRecord struct {
 	// starting state as its outcome. Each summary therefore carries its
 	// revision, and the LAST summary for a run id is its outcome.
 	summaryRevision int
+
+	// ── R5 progress transition (observability only) ─────────────────────
+	//
+	// progress is the authoritative objective-progress classification at the
+	// CURRENT decision point; previousProgress is the value at the PREVIOUS
+	// one. The transition flags describe what the attempt behind this
+	// decision point changed in the authoritative state. They are computed
+	// from runtime-observed evidence and are NEVER consulted to decide
+	// anything — they exist so a forensic reader can answer "what changed
+	// between attempt N and N+1?" and "why was another attempt authorized?"
+	// from the record instead of reconstructing it.
+	progress             string
+	previousProgress     string
+	newEvidence          bool
+	newArtifact          bool
+	mutationApplied      bool
+	verificationAdvanced bool
+	objectiveAdvanced    bool
+	prevSnapshot         progressSnapshot
+	havePrevSnapshot     bool
+}
+
+// progressSnapshot is the bounded, authoritative state one decision point is
+// classified from. Every field is a fact the driver already owns; none is
+// derived from model prose.
+type progressSnapshot struct {
+	progress  execution.ObjectiveProgress
+	satisfied int
+	mutated   bool
+	artifact  bool
+	verified  bool
+	observed  int
+}
+
+// snapshotProgress reads the current authoritative progress state. It is a pure
+// read of the same evidence the completion authority and the continuation
+// router consume, so the forensic classification cannot disagree with the
+// decision it describes.
+func (d *Driver) snapshotProgress() progressSnapshot {
+	if d == nil {
+		return progressSnapshot{}
+	}
+	snap := progressSnapshot{
+		progress: d.objectiveProgress(),
+		observed: d.obs.Objective.WorkspaceObservations,
+		mutated:  d.obs.Objective.Mutated(),
+		artifact: d.obs.Objective.Artifact == execution.ArtifactProduced ||
+			d.obs.Objective.Artifact == execution.ArtifactContinuing,
+		verified: d.obs.Objective.VerificationPassed,
+	}
+	for _, c := range d.ObjectiveConditions() {
+		if c.Satisfied() {
+			snap.satisfied++
+		}
+	}
+	return snap
+}
+
+// captureProgress folds one decision point's snapshot into the record and
+// derives the deltas relative to the previous point. Called once per proposal
+// (not per event) so the evaluated and selected records report identical
+// facts.
+func (r *decisionRecord) captureProgress(cur progressSnapshot) {
+	if r == nil {
+		return
+	}
+	r.progress = string(cur.progress)
+	if !r.havePrevSnapshot {
+		// The first decision point has no predecessor. Reporting a delta
+		// against an empty state would invent a transition; instead the
+		// previous classification is left absent and the flags state only
+		// what this first observed state already contains.
+		r.previousProgress = ""
+		r.newEvidence = cur.observed > 0 || cur.mutated
+		r.newArtifact = cur.artifact
+		r.mutationApplied = cur.mutated
+		r.verificationAdvanced = cur.verified
+		r.objectiveAdvanced = cur.satisfied > 0
+	} else {
+		prev := r.prevSnapshot
+		r.previousProgress = string(prev.progress)
+		r.newEvidence = (cur.mutated && !prev.mutated) || cur.observed > prev.observed
+		r.newArtifact = cur.artifact && !prev.artifact
+		r.mutationApplied = cur.mutated
+		r.verificationAdvanced = cur.verified && !prev.verified
+		r.objectiveAdvanced = cur.satisfied > prev.satisfied
+	}
+	r.prevSnapshot = cur
+	r.havePrevSnapshot = true
+}
+
+// resetProgress clears the per-run progress tracker. It is called at the start
+// of every run so one objective's satisfied-condition count cannot render as a
+// change against a different objective.
+func (r *decisionRecord) resetProgress() {
+	if r == nil {
+		return
+	}
+	r.progress = ""
+	r.previousProgress = ""
+	r.newEvidence = false
+	r.newArtifact = false
+	r.mutationApplied = false
+	r.verificationAdvanced = false
+	r.objectiveAdvanced = false
+	r.prevSnapshot = progressSnapshot{}
+	r.havePrevSnapshot = false
 }
 
 // noteAuthority records that an authority CHANGED the current proposal.
@@ -128,6 +235,9 @@ func (d *Driver) beginDecision(proposed autonomy.LoopDecision) {
 	d.forensics.proposed = proposed
 	d.forensics.proposedAt = time.Now()
 	d.forensics.authorities = nil
+	// R5: classify the authoritative progress at THIS decision point before
+	// any authority may rewrite the proposal.
+	d.forensics.captureProgress(d.snapshotProgress())
 
 	d.bus.Publish(events.NewContinuationEvaluated(d.continuationPayload(proposed, "", false)))
 }
@@ -217,6 +327,15 @@ func (d *Driver) continuationPayload(decision autonomy.LoopDecision, nextState s
 		payload.ObjectiveState = string(ev.Outcome)
 	}
 	payload.PendingWork = string(d.ObjectiveContinuation().Decision)
+	// R5: the authoritative progress classification and the per-attempt
+	// transition flags. These are observability only; no decision reads them.
+	payload.Progress = d.forensics.progress
+	payload.PreviousProgress = d.forensics.previousProgress
+	payload.NewEvidence = d.forensics.newEvidence
+	payload.NewArtifact = d.forensics.newArtifact
+	payload.MutationApplied = d.forensics.mutationApplied
+	payload.VerificationAdvanced = d.forensics.verificationAdvanced
+	payload.ObjectiveAdvanced = d.forensics.objectiveAdvanced
 	return payload
 }
 

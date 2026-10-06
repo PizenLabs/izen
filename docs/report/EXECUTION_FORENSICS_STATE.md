@@ -12,8 +12,12 @@
   are now separate, single-sourced control-plane facts. **R4 PROVEN** — a real
   model call can exhaust its output ceiling, IZEN records it truthfully, the
   runtime-owned continuation stays inside the same execution, and completion
-  remains evidence-gated. The remaining items are open questions, not open
-  defects.
+  remains evidence-gated. **R5 PROVEN** — IZEN already owns a runtime-side
+  definition of progress (evidence-reduced completion conditions + the failure
+  ledger), the five non-progress scenarios are bounded and proven, and one
+  precisely-bounded missing transition is recorded (the per-attempt progress
+  delta on the successful-partial path). The remaining items are open questions,
+  not open defects.
 
 ---
 
@@ -240,6 +244,78 @@ go test ./test/forensics/ -run TestR4_ -v
 
 ---
 
+## R5 STATUS: PROVEN
+
+R5 asks what prevents a continuation-capable execution from repeatedly
+continuing without making meaningful progress. Full report:
+**`R5_NON_PROGRESS_REPORT.md`**.
+
+The finding: IZEN **already owns a runtime-side definition of progress**. It is
+not model output and not a step count. Three independent owners exist:
+
+1. **Objective progress** (`internal/execution/objective_conditions.go`,
+   `ReduceProgress`/`ReduceProgressWith` + `DecideContinuation`): a function of
+   **observed completion conditions**, recomputed from evidence. P2 (new
+   evidence), P4 (durable workspace/artifact delta), P5 (verification) and P6
+   (objective advancement) are authoritative; P0 (no change), P1 (model tokens)
+   and P3 (a capability ran) are not.
+2. **Failure ledger** (`internal/runtime/autonomy/failure_ledger.go` +
+   `DecideRecoveryWith`): a failure fingerprint repeated under an **unchanged
+   evidence epoch** is `NON_PROGRESSING_EXECUTION` and terminates.
+3. **RuntimeLoop bounds** (`internal/autonomy/runtime_loop.go`):
+   `MaxAttempts`, `MaxExecutionSteps`, `MaxIdenticalDecisions`, `MaxTotalTokens`
+   — the safety ceiling, deliberately separate from progress detection.
+
+The five required scenarios are pinned deterministically:
+
+| Case | Result |
+|---|---|
+| A genuine progress → continuation allowed | **PASS** — `PartiallySatisfied` re-opens via `routeObjectiveContinuation`; a real two-target run reaches `PROVEN` |
+| B same output/state → stops | **PASS** — ledger `NON_PROGRESSING_EXECUTION`; loop ceiling aborts identical decisions |
+| C repeated no-op capability | **PASS** — a zero-delta success satisfies no condition; `EXECUTION_INERTIA_NO_OP` never completes |
+| D repeated mutation attempt | **PASS** — the repeat is named non-progressing and terminates |
+| E progress then stall | **PASS (bounded)** — progress clears one epoch; the stall is bounded |
+
+**One missing transition, recorded not implemented.** On the
+**successful-but-partial** path, `routeObjectiveContinuation` re-opens on the
+*static* `PARTIALLY_SATISFIED` projection; it does not compare attempt N to
+attempt N−1. So stall-after-progress is bounded by the action-based
+`MaxIdenticalDecisions` ceiling, which is not progress-aware (it would also
+curtail a genuinely progressing multi-step objective). The state-delta detector
+`internal/progress.Detector` already implements the missing semantic but is
+wired only to the behavioral loop. The smallest boundary — a per-lifecycle
+previous-progress fingerprint plus a delta predicate at the router — is recorded
+in the report §5 and **not** implemented, because R5 was instructed not to add a
+generic loop detector and the existing stop is truthful (`NOT PROVEN`).
+
+**Forensic coverage added (observability only).** `continuation.evaluated` /
+`continuation.selected` now carry `progress`, `previous_progress`,
+`new_evidence`, `new_artifact`, `mutation_applied`, `verification_advanced` and
+`objective_advanced`, computed from the same evidence the authority judges.
+Nothing reads them to decide anything.
+
+| Critical invariant | Result |
+|---|---|
+| model output alone counts as progress | **no** (`TestR5_P1_ModelOutputAloneIsNeverProgress`) |
+| successful no-op counts as progress | **no** (`TestR5_CaseC_NoOpCapabilitySatisfiesNoCondition`) |
+| repeated identical failure stops semantically | **yes** (failure ledger) |
+| repeated identical decisions are bounded | **yes** (`RuntimeLoop`) |
+| completion remains evidence-gated | **yes** (authority is downgrade-only) |
+| live low-progress run stops boundedly | **yes** (see report §7) |
+
+Reproduce:
+
+```
+ollama serve
+IZEN_LIVE_FORENSICS=1 go test ./test/live_r5/ -v -timeout 1500s
+# deterministic, no model:
+go test ./internal/execution/        -run TestR5_ -v
+go test ./internal/runtime/autonomy/ -run TestR5_ -v
+go test ./internal/progress/         -run TestR5_ -v
+```
+
+---
+
 ## What is broken RIGHT NOW
 
 Nothing in the repository. Eight defects are fixed:
@@ -371,6 +447,21 @@ NEW  test/forensics/r4_continuation_test.go  R4 deterministic state-machine (5 t
 NEW  docs/report/R4_BOUNDED_CONTINUATION_REPORT.md
 ```
 
+R5 added **observability only** (no authority-bearing production change):
+
+```
+NEW  internal/execution/r5_progress_test.go              P0–P6 semantic proof (9 tests)
+NEW  internal/runtime/autonomy/r5_nonprogress_test.go    cases A–E + forensics (9 tests)
+NEW  internal/progress/r5_nonprogress_test.go            state-delta detector (3 tests)
+NEW  test/live_r5/probe_test.go                          live boundedness benchmark (opt-in)
+NEW  docs/report/R5_NON_PROGRESS_REPORT.md               the R5 report
+MOD  internal/events/events.go                           progress + transition fields on
+                                                         ContinuationDecisionPayload
+MOD  internal/runtime/autonomy/forensics.go              snapshot/capture/emit progress
+MOD  internal/runtime/autonomy/driver.go                 per-run progress reset
+MOD  internal/forensics/trace.go                         render progress transitions
+```
+
 ---
 
 ## What must NOT be touched
@@ -394,11 +485,17 @@ change is outside it: the `IsCasualChat` classification guard.
 ## The next EXACT experiment
 
 R2 is closed **BLOCKED**; R3 is closed **PROVEN** (`R3_TARGET_PROPOSAL_REPORT.md`);
-R4 is closed **PROVEN** (`R4_BOUNDED_CONTINUATION_REPORT.md`). R3 identified the
-single authority boundary (`EvaluatePreflightAdmission`) and made
-DISCOVERED/PROPOSED/AUTHORIZED explicit without granting authority. R4 proved
-that a real `finish_reason=length` is continued inside the same execution by
-runtime-owned logic and never falsely completed.
+R4 is closed **PROVEN** (`R4_BOUNDED_CONTINUATION_REPORT.md`); R5 is closed
+**PROVEN** (`R5_NON_PROGRESS_REPORT.md`). R3 identified the single authority
+boundary (`EvaluatePreflightAdmission`) and made DISCOVERED/PROPOSED/AUTHORIZED
+explicit without granting authority. R4 proved that a real `finish_reason=length`
+is continued inside the same execution by runtime-owned logic and never falsely
+completed. R5 proved that the runtime already owns a definition of progress
+(evidence-reduced completion conditions + the failure ledger), that the five
+non-progress scenarios are bounded, and recorded one missing transition: the
+per-attempt progress delta on the successful-partial path (report §5). That
+boundary is **reported, not implemented** — R5 was instructed not to add a
+generic loop detector, and the surviving stop is truthful (`NOT PROVEN`).
 
 R4 resolved the two open items that R1/R3 had left in this section:
 
@@ -440,3 +537,13 @@ is a separate capability from R2's target discovery.
 5. **Contract recovery (§1, Benchmark C)** was never exercised: the scripted
    prose answer reached an approval gate, so only one call happened. Whether
    `authorizeContractRecovery` produces a *useful* second prompt is untested.
+6. **The successful-partial progress delta is not yet a router input (R5).**
+   `routeObjectiveContinuation` re-opens on the static `PARTIALLY_SATISFIED`
+   projection rather than on an advance since the previous attempt, so
+   stall-after-progress is bounded by the action-based
+   `RuntimeLoop.MaxIdenticalDecisions` ceiling, which is not progress-aware.
+   The smallest boundary (a per-lifecycle previous-progress fingerprint plus a
+   delta predicate at the router) is in `R5_NON_PROGRESS_REPORT.md` §5. The
+   state-delta detector `internal/progress.Detector` already implements the
+   semantic and is wired only to the behavioral loop. **Reported, not
+   implemented**: R5 was instructed not to add a generic loop detector.

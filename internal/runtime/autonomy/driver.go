@@ -617,6 +617,10 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.contractRecoveries = 0
 	d.contractRecoveryExhausted = false
 	d.derivationNote = ""
+	// R5: a new run is a new progress lifecycle. Carrying the previous run's
+	// satisfied-condition snapshot forward would render one objective's
+	// first decision as an advance over another objective.
+	d.forensics.resetProgress()
 	// The run's derived SCOPE state is not reset here but by the single owner of
 	// target binding: bindAuthoritativeTargets below invalidates the previous
 	// verdict, the scope record and the objective contract together and then
