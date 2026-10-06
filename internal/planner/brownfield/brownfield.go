@@ -23,8 +23,10 @@ import (
 	"github.com/PizenLabs/izen/internal/ir"
 	"github.com/PizenLabs/izen/internal/op"
 	"github.com/PizenLabs/izen/internal/planner"
+	"github.com/PizenLabs/izen/internal/resource"
 	"github.com/PizenLabs/izen/internal/resource/file"
 	"github.com/PizenLabs/izen/internal/resource/terminal"
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
 const (
@@ -51,6 +53,20 @@ var (
 	ErrNilGraph = errors.New("brownfield: nil execution graph")
 	// ErrNoRepair is returned when a failure produced no repair operations.
 	ErrNoRepair = errors.New("brownfield: no repair operations produced")
+	// ErrNoMutationAuthority is returned when a plan would write a file but no
+	// Core execution authority was configured. Writes fail closed rather than
+	// falling back to a raw resource: a brownfield mutation must not mutate the
+	// workspace merely because it reached the planner.
+	ErrNoMutationAuthority = errors.New("brownfield: no Core mutation authority configured; use WithMutationExecutor so writes are authorized, transacted and kernel-executed")
+	// ErrMutationAuthorityRootMismatch is returned when the configured authority
+	// is bound to a different workspace than the planner. Placing the plan's
+	// relative targets under another root would mutate a tree the planner never
+	// described.
+	ErrMutationAuthorityRootMismatch = errors.New("brownfield: mutation authority is bound to a different workspace root")
+	// ErrResourceRestoreUnsupported is returned by the Core mutation target's
+	// Restore. Rollback is Core's and lives in the execution authority, so the
+	// adapter refuses to restore rather than reintroducing a direct writer.
+	ErrResourceRestoreUnsupported = errors.New("brownfield: restore is owned by the Core transaction, not the resource adapter")
 )
 
 // Compile-time assertion that BrownfieldPlanner satisfies planner.PlanBuilder.
@@ -109,8 +125,16 @@ type BrownfieldPlanner struct {
 	verify   func(intent string) string
 	repair   RepairFunc
 
-	artifacts []ir.Artifact
-	repairSeq atomic.Uint64
+	// executor is the Core execution authority every file mutation the plan
+	// describes is submitted to. It is the existing substrate authority
+	// (substrate.ProposalExecutor) — this planner owns no mutation engine and no
+	// transaction system of its own. A plan that writes without an authority
+	// fails closed with ErrNoMutationAuthority.
+	executor substrate.ProposalExecutor
+
+	artifacts   []ir.Artifact
+	repairSeq   atomic.Uint64
+	mutationSeq atomic.Uint64
 }
 
 // Option configures a BrownfieldPlanner.
@@ -150,6 +174,20 @@ func WithFileMode(mode fs.FileMode) Option {
 	return func(p *BrownfieldPlanner) { p.mode = mode }
 }
 
+// WithMutationExecutor binds the Core execution authority every file mutation
+// is submitted to. It is satisfied by substrate.ProposalExecutor (concretely
+// *substrate.ConcreteSubstrate), the same authority Path A and the greenfield
+// proposal path use. A planner with file artifacts and no executor fails
+// closed at Plan with ErrNoMutationAuthority rather than mutating through a
+// raw file resource.
+func WithMutationExecutor(exec substrate.ProposalExecutor) Option {
+	return func(p *BrownfieldPlanner) {
+		if exec != nil {
+			p.executor = exec
+		}
+	}
+}
+
 // WithTimeout bounds the execution of every operation in the graph.
 func WithTimeout(timeout time.Duration) Option {
 	return func(p *BrownfieldPlanner) { p.timeout = timeout }
@@ -183,6 +221,9 @@ func NewBrownfieldPlanner(workspaceRoot string, opts ...Option) (*BrownfieldPlan
 	for _, opt := range opts {
 		opt(p)
 	}
+	if p.executor != nil && !rootsMatch(p.executor, p.workspaceRoot) {
+		return nil, fmt.Errorf("%w: planner root %q", ErrMutationAuthorityRootMismatch, p.workspaceRoot)
+	}
 	if p.terminal == nil {
 		t, err := terminal.NewTerminalResource(workspaceRoot, nil, "")
 		if err != nil {
@@ -215,7 +256,7 @@ func (p *BrownfieldPlanner) Plan(ctx context.Context, intent string, artifacts [
 		if a.Kind != ir.ArtifactFile {
 			continue
 		}
-		res, err := file.NewFileResource(p.workspaceRoot, a.Path, p.mode)
+		res, err := p.fileTarget(a.Path)
 		if err != nil {
 			return nil, fmt.Errorf("brownfield: target %q: %w", a.Path, err)
 		}
@@ -330,7 +371,7 @@ func (p *BrownfieldPlanner) defaultRepair(ctx context.Context, failure *graph.Ex
 		if a.Kind != ir.ArtifactFile || !matchesMissingPath(a.Path, report.MissingPath) {
 			continue
 		}
-		res, err := file.NewFileResource(p.workspaceRoot, a.Path, p.mode)
+		res, err := p.fileTarget(a.Path)
 		if err != nil {
 			return nil, err
 		}
@@ -341,6 +382,22 @@ func (p *BrownfieldPlanner) defaultRepair(ctx context.Context, failure *graph.Ex
 		return []op.Operation{operation}, nil
 	}
 	return nil, nil
+}
+
+// fileTarget lowers an artifact path into the resource the graph write node
+// runs against. It is a coreMutationTarget: the resource describes the target
+// and desired content, and the configured Core authority performs and decides
+// the effect. A missing authority fails closed so no brownfield write can
+// reach the workspace through a raw resource.
+func (p *BrownfieldPlanner) fileTarget(relPath string) (resource.Resource, error) {
+	base, err := file.NewFileResource(p.workspaceRoot, relPath, p.mode)
+	if err != nil {
+		return nil, err
+	}
+	if p.executor == nil {
+		return nil, ErrNoMutationAuthority
+	}
+	return &coreMutationTarget{base: base, exec: p.executor, seq: &p.mutationSeq}, nil
 }
 
 // nextRepairID returns a monotonically increasing repair node ID, unique

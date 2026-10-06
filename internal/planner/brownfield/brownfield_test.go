@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,16 +17,18 @@ import (
 	"github.com/PizenLabs/izen/internal/op"
 	"github.com/PizenLabs/izen/internal/resource/file"
 	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
-// writeRepair builds an op.OpWriteFile repair operation writing an artifact
-// to relPath inside root.
-func writeRepair(root, id, relPath, content string) (op.Operation, error) {
-	res, err := file.NewFileResource(root, relPath, 0)
+// writeRepair builds an op.OpWriteFile repair operation routed through the
+// Core execution authority, exactly as the production planner does.
+func writeRepair(root, id, relPath, content string, exec substrate.ProposalExecutor) (op.Operation, error) {
+	base, err := file.NewFileResource(root, relPath, 0)
 	if err != nil {
 		return op.Operation{}, err
 	}
-	return op.NewOperation(id, op.OpWriteFile, res, ir.NewFile(relPath, []byte(content)), nil, time.Second)
+	target := &coreMutationTarget{base: base, exec: exec, seq: new(atomic.Uint64)}
+	return op.NewOperation(id, op.OpWriteFile, target, ir.NewFile(relPath, []byte(content)), nil, time.Second)
 }
 
 func TestBrownfieldPlannerClosedLoopRepair(t *testing.T) {
@@ -34,6 +37,7 @@ func TestBrownfieldPlannerClosedLoopRepair(t *testing.T) {
 		ir.NewFile("main.go", []byte("package main\n")),
 	}
 	verify := func(string) string { return "cat helper.go" }
+	exec := substrate.NewConcreteSubstrate(root)
 
 	repairs := 0
 	repair := func(ctx context.Context, failure *graph.ExecutionFailure, report FailureReport, attempt int) ([]op.Operation, error) {
@@ -41,14 +45,14 @@ func TestBrownfieldPlannerClosedLoopRepair(t *testing.T) {
 		if report.Symptom != SymptomMissingFile || report.MissingPath != "helper.go" {
 			return nil, nil
 		}
-		o, err := writeRepair(root, fmt.Sprintf("fix-%d", attempt), "helper.go", "package main\n")
+		o, err := writeRepair(root, fmt.Sprintf("fix-%d", attempt), "helper.go", "package main\n", exec)
 		if err != nil {
 			return nil, err
 		}
 		return []op.Operation{o}, nil
 	}
 
-	p, err := NewBrownfieldPlanner(root, WithVerifyCommand(verify), WithRepairFunc(repair))
+	p, err := NewBrownfieldPlanner(root, WithVerifyCommand(verify), WithRepairFunc(repair), WithMutationExecutor(exec))
 	if err != nil {
 		t.Fatalf("NewBrownfieldPlanner: %v", err)
 	}
@@ -84,17 +88,18 @@ func TestBrownfieldPlannerRepairBudgetExhausted(t *testing.T) {
 		ir.NewFile("main.go", []byte("package main\n")),
 	}
 	verify := func(string) string { return "exit 1" }
+	exec := substrate.NewConcreteSubstrate(root)
 	// Every repair op fails to execute, so each repair cycle surfaces a new
 	// failure and the budget is consumed without ever reaching green.
 	repair := func(ctx context.Context, failure *graph.ExecutionFailure, report FailureReport, attempt int) ([]op.Operation, error) {
-		o, err := writeRepair(root, fmt.Sprintf("noop-%d", attempt), "no/such/dir/noop.go", "x")
+		o, err := writeRepair(root, fmt.Sprintf("noop-%d", attempt), "no/such/dir/noop.go", "x", exec)
 		if err != nil {
 			return nil, err
 		}
 		return []op.Operation{o}, nil
 	}
 
-	p, err := NewBrownfieldPlanner(root, WithVerifyCommand(verify), WithRepairFunc(repair))
+	p, err := NewBrownfieldPlanner(root, WithVerifyCommand(verify), WithRepairFunc(repair), WithMutationExecutor(exec))
 	if err != nil {
 		t.Fatalf("NewBrownfieldPlanner: %v", err)
 	}
@@ -142,7 +147,8 @@ func TestBrownfieldPlannerDefaultRepairWritesMissingArtifact(t *testing.T) {
 		ir.NewFile("helper.go", []byte("package main\n")),
 	}
 
-	p, err := NewBrownfieldPlanner(root, WithVerifyCommand(func(string) string { return "cat helper.go" }))
+	p, err := NewBrownfieldPlanner(root, WithVerifyCommand(func(string) string { return "cat helper.go" }),
+		WithMutationExecutor(substrate.NewConcreteSubstrate(root)))
 	if err != nil {
 		t.Fatalf("NewBrownfieldPlanner: %v", err)
 	}

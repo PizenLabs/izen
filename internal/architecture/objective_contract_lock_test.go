@@ -184,6 +184,7 @@ var bannedObjectiveVocabulary = []string{
 var objectiveDecisionSources = []string{
 	"internal/execution/objective_conditions.go",
 	"internal/execution/objective_authority.go",
+	"internal/execution/objective_operation.go",
 	"internal/runtime/autonomy/objective_lifecycle.go",
 	"internal/runtime/autonomy/objective_completion.go",
 	"internal/runtime/autonomy/scope_resolution.go",

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/PizenLabs/izen/internal/kernelbridge"
 	"github.com/PizenLabs/izen/internal/runtime/scope"
 )
 
@@ -21,8 +23,20 @@ var ErrWorkspaceEscape = scope.ErrWorkspaceEscape
 const defaultCommitMode fs.FileMode = 0o644
 
 // FileExecutor applies approved proposals transactionally over a captured
-// FileBackup snapshot. It owns zero-orphan temp-file cleanup and automatic
-// rollback: any commit failure restores the pre-mutation state.
+// FileBackup snapshot. It owns automatic rollback: any commit failure restores
+// the pre-mutation state.
+//
+// What it owns, and keeps owning, is the transaction rather than the bytes:
+// which target a proposal names, what that target should hold, whether the
+// result is redundant, and what must be undone when anything fails. The final
+// filesystem effect of a commit and of a rollback is placed by the Runtime
+// Kernel — see kernelcommit.go for the full crossing and for the two rules
+// that govern it.
+//
+// Zero-orphan cleanup is no longer this file's job for the same reason. It
+// never belonged here: the temp file that could be orphaned was always the
+// kernel capability's staging file, and the kernel deletes it on every path
+// that does not rename it into place.
 //
 // Execution-time confinement: when bound to a workspace-root FD handle
 // (WithScopeRoot), every Commit, PrepareSnapshot, and Rollback verifies
@@ -33,21 +47,51 @@ const defaultCommitMode fs.FileMode = 0o644
 // permitted.
 type FileExecutor struct {
 	scopeRoot *scope.Root
+
+	// workspace is the root every mutation of this executor is authorized
+	// against. It is the root the kernel grant is formed over, so an executor
+	// without one has nothing to ask about and refuses to place bytes rather
+	// than guessing a root.
+	workspace string
 }
 
-// NewExecutor returns a ready-to-use FileExecutor.
+// NewExecutor returns a FileExecutor with no workspace bound.
+//
+// The result can snapshot and validate, but any mutation fails with
+// ErrUnboundWorkspace. Bind it with WithWorkspace (or WithScopeRoot) at the
+// composition root, where the workspace root is already known.
 func NewExecutor() *FileExecutor {
 	return &FileExecutor{}
+}
+
+// WithWorkspace declares the root every mutation of this executor is
+// authorized against. It is the root the kernel grant is formed over, so it
+// must be the workspace the caller actually intends to change.
+func (e *FileExecutor) WithWorkspace(root string) *FileExecutor {
+	if e == nil {
+		return e
+	}
+	e.workspace = root
+	return e
 }
 
 // WithScopeRoot anchors the executor to an open workspace-root FD
 // handle. The caller retains ownership (Close); the executor never
 // closes a handle it did not open.
+//
+// It also declares the workspace, because the FD handle already knows the
+// root and a grant needs one. Binding both from a single call is what keeps
+// them from disagreeing: a handle at one root and a grant at another would
+// confine the check and the effect to different workspaces, which is a
+// guarantee that reads as if it held and does not.
 func (e *FileExecutor) WithScopeRoot(r *scope.Root) *FileExecutor {
 	if e == nil {
 		return e
 	}
 	e.scopeRoot = r
+	if r != nil {
+		e.workspace = r.RootPath()
+	}
 	return e
 }
 
@@ -64,7 +108,7 @@ func (e *FileExecutor) verifyUse(targetPath string) error {
 	if filepath.IsAbs(targetPath) {
 		r, err := filepath.Rel(root, targetPath)
 		if err != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("%w: target %q escapes workspace", scope.ErrWorkspaceEscape, targetPath)
+			return fmt.Errorf("%w: target %q escapes workspace", ErrWorkspaceEscape, targetPath)
 		}
 		rel = r
 	}
@@ -114,11 +158,14 @@ func (e *FileExecutor) PrepareSnapshot(targetPath string) (*FileBackup, error) {
 }
 
 // Commit materializes the proposal against the snapshot's base content and
-// writes the result atomically: content is written to a same-directory temp
-// file (.tmp.izen.*), fsynced, and renamed over targetPath. On any failure
-// Commit automatically invokes Rollback and returns the cause; a rollback
-// failure is appended to the returned error.
-func (e *FileExecutor) Commit(proposal ProposedMutation, backup *FileBackup) error {
+// places the result through the Runtime Kernel. On any failure Commit
+// automatically invokes Rollback and returns the cause; a rollback failure is
+// appended to the returned error.
+//
+// The context is threaded to the one place that can honour it — the kernel
+// execution — so a withdrawn execution stops the kernel rather than
+// abandoning a goroutine that is still placing bytes.
+func (e *FileExecutor) Commit(ctx context.Context, proposal ProposedMutation, backup *FileBackup) error {
 	if e == nil {
 		return errors.New("executor: nil FileExecutor")
 	}
@@ -144,11 +191,11 @@ func (e *FileExecutor) Commit(proposal ProposedMutation, backup *FileBackup) err
 
 	final, err := materializeContent(proposal, base)
 	if err != nil {
-		return e.failWithRollback(backup, err)
+		return e.failWithRollback(ctx, backup, err)
 	}
 
 	// Execution-time confinement gate: verify at USE time, immediately
-	// before the atomic write, so a TOCTOU symlink swap fails closed
+	// before the write, so a TOCTOU symlink swap fails closed
 	// with ErrWorkspaceEscape and nothing is written outside.
 	if verr := e.verifyUse(targetPath); verr != nil {
 		return verr
@@ -162,81 +209,27 @@ func (e *FileExecutor) Commit(proposal ProposedMutation, backup *FileBackup) err
 		}
 	}
 
-	mode := fs.FileMode(backup.FileMode)
-	if mode == 0 {
-		mode = defaultCommitMode
-	}
-
-	if err := e.atomicWrite(targetPath, final, mode); err != nil {
-		return e.failWithRollback(backup, err)
-	}
-	return nil
-}
-
-// atomicWrite writes content to targetPath atomically: content is written to a
-// same-directory temp file (.tmp.izen.*), fsynced, and renamed over targetPath.
-// On any failure the temp file is removed (zero-orphan guard). It never reads
-// the target, so it may be driven purely from an in-memory snapshot.
-func (e *FileExecutor) atomicWrite(targetPath, content string, mode fs.FileMode) error {
-	if targetPath == "" {
-		return errors.New("executor: atomic write requires a target path")
-	}
-
-	dir := filepath.Dir(targetPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("executor: create directory for %q: %w", targetPath, err)
-	}
-
-	tmp, err := os.CreateTemp(dir, ".tmp.izen.*")
+	applied, target, err := e.commitThroughKernel(ctx, targetPath, final)
 	if err != nil {
-		return fmt.Errorf("executor: create temp for %q: %w", targetPath, err)
+		return e.failWithKernelWrite(ctx, backup, applied, target, err)
 	}
-	tmpName := tmp.Name()
-
-	// Zero-orphan guard: unless the temp was atomically renamed into place,
-	// it is removed when the write returns.
-	committed := false
-	defer func() {
-		if !committed {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write([]byte(content)); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("executor: write temp for %q: %w", targetPath, err)
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("executor: chmod temp for %q: %w", targetPath, err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("executor: sync temp for %q: %w", targetPath, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("executor: close temp for %q: %w", targetPath, err)
-	}
-
-	// Second use-time gate immediately before the rename: closes the
-	// temp-write→rename window against a swap planted during the write.
-	if verr := e.verifyUse(targetPath); verr != nil {
-		return verr
-	}
-	if err := os.Rename(tmpName, targetPath); err != nil {
-		return fmt.Errorf("executor: rename temp to %q: %w", targetPath, err)
-	}
-	committed = true
-
-	fsyncDir(dir)
 	return nil
 }
 
 // Rollback restores the pre-mutation state captured by the backup snapshot:
 // existing files are rewritten byte-for-byte with their original permissions,
-// and files that did not exist before are removed. Rolling back a pristine
-// snapshot is idempotent and safe.
-func (e *FileExecutor) Rollback(backup *FileBackup) error {
+// and files that did not exist before are removed. Both directions are placed
+// through the Runtime Kernel, so a restore that cannot be proven is reported
+// rather than assumed. Rolling back a pristine snapshot is idempotent and
+// safe.
+//
+// The permissions FileBackup carries are no longer applied by an explicit
+// chmod, and the guarantee is not lost: the kernel's write capability
+// preserves the destination's existing permission bits across the atomic
+// replace and defaults to 0o644 for a destination that does not exist. Those
+// are exactly the two cases the local mode arithmetic covered, because the
+// commit that created the divergence started from the same snapshot.
+func (e *FileExecutor) Rollback(ctx context.Context, backup *FileBackup) error {
 	if e == nil {
 		return errors.New("executor: nil FileExecutor")
 	}
@@ -254,23 +247,13 @@ func (e *FileExecutor) Rollback(backup *FileBackup) error {
 	}
 
 	if backup.Exists {
-		mode := fs.FileMode(backup.FileMode)
-		if mode == 0 {
-			mode = defaultCommitMode
-		}
-		if err := os.WriteFile(backup.Path, backup.Content, mode); err != nil {
+		if err := e.restoreThroughKernel(ctx, backup.Path, string(backup.Content)); err != nil {
 			return fmt.Errorf("executor: rollback restore %q: %w", backup.Path, err)
-		}
-		if err := os.Chmod(backup.Path, mode); err != nil {
-			return fmt.Errorf("executor: rollback chmod %q: %w", backup.Path, err)
 		}
 		return nil
 	}
 
-	if err := os.Remove(backup.Path); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
+	if err := e.removeThroughKernel(ctx, backup.Path); err != nil {
 		return fmt.Errorf("executor: rollback remove %q: %w", backup.Path, err)
 	}
 	return nil
@@ -279,21 +262,28 @@ func (e *FileExecutor) Rollback(backup *FileBackup) error {
 // failWithRollback rolls back backup and returns cause. A rollback failure is
 // appended to the returned error so the caller learns the workspace was not
 // fully restored.
-func (e *FileExecutor) failWithRollback(backup *FileBackup, cause error) error {
-	if rbErr := e.Rollback(backup); rbErr != nil {
+func (e *FileExecutor) failWithRollback(ctx context.Context, backup *FileBackup, cause error) error {
+	if rbErr := e.Rollback(ctx, backup); rbErr != nil {
 		return fmt.Errorf("%w (rollback failed: %w)", cause, rbErr)
 	}
 	return cause
 }
 
-// fsyncDir best-effort flushes dir to disk so a completed rename is durable.
-// Failures are intentionally ignored: correctness is guaranteed by rollback,
-// durability is best-effort.
-func fsyncDir(dir string) {
-	f, err := os.Open(dir)
-	if err != nil {
-		return
+// failWithKernelWrite is failWithRollback for a commit whose kernel execution
+// did not prove the write, annotated with whether bytes actually reached disk.
+//
+// The annotation is the point. "The kernel could not prove it" covers two
+// workspace states that a caller must be able to tell apart: a refused write
+// that changed nothing, and a write that landed and then failed its
+// independent re-read. Both are rolled back — that is what the transaction
+// is for — but only the second is an executed mutation, and reporting a
+// rollback that undid nothing as a rollback of real bytes teaches a reader
+// that this evidence is noise.
+func (e *FileExecutor) failWithKernelWrite(ctx context.Context, backup *FileBackup, applied kernelbridge.Applied, target string, cause error) error {
+	executed := applied.Wrote(target)
+	rolled := e.failWithRollback(ctx, backup, cause)
+	if !executed {
+		return rolled
 	}
-	_ = f.Sync()
-	_ = f.Close()
+	return fmt.Errorf("%w (kernel evidence records %q as written before the failure; rollback ran)", rolled, target)
 }

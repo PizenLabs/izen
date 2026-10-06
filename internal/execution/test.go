@@ -2,6 +2,7 @@ package execution
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -46,23 +47,23 @@ func (tr *TestRunner) ActiveContextID() string {
 	return tr.contextID
 }
 
-func (tr *TestRunner) RunAll() (*TestResult, error) {
-	return tr.run(filepath.Join(tr.root, "..."), false)
+func (tr *TestRunner) RunAll(ctx context.Context) (*TestResult, error) {
+	return tr.run(ctx, filepath.Join(tr.root, "..."), false)
 }
 
-func (tr *TestRunner) RunPackage(pkg string) (*TestResult, error) {
-	return tr.run(pkg, false)
+func (tr *TestRunner) RunPackage(ctx context.Context, pkg string) (*TestResult, error) {
+	return tr.run(ctx, pkg, false)
 }
 
-func (tr *TestRunner) RunWithCoverage(pkg string) (*TestResult, error) {
-	return tr.run(pkg, true)
+func (tr *TestRunner) RunWithCoverage(ctx context.Context, pkg string) (*TestResult, error) {
+	return tr.run(ctx, pkg, true)
 }
 
-func (tr *TestRunner) RunFile(file string) (*TestResult, error) {
-	return tr.run(file, false)
+func (tr *TestRunner) RunFile(ctx context.Context, file string) (*TestResult, error) {
+	return tr.run(ctx, file, false)
 }
 
-func (tr *TestRunner) run(target string, cover bool) (*TestResult, error) {
+func (tr *TestRunner) run(ctx context.Context, target string, cover bool) (*TestResult, error) {
 	runner := NewRunner(tr.root, false, false)
 	runner.SetContextID(tr.contextID)
 
@@ -72,7 +73,7 @@ func (tr *TestRunner) run(target string, cover bool) (*TestResult, error) {
 	}
 	args = append(args, "-v", target)
 
-	result, err := runner.Run(strings.Join(args, " "))
+	result, err := runner.Run(ctx, strings.Join(args, " "))
 	if err != nil {
 		return nil, err
 	}
@@ -197,10 +198,10 @@ func parseTestOutput(output string) *TestResult {
 	return result
 }
 
-func (tr *TestRunner) RunTests(dir, pattern string) (*TestResult, error) {
+func (tr *TestRunner) RunTests(ctx context.Context, dir, pattern string) (*TestResult, error) {
 	target := filepath.Join(tr.root, dir)
 	if pattern != "" {
 		target = fmt.Sprintf("%s -run %s", target, pattern)
 	}
-	return tr.run(target, false)
+	return tr.run(ctx, target, false)
 }

@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -123,25 +124,25 @@ func (e *Engine) AdmitOperation(operation string) error {
 // Run is the contract-aware legacy command facade. Callers that need a
 // contract-bound shell operation should use this method rather than reaching
 // directly into Runner; a nil active contract preserves legacy behavior.
-func (e *Engine) Run(command string) (*RunResult, error) {
+func (e *Engine) Run(ctx context.Context, command string) (*RunResult, error) {
 	if err := e.AdmitOperation(string(protocol.OperationShell)); err != nil {
 		return nil, err
 	}
 	if e == nil || e.Runner == nil {
 		return nil, fmt.Errorf("execution: engine runner is not wired")
 	}
-	return e.Runner.Run(command)
+	return e.Runner.Run(ctx, command)
 }
 
 // RunInDir is the directory-scoped contract-aware command facade.
-func (e *Engine) RunInDir(command, dir string) (*RunResult, error) {
+func (e *Engine) RunInDir(ctx context.Context, command, dir string) (*RunResult, error) {
 	if err := e.AdmitOperation(string(protocol.OperationShell)); err != nil {
 		return nil, err
 	}
 	if e == nil || e.Runner == nil {
 		return nil, fmt.Errorf("execution: engine runner is not wired")
 	}
-	return e.Runner.RunInDir(command, dir)
+	return e.Runner.RunInDir(ctx, command, dir)
 }
 
 // Apply is the contract-aware legacy patch facade. The admission check runs

@@ -53,35 +53,45 @@ var templateTargets = map[string]bool{
 	"CHANGELOG.md": true, "CONTRIBUTING.md": true,
 }
 
-// diagnosticSignals mark a root-cause investigation request.
+// ── Operation-family signals ─────────────────────────────────────────────────
+//
+// These pick an OPERATION FAMILY, which steers the strategy and the complexity
+// base. They are deliberately NOT the semantic authority: whether the user asked
+// the workspace to change at all is answered by ClassifySemantic (semantics.go),
+// from a strictly larger act vocabulary. The two are separate questions and the
+// engine answers both.
+//
+// Matching is on whole tokens, never on substrings. `move` is a substring of
+// `remove`, so substring matching classified "check @index.html and remove extra
+// contents" as a REFACTOR; `design` is a substring of `redesign`, and the fix for
+// that had been to add "redesign" to the mutation table — treating a matching bug
+// with a wider dictionary. Every such entry widens authority for text nobody
+// reviewed.
+
 var diagnosticSignals = []string{
 	"why is", "why does", "why isn't", "why doesn't", "what caused",
 	"root cause", "stack trace", "backtrace", "crash", "panic",
 	"is broken", "is crashing", "is failing", "test failure",
 }
 
-// architecturalSignals mark a broad architectural request.
 var architecturalSignals = []string{
 	"architecture", "redesign", "restructure", "migrate", "schema",
 	"database", "pipeline", "event-driven", "message queue",
 	"cross-cutting", "multi-file", "distributed",
 }
 
-// explainSignals mark a read-only understanding request.
 var explainSignals = []string{
 	"explain", "describe", "what is", "what does", "how does",
 	"understand", "summarize", "walk me through",
 }
 
-// createSignals mark a file-creation request.
+var refactorSignals = []string{
+	"refactor", "rename", "extract", "restructure", "move",
+}
+
 var createSignals = []string{
 	"create", "generate", "add a", "write a", "new file", "init a",
 	"scaffold", "bootstrap",
-}
-
-// refactorSignals mark a structural/renaming change.
-var refactorSignals = []string{
-	"refactor", "rename", "extract", "restructure", "move",
 }
 
 // Select classifies a raw $prompt (or free-form) request into an execution
@@ -108,6 +118,19 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 
 	op := classifyOperation(raw, parsed)
 	profile.Targets = targets
+
+	// The canonical semantic verdict, read once. It answers "what act does this
+	// request perform?" and is what stops a review that named a file from
+	// dispatching a mutation (step 4) and a vague improvement request from
+	// reaching a mutation at all.
+	semantic := ClassifySemantic(goalText(raw, parsed))
+
+	// An explicit read-only constraint in the request closes the mutation path
+	// for the whole request. It is read ONCE here and applied at the only two
+	// places below that can produce a mutation strategy, because those two are
+	// where authority would actually widen. A family table alone cannot do this:
+	// "refactor @auth.go, read-only" matches refactorSignals, and a keyword must
+	// never outrank the human's own statement that nothing may change.
 
 	// ── 1. Deterministic template create (zero model) ──────────────────
 	explicit := resolvedTargets(targets, TargetExplicit, TargetResolved)
@@ -222,8 +245,8 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 		if len(named) == 0 {
 			named = explicitSyntax
 		}
-		switch op {
-		case OperationExplain:
+		switch {
+		case op == OperationExplain:
 			profile.Strategy = TargetedReasoning
 			profile.ModelRequired = true
 			profile.StrategyReason = "read-only understanding request with an explicit target"
@@ -233,6 +256,35 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 			profile.ContextKinds = []ContextKind{ContextUserIntent, ContextExplicitTargets, ContextTargetContent}
 			profile.ContextPolicy = ContextPolicyTargetFileOnly
 			profile.Complexity = Assess(ComplexityInputs{Operation: op, TargetCount: len(named),
+				FileCount: len(named), ExplicitTargets: true})
+			return withBudgets(profile)
+		case semantic.IsReadOnly() && semantic.HasAdvisoryClause():
+			// An ADVISORY request must not become a mutation merely because it
+			// NAMED a file. Naming a target says what to look at; it does not say
+			// what to change, and the arm below would otherwise read the name as
+			// a licence to write — "review @index.html and suggest improvements"
+			// was dispatching an APPLIED mutation for a review request.
+			//
+			// The guard is HasAdvisoryClause rather than IsReadOnly so that an
+			// INVESTIGATIVE request ("inspect every handler in @big.go") keeps
+			// its existing targeted path: reporting on a named target is not
+			// advice about it.
+			//
+			// ClassifySemantic is safe to consult here even though Select also
+			// runs on runtime-composed provider prompts: it reads the SPEECH ACT
+			// of the text and never the negation table, and a compiled mutation
+			// prompt carries executive verbs ("modify", "change", "replace") and
+			// therefore reads as MUTATION.
+			profile.Strategy = TargetedReasoning
+			profile.ModelRequired = true
+			profile.StrategyReason = "the request asks to be shown or advised something, not changed; " +
+				"the named target may be read but not written"
+			profile.ModelDecision = "answer from the provided target context without producing file mutations"
+			profile.Artifact = ArtifactContract{Kind: "explanation", Bounded: true,
+				Description: "focused explanation of the target"}
+			profile.ContextKinds = []ContextKind{ContextUserIntent, ContextExplicitTargets, ContextTargetContent}
+			profile.ContextPolicy = ContextPolicyTargetFileOnly
+			profile.Complexity = Assess(ComplexityInputs{Operation: OperationExplain, TargetCount: len(named),
 				FileCount: len(named), ExplicitTargets: true})
 			return withBudgets(profile)
 		default:
@@ -323,13 +375,52 @@ func ResolveConstraints(profile ExecutionStrategyProfile, astCorrupt bool, requi
 	return profile
 }
 
-func classifyOperation(raw string, parsed *parser.IntentAST) OperationKind {
-	text := raw
+// classifyOperation derives the coarse operation class from the request. It
+// classifies the parsed Goal — the actual task text without @scope markers —
+// so a filename like @architecture.md can never trigger the architectural
+// signal. The operation family steers the strategy and the complexity base; it
+// never alone decides complexity (see complexity.go).
+//
+// It reads the canonical semantic boundary (semantics.go) and narrows its
+// answer into the engine's operation families. It keeps NO signal table of its
+// own: the tables that used to live here and the ones the objective contract
+// layer kept were two copies of the same fact, they had already drifted apart
+// ("implement" was a creation verb in one and unknown in the other), and a
+// drift here silently changes which objective the engine judges a mutation.
+// goalText renders the text a classification should read: the parsed Goal — the
+// task text without @scope markers — when the parser produced one, so a filename
+// like @architecture.md can never trigger a signal carried by a target name.
+func goalText(raw string, parsed *parser.IntentAST) string {
 	if parsed != nil && parsed.Goal != "" {
-		text = parsed.Goal
+		return parsed.Goal
 	}
-	lower := strings.ToLower(text)
+	return raw
+}
 
+func classifyOperation(raw string, parsed *parser.IntentAST) OperationKind {
+	text := goalText(raw, parsed)
+	tokens := tokenize(text)
+
+	// The family tables answer "which operation family is this", which steers
+	// strategy selection, complexity and the output budget. They are NOT the
+	// authority signal — authority is carried by SemanticIntent, then by
+	// MutationSemanticsOf, then by the grant — and they are deliberately left on
+	// their historical whole-text substring matching.
+	//
+	// That is a known, recorded limitation rather than an oversight. Fixing it
+	// here is not free: "check @index.html and remove redundant content" matched
+	// refactorSignals through `move` ⊂ `remove`, and that accident is what gave
+	// it OperationRefactor, a higher complexity base and a 2048-token output
+	// budget. Classified correctly it is OperationContent, which the complexity
+	// model funds at 1024 — and the bounded-patch contract test pins recovery at
+	// exactly 1024. So making this matcher exact requires deciding how a
+	// whole-file rewrite of a large target is funded, which is BUDGET POLICY and
+	// not an authority question. Until that policy exists, an exact matcher here
+	// would silently turn correct, affordable mutations into preflight refusals.
+	//
+	// The canonical semantic boundary (semantics.go) IS exact, on whole tokens,
+	// and it is the layer the authority actually reads.
+	lower := strings.ToLower(text)
 	for _, s := range diagnosticSignals {
 		if strings.Contains(lower, s) {
 			return OperationDiagnose
@@ -354,6 +445,20 @@ func classifyOperation(raw string, parsed *parser.IntentAST) OperationKind {
 		if strings.Contains(lower, s) {
 			return OperationCreate
 		}
+	}
+	_ = tokens
+	// No family matched, but the semantic boundary still has a verdict: READ-ONLY
+	// for a request that only asks to be shown something, UNDETERMINED for one
+	// that says no act at all, MUTATION for one whose change verbs the families
+	// happen not to name ("change bar to qux in @index.html").
+	//
+	// UNDETERMINED is the load-bearing case. The previous catch-all answered
+	// OperationContent to every request it did not recognise, so a request the
+	// runtime could not read — "Make this project better" — entered the mutation
+	// path as a defaulted answer rather than as a question. OperationUndetermined
+	// is not a mutation family and Select fails it closed.
+	if ClassifySemantic(text).IsUndetermined() {
+		return OperationUndetermined
 	}
 	return OperationContent
 }

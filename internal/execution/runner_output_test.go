@@ -19,7 +19,7 @@ func TestRunnerPipelineWritesLogs(t *testing.T) {
 	r.SetAuthorization(testAuth())
 	r.WithPipeline(output.New().WithWorkspace(dir))
 
-	result, err := r.Run("echo 'hello pipeline world'")
+	result, err := r.Run(t.Context(), "echo 'hello pipeline world'")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestRunnerPipelineCompressesGoTest(t *testing.T) {
 	// "go test" token so the classifier tags it GO_TEST and the semantic
 	// compressor drops passing blocks while keeping failures.
 	cmd := "go test 2>/dev/null; printf '=== RUN   TestOK\\n--- PASS: TestOK (0.00s)\\n=== RUN   TestBad\\n--- FAIL: TestBad (0.01s)\\n\\tbad.go:12: got 1, want 2\\nFAIL\\n'"
-	result, err := r.Run(cmd)
+	result, err := r.Run(t.Context(), cmd)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}

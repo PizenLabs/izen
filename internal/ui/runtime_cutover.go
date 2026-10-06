@@ -129,17 +129,17 @@ func (m *model) executeAutonomyViaRuntime(trace autonomy.Trace) tea.Cmd {
 
 	// ── EXPLICIT AMBIGUITY (never silent, never the model as resolver) ──
 	if profile.Strategy == strategy.HumanClarification {
-		target, candidates := m.resolveAutonomyBuildTarget(trace.Intent.Target())
+		resolution := m.resolveAutonomyBuildTarget(trace.Intent.Target())
 		switch {
-		case len(candidates) > 1:
+		case len(resolution.candidates) > 1:
 			// Several workspace files match — the candidate selector pauses.
-			m.stageAutonomyTargetSelector(trace, candidates)
+			m.stageAutonomyTargetSelector(trace, resolution.candidates)
 			return nil
-		case len(candidates) == 0:
+		case len(resolution.candidates) == 0:
 			// A named target that exists nowhere is a terminal diagnosis (unless
 			// the objective is a creation request). Never fabricate a target.
 			if trace.Intent.Target() != "" && !isAutonomyCreationRequest(trace.Input) {
-				return m.reportAutonomyTargetNotFound(trace, target)
+				return m.reportAutonomyTargetNotFound(trace, resolution.resolved, resolution)
 			}
 		}
 	}

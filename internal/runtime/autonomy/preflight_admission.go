@@ -113,6 +113,17 @@ type ExecutionSpec struct {
 	// WorkspaceEvidence is the DISCOVERY output. It is context only (I13): it is
 	// never read to populate the mutation target.
 	WorkspaceEvidence *execution.WorkspaceProfile
+	// Derivation is the TYPED verdict of evidence-bound scope derivation. The
+	// gate reads it before it reads the target binding, because an AMBIGUOUS
+	// derivation is a question about the objective's scope that no later, more
+	// confident-looking binding may overwrite: the candidates came from the
+	// kinds the objective DECLARED, and nothing has proven which of them it
+	// means. It is the field that makes
+	//
+	//	ambiguous evidence → non-empty candidates → NOT a mutation scope
+	//
+	// structural rather than a convention each call site has to remember.
+	Derivation execution.Derivation
 	// ContextChannels are the authoritative context feeds. A mutation with zero
 	// channels is inadmissible.
 	ContextChannels []ContextChannel
@@ -263,6 +274,22 @@ func TransitionToAwaitingDisambiguation(spec ExecutionSpec) PreflightOutcome {
 	}
 }
 
+// DisambiguateAmbiguousDerivation is the canonical DISAMBIGUATE constructor for
+// AMBIGUOUS EVIDENCE. It is a function (not an inline struct) so no call site can
+// produce a disambiguation request from ambiguous evidence without carrying the
+// candidate set the human has to choose from.
+func DisambiguateAmbiguousDerivation(spec ExecutionSpec) PreflightOutcome {
+	candidates := append([]string(nil), spec.Derivation.Targets...)
+	reason := fmt.Sprintf(
+		"bounded discovery observed %d candidate file(s) satisfying the artifact kind(s) %s, and the objective does not establish which of them it is about; the human must name the intended file(s) before any provider call",
+		len(candidates), strings.Join(spec.Derivation.Kinds, ","))
+	return PreflightOutcome{
+		Verdict:    AdmissionDisambiguate,
+		Candidates: candidates,
+		Reason:     reason,
+	}
+}
+
 // EvaluatePreflightAdmission applies I12/I13 to one execution spec. It is a
 // PURE function: it reads the spec, invokes nothing, and touches no provider.
 //
@@ -275,6 +302,20 @@ func EvaluatePreflightAdmission(spec ExecutionSpec) PreflightOutcome {
 	// gate does not apply to it.
 	if !spec.Intent.IsMutation() {
 		return PreflightOutcome{Verdict: AdmissionAdmit, Reason: "read-only intent requires no mutation target"}
+	}
+
+	// ── Ambiguous evidence is a question, not a destination ────────────
+	// This runs BEFORE the binding is consulted, and it is the reason the gate
+	// cannot be satisfied by a non-empty candidate list.
+	//
+	// A previous version read `derivable && len(targets) > 0` as a resolution, so
+	// "rewrite the HTML and CSS" over a workspace holding three html files bound
+	// all three and mutated all three. Ordering the check first makes that
+	// unreachable: an ambiguous derivation halts the admission pass before any
+	// binding, boundary or evidence fact is even looked at, and before a provider
+	// is reachable at all (I12).
+	if spec.Derivation.IsAmbiguous() {
+		return DisambiguateAmbiguousDerivation(spec)
 	}
 
 	// ── No Evidence, No Provider ───────────────────────────────────────

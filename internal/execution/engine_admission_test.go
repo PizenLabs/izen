@@ -17,10 +17,10 @@ func TestLegacyEngineBindsContractBeforeCommandDispatch(t *testing.T) {
 	if err := engine.AdmitOperation(string(protocol.OperationFileMutate)); !errors.Is(err, ErrAuthorityExceeded) {
 		t.Fatalf("engine mutation admission error = %v, want ErrAuthorityExceeded", err)
 	}
-	if _, err := engine.Run("echo should-not-run"); !errors.Is(err, ErrAuthorityExceeded) {
+	if _, err := engine.Run(t.Context(), "echo should-not-run"); !errors.Is(err, ErrAuthorityExceeded) {
 		t.Fatalf("engine command admission error = %v, want ErrAuthorityExceeded", err)
 	}
-	if _, err := engine.Runner.Run("echo direct-field-bypass"); !errors.Is(err, ErrAuthorityExceeded) {
+	if _, err := engine.Runner.Run(t.Context(), "echo direct-field-bypass"); !errors.Is(err, ErrAuthorityExceeded) {
 		t.Fatalf("direct runner admission error = %v, want ErrAuthorityExceeded", err)
 	}
 	if err := engine.Patches.Apply(&Patch{File: "a.txt", Modified: "changed"}); !errors.Is(err, ErrAuthorityExceeded) {

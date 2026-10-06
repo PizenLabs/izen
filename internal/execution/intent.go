@@ -155,9 +155,57 @@ func (g *IntentGateway) Gate(_ context.Context, line string) (ExecuteRequest, In
 
 // selectScopedStrategy compiles an unauthorized goal to an observational graph,
 // even when its natural-language operation asks for file creation or mutation.
+//
+// ── WHY THE READ-ONLY CONSTRAINT IS READ HERE AND NOT IN Select ─────────────
+//
+// An explicit "read-only" / "do not change anything" in the request is a
+// statement by the human, and it closes the mutation path exactly as an
+// unauthorized scope does. It is evaluated HERE, and not inside
+// strategy.Select, for one decisive reason: Select is also called on text the
+// runtime itself composed.
+//
+// Decomposition re-classifies every sub-task by running Select over the fully
+// compiled provider prompt — target context, the assigned change window, the
+// artifact contract and the scoping instructions. Those instructions include
+// phrases like "do not modify any other region". Scanned as if they were a
+// human request, the runtime read its OWN prompt back as the user revoking
+// mutation authority and downgraded a live mutation to read-only. The
+// subtask's patch was then never authorized, the DAG applied no bytes, and the
+// objective failed as UNSUBSTANTIATED with "no durable delta observed".
+//
+// The general rule this file now enforces: the semantic boundary may read a
+// human REQUEST; it may never read runtime-composed TEXT as if it were one.
 func (g *IntentGateway) selectScopedStrategy(prompt string, scope intentdomain.ScopeProvenance) strategy.ExecutionStrategyProfile {
 	profile := g.SelectStrategy(prompt)
-	if scope.AllowsMutation() {
+
+	// ── UNDETERMINED fails closed HERE, and only here ─────────────────
+	// A request that states a goal but no workspace act — "make this project
+	// better" — has no basis for a file, an operation, or a change. Choosing any
+	// of them would be the runtime writing the objective instead of executing
+	// it, so the run parks at the clarification boundary instead: no provider
+	// call, no workspace scan, no grant.
+	//
+	// It is enforced at this boundary and NOT inside strategy.Select for the
+	// same reason the read-only constraint is: Select is called a second time by
+	// the RuntimeExecutor, AFTER admission, purely to choose budgets and an
+	// artifact shape for work that is already authorized. Stopping there would
+	// refuse authorized work on a classification made before anyone was
+	// authorized — the authority gate and the execution planner are different
+	// questions, and only the gate may refuse.
+	if strategy.ClassifySemantic(prompt).IsUndetermined() && !strategy.IsCasualPrompt(prompt) {
+		profile.Strategy = strategy.HumanClarification
+		profile.Deterministic = true
+		profile.ModelRequired = false
+		profile.StrategyReason = "the request names a goal but states no workspace act; " +
+			strategy.ClassifySemantic(prompt).Reason
+		profile.ContextKinds = []strategy.ContextKind{strategy.ContextUserIntent}
+		profile.ContextPolicy = strategy.ContextPolicyNone
+		profile.Escalation = true
+		profile.EscalationReason = "human clarification required before execution"
+		return profile
+	}
+	readOnlyRequested := strategy.StatesReadOnlyConstraint(prompt)
+	if scope.AllowsMutation() && !readOnlyRequested {
 		return profile
 	}
 	switch profile.Strategy {
@@ -170,7 +218,14 @@ func (g *IntentGateway) selectScopedStrategy(prompt string, scope intentdomain.S
 			profile.ContextPolicy = strategy.ContextPolicyTargetFileOnly
 			profile.ContextKinds = []strategy.ContextKind{strategy.ContextUserIntent, strategy.ContextExplicitTargets, strategy.ContextTargetContent}
 		}
-		profile.StrategyReason = "read-only intent: mutation scope was not authorized"
+		// The two causes are reported separately. They close the same path but
+		// they mean opposite things to a human reading the transcript: one is
+		// the system withholding authority, the other is the user declining it.
+		if readOnlyRequested {
+			profile.StrategyReason = "read-only intent: the request itself states an explicit read-only constraint"
+		} else {
+			profile.StrategyReason = "read-only intent: mutation scope was not authorized"
+		}
 		profile.ModelRequired, profile.Deterministic = true, false
 		profile.ModelDecision = "investigate the request and explain a plan without producing or applying file mutations"
 		profile.Artifact = strategy.ArtifactContract{Kind: "explanation", Bounded: true, Description: "read-only investigation or plan"}

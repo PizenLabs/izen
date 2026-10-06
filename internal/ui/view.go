@@ -11,6 +11,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/PizenLabs/izen/internal/execution"
 	"github.com/PizenLabs/izen/internal/llm"
 	"github.com/PizenLabs/izen/internal/modes"
 	"github.com/PizenLabs/izen/internal/ui/markdown"
@@ -582,6 +583,21 @@ func (m *model) renderEffortSelector(width int) string {
 	return b.String()
 }
 
+// toolCallCreatesFile reports whether a buffered call's diff is a pure creation.
+//
+// It reads the diff rather than a flag the buffer used to carry. That flag was
+// decided by comparing the baseline against the empty string, so an existing
+// zero-byte file presented as a creation, and the answer went stale the moment
+// anything touched the workspace between buffering and approval.
+//
+// The diff is at least derived from the baseline the kernel actually read, so this
+// icon is a statement about real content. It is also only an icon: the
+// authoritative created-or-modified answer is established at commit time from the
+// kernel's pre-write observation and is what the result line reports.
+func toolCallCreatesFile(call execution.BufferedToolCall) bool {
+	return strings.Contains(call.Diff, "@@ -0,0 +")
+}
+
 // renderToolCallApprovalBlock renders the approval controls for buffered tool calls.
 func (m *model) renderToolCallApprovalBlock(width int) string {
 	pending := m.toolCallBuffer.Pending()
@@ -601,7 +617,7 @@ func (m *model) renderToolCallApprovalBlock(width int) string {
 	// List each pending tool call
 	for i, tc := range pending {
 		icon := Icon.Edit
-		if tc.IsNew {
+		if toolCallCreatesFile(tc) {
 			icon = Icon.Spark
 		}
 		fmt.Fprintf(&b, "  %s %s\n", icon, tc.Path)

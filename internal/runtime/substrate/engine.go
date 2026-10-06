@@ -10,17 +10,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/PizenLabs/izen/internal/retrieval/symbol/extractors"
 	"github.com/PizenLabs/izen/internal/runtime/substrate/store"
 )
 
-// ConcreteSubstrate is the legacy proposal execution surface. It no longer
-// performs direct side-effects: every mutation is delegated to the single
-// Substrate mutation pipe (Substrate.ExecuteUnit via the port layer) so that
-// 100% of writes originate from internal/runtime/compose and execute via
-// RuntimeExecutor → Substrate. Strategies emit Proposals; Substrate executes.
+// ConcreteSubstrate is the proposal execution surface behind `izen run` and
+// `izen orchestrate`: strategies emit Proposals, this executes them.
+//
+// It splits its authority in two, and the split is the point. Everything about
+// orchestrating a change — admitting it, snapshotting it, undoing it when a
+// later operation fails, verifying it before commit, and recording what happened
+// — is Core's and lives in this file and snapshot.go. The one thing it delegates
+// is the final filesystem effect of an operation, which crosses into the Runtime
+// Kernel through commitWrite and commitDelete in kernelcommit.go and is decided
+// by an adjudicated outcome rather than by a syscall's return code.
 type ConcreteSubstrate struct {
 	root     string
 	store    *store.Store
@@ -143,11 +147,23 @@ func newTxID() string {
 
 // Execute applies the proposal's operations atomically and returns an
 // ExecutionProof. No strategy or mode package holds a direct Write handle.
-// It performs a mandatory pre-commit AST symbol re-anchoring verification;
-// any verification failure rolls back staged operations and returns
-// ErrVerificationFailed explicitly. Every execution — committed or failed —
-// is automatically recorded in the substrate-owned EvidenceStore and
-// ArtifactLedger without relying on external execution helpers.
+//
+// Three responsibilities are Core's and stay here. Admission: a target that
+// names no file is refused before anything is opened. Transaction: each target
+// is snapshotted before it is touched, and any failure — verification, refusal,
+// cancellation, unknown operation — rolls the whole proposal back and marks the
+// proof failed. Verification: every FILE_WRITE payload is re-anchored by AST
+// symbol extraction before commit, and a failure returns ErrVerificationFailed
+// with the workspace restored.
+//
+// The filesystem effect itself is not Core's. Each FILE_WRITE and FILE_DELETE is
+// handed to commitWrite/commitDelete, which ask the Runtime Kernel to perform it
+// under an explicit grant and return an adjudicated outcome. That outcome is
+// recorded per operation in proof.Mutations, which is what makes the chain
+// legible: what the primitive did, what the kernel proved about it, and what the
+// transaction concluded — three separate claims that must not be collapsed into
+// one. A PROVEN outcome for one file is not a PROVEN objective, and the proof's
+// Status is set only by the transaction that owns it.
 func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (ExecutionProof, error) {
 	if s == nil {
 		return ExecutionProof{ProposalID: prop.ID, Status: "failed", Error: fmt.Errorf("substrate: nil substrate")}, fmt.Errorf("substrate: nil substrate")
@@ -165,65 +181,39 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 		Status:        "committed",
 	}
 
-	// Track originals for rollback. Reads are via os (read-only scope);
-	// writes/removals during rollback are delegated to the Substrate's
-	// FilePort so the single mutation pipe invariant holds.
-	type snap struct {
-		path    string
-		content []byte
-		exists  bool
-		mode    os.FileMode
-	}
-	snaps := make(map[string]*snap)
-
+	// ── Core transaction state ───────────────────────────────────────────
+	//
+	// Everything below is Core authority and stays here: the pre-mutation
+	// snapshot, the rollback that undoes a partial batch, the pre-commit
+	// verification, the proof and its evidence store. Only the final filesystem
+	// effect of a committed operation crossed the kernel; the decision to undo it
+	// never did.
+	snaps := newRecordedSnapshots()
+	// record captures a target's pre-mutation state for rollback. It reads; it
+	// never writes. Snapshotting is Core's job precisely because recovery needs
+	// to know what the workspace held BEFORE the kernel was asked to change it.
 	record := func(target string) error {
-		if _, ok := snaps[target]; ok {
-			return nil
-		}
-		data, err := os.ReadFile(target)
-		if err != nil {
-			if os.IsNotExist(err) {
-				snaps[target] = &snap{path: target, exists: false}
-				return nil
-			}
-			return err
-		}
-		info, _ := os.Stat(target)
-		mode := os.FileMode(0o644)
-		if info != nil {
-			mode = info.Mode().Perm()
-		}
-		snaps[target] = &snap{path: target, content: append([]byte(nil), data...), exists: true, mode: mode}
-		return nil
+		return snaps.record(s, target)
 	}
-	rollback := func(rollbackCtx context.Context) {
-		for _, sp := range snaps {
-			if sp.exists {
-				if s.delegate != nil && s.delegate.file != nil {
-					_ = s.delegate.file.Write(rollbackCtx, sp.path, string(sp.content)) //nolint:contextcheck // rollback uses the Execute ctx, not a new background
-				} else {
-					_ = os.WriteFile(sp.path, sp.content, sp.mode)
-				}
-			} else {
-				if s.delegate != nil && s.delegate.file != nil {
-					_ = s.delegate.file.Remove(rollbackCtx, sp.path) //nolint:contextcheck // rollback context
-				} else {
-					_ = os.Remove(sp.path)
-				}
-			}
-		}
+
+	// fail aborts the whole proposal: it restores every captured original, marks
+	// the proof failed, records it, and returns. Every exit from here goes
+	// through it, so no path can mutate the workspace and then report success,
+	// and no failure path can forget to roll back.
+	fail := func(err error) (ExecutionProof, error) {
+		s.rollbackRecorded(ctx, snaps)
+		proof.Status = "failed"
+		proof.Error = err
+		s.recordProof(proof)
+		return proof, err
 	}
 
 	// ── Mandatory pre-commit symbol re-anchoring verification ──────────
 	if err := verifyProposal(prop); err != nil {
-		rollback(ctx)
-		proof.Status = "failed"
 		if !errors.Is(err, ErrVerificationFailed) {
 			err = fmt.Errorf("%w: %w", ErrVerificationFailed, err)
 		}
-		proof.Error = err
-		s.recordProof(proof)
-		return proof, err
+		return fail(err)
 	}
 
 	for _, pre := range prop.Preconditions {
@@ -231,159 +221,140 @@ func (s *ConcreteSubstrate) Execute(ctx context.Context, prop Proposal) (Executi
 			continue
 		}
 		if err := ctx.Err(); err != nil {
-			rollback(ctx)
-			proof.Status = "failed"
-			proof.Error = err
-			s.recordProof(proof)
-			return proof, err
+			return fail(err)
 		}
 		_ = pre
 	}
 
 	for _, op := range prop.Operations {
 		if err := ctx.Err(); err != nil {
-			rollback(ctx)
-			proof.Status = "failed"
-			proof.Error = err
-			s.recordProof(proof)
-			return proof, err
+			return fail(err)
 		}
 		switch op.Type {
 		case OpFileWrite:
-			if op.Target == "" {
-				rollback(ctx)
-				err := fmt.Errorf("substrate: FILE_WRITE requires target")
-				proof.Status = "failed"
-				proof.Error = err
-				s.recordProof(proof)
-				return proof, err
-			}
-			cleanTarget := filepath.Clean(op.Target)
-			target := cleanTarget
-			if !filepath.IsAbs(cleanTarget) {
-				target = filepath.Join(s.root, cleanTarget)
+			target, err := operationTarget(s.root, op)
+			if err != nil {
+				return fail(err)
 			}
 			if err := record(target); err != nil {
-				rollback(ctx)
-				proof.Status = "failed"
-				proof.Error = err
-				s.recordProof(proof)
-				return proof, err
+				return fail(err)
 			}
-			// Delegate mutation through the single Substrate pipe (FilePort).
-			if s.delegate != nil && s.delegate.file != nil {
-				if err := s.delegate.file.Write(ctx, target, string(op.Content)); err != nil {
-					rollback(ctx)
-					proof.Status = "failed"
-					proof.Error = err
-					s.recordProof(proof)
-					return proof, err
-				}
-			} else {
-				dir := filepath.Dir(target)
-				if err := os.MkdirAll(dir, 0o755); err != nil {
-					rollback(ctx)
-					proof.Status = "failed"
-					proof.Error = err
-					s.recordProof(proof)
-					return proof, err
-				}
-				if err := os.WriteFile(target, op.Content, 0o644); err != nil {
-					rollback(ctx)
-					proof.Status = "failed"
-					proof.Error = err
-					s.recordProof(proof)
-					return proof, err
-				}
+			snaps.note(target, op.Content, false)
+			// The commit itself. The kernel places the bytes under an explicit
+			// grant naming exactly this destination and re-reads them from disk
+			// afterwards; Core keeps the snapshot and the rollback either way.
+			//
+			// Evidence is recorded only when an execution actually ran. A target
+			// refused by Core's own admission — an escape, or a destination that is
+			// not a restorable file — never reached the kernel, and a record with
+			// no execution behind it would put a verdict into the evidence chain
+			// that nothing ever adjudicated.
+			evidence, werr := s.commitWrite(ctx, target, op.Content)
+			if evidence.ExecutionID != "" {
+				proof.Mutations = append(proof.Mutations, evidence)
+			}
+			if werr != nil {
+				return fail(fmt.Errorf("substrate: write %q: %w", target, werr))
 			}
 		case OpFileDelete:
-			if op.Target == "" {
-				rollback(ctx)
-				err := fmt.Errorf("substrate: FILE_DELETE requires target")
-				proof.Status = "failed"
-				proof.Error = err
-				s.recordProof(proof)
-				return proof, err
-			}
-			cleanTarget := filepath.Clean(op.Target)
-			target := cleanTarget
-			if !filepath.IsAbs(cleanTarget) {
-				target = filepath.Join(s.root, cleanTarget)
+			target, err := operationTarget(s.root, op)
+			if err != nil {
+				return fail(err)
 			}
 			if err := record(target); err != nil {
-				rollback(ctx)
-				proof.Status = "failed"
-				proof.Error = err
-				s.recordProof(proof)
-				return proof, err
+				return fail(err)
 			}
-			if s.delegate != nil && s.delegate.file != nil {
-				if err := s.delegate.file.Remove(ctx, target); err != nil && !os.IsNotExist(err) {
-					rollback(ctx)
-					proof.Status = "failed"
-					proof.Error = err
-					s.recordProof(proof)
-					return proof, err
-				}
-			} else {
-				if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-					rollback(ctx)
-					proof.Status = "failed"
-					proof.Error = err
-					s.recordProof(proof)
-					return proof, err
-				}
+			snaps.note(target, nil, true)
+			evidence, derr := s.commitDelete(ctx, target)
+			if evidence.ExecutionID != "" {
+				proof.Mutations = append(proof.Mutations, evidence)
+			}
+			if derr != nil {
+				return fail(fmt.Errorf("substrate: delete %q: %w", target, derr))
 			}
 		case OpExecCmd:
 			if len(op.Args) == 0 {
-				rollback(ctx)
-				err := fmt.Errorf("substrate: EXEC_CMD requires args")
-				proof.Status = "failed"
-				proof.Error = err
-				s.recordProof(proof)
-				return proof, err
+				return fail(fmt.Errorf("substrate: EXEC_CMD requires args"))
 			}
-			// Delegate shell execution through the Substrate's ShellPort
-			// (single mutation pipe) so process-group isolation is enforced.
-			shellCmd := strings.Join(op.Args, " ")
-			if s.delegate != nil && s.delegate.shell != nil {
-				if _, err := s.delegate.shell.Execute(ctx, shellCmd); err != nil {
-					rollback(ctx)
-					proof.Status = "failed"
-					proof.Error = fmt.Errorf("substrate: exec %v: %w", op.Args, err)
-					s.recordProof(proof)
-					return proof, proof.Error
-				}
-			} else {
-				// Fallback through the shared exec helper (also enforces Setpgid)
-				res := ExecCommand(ctx, s.root, nil, op.Args)
-				if res.Err != nil {
-					rollback(ctx)
-					proof.Status = "failed"
-					proof.Error = fmt.Errorf("substrate: exec %v: %w (output: %s)", op.Args, res.Err, res.Stdout+res.Stderr)
-					s.recordProof(proof)
-					return proof, proof.Error
-				}
+			// Process execution is a different capability and a different
+			// authority; it did not migrate with the filesystem primitive and is
+			// deliberately left exactly as it was.
+			if err := s.runOperationCommand(ctx, op); err != nil {
+				return fail(err)
 			}
 		default:
-			rollback(ctx)
-			err := fmt.Errorf("substrate: unknown operation type %q", op.Type)
-			proof.Status = "failed"
-			proof.Error = err
-			s.recordProof(proof)
-			return proof, err
+			return fail(fmt.Errorf("substrate: unknown operation type %q", op.Type))
 		}
 	}
 
-	proof.EvidencePath = filepath.Join(s.root, ".izen", "substrate", prop.ID+".proof")
-	evidenceContent := fmt.Sprintf("proposal=%s tx=%s at=%s ops=%d\n", prop.ID, txID, time.Now().UTC().Format(time.RFC3339), len(prop.Operations))
-	if s.delegate != nil && s.delegate.file != nil {
-		_ = s.delegate.file.Write(ctx, proof.EvidencePath, evidenceContent) //nolint:contextcheck
-	} else {
-		if err := os.MkdirAll(filepath.Dir(proof.EvidencePath), 0o755); err == nil {
-			_ = os.WriteFile(proof.EvidencePath, []byte(evidenceContent), 0o644)
-		}
-	}
+	s.writeEvidenceProof(ctx, &proof)
 	s.recordProof(proof)
 	return proof, nil
+}
+
+// operationTarget resolves a proposal operation's target to the absolute
+// workspace path Core will snapshot and admit.
+//
+// An empty target is refused here, before anything is opened and before the
+// kernel is asked, because it names no file: joining it to the root would
+// silently produce the root directory itself, which is not a destination
+// anybody asked to mutate.
+func operationTarget(root string, op Operation) (string, error) {
+	if op.Target == "" {
+		return "", fmt.Errorf("substrate: %s requires target", op.Type)
+	}
+	clean := filepath.Clean(op.Target)
+	if filepath.IsAbs(clean) {
+		return clean, nil
+	}
+	return filepath.Join(root, clean), nil
+}
+
+// runOperationCommand executes one EXEC_CMD operation.
+//
+// It exists as its own method so the operation loop above reads as three
+// delegations, and so the process-execution surface stays visibly separate from
+// the filesystem surface that did migrate. Process-group isolation is enforced
+// by the shell port, exactly as before.
+func (s *ConcreteSubstrate) runOperationCommand(ctx context.Context, op Operation) error {
+	shellCmd := strings.Join(op.Args, " ")
+	if s.delegate != nil && s.delegate.shell != nil {
+		if _, err := s.delegate.shell.Execute(ctx, shellCmd); err != nil {
+			return fmt.Errorf("substrate: exec %v: %w", op.Args, err)
+		}
+		return nil
+	}
+	// No shell port bound: the shared exec helper, which enforces the same
+	// process-group isolation.
+	res := ExecCommand(ctx, s.root, nil, op.Args)
+	if res.Err != nil {
+		return fmt.Errorf("substrate: exec %v: %w (output: %s)", op.Args, res.Err, res.Stdout+res.Stderr)
+	}
+	return nil
+}
+
+// writeEvidenceProof persists the proposal's proof artifact under .izen.
+//
+// This is bookkeeping, not execution: it records what the transaction did rather
+// than changing anything a user asked for, so it stays on the substrate's own
+// FilePort. It is also the one place the artifact carries the kernel evidence, so
+// the chain a reader has to reconstruct is
+//
+//	primitive result → kernel evidence → Core evidence → verification → state
+//
+// written down in one artifact rather than reassembled from three log formats.
+func (s *ConcreteSubstrate) writeEvidenceProof(ctx context.Context, proof *ExecutionProof) {
+	proof.EvidencePath = filepath.Join(s.root, ".izen", "substrate", proof.ProposalID+".proof")
+	content := fmt.Sprintf("proposal=%s tx=%s status=%s mutations=%d\n",
+		proof.ProposalID, proof.TransactionID, proof.Status, len(proof.Mutations))
+	for _, m := range proof.Mutations {
+		content += m.Format() + "\n"
+	}
+	if s.delegate != nil && s.delegate.file != nil {
+		_ = s.delegate.file.Write(ctx, proof.EvidencePath, content) //nolint:contextcheck
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(proof.EvidencePath), 0o755); err == nil {
+		_ = os.WriteFile(proof.EvidencePath, []byte(content), 0o644)
+	}
 }

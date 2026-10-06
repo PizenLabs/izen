@@ -48,7 +48,7 @@ func TestStepsForLanguageGoUsesConfiguredSteps(t *testing.T) {
 
 func TestNewLanguageVerifierHTMLReportsSkipped(t *testing.T) {
 	v := NewLanguageVerifier(t.TempDir(), language.HTML)
-	report := v.RunAll()
+	report := v.RunAll(t.Context(), )
 	if !report.Skipped {
 		t.Fatal("HTML verifier must report Skipped, not a pass or failure")
 	}
@@ -62,7 +62,7 @@ func TestNewLanguageVerifierHTMLReportsSkipped(t *testing.T) {
 
 func TestNewVerifierReportsSkippedWithoutSteps(t *testing.T) {
 	v := NewVerifier(t.TempDir())
-	report := v.RunAll()
+	report := v.RunAll(t.Context(), )
 	if !report.Skipped {
 		t.Fatal("a verifier with no attached steps must report Skipped")
 	}
@@ -74,7 +74,7 @@ func TestNewVerifierReportsSkippedWithoutSteps(t *testing.T) {
 func TestConfiguredVerifierFailureStillFails(t *testing.T) {
 	v := NewVerifier(t.TempDir())
 	v.SetCustomSteps([]VerificationStep{{Name: "fail", Command: "false", Optional: false}})
-	report := v.RunAll()
+	report := v.RunAll(t.Context(), )
 	if report.Skipped {
 		t.Fatal("a configured, failing gate must not report Skipped")
 	}

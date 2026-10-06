@@ -683,6 +683,7 @@ func continuationReason(unmetConds, unmetReqs []string, base string) string {
 type ObjectiveProgressReport struct {
 	ObjectiveID  string               `json:"objective_id"`
 	TaskKind     TaskKind             `json:"task_kind"`
+	Semantics    ObjectiveSemantics   `json:"semantics"`
 	Scope        []string             `json:"scope,omitempty"`
 	Progress     ObjectiveProgress    `json:"progress"`
 	Outcome      ObjectiveOutcome     `json:"outcome"`
@@ -721,6 +722,7 @@ func BuildObjectiveProgressReport(contract ObjectiveContract, conditions []Compl
 	report := ObjectiveProgressReport{
 		ObjectiveID:  contract.ObjectiveID,
 		TaskKind:     contract.TaskKind,
+		Semantics:    contract.Semantics,
 		Scope:        append([]string(nil), contract.Scope...),
 		Progress:     progress,
 		Outcome:      outcome,

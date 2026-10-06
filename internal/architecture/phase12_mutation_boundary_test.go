@@ -59,11 +59,11 @@ var workspaceWritePrimitives = []string{
 //     DELEGATES to internal/execution; it contains no primitive of its own.
 //   - internal/runtime/autonomy — holds NO primitive. The DAG rollback seam
 //     routes through the boundary (see TestPhase12_DAGRollbackCrossesTheMutationBoundary).
-//   - internal/runtime/substrate, internal/runtime/executor, internal/substrate,
-//     internal/patch, internal/resource/file,
-//     internal/infrastructure/capabilities, internal/app, internal/runtime/scope —
-//     the remaining write surfaces audited and frozen here so a new one cannot
-//     appear unnoticed. Their existence is a recorded fact, not an endorsement.
+//   - internal/runtime/substrate, internal/substrate, internal/patch,
+//     internal/resource/file, internal/infrastructure/capabilities,
+//     internal/app, internal/runtime/scope — the remaining write surfaces
+//     audited and frozen here so a new one cannot appear unnoticed. Their
+//     existence is a recorded fact, not an endorsement.
 //
 // Everything absent from this map that contains one of the primitives fails the
 // test. That is the rule: ownership is explicit, and unknown writers are
@@ -81,7 +81,6 @@ var workspaceWriteOwners = map[string][]string{
 	// and cache blobs. They are frozen here so the distinction from a workspace
 	// mutation is explicit and so a new writer inside them shows up in the diff.
 	"cmd/izen":                             {"os.WriteFile("},
-	"internal/app":                         {"os.MkdirAll("},
 	"internal/app/model":                   {"os.MkdirAll(", "os.WriteFile("},
 	"internal/audit":                       {"os.MkdirAll(", "os.OpenFile("},
 	"internal/checkpoint":                  {"os.MkdirAll(", "os.Remove(", "os.RemoveAll(", "os.WriteFile("},
@@ -118,12 +117,22 @@ var workspaceWriteOwners = map[string][]string{
 	// platform file capability, and the `izen compact` command. They are frozen
 	// so that any NEW writer here fails the build; closing them down is recorded
 	// as remaining work rather than silently accepted here.
-	"internal/fs/txfs":          nil, // (declared clean above via internal/fs)
-	"internal/patch":            {"os.MkdirAll(", "os.WriteFile("},
-	"internal/resource/file":    {"os.Chmod(", "os.OpenFile(", "os.Remove(", "os.WriteFile("},
-	"internal/runtime/executor": {"os.Chmod(", "os.CreateTemp(", "os.MkdirAll(", "os.Remove(", "os.Rename(", "os.WriteFile("},
-	"internal/ui":               {"os.MkdirAll(", "os.OpenFile("},
-	"test/benchmark":            {"os.MkdirAll(", "os.RemoveAll(", "os.WriteFile("},
+	"internal/fs/txfs":       nil, // (declared clean above via internal/fs)
+	"internal/patch":         {"os.MkdirAll(", "os.WriteFile("},
+	"internal/resource/file": {"os.Chmod(", "os.OpenFile(", "os.Remove(", "os.WriteFile("},
+	"internal/ui":            {"os.MkdirAll(", "os.OpenFile("},
+	"test/benchmark":         {"os.MkdirAll(", "os.RemoveAll(", "os.WriteFile("},
+
+	// FileExecutor used to sit in the list above: it wrote a commit through a
+	// hand-rolled temp-file-and-rename protocol and undid it with os.WriteFile
+	// and os.Remove. Both directions now cross internal/kernelbridge (see
+	// internal/runtime/executor/kernelcommit.go and the
+	// TestKernelLock_PathBMutationRoutesThroughKernel lock), so the package
+	// holds no workspace-write primitive at all. Recording it as clean rather
+	// than deleting the entry is the point: a primitive reappearing here fails
+	// the build, which is what stops the migration from silently un-doing
+	// itself.
+	"internal/runtime/executor": nil,
 
 	// ── EXPLICITLY CLEAN: no workspace-write primitive at all ─────────────
 	// The DAG rollback seam, the human-boundary driver, the workspace policy
@@ -133,24 +142,33 @@ var workspaceWriteOwners = map[string][]string{
 	"internal/boundary":           nil, // delegates to internal/execution
 	"internal/runtime/autonomy":   nil, // the DAG rollback seam
 	"internal/runtime/scopeguard": nil,
-	"internal/autonomy":           nil,
-	"internal/policy":             nil,
-	"internal/modes":              nil,
-	"internal/verification":       nil,
-	"internal/contextspec":        nil,
-	"internal/protocol":           nil,
-	"internal/understanding":      nil,
-	"internal/changesurface":      nil,
-	"internal/presentation":       nil,
-	"internal/contextcompiler":    nil,
-	"internal/domain":             nil,
-	"internal/core":               nil,
-	"internal/continuation":       nil,
-	"internal/hotfix":             nil,
-	"internal/tui":                nil,
-	"internal/events":             nil,
-	"internal/ai":                 nil,
-	"internal/llmstep":            nil,
+	// internal/app used to own os.MkdirAll(: the brownfield branch created
+	// artifact parent directories eagerly before the graph ran. Those writes
+	// now disappear with the brownfield mutation migration — the kernel's
+	// file.write capability creates parents as part of the authorized,
+	// evidence-backed mutation — so internal/app holds no workspace-write
+	// primitive and is recorded clean. A primitive reappearing here fails the
+	// build, which is what stops the eager directory creation from quietly
+	// returning.
+	"internal/app":             nil,
+	"internal/autonomy":        nil,
+	"internal/policy":          nil,
+	"internal/modes":           nil,
+	"internal/verification":    nil,
+	"internal/contextspec":     nil,
+	"internal/protocol":        nil,
+	"internal/understanding":   nil,
+	"internal/changesurface":   nil,
+	"internal/presentation":    nil,
+	"internal/contextcompiler": nil,
+	"internal/domain":          nil,
+	"internal/core":            nil,
+	"internal/continuation":    nil,
+	"internal/hotfix":          nil,
+	"internal/tui":             nil,
+	"internal/events":          nil,
+	"internal/ai":              nil,
+	"internal/llmstep":         nil,
 }
 
 // TestPhase12_WorkspaceWriteOwnershipIsFrozen pins the mutation-boundary

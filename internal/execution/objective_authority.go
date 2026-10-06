@@ -32,6 +32,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/PizenLabs/izen/internal/execution/strategy"
 )
 
 // ── The four independent lifecycle states ───────────────────────────────────
@@ -464,21 +466,12 @@ type TaskClassification struct {
 	StructuralNoOpConfirmed bool
 }
 
-// creationVerbs are the objective verbs that ask for a NEW artifact. They are
-// only consulted when the target has no durable pre-existing content, so
-// "rewrite the docs" against an existing file is a PATCH, never a CREATE.
-var creationVerbs = []string{
-	"create ", "add ", "write ", "generate ", "implement ", "scaffold ", "new file",
-}
-
-// deletionVerbs are the objective verbs that can ask for a removal. A verb alone
-// never selects the DELETE contract — see requestsDeletionOf for the binding
-// rule — because "remove every deprecated comment from @big.go" removes CONTENT
-// from a file that must survive, and judging it as DELETE would demand the
-// absence of a file the objective explicitly keeps.
-var deletionVerbs = map[string]bool{
-	"delete": true, "remove": true, "erase": true, "drop": true, "unlink": true,
-}
+// The creation and deletion verb vocabularies are owned by the strategy layer
+// (semantics.go), which is the canonical semantic boundary. They used to be
+// declared here as a SECOND copy, and the two had already drifted: "implement"
+// was a creation verb here and unknown to the operation classifier, so the same
+// request could be judged a mutation by the contract and read as unreadable by
+// the gateway. One owner is the whole fix.
 
 // deletionLookahead is how many tokens after the verb a declared target may
 // appear and still bind the verb to it. It admits the natural object phrases
@@ -504,7 +497,7 @@ func requestsDeletionOf(objective string, targets []string) bool {
 	fields := strings.Fields(lower)
 	for i, f := range fields {
 		verb := strings.Trim(f, ".,:;!?\"'()")
-		if !deletionVerbs[verb] {
+		if !strategy.DeletionVerbs()[verb] {
 			continue
 		}
 		for j := i + 1; j < len(fields) && j <= i+deletionLookahead; j++ {
@@ -552,8 +545,8 @@ var reviewIntents = map[string]bool{
 // The rules, in precedence order:
 //
 //  1. a deletion objective                 → DELETE
-//  2. a mutation objective whose target has no durable pre-existing content
-//     (or whose artifact contract is a creation shape) → CREATE
+//  2. a mutation objective that NAMES a target with no durable pre-existing
+//     content (or whose artifact contract is a creation shape) → CREATE
 //  3. a mutation objective that applied no delta AND carries a structural
 //     confirmation that its target state was already satisfied
 //     (pre-execution determination or the executor's NO-OP structural verdict)
@@ -561,6 +554,11 @@ var reviewIntents = map[string]bool{
 //  4. any other mutation objective        → PATCH
 //  5. a review-classified read-only intent → REVIEW
 //  6. any other read-only intent           → READ
+//
+// A mutation objective that names NO target (target DEFERRED) takes rule 4, not
+// rule 2: an unresolved target is not evidence of a new artifact. Discovery
+// resolves the target later and the execution-shape kind may then be re-derived
+// against the concrete target; until then it is a modification, never a CREATE.
 //
 // Rule 3 is the ONLY path to IDEMPOTENT, and it REQUIRES a structural
 // confirmation. "The file existed and nothing changed" is execution inertia, not
@@ -571,8 +569,10 @@ func DeriveTaskContract(in TaskClassification) TaskContract {
 	targets := append([]string(nil), in.Targets...)
 	contract := TaskContract{Targets: targets}
 	// The verb scan reads the OBJECTIVE, not the intent label; an unclassified
-	// label must not silently decide the contract kind.
-	objective := " " + strings.ToLower(strings.TrimSpace(in.Objective)) + " "
+	// label must not silently decide the contract kind. Matching goes through
+	// the canonical token matcher so "write" cannot be read inside "rewrite" —
+	// that boundary used to be re-implemented locally here and hand-rolled there
+	// in the classifier, and two hand-rolled boundaries eventually disagree.
 
 	// 1 — DELETE.
 	if in.RequiresMutation && (in.DeleteRequested || requestsDeletionOf(in.Objective, targets)) {
@@ -582,24 +582,45 @@ func DeriveTaskContract(in TaskClassification) TaskContract {
 	}
 
 	if in.RequiresMutation {
-		// 2 — CREATE: the target has no durable pre-existing content, or the
-		// dispatched artifact contract was itself a creation shape.
-		noExistingContent := !anyTargetExisted(in.TargetsExistedBefore, targets)
-		askedForNewFile := containsAnyWord(objective, creationVerbs) &&
-			!allTargetsExisted(in.TargetsExistedBefore, targets)
-		if noExistingContent || askedForNewFile {
-			contract.Kind = TaskCreate
-			contract.RequiresVerifier = true
-			return contract
-		}
-		// A creation SHAPE is authoritative and outranks every other mutation
-		// rule: a creation contract has no existing content to anchor a bounded
-		// patch against, so relabelling it — by recovery or by evidence — would
-		// ask the model for a patch against a file that does not exist.
-		if creationShape(in.ArtifactShape) {
-			contract.Kind = TaskCreate
-			contract.RequiresVerifier = true
-			return contract
+		// 2 — CREATE: the objective NAMES a target AND that target has no
+		// durable pre-existing content, or the dispatched artifact contract was
+		// itself a creation shape.
+		//
+		// A DECLARED target is a precondition for CREATE. When the objective
+		// names no target at all, its target is DEFERRED: the runtime has not
+		// discovered it yet. The absence of a resolved target is NOT evidence
+		// that the artifact is new, and reading it as CREATE is precisely the
+		// defect this guard removes — it invents a creation objective (with an
+		// empty creation scope) out of an unresolved one. A targetless mutation
+		// objective stays a PATCH, a MODIFY whose concrete target discovery must
+		// resolve, and is never relabelled. See objective_operation.go.
+		if len(targets) > 0 {
+			// `TargetsExistedBefore` nil means the runtime made NO pre-execution
+			// observation; an EMPTY map means it observed that nothing existed.
+			// Only the latter is positive evidence of a new artifact. Treating
+			// an unobserved target as new is the same category error as treating
+			// an unresolved target as new, one layer down.
+			noExistingContent := in.TargetsExistedBefore != nil &&
+				!anyTargetExisted(in.TargetsExistedBefore, targets)
+			askedForNewFile := strategy.ContainsPhrase(in.Objective, strategy.CreationVerbs()) &&
+				!allTargetsExisted(in.TargetsExistedBefore, targets)
+			if noExistingContent || askedForNewFile {
+				contract.Kind = TaskCreate
+				contract.RequiresVerifier = true
+				return contract
+			}
+			// A creation SHAPE is authoritative and outranks every other
+			// mutation rule: a creation contract has no existing content to
+			// anchor a bounded patch against, so relabelling it — by recovery
+			// or by evidence — would ask the model for a patch against a file
+			// that does not exist. It is only meaningful once the objective
+			// names the file being created; a targetless creation shape is a
+			// deferred target, not an invention.
+			if creationShape(in.ArtifactShape) {
+				contract.Kind = TaskCreate
+				contract.RequiresVerifier = true
+				return contract
+			}
 		}
 		// 3 — IDEMPOTENT: every declared target already existed BEFORE
 		// execution, the boundary applied no delta, AND a deterministic
@@ -639,17 +660,6 @@ func DeriveTaskContract(in TaskClassification) TaskContract {
 // a bounded patch, so it stays a CREATE for the whole lifecycle.
 func creationShape(shape string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(shape)), "create")
-}
-
-// containsAnyWord reports whether the padded lowercased text carries any of the
-// space-delimited markers.
-func containsAnyWord(paddedLower string, markers []string) bool {
-	for _, marker := range markers {
-		if strings.Contains(paddedLower, marker) {
-			return true
-		}
-	}
-	return false
 }
 
 func anyTargetExisted(before map[string]bool, targets []string) bool {

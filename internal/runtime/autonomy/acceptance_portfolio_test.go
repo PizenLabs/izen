@@ -70,6 +70,85 @@ func portfolioWorkspace(t *testing.T) string {
 	return root
 }
 
+// ambiguousPortfolioWorkspace is the multi-candidate web workspace: three html
+// files and three stylesheets.
+//
+// It exists to pin the difference the audit found between "the user named the
+// files" and "the user named a KIND and discovery happened to find several". It
+// is deliberately hostile to every shortcut that used to pass: there is no
+// singular "the HTML file" to fall back on, no index.html to prefer, and no
+// subset that is obviously what a human meant.
+func ambiguousPortfolioWorkspace(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	files := map[string]string{
+		"a.html":     "<!DOCTYPE html>\n<html><body>\n  <h1>Alpha</h1>\n</body></html>\n",
+		"b.html":     "<!DOCTYPE html>\n<html><body>\n  <h1>Bravo</h1>\n</body></html>\n",
+		"index.html": "<!DOCTYPE html>\n<html><body>\n  <h1>Index</h1>\n</body></html>\n",
+		"a.css":      ".alpha { color: red }\n",
+		"b.css":      ".bravo { color: blue }\n",
+		"styles.css": ":root { --fg: #111 }\n",
+		"script.js":  "console.log('placeholder');\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// ambiguousPortfolioArtifacts scripts the artifact each file would receive IF it
+// were ever dispatched. It is intentionally complete: the point of the ambiguous
+// case is that no invocation happens at all, so a provider that answers is a
+// failure, not a convenient default.
+var ambiguousPortfolioArtifacts = map[string]scriptResponse{
+	"a.html":     {Response: ai.Response{Content: "<<<<<<< SEARCH\n  <h1>Alpha</h1>\n=======\n  <h1>Rewritten</h1>\n>>>>>>> REPLACE"}, marker: "<h1>Alpha</h1>"},
+	"b.html":     {Response: ai.Response{Content: "<<<<<<< SEARCH\n  <h1>Bravo</h1>\n=======\n  <h1>Rewritten</h1>\n>>>>>>> REPLACE"}, marker: "<h1>Bravo</h1>"},
+	"index.html": {Response: ai.Response{Content: "<<<<<<< SEARCH\n  <h1>Index</h1>\n=======\n  <h1>Rewritten</h1>\n>>>>>>> REPLACE"}, marker: "<h1>Index</h1>"},
+	"a.css":      {Response: ai.Response{Content: "<<<<<<< SEARCH\n.alpha { color: red }\n=======\n.alpha { color: green }\n>>>>>>> REPLACE"}, marker: ".alpha { color: red }"},
+	"b.css":      {Response: ai.Response{Content: "<<<<<<< SEARCH\n.bravo { color: blue }\n=======\n.bravo { color: green }\n>>>>>>> REPLACE"}, marker: ".bravo { color: blue }"},
+	"styles.css": {Response: ai.Response{Content: "<<<<<<< SEARCH\n:root { --fg: #111 }\n=======\n:root { --fg: #222 }\n>>>>>>> REPLACE"}, marker: ":root { --fg: #111 }"},
+	"script.js":  {Response: ai.Response{Content: "<<<<<<< SEARCH\nconsole.log('placeholder');\n=======\nconsole.log('rewritten');\n>>>>>>> REPLACE"}, marker: "console.log('placeholder');"},
+}
+
+// ambiguityProbeProvider records every invocation and answers from the scripted
+// artifact for whichever file it was shown. Its call count is the measurement
+// the ambiguous case turns on: "no provider calls" must be an observed fact, not
+// an inference from a zero filesystem delta.
+type ambiguityProbeProvider struct {
+	mu    sync.Mutex
+	calls int
+	seen  []string
+}
+
+func (p *ambiguityProbeProvider) Name() string { return "ambiguity-counting" }
+
+func (p *ambiguityProbeProvider) Execute(_ context.Context, req ai.Request) (*ai.Response, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	target := targetOf(req)
+	p.seen = append(p.seen, target)
+	artifact, ok := ambiguousPortfolioArtifacts[target]
+	if !ok {
+		return nil, fmt.Errorf("invocation #%d targeted %q, which the ambiguity scenario never describes", p.calls, target)
+	}
+	resp := artifact.Response
+	return &resp, nil
+}
+
+func (p *ambiguityProbeProvider) ExecuteStream(context.Context, ai.Request) (io.ReadCloser, error) {
+	return nil, fmt.Errorf("stream not supported in ambiguityProbeProvider")
+}
+
+// Calls returns the observed provider invocation count.
+func (p *ambiguityProbeProvider) Calls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
 // portfolioArtifacts maps each bound target to the SEARCH/REPLACE artifact a
 // model working from that file's real bytes would produce.
 //

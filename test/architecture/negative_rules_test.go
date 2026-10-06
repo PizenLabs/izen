@@ -15,6 +15,10 @@ import (
 func TestNegativeArchitecture_NoStaticModelDefaults(t *testing.T) {
 	// Scan internal/ production execution packages only (not test, not docs).
 	productionDirs := []string{
+		// runtime/ is the standalone Runtime Kernel. It is held to the same
+		// negative audit as internal/ so the new substrate cannot reintroduce the
+		// static-model-defaults defect the rest of the tree is forbidden from.
+		"runtime",
 		"internal/engine",
 		"internal/execution",
 		"internal/runtime",

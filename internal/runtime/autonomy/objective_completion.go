@@ -441,10 +441,12 @@ func (d *Driver) syncCanonicalIntent(ctx context.Context, objective string) erro
 	authority.Resolve(classified.Intent)
 
 	// Elevation is a one-way, deterministic fact: the gateway selected a
-	// mutation strategy for an objective the classifier read as read-only.
-	needsMutationContract := d.resolved.Profile.Strategy == strategy.TargetedMutation ||
-		d.resolved.Profile.Strategy == strategy.DirectDeterministic ||
-		d.resolved.Profile.Strategy == strategy.MultiFilePlanning
+	// mutation-shaped strategy for an objective the classifier read as
+	// read-only. It reads the SAME canonical projection admission reads
+	// (strategy.MutationSemanticsOf), so the two can never disagree about
+	// whether a strategy carries mutation semantics — which is exactly the split
+	// brain this revision exists to repair, one layer earlier.
+	needsMutationContract := strategy.MutationSemanticsOf(d.resolved.Profile.Strategy).RequiresMutationContract()
 	if !needsMutationContract || classified.Intent.RequiresMutation() {
 		// No elevation: the classification and the dispatched contract already
 		// agree. Bind the compiled context to the canonical intent so a later

@@ -172,6 +172,13 @@ type Driver struct {
 	// first dispatch. It is the only admissible evidence for an idempotent
 	// ("already satisfied") claim.
 	preTargets map[string]bool
+	// scopeDerivation is the TYPED verdict of the last evidence-bound derivation
+	// pass. It is the run's durable answer to "did discovery determine a target
+	// set, find nothing, or find several candidates and no proof?" — a question
+	// the LENGTH of the target list cannot answer, and the field the admission
+	// gate reads so ambiguous evidence can never be admitted as a scope.
+	scopeDerivation execution.Derivation
+
 	// derivationNote records what evidence-bound scope derivation concluded for
 	// this run — either the evidence that bound a target set, or the reason no
 	// target could be bound. It is per-run evidence rather than a log line,
@@ -553,6 +560,13 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.contractRecoveries = 0
 	d.contractRecoveryExhausted = false
 	d.derivationNote = ""
+	// The run's derived SCOPE state is not reset here but by the single owner of
+	// target binding: bindAuthoritativeTargets below invalidates the previous
+	// verdict, the scope record and the objective contract together and then
+	// re-derives from this run's request. Splitting the reset across two places is
+	// how a run ends up carrying an ambiguous verdict forward — or, after a
+	// clarification, keeping one that describes a request the user has replaced.
+
 	// A new run is a new objective lifecycle, so it starts with no memory of
 	// prior failures. Carrying the ledger forward would let one objective's dead
 	// ends suppress another objective's legitimate recovery.
@@ -588,7 +602,7 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// Target resolution is the gateway's deterministic authority; the loop
 	// never guesses a target. A clarification boundary parks BEFORE any
 	// execution — no model call, no mutation.
-	d.resolved = d.adapter.Resolve(objective)
+	//
 	// ── EVIDENCE-BOUND SCOPE DERIVATION ─────────────────────────────────
 	// A broad objective ("redesign the portfolio page using HTML, CSS and JS")
 	// names no file, so the gateway classifies it read-only and the driver would
@@ -605,7 +619,11 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// canonical resolution, OCC baseline, MutationSet, approval, verification —
 	// applies unchanged. When it yields nothing, the run stays read-only and the
 	// emptiness is reported truthfully rather than papered over.
-	d.deriveEvidenceScope()
+	//
+	// bindAuthoritativeTargets is that resolution and that derivation, in the one
+	// place either can happen for this lifecycle. Nothing stated yet, so the
+	// objective resolves alone.
+	d.bindAuthoritativeTargets(nil, "a new run resolves and derives its own scope")
 	interaction, interactionDescriptor, contractErr := d.selectInteractionContract(objective)
 	if contractErr != nil {
 		_, _ = d.loop.Abort("interaction contract binding failed: "+contractErr.Error(), autonomy.FailurePermanent)
@@ -885,12 +903,29 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	if contractErr != nil {
 		return d.term(), fmt.Errorf("autonomy: interaction contract: %w", contractErr)
 	}
+	// ── AUTHORITATIVE TARGET CHANGE ─────────────────────────────────────
+	// The human named the target, so the request the rest of this lifecycle
+	// derives from has changed. Everything derived from the PREVIOUS resolution
+	// is therefore stale — above all the typed derivation verdict, which the
+	// admission gate reads before it reads anything else and which would
+	// otherwise turn this very preflight back into the same DISAMBIGUATE
+	// question, with the candidates the human just answered.
+	//
+	// The target is bound through the same seam a fresh run uses, so it is
+	// re-resolved by the canonical gateway and re-derived by the canonical
+	// derivation. Setting DerivationStatus = UNIQUE here instead would be a
+	// claim with no derivation behind it, and it is exactly the claim that makes
+	// invalidation an authorization bypass: a target the gateway refuses (a file
+	// the workspace does not contain) must fail closed through the same gate as
+	// any other unbound destination.
+	targets := d.bindAuthoritativeTargets([]string{target},
+		"a human named the target at the clarification boundary: "+target)
 	// Preserve the active contract and request identity across clarification;
 	// only the deterministic target is replaced.
 	d.req.Prompt = d.prompt
 	d.req.Target = target
-	d.req.Targets = []string{target}
-	d.req.WorkspaceDigest = d.adapter.WorkspaceVersion([]string{target})
+	d.req.Targets = targets
+	d.req.WorkspaceDigest = d.adapter.WorkspaceVersion(targets)
 	d.req.InteractionContract = interaction
 	d.req.Contract = interactionDescriptor
 	d.req.RecoveryAttempt = 0
@@ -902,6 +937,8 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	// A human-specified target replaces the declared set, so the pre-execution
 	// provenance is re-captured against the NEW target before dispatch. It is a
 	// first observation of a changed scope, not a refresh of an existing claim.
+	// It runs after the seam above so the existence it records belongs to the
+	// scope that was actually re-derived.
 	d.capturePreExecutionTargets()
 	d.obs = d.contextObservation()
 	d.markHumanGated()
@@ -1445,7 +1482,176 @@ func (d *Driver) currentInteractionMetadata() (protocol.InteractionContract, *pr
 // execute until the loop terminates or parks at AwaitingHuman.
 // runID is the identity of the run that started this observation loop;
 // late results from a different runID are discarded.
+
+// ── The authoritative-scope seam ─────────────────────────────────────────────
 //
+// ONE rule owns target binding for a whole lifecycle:
+//
+//	authoritative request changes
+//	    ↓
+//	invalidate everything derived from the previous resolution
+//	    ↓
+//	canonical resolution (the strategy gateway)
+//	    ↓
+//	canonical derivation (deriveEvidenceScope)
+//	    ↓
+//	new derived state
+//
+// It exists because the derived facts and the authoritative fact have DIFFERENT
+// owners, and only one of them can be rewritten in place. The authoritative
+// target is a human statement (or the objective's own target statement); the
+// derivation verdict, the scope record, the objective contract's scope and every
+// mutation candidate derived from them are all FUNCTIONS of it. Rewriting the
+// authoritative target without dropping those leaves exactly the state this seam
+// was written to forbid:
+//
+//	authoritative target = the file the human just named
+//	derived scope        = the verdict reached for the request BEFORE they named it
+//
+// Those two coexisting are the reported defect. A clarification that left the
+// previous AMBIGUOUS verdict in place re-derived nothing and re-parked the run at
+// the same disambiguation question forever: the user answered, and the runtime
+// asked again, with the old candidates.
+//
+// The seam is deliberately NOT a second resolution path. `Run` (no stated target)
+// and `ResumeClarify` (a human-named target) both go through it, and both hand the
+// request to the SAME gateway and the SAME derivation. The only difference is the
+// input, which is exactly the difference in authority: nothing was stated, or a
+// human stated something.
+
+// bindAuthoritativeTargets establishes (or REPLACES) the lifecycle's
+// authoritative target set and re-derives every fact that depended on the
+// previous one. It returns the normalized authoritative set — the human's
+// statement, NOT the derived scope — because a statement survives a refusal to
+// resolve it: naming a file the workspace does not contain is still what the user
+// said, and the runtime's job is to fail closed on it, not to rewrite it.
+func (d *Driver) bindAuthoritativeTargets(targets []string, reason string) []string {
+	if d == nil {
+		return nil
+	}
+	authoritative := uniqueNonEmpty(targets)
+	d.invalidateDerivedScope(reason)
+	d.resolved = d.resolveAuthoritativeScope(authoritative)
+	d.deriveEvidenceScope()
+	return authoritative
+}
+
+// resolveAuthoritativeScope re-resolves the lifecycle's request through the
+// canonical strategy gateway — the same authority Run resolves through — and
+// records the verdict exactly as it comes back, including a refusal. A target the
+// gateway will not resolve therefore stays unresolved: the gateway remains the
+// only authority that may turn a statement into a bound scope.
+func (d *Driver) resolveAuthoritativeScope(targets []string) Resolved {
+	if d == nil || d.adapter == nil {
+		return d.resolved
+	}
+	return d.adapter.Resolve(d.scopeRequest(targets))
+}
+
+// scopeRequest renders the text the canonical gateway is asked to resolve.
+//
+// With no stated target it is the objective, verbatim. With a stated target the
+// human's answer SUPERSEDES the objective's own target statement, so the
+// objective's scope tokens are dropped and the answer is rendered through the
+// gateway's EXISTING @scope path.
+//
+// Rendering the objective's stale statement alongside the answer would ask the
+// gateway to resolve a request the user has already corrected. "change
+// @missing.txt to something" + an answer of "note.txt" still resolves to
+// human_clarification while the unresolved @missing.txt is in the text — the run
+// would park again on a question that has already been answered, which is the
+// loop this seam exists to close.
+//
+// The user's own text is never rewritten: d.prompt stays verbatim everywhere the
+// runtime records the objective (the task contract, the objective contract, the
+// provider prompt). Only the resolution REQUEST is composed, and only from the
+// objective and the human's statement.
+func (d *Driver) scopeRequest(targets []string) string {
+	if len(targets) == 0 {
+		return d.prompt
+	}
+	return strings.TrimSpace(withoutScopeTokens(d.prompt) + " " + joinTargets(targets))
+}
+
+// withoutScopeTokens removes the objective's own @scope tokens. It is a textual
+// projection, not a target resolver: it decides nothing about which file is
+// meant, it only stops a superseded statement from being resolved a second time.
+func withoutScopeTokens(objective string) string {
+	fields := strings.Fields(objective)
+	kept := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if strings.HasPrefix(field, "@") && len(field) > 1 {
+			continue
+		}
+		kept = append(kept, field)
+	}
+	return strings.Join(kept, " ")
+}
+
+// invalidateDerivedScope drops every fact that was DERIVED from the previous
+// target resolution, and nothing else.
+//
+// What is dropped, and why each item is genuinely derived:
+//
+//   - the typed derivation verdict (status, candidates, declared kinds,
+//     per-kind resolutions): the admission gate reads it BEFORE it reads the
+//     target binding, so a surviving AMBIGUOUS verdict outranks the human's own
+//     answer and turns the next preflight back into DISAMBIGUATE.
+//   - the scope-resolution RECORD: it is the typed account of how the target set
+//     came to be, including its candidates. Left in place it keeps answering
+//     "what is the authoritative scope?" with the previous request's answer.
+//   - the recorded derivation note: the evidence sentence for the previous pass.
+//   - the objective completion contract: its Scope is derived from the target set
+//     (see invalidateObjectiveContractForScopeChange — only the contract is
+//     re-opened; the requirement ledger, the discharge set and the step count are
+//     per-lifecycle facts about the WORK, not about which files it lands on).
+//   - every held mutation candidate: a patch derived from the previous scope is a
+//     proposal to change files this run no longer has authority over.
+//   - the compiled workspace context: the canonical intent is unchanged (the
+//     objective text did not change) but the context it was compiled from was the
+//     old scope, which is precisely the case IntentAuthority.InvalidateContext
+//     exists for. Re-synchronising the grant gate makes the canonical
+//     re-compilation path run against the new scope; until it does, the authority
+//     reports the context invalid rather than letting a stale one stand.
+//
+// What is NOT dropped, by construction:
+//
+//   - the authoritative input itself (d.req / the returned target set). Clearing it
+//     would erase the user's answer, and the whole point is to derive FROM it.
+//   - the interaction contract, the prompt and the canonical intent. A clarification
+//     changes WHICH files are in scope, not what kind of work was asked for.
+//   - the mutation strategy, the loop bounds and the failure ledger. Those are the
+//     lifecycle's execution choices and its memory, owned by Run and by human
+//     proposal decisions — not facts about the previous target set.
+func (d *Driver) invalidateDerivedScope(reason string) {
+	if d == nil {
+		return
+	}
+	previous := d.scopeResolution.State
+	ambiguous := d.scopeDerivation.IsAmbiguous()
+	d.scopeDerivation = execution.Derivation{}
+	d.scopeResolution = ScopeResolution{}
+	d.derivationNote = ""
+	d.invalidateObjectiveContractForScopeChange()
+
+	dropped := 0
+	if d.adapter != nil {
+		dropped = d.adapter.InvalidatePendingCandidates("authoritative scope changed: " + reason)
+	}
+	if d.intents != nil {
+		d.intents.InvalidateContext()
+	}
+	d.grantContextSynced = false
+
+	diagnosticf("[scope] derived state invalidated (previous=%s ambiguous=%t candidates_dropped=%d): %s",
+		previous, ambiguous, dropped, reason)
+	if d.bus != nil {
+		d.bus.Publish(events.NewActivity(fmt.Sprintf(
+			"[scope] derived state invalidated from %s (candidates dropped=%d) — re-deriving: %s",
+			previous, dropped, reason)))
+	}
+}
+
 // deriveEvidenceScope observes the workspace and binds an evidence-backed target
 // set for an objective that names no file but DOES declare artifact kinds.
 //
@@ -1469,6 +1675,25 @@ func (d *Driver) currentInteractionMetadata() (protocol.InteractionContract, *pr
 // A failed derivation is NOT an error and NOT a fabrication. The run keeps its
 // read-only classification and the refusal is recorded on the run so a later
 // report can say exactly why no target was bound.
+//
+// ── AMBIGUITY IS NOT A SCOPE ────────────────────────────────────────────────
+//
+// The gate on this step is the derivation's TYPED STATUS, not the length of its
+// target list:
+//
+//	UNIQUE      → re-resolve over the observed files; on the gateway's
+//	              acceptance the scope becomes RESOLVED
+//	AMBIGUOUS   → candidates exist and none is proven. NOTHING is bound, the
+//	              scope stays unresolved, and the candidates travel to the
+//	              admission gate as a question for a human.
+//	UNRESOLVED  → nothing derived; the scope stays unresolved
+//
+// The ambiguous branch is the defect this method used to have. It read
+// `derivable && len(targets) > 0` as a resolution, so an objective that named no
+// file ("rewrite the HTML and CSS") bound every matching file the scan happened
+// to observe and mutated all of them. It also had no smaller alternative to
+// offer: binding the first candidate, or the subset the runtime felt sure about,
+// would silently rewrite the objective into something the user never asked for.
 func (d *Driver) deriveEvidenceScope() {
 	if d.adapter == nil {
 		return
@@ -1479,12 +1704,48 @@ func (d *Driver) deriveEvidenceScope() {
 		d.noteScopeTransition(ScopeResolution{
 			State:   ScopeResolved,
 			Targets: append([]string(nil), d.resolved.Targets...),
-			Reason:  "the strategy gateway resolved the target set from the objective itself",
+			Reason:  "the strategy gateway resolved this request's target set before discovery was consulted",
 		})
 		return
 	}
-	derivation := d.adapter.DeriveScope(d.prompt, nil)
-	if !derivation.Derivable || len(derivation.Targets) == 0 {
+	// The objective is a MUTATING operation whose concrete target is DEFERRED:
+	// discovery is REQUIRED before any mutation may be proposed. This is an
+	// explicit state, not an inference — an empty scope is never read as a
+	// verdict that nothing is needed (see scope_resolution.go).
+	if sem := d.objectiveSemantics(); sem.RequiresDiscovery() {
+		diagnosticf("[discovery] REQUIRED: operation=%s scope=%s target=%s — observing the workspace before any mutation",
+			sem.Operation, sem.Scope, sem.Target)
+	}
+	// The stated target set is passed explicitly rather than left implicit: a
+	// proven target outranks anything discovery could derive, and the precedence
+	// must be legible HERE, at the one place a run acquires a target it was not
+	// given. (The early return above guarantees it is empty on this path.)
+	derivation := d.adapter.DeriveScope(d.prompt, d.resolved.Targets)
+	d.scopeDerivation = derivation
+
+	// ── AMBIGUOUS ──────────────────────────────────────────────────────
+	// Candidates were observed and none is proven. This is a QUESTION for a
+	// human, so it is recorded as a typed scope position carrying the candidate
+	// set as evidence — and nothing is bound, re-resolved or dispatched. The
+	// admission gate reads the same verdict (preflightExecutionSpec carries
+	// d.scopeDerivation) and turns it into a disambiguation request before any
+	// provider is billed, so an ambiguous scope cannot reach mutation authority
+	// even if a later step were to ask again.
+	if derivation.IsAmbiguous() {
+		d.derivationNote = derivation.Reason
+		diagnosticf("[scope] AMBIGUOUS derivation: observed candidates %v for declared kinds %v — "+
+			"no target is bound and no mutation is admissible until a human narrows the scope",
+			derivation.Targets, derivation.Kinds)
+		d.noteScopeTransition(ScopeResolution{
+			State:      ScopeAmbiguous,
+			Candidates: append([]string(nil), derivation.Targets...),
+			Kinds:      append([]string(nil), derivation.Kinds...),
+			Reason:     derivation.Reason,
+		})
+		return
+	}
+
+	if !derivation.IsUnique() || len(derivation.Targets) == 0 {
 		if derivation.Reason != "" {
 			d.derivationNote = derivation.Reason
 			diagnosticf("[scope] no evidence-bound target derived: %s", derivation.Reason)
@@ -1581,8 +1842,55 @@ func joinTargets(targets []string) string {
 // ctx is the run's own cancellation context, threaded so resolution is
 // interruptible: a cancelled run resolves to an unsubstantiated verdict and
 // stops, rather than completing a bounded scan nobody is waiting for.
+// admissionIntent is the coarse intent class the ADMISSION GATE reasons over.
+//
+// It is intentClassForStrategy plus the one fact a strategy projection cannot
+// know: whether the OBJECTIVE itself intends to write. Those are different
+// questions and they have different authorities —
+//
+//	strategy      what KIND of execution this is        (the gateway's authority)
+//	objective     whether the work WILL write          (the objective's authority)
+//
+// A PROPOSAL strategy dispatches a planning turn — that is its SHAPE — but when
+// the objective it carries is a mutation, the lifecycle holds mutation authority
+// and the gate's target/boundary/evidence checks MUST apply to it. Classifying
+// such a run as read-only let the gate wave through an objective whose scope was
+// never resolved: "rewrite the HTML and CSS" over an ambiguous workspace was
+// admitted as a plan and then dispatched.
+//
+// So the two axes are read separately and combined once, here. Both inputs are
+// canonical: strategy.MutationSemanticsOf for the first, execution objective
+// semantics for the second. Neither is re-derived locally.
+//
+// The objective axis decides on its OWN evidence, not on whether the strategy
+// happens to be mutation-shaped. Requiring both was a hole the clarification path
+// walked into: a human names a file the workspace does not contain, the gateway
+// correctly refuses to resolve it and drops the run to its clarification shape,
+// and a run whose strategy no longer LOOKS like a mutation was admitted as
+// read-only — skipping the target gate entirely and dispatching a provider over a
+// destination that does not exist. A clarification shape is not a read-only
+// objective; it is a mutating objective with no proven destination, and it must be
+// gated as one so the DISAMBIGUATE verdict below is reachable.
+func (d *Driver) admissionIntent() IntentClass {
+	class := intentClassForStrategy(d.resolved.Profile.Strategy)
+	if class.IsMutation() {
+		return class
+	}
+	if d.objectiveSemantics().Operation.RequiresMutation() {
+		return IntentMutate
+	}
+	return class
+}
+
 func (d *Driver) preflightExecutionSpec(ctx context.Context) ExecutionSpec {
-	spec := ExecutionSpec{Intent: intentClassForStrategy(d.resolved.Profile.Strategy)}
+	spec := ExecutionSpec{
+		Intent: d.admissionIntent(),
+		// The TYPED derivation verdict travels with the spec. An ambiguous
+		// derivation is a disambiguation request, not a resolved scope, and the
+		// gate must be able to see that even when the strategy it is handed is
+		// mutation-shaped.
+		Derivation: d.scopeDerivation,
+	}
 	if !spec.Intent.IsMutation() {
 		return spec
 	}
@@ -1623,18 +1931,31 @@ func (d *Driver) preflightExecutionSpec(ctx context.Context) ExecutionSpec {
 }
 
 // intentClassForStrategy maps the deterministic execution strategy onto the
-// coarse admission intent. It is a pure projection: the strategy is already
-// the authority, this only names the mutation/read-only distinction the gate
-// reasons over.
+// coarse admission intent. It is a pure projection over the CANONICAL mutation
+// semantics (strategy.MutationSemanticsOf), not a second strategy list.
+//
+// Why it is one projection and not two: `syncCanonicalIntent` used to ask the
+// same question with its own hard-coded strategy set, and the two disagreed —
+// MultiFilePlanning was a mutation contract to canonical intent and PLAN to
+// admission. A lifecycle whose compiled context says "modification" while its
+// admission gate says "read-only" is split-brained one layer before dispatch, so
+// both now read the same source:
+//
+//	APPLIED   → MUTATE  (the dispatched turn writes the workspace)
+//	PROPOSAL  → PLAN    (the dispatched turn proposes; the lifecycle still needs
+//	                    the mutation contract, so canonical intent elevates while
+//	                    admission stays read-only for THIS turn)
+//	READ-ONLY → ASK / INVESTIGATE
 func intentClassForStrategy(s strategy.ExecutionStrategy) IntentClass {
-	switch s {
-	case strategy.TargetedMutation, strategy.DirectDeterministic:
+	switch strategy.MutationSemanticsOf(s) {
+	case strategy.MutationSemanticsApplied:
 		return IntentMutate
-	case strategy.MultiFilePlanning:
+	case strategy.MutationSemanticsProposal:
 		return IntentPlan
-	case strategy.RepositoryInvestigation:
-		return IntentInvestigate
 	default:
+		if s == strategy.RepositoryInvestigation {
+			return IntentInvestigate
+		}
 		return IntentAsk
 	}
 }
@@ -1705,6 +2026,24 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 		if outcome.Verdict == AdmissionDisambiguate {
 			if d.bus != nil {
 				d.bus.Publish(events.NewActivity("[preflight] target unresolved — awaiting disambiguation: " + outcome.Reason))
+			}
+			// An AMBIGUOUS derivation gets its scope record restated here, so a run
+			// parked at this boundary still answers "why is nothing bound?" from
+			// its own state rather than only from a bus line. The candidates are
+			// recorded as CANDIDATES — no target set is bound, and
+			// AuthorizesMutation stays false until a human names one.
+			//
+			// A disambiguation reached WITHOUT an ambiguous derivation (an
+			// unbound directory, say) leaves the existing record alone: those
+			// candidates come from the resolver, not from a declared artifact
+			// kind, and relabelling them AMBIGUOUS would misattribute them.
+			if d.scopeDerivation.IsAmbiguous() {
+				d.noteScopeTransition(ScopeResolution{
+					State:      ScopeAmbiguous,
+					Candidates: append([]string(nil), outcome.Candidates...),
+					Kinds:      append([]string(nil), d.scopeDerivation.Kinds...),
+					Reason:     outcome.Reason,
+				})
 			}
 			d.loop.AwaitHuman(autonomy.HumanBoundary{
 				Reason:  outcome.Reason,
@@ -2028,6 +2367,14 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// same nonexistent target was re-requested.
 			d.carryObjectiveForward()
 			req.Evidence = joinEvidence(req.Evidence, d.recoveryBrief())
+			// ── REPLAN CONSUMES DISCOVERY EVIDENCE ────────────────────────
+			// A lifecycle whose target was DEFERRED re-observes the CURRENT
+			// workspace here. The resolved scope is then carried into the
+			// recovery request exactly like a stated target; if discovery still
+			// cannot resolve it, the scope stays unresolved and nothing is
+			// invented. This is what makes a replan an evidence-driven
+			// continuation rather than a recompile from the original prompt.
+			d.replanDeferredScope()
 			// The scope is carried through UNCHANGED. A recovery may re-read its
 			// targets; it may never widen them. Writing the authoritative set
 			// here makes that structural rather than conventional.
@@ -2717,13 +3064,87 @@ func (d *Driver) recoveryInput(o autonomy.Observation, b autonomy.LoopBounds) Re
 // once resolved, and using the record keeps telemetry, recovery and telemetry
 // agreeing on one answer.
 func (d *Driver) authoritativeScope() []string {
-	if len(d.scopeResolution.Targets) > 0 && d.scopeResolution.State == ScopeResolved {
+	// The predicate is AUTHORIZES MUTATION, not "state == RESOLVED". The
+	// ambiguous position carries a non-empty candidate set and is deliberately
+	// not authority; reading it as a scope would bind every candidate.
+	if d.scopeResolution.AuthorizesMutation() && len(d.scopeResolution.Targets) > 0 {
 		return append([]string(nil), d.scopeResolution.Targets...)
 	}
 	if len(d.resolved.Targets) > 0 {
 		return append([]string(nil), d.resolved.Targets...)
 	}
 	return append([]string(nil), d.req.Targets...)
+}
+
+// objectiveSemantics reads the objective's independent semantic model from the
+// SAME facts the completion contract uses: the execution-shape kind and the
+// currently-bound scope. It is cheap and does not cache, so it is safe to
+// consult before the contract is authored.
+func (d *Driver) objectiveSemantics() execution.ObjectiveSemantics {
+	if d == nil {
+		return execution.DeriveObjectiveSemantics(execution.OperationRead, nil)
+	}
+	return execution.DeriveObjectiveSemantics(
+		execution.OperationForTaskKind(d.taskContract().Kind),
+		d.objectiveTargets(),
+	)
+}
+
+// invalidateObjectiveContractForScopeChange re-opens the one-shot objective
+// contract so it is re-authored against the scope discovery just proved.
+//
+// It deliberately resets ONLY the derived contract, never the requirement
+// ledger, the discharge set or the step count: a scope resolution is a change
+// of the objective's TARGET (a runtime fact), not a new objective, and the
+// contract must be allowed to judge the obligations against the evidence-derived
+// targets rather than the empty scope it was first authored with. Nothing here
+// can make a completion claim succeed — the authority still recomputes every
+// condition from evidence.
+func (d *Driver) invalidateObjectiveContractForScopeChange() {
+	if d == nil {
+		return
+	}
+	d.objective.contract = execution.ObjectiveContract{}
+	d.objective.derived = false
+}
+
+// replanDeferredScope makes a REPLAN consume CURRENT workspace evidence instead
+// of recompiling scope from the original prompt.
+//
+// A lifecycle that began with a DEFERRED target (a mutating objective that named
+// no file) reaches recovery with an empty scope. Rebuilding that scope from the
+// prompt would produce the same empty set forever; instead the replan re-runs
+// the existing evidence-bound discovery against the workspace as it is NOW. The
+// derivation is the SAME one the initial run used, so it can only bind files the
+// bounded scan actually observed and the objective's declared artifact kinds
+// match — a replan cannot invent a target, and if discovery still cannot resolve
+// the scope stays unresolved and the run fails closed.
+//
+// AMBIGUOUS IS NOT A REPLAN TRIGGER. Re-deriving is unconditional and re-reads
+// the workspace as it is NOW, which is what makes the recovery path honest:
+// new evidence (a file renamed, a target added, a human naming one) can turn
+// AMBIGUOUS into UNIQUE and re-open the existing authorization path. What a
+// replan must NEVER do is treat the ambiguity it already found as if the scope
+// had been resolved, so the only thing that may re-open the objective contract
+// is a target set the GATEWAY actually accepted.
+func (d *Driver) replanDeferredScope() {
+	if d == nil || d.adapter == nil {
+		return
+	}
+	if len(d.resolved.Targets) > 0 {
+		return // already resolved; a replan may never re-pick or widen it
+	}
+	before := d.scopeResolution.State
+	d.deriveEvidenceScope()
+	if len(d.resolved.Targets) > 0 && before != ScopeResolved {
+		d.invalidateObjectiveContractForScopeChange()
+		diagnosticf("[replan] discovery resolved a deferred scope from current workspace evidence: %v",
+			d.resolved.Targets)
+	}
+	if d.scopeDerivation.IsAmbiguous() {
+		diagnosticf("[replan] re-derivation remained AMBIGUOUS over %v — no scope resolved, no mutation admitted",
+			d.scopeDerivation.Targets)
+	}
 }
 
 // recordAnchorFailure records a patch-anchor failure, invalidates the candidate

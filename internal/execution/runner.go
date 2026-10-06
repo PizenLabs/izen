@@ -213,7 +213,7 @@ func (r *Runner) SandboxCheck(command string) error {
 	}
 }
 
-func (r *Runner) run(command, dir string) (*RunResult, error) {
+func (r *Runner) run(ctx context.Context, command, dir string) (*RunResult, error) {
 	if r.admissionCheck != nil {
 		if err := r.admissionCheck("SHELL_EXEC"); err != nil {
 			return &RunResult{Command: command, Dir: dir, ExitCode: -1, Stderr: err.Error()}, err
@@ -239,7 +239,11 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 		}
 	}
 
-	ctx := context.Background()
+	// The caller's context, not a fresh Background: a cancelled or interrupted
+	// run must actually stop the subprocess it spawned. Spawning under
+	// context.Background() made every verification step outlive the cancellation
+	// that ended the run, so the workspace kept being written by a runtime
+	// nobody was waiting for.
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -327,7 +331,7 @@ func (r *Runner) run(command, dir string) (*RunResult, error) {
 	return result, nil
 }
 
-func (r *Runner) Run(command string) (*RunResult, error) {
+func (r *Runner) Run(ctx context.Context, command string) (*RunResult, error) {
 	if r.admissionCheck != nil {
 		if err := r.admissionCheck("SHELL_EXEC"); err != nil {
 			return &RunResult{Command: command, ExitCode: -1, Stderr: err.Error()}, err
@@ -340,10 +344,10 @@ func (r *Runner) Run(command string) (*RunResult, error) {
 			Stderr:   err.Error(),
 		}, err
 	}
-	return r.run(command, r.root)
+	return r.run(ctx, command, r.root)
 }
 
-func (r *Runner) RunInDir(command, dir string) (*RunResult, error) {
+func (r *Runner) RunInDir(ctx context.Context, command, dir string) (*RunResult, error) {
 	if r.admissionCheck != nil {
 		if err := r.admissionCheck("SHELL_EXEC"); err != nil {
 			return &RunResult{Command: command, Dir: dir, ExitCode: -1, Stderr: err.Error()}, err
@@ -358,7 +362,7 @@ func (r *Runner) RunInDir(command, dir string) (*RunResult, error) {
 		}, err
 	}
 	fullDir := filepath.Join(r.root, dir)
-	return r.run(command, fullDir)
+	return r.run(ctx, command, fullDir)
 }
 
 func (r *Runner) KillOrphans() {

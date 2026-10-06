@@ -103,7 +103,7 @@ func TestCheckAuthorizationNoExpiry(t *testing.T) {
 func TestRunnerAuthorizationEnforcement(t *testing.T) {
 	runner := NewRunner("/tmp", false, false)
 
-	_, err := runner.Run("echo hello")
+	_, err := runner.Run(t.Context(), "echo hello")
 	if err == nil {
 		t.Fatal("expected ExecutionDeniedError without authorization")
 	}
@@ -121,7 +121,7 @@ func TestRunnerAuthorizationValid(t *testing.T) {
 	})
 	runner.SetBudget(NewTestBudget())
 
-	result, err := runner.Run("echo hello")
+	result, err := runner.Run(t.Context(), "echo hello")
 	if err != nil {
 		t.Fatalf("expected no error with valid auth, got: %v", err)
 	}

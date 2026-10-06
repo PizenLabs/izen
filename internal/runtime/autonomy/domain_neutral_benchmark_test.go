@@ -256,6 +256,11 @@ func TestDomainNeutralBenchmark_UnprovenObjectiveNeverCompletes(t *testing.T) {
 	if mock.calls() == 0 {
 		t.Fatal("the model was never invoked: this case must exercise the real path")
 	}
+	// The bus delivers on per-subscription goroutines, so the transition count
+	// must be given time to settle before it is read. The positive case above
+	// waits for the same reason: without this the assertion measures goroutine
+	// scheduling under load rather than whether the runtime published evidence.
+	collector.waitTransitions(1, 5*time.Second)
 	if collector.loopTransitions() == 0 {
 		t.Fatal("an unproven run must still publish terminal evidence")
 	}
