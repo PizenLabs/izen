@@ -4,7 +4,7 @@
 
 - **Branch:** `fix/runtime` (base `f40f369`)
 - **Suite:** `go test ./...` green; `go test -race ./...` green (full tree);
-  `go vet ./...` clean. Verified after R6-C.
+  `go vet ./...` clean. Verified after R6-D.
 - **Status:** **R1 PROVEN** by live execution. **R2 BLOCKED** by live
   execution — recorded, not worked around. **R3 PROVEN** — the target-proposal
   authority boundary is identified and pinned; DISCOVERED/PROPOSED/AUTHORIZED
@@ -45,6 +45,16 @@
    One lifecycle defect was found and fixed: `Verifier.runStep` reported
    `PASSED` for a command that never ran (cancelled/unstarted context) — the
    mutation apply-gate. Full report: `R6_CRASH_FAILURE_REPORT.md`.
+   **R6-D PROVEN** — durable mutation commit marker wiring. The autonomous
+   `autonomy.Driver` now dispatches a durable pre-digest cursor before a
+   side-effecting dispatch and records a durable commit marker with the observed
+   post-digest immediately after a real mutation lands (`changed`/`created`) —
+   independent of objective `PROVEN`. A fresh runtime can classify the
+   interrupted mutation from surviving evidence as `ALREADY_COMMITTED` /
+   `SAFE_RETRY` / `CONFLICT` / `UNKNOWN` via a **read-only**
+   `ReconcileInterrupted`. No WAL, no resume, no automatic retry, no queue; the
+   existing `ExecutionCursor` / `Reconcile` machinery is the authority. Full
+   report: `R6_D_DURABLE_COMMIT_REPORT.md`.
 
 ---
 
@@ -580,6 +590,80 @@ One production file changed: `internal/execution/verify.go` (F1).
 
 ---
 
+## R6-D STATUS: PROVEN
+
+R6-D asks whether the autonomous execution path can turn
+
+```text
+mutation -> process death -> fresh runtime
+```
+
+from `UNKNOWN` into a truthful reconciliation result (`ALREADY_COMMITTED` /
+`SAFE_RETRY` / `CONFLICT`) using the existing `ExecutionCursor`/`Reconcile`
+machinery. Full report: **`R6_D_DURABLE_COMMIT_REPORT.md`**.
+
+The finding: the durable cursor machinery was already authoritative but was
+reachable only from the scoped `scopeguard` path. R6-D wires it into the single
+autonomous mutation seam and makes the existing contract reachable with the
+smallest durable correction.
+
+- **Prepared.** `driver.go` dispatches a durable cursor with the workspace
+  **pre-digest** before `adapter.Execute` (and before `adapter.Approve`).
+- **Committed.** Immediately after a real mutation lands
+  (`changed`/`created`), the driver records `EXECUTION_COMMITTED` **with the
+  observed post-digest** (`CommitExecutionWithDigest`). This commit is
+  independent of `PROVEN`; the PROVEN-gated commit now skips an operation already
+  recorded at the mutation boundary.
+- **Reconcile.** `durable.InspectCursors` is a **read-only** fresh-runtime
+  inspection. It applies the existing `Reconcile` rule to dispatched cursors,
+  treats a committed cursor's recorded post-digest as authoritative, and reports
+  `UNKNOWN` (new `DecisionUnknown`) when no cursor exists — absence of evidence
+  is never rounded up. `Driver.ReconcileInterrupted` /
+  `Application.ReconcileInterrupted` expose it; it resumes, retries and mutates
+  nothing.
+- `Reconcile` and `ReconcileAll` are unchanged. The commit reuses the existing
+  `EXECUTION_COMMITTED` event (optional `postconditionDigest`), so replay of an
+  older journal is unaffected.
+
+| Crash window | Result |
+|---|---|
+| D1 before mutation | **SAFE_RETRY** (pre-state agreement) |
+| D2 mutation + marker | **ALREADY_COMMITTED** |
+| D3 mutation, marker absent | **CONFLICT** (never forced to `ALREADY_COMMITTED`) |
+| D4 mismatch | **CONFLICT** |
+| D5 restart at post-state | **ALREADY_COMMITTED**, zero further writes |
+| D6 safe retry | **SAFE_RETRY** iff pre-state agreement, else `CONFLICT` |
+| no cursor at all | **UNKNOWN** |
+| D7 real `kill -9` | fresh runtime → **ALREADY_COMMITTED**, no duplicate write |
+
+Deterministic proof:
+
+```
+go test -count=1 ./internal/runtime/durable/  -run TestR6D -v
+go test -count=1 ./internal/runtime/autonomy/ -run TestR6D -v
+```
+
+Verification (after R6-D):
+
+```
+go test -count=1 ./...        PASS  (exit 0; all packages)
+go test -race -count=1 ./...  PASS  (exit 0; no data race, no panic)
+go vet ./...                  PASS  (no findings)
+```
+
+Scope: two new test files, `R6_D_DURABLE_COMMIT_REPORT.md`, and this handoff.
+Five production files changed (durable commit/read-only inspection; autonomous
+pre-digest + commit seam; composition bridge). No WAL, no new journal, no resume,
+no queue, no automatic retry; `Reconcile`/`ReconcileAll` untouched.
+
+**The remaining `UNKNOWN` is genuine, not a defect.** The postcondition is
+unknowable before the effect, so the D3 gap resolves to the conservative
+`CONFLICT`; a death before any cursor was dispatched has no evidence at all and
+stays `UNKNOWN`. The verification marker, the panic boundary, and a startup
+consumer of `ReconcileInterrupted` are recorded as future work.
+
+---
+
 ## What is broken RIGHT NOW
 
 Nothing in the repository. Eight defects are fixed:
@@ -761,6 +845,22 @@ MOD  internal/execution/verify.go                          F1: an errored verifi
                                                            step is never Passed
 ```
 
+R6-D added **the autonomous commit-marker wiring + deterministic crash tests**:
+
+```
+NEW  internal/runtime/durable/r6d_commit_marker_test.go    D1–D6 + UNKNOWN + D7 kill -9
+NEW  internal/runtime/autonomy/r6d_wiring_test.go          real-driver dispatch/commit/reconcile
+NEW  docs/report/R6_D_DURABLE_COMMIT_REPORT.md             the R6-D report
+MOD  internal/runtime/durable/types.go                     + DecisionUnknown, + CursorInspection
+MOD  internal/runtime/durable/store.go                     + CommitExecutionWithDigest; commit folds
+                                                           the observed post-digest; + InspectCursors
+MOD  internal/runtime/autonomy/ledger.go                   + ledgerMutationPrepared / Committed /
+                                                           ReconcileInterrupted; dedup PROVEN commit
+MOD  internal/runtime/autonomy/driver.go                   prepare + commit at the execution and
+                                                           approval seams
+MOD  internal/runtime/compose/compose.go                   + Application.ReconcileInterrupted bridge
+```
+
 ---
 
 ## What must NOT be touched
@@ -797,16 +897,26 @@ recorded observation gap from R6-A (F2: no distinct loop-level cancellation
 state; `cancel.requested` / `cancel.propagated` events absent) remains the next
 candidate decision, not an open defect.
 
-**The next EXACT experiment** is **R6-D — Durable Mutation Commit Marker**
-(design/implementation), and it MUST NOT be started here: wire the existing
-`durable.ExecutionCursor` (`DispatchCursor` with precondition/postcondition
-digests, `CommitExecution`) and `Reconcile` (`ALREADY_COMMITTED` / `SAFE_RETRY`
-/ `CONFLICT`) into the `autonomy.Driver`'s mutation boundary, so a fresh runtime
-can resolve post-crash mutation state from the workspace itself. Optionally add a
-durable "verification started" marker and a panic boundary at the executor/driver
-seam. Crash recovery, WAL, resume, replay, disconnect recovery, distributed
-execution, multi-lane execution, queue redesign and provider redesign all remain
-out of scope until R6-D provides the evidence that they are required.
+R6-D is closed **PROVEN** (`R6_D_DURABLE_COMMIT_REPORT.md`): the autonomous
+driver now records a durable pre-digest before the mutation and a durable commit
+marker (with the observed post-digest) after it, independent of `PROVEN`, and a
+read-only `ReconcileInterrupted` resolves post-crash mutation state as
+`ALREADY_COMMITTED` / `SAFE_RETRY` / `CONFLICT` / `UNKNOWN`.
+
+**The next EXACT experiment** is **R6-E — Durable Reconciliation Surface &
+Human Decision Boundary**, chosen from R6-D evidence and NOT started here: R6-D
+makes reconciliation *computable and reachable* (`Application.
+ReconcileInterrupted`) but nothing in production consumes it at startup, and the
+`CONFLICT` / `UNKNOWN` outcomes need a truthful human-facing decision surface
+before any recovery policy could be considered. A "predict the postcondition
+before the effect" design (which would move D3 toward `ALREADY_COMMITTED`) is an
+alternative candidate but must be justified by a deterministic reproduction of a
+harmful D3 outcome. Crash recovery, WAL, resume, replay, disconnect recovery,
+distributed execution, multi-lane execution, queue redesign and provider
+redesign all remain out of scope until R6-E provides the evidence that they are
+required. The R6-C verification marker and panic boundary remain future work:
+R6-D assessed both and neither is required to make an existing truthful contract
+reachable.
 
 R2 is closed **BLOCKED**; R3 is closed **PROVEN** (`R3_TARGET_PROPOSAL_REPORT.md`);
 R4 is closed **PROVEN** (`R4_BOUNDED_CONTINUATION_REPORT.md`); R5 is closed

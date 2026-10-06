@@ -299,6 +299,18 @@ type Driver struct {
 	// ledgerTask is the current run's durable task id, empty when no ledger
 	// is bound.
 	ledgerTask string
+	// ledgerCommittedOp is the operationID whose durable mutation commit
+	// marker this run has already written. The mutation boundary commits as
+	// soon as a mutation is observed to have landed (changed/created), and
+	// the objective authority commits again when it PROVES the objective; this
+	// field keeps that second, weaker act from appending a duplicate truth
+	// boundary for the same operation.
+	ledgerCommittedOp string
+	// ledgerPendingOp is the operationID of the cursor most recently dispatched
+	// by ledgerMutationPrepared. The commit marker binds to this exact cursor,
+	// independent of any loop attempt-counter movement between the pre-digest
+	// dispatch and the commit.
+	ledgerPendingOp string
 	// ledgerLastState is the last loop state written to the journal. Every
 	// return path funnels through term(), so this is what keeps a single
 	// transition from being appended twice while still recording every
@@ -905,6 +917,14 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 		return d.term(), nil
 	}
 	d.obs = obs
+	// ── DURABLE MUTATION EVIDENCE: COMMITTED (APPROVAL PATH) ─────────
+	// The human gate is a real mutation seam too: the held patch was applied
+	// here. Record the same commit marker the autonomous dispatch records, so
+	// a crash after "approve" but before the objective terminal is
+	// reconcilable exactly like any other committed mutation.
+	if mutationObservedCommitted(obs) {
+		d.ledgerMutationCommitted(d.objectiveTargets())
+	}
 	// The apply landed through the human gate, so the runtime — not an executor
 	// dispatch — is what produced this observation. Fold it into the objective
 	// lifecycle here: the result must be re-inspected and the step's evidence
@@ -2357,6 +2377,14 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				term := d.terminateAbort(ctx, "interaction contract authority ceiling: "+contractErr.Error(), autonomy.FailurePermanent)
 				return term, contractErr
 			}
+			// ── DURABLE MUTATION EVIDENCE: PREPARED ──────────────────────
+			// Record the workspace PRE-state durably BEFORE the mutation
+			// boundary is crossed. If the process dies before the commit
+			// marker below, a fresh runtime compares the surviving digest to
+			// this pre-digest: an unchanged workspace is SAFE_RETRY, anything
+			// else is CONFLICT — never a silent retry. This is dispatched at
+			// the ONE autonomous mutation seam, not scattered across the loop.
+			d.ledgerMutationPrepared(d.objectiveTargets())
 			obs, err := d.adapter.Execute(ctx, d.req)
 			// Late-result guard: if the run was aborted/superseded while we were
 			// executing, discard the result and return the terminal state.
@@ -2367,6 +2395,16 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				return nil, fmt.Errorf("autonomy: execute: %w", err)
 			}
 			d.obs = obs
+			// ── DURABLE MUTATION EVIDENCE: COMMITTED ─────────────────────
+			// The mutation boundary has been crossed. If a real change landed
+			// (changed/created), record the commit marker and the observed
+			// POST-state now — before any further observation or decision — so
+			// the gap between the kernel write and durable commit evidence is
+			// as small as the architecture allows. This commits the OPERATION,
+			// never the objective.
+			if mutationObservedCommitted(obs) {
+				d.ledgerMutationCommitted(d.objectiveTargets())
+			}
 			// ── OBJECTIVE EVIDENCE BINDING ───────────────────────
 			// Fold this step's facts into the objective lifecycle: re-read the
 			// declared targets so the RESULT is observed (not just requested),

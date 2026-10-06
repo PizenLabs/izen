@@ -479,6 +479,20 @@ func (a *Application) InterruptedTask() (durable.TaskState, bool) {
 	return a.ledger.MostRecentRecoverable()
 }
 
+// ReconcileInterrupted is the fresh-runtime mutation-reconciliation surface:
+// for every task the durable ledger holds, it reports whether an interrupted
+// mutation is ALREADY_COMMITTED, SAFE_RETRY, CONFLICT or UNKNOWN, computed
+// against the live workspace. It is READ-ONLY — it resumes nothing, retries
+// nothing and mutates nothing — so a restart can learn the truthful state of an
+// interrupted objective before a human decides what to do. Nil-safe: with no
+// autonomous driver wired it returns no inspections.
+func (a *Application) ReconcileInterrupted() ([]durable.CursorInspection, error) {
+	if a == nil || a.Autonomous == nil {
+		return nil, nil
+	}
+	return a.Autonomous.ReconcileInterrupted()
+}
+
 // Wire builds the Application: domain runtime, dispatcher, handlers, ledger
 // projection, the Runtime facade, and the complete engine tree — all bound to
 // the shared event bus. It is the sole place the application dependency graph
