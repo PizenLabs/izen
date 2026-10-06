@@ -83,7 +83,7 @@ var codingActionPatterns = []string{
 //     /plan, /hotfix) are ALWAYS coding tasks, never casual.
 //  2. Messages containing file references (@file, .go, error:, import, etc.)
 //     are ALWAYS coding tasks.
-//  2b. Messages containing an explicit workspace action (fix, verify, change,
+//     2b. Messages containing an explicit workspace action (fix, verify, change,
 //     inspect, ...) are ALWAYS coding tasks. A greeting word inside an
 //     instruction is a value to write, not small talk.
 //  3. Messages matching known casual greeting / small-talk patterns

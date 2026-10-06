@@ -9,8 +9,11 @@
 - **Status:** **R1 PROVEN** by live execution. **R2 BLOCKED** by live
   execution — recorded, not worked around. **R3 PROVEN** — the target-proposal
   authority boundary is identified and pinned; DISCOVERED/PROPOSED/AUTHORIZED
-  are now separate, single-sourced control-plane facts. The remaining items are
-  open questions, not open defects.
+  are now separate, single-sourced control-plane facts. **R4 PROVEN** — a real
+  model call can exhaust its output ceiling, IZEN records it truthfully, the
+  runtime-owned continuation stays inside the same execution, and completion
+  remains evidence-gated. The remaining items are open questions, not open
+  defects.
 
 ---
 
@@ -181,6 +184,62 @@ IZEN_LIVE_FORENSICS=1 go test ./test/live_r2/ -run TestLiveR3_ -v
 
 ---
 
+## R4 STATUS: PROVEN
+
+R4 asks whether a real model that reaches its output limit before completing an
+authorized objective is continued correctly — or stopped, restarted, duplicated,
+context-lost, or falsely completed. Full report:
+**`R4_BOUNDED_CONTINUATION_REPORT.md`**.
+
+The finding: continuation is **runtime-owned** and, in fact, has **two layers**,
+both of which were verified live:
+
+1. **Executor full-artifact bounded-step continuation**
+   (`internal/execution/artifact_step.go`): a `length` is an INVOCATION outcome,
+   not a task failure. The delivered prefix is preserved as a *candidate* and the
+   SAME artifact contract is advanced across bounded invocations, up to
+   `llmstep.DefaultMaxContinuationSteps`.
+2. **Driver recovery matrix** (`internal/runtime/autonomy`): when the step budget
+   is consumed (or the exhausted step delivered no bytes) the typed
+   `OUTPUT_EXHAUSTED` reaches the driver, which materialises a materially
+   different contract (`FULL_REWRITE → BOUNDED_PATCH`) and makes a second call in
+   the SAME execution.
+
+The live benchmark (`test/live_r4/`, real `ollama/qwen2.5-coder:7b`, isolated git
+workspace, explicit `@index.html` target, bounded 1024-token mutation request)
+produced a genuine `finish_reason=length` (`requested=1024 effective=1024
+known=true completion=1024`), an explicit `continuation.evaluated/selected`
+repair, and a second call `run-1-attempt-2` in the **same run**, converging to
+`PROVEN` through the evidence-gated authority with exactly one applied mutation.
+
+| Critical invariant | Result |
+|---|---|
+| real `finish_reason=length` observed | **yes** |
+| exhaustion recorded truthfully (`output_exhausted=1`, `effective=1024`) | **yes** |
+| incomplete state never becomes `PROVEN` | **yes** (live negatives ended `unsubstantiated`/`awaiting_human`) |
+| continuation explicitly evaluated, not a blind retry | **yes** |
+| continuation stays in the same execution (`run-1` → `run-1-attempt-2`) | **yes** |
+| mutation not blindly duplicated | **yes** (exactly 1 applied) |
+| completion remains evidence-gated | **yes** |
+
+**No production file was changed.** R4 is observability + proof. One concrete
+finding is reported, not fixed: the executor’s streaming truncation path
+(`invokeStream`) discards the delivered prefix, whereas the non-streaming path
+returns it so the same-contract continuation can use it. Continuation correctness
+is unaffected (the driver layer covers it); it is a salvage symmetry, and the
+minimal correction boundary is recorded in the report.
+
+Reproduce:
+
+```
+ollama serve
+IZEN_LIVE_FORENSICS=1 go test ./test/live_r4/ -v -timeout 1200s
+# deterministic, no model:
+go test ./test/forensics/ -run TestR4_ -v
+```
+
+---
+
 ## What is broken RIGHT NOW
 
 Nothing in the repository. Eight defects are fixed:
@@ -304,6 +363,14 @@ MOD  internal/execution/strategy/strategy_test.go  R2 regression: the repair
                                      objective carries mutation semantics
 ```
 
+R4 added **no production change** — observability + proof only:
+
+```
+NEW  test/live_r4/probe_test.go              R4 live bounded-continuation benchmark
+NEW  test/forensics/r4_continuation_test.go  R4 deterministic state-machine (5 tests)
+NEW  docs/report/R4_BOUNDED_CONTINUATION_REPORT.md
+```
+
 ---
 
 ## What must NOT be touched
@@ -326,14 +393,24 @@ change is outside it: the `IsCasualChat` classification guard.
 
 ## The next EXACT experiment
 
-R2 is closed **BLOCKED**; R3 is closed **PROVEN** (`R3_TARGET_PROPOSAL_REPORT.md`).
-R3 identified the single authority boundary (`EvaluatePreflightAdmission`) and
-made DISCOVERED/PROPOSED/AUTHORIZED explicit without granting authority. It did
-**not** make the R2 benchmark reach `PROVEN`, and deliberately so: a no-kind
-objective that names no file still cannot become an authorized target.
+R2 is closed **BLOCKED**; R3 is closed **PROVEN** (`R3_TARGET_PROPOSAL_REPORT.md`);
+R4 is closed **PROVEN** (`R4_BOUNDED_CONTINUATION_REPORT.md`). R3 identified the
+single authority boundary (`EvaluatePreflightAdmission`) and made
+DISCOVERED/PROPOSED/AUTHORIZED explicit without granting authority. R4 proved
+that a real `finish_reason=length` is continued inside the same execution by
+runtime-owned logic and never falsely completed.
 
-The remaining open question is therefore a *policy* question, not an execution
-one, and it is explicitly out of R3 scope:
+R4 resolved the two open items that R1/R3 had left in this section:
+
+- **The per-model budget table is no longer scripted-only.** A live call now
+  reports `finish_reason=length` with `requested=1024 effective=1024 known=true`.
+  A provider that caps silently is exactly what `effective < requested` records.
+- **`ProviderExecutionPayload.OutputChars` is populated on the streaming mutation
+  lane** in the R4 live trace (`output_chars=2499` on the truncated call), so the
+  delivered prefix is observable even on exhaustion.
+
+The remaining open question is a *policy* question, not an execution one, and it
+is explicitly out of R3/R4 scope:
 
 > Should IZEN ever accept a *content-grounded* proposal — a bounded, read-only
 > inspection pass that establishes a discovered candidate is what the objective
@@ -353,12 +430,13 @@ workspace a genuinely broken document and assert on `execution.behavior.observed
 that a real defect, a real repair and a `repairs > 0` re-observation occur. That
 is a separate capability from R2's target discovery.
 
-1. **§14's per-model budget table is still scripted-only.** Every live call in
-   the R1 experiment reported `finish=stop` with no truncation, so
-   `effective` budget remains `unobserved`. A provider that caps silently is
-   still undetectable.
-2. **`ProviderExecutionPayload.OutputChars` is 0 on the mutation lane** (the
-   manifest path populates it). Cosmetic.
-3. **Contract recovery (§1, Benchmark C)** was never exercised: the scripted
+4. **Executor streaming truncation drops the delivered prefix.** The
+   non-streaming `invokeStream` path returns the accumulated bytes with the
+   output-gate error so the executor’s full-artifact bounded-step continuation
+   can advance the same contract; the streaming path returns `""`. R4 semantics
+   are unaffected (the driver recovery layer continues correctly), but the
+   smallest correction is a symmetry fix at the three streaming return sites.
+   Reported in `R4_BOUNDED_CONTINUATION_REPORT.md` §6; not applied.
+5. **Contract recovery (§1, Benchmark C)** was never exercised: the scripted
    prose answer reached an approval gate, so only one call happened. Whether
    `authorizeContractRecovery` produces a *useful* second prompt is untested.
