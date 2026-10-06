@@ -75,7 +75,7 @@ func TestR6C_AbruptProcessDeathLeavesMutationStateUnreconstructible(t *testing.T
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestR6C_CrashHelperProcess$")
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestR6C_CrashHelperProcess$")
 	cmd.Env = append(os.Environ(), r6cHelperEnv+"=1", r6cWSEnv+"="+ws)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("spawn helper: %v", err)

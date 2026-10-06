@@ -375,7 +375,7 @@ func TestR6D_D7_ProcessDeathAndFreshRuntimeReconcile(t *testing.T) {
 	}
 	defer func() { _ = r.Close() }()
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestR6D_CommitHelperProcess$")
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestR6D_CommitHelperProcess$")
 	cmd.Env = append(os.Environ(), r6dHelperEnv+"=1", r6dWSEnv+"="+ws)
 	cmd.ExtraFiles = []*os.File{w}
 	if err := cmd.Start(); err != nil {
