@@ -4,7 +4,7 @@
 
 - **Branch:** `fix/runtime` (base `f40f369`)
 - **Suite:** `go test ./...` green; `go test -race ./...` green (full tree);
-  `go vet ./...` clean. Verified after R6-A.
+  `go vet ./...` clean. Verified after R6-C.
 - **Status:** **R1 PROVEN** by live execution. **R2 BLOCKED** by live
   execution — recorded, not worked around. **R3 PROVEN** — the target-proposal
   authority boundary is identified and pinned; DISCOVERED/PROPOSED/AUTHORIZED
@@ -36,6 +36,15 @@
   found and **no production code was changed**. Full report:
   `R6_INTERRUPT_QUEUE_REPORT.md`.
   The remaining items are open questions, not open defects.
+
+   **R6-C PROVEN (audit)** — process/crash failure forensics. In-process failure
+   boundaries are truthful and cannot round up to `PROVEN`; the autonomous
+   execution path has **no durable mutation commit marker**, so after
+   `mutation commit → process death` the post-crash mutation state is
+   **UNKNOWN**. Crash recovery is **not** a supported contract (Decision Case B).
+   One lifecycle defect was found and fixed: `Verifier.runStep` reported
+   `PASSED` for a command that never ran (cancelled/unstarted context) — the
+   mutation apply-gate. Full report: `R6_CRASH_FAILURE_REPORT.md`.
 
 ---
 
@@ -495,6 +504,82 @@ No production file changed.
 
 ---
 
+## R6-C STATUS: PROVEN (audit)
+
+R6-C asks what IZEN guarantees when execution fails because the process,
+provider, command, runtime, or host execution path terminates unexpectedly, and
+specifically whether it can distinguish **no mutation**, **mutation not
+committed**, **mutation committed**, and **mutation state unknowable**. Full
+report: **`R6_CRASH_FAILURE_REPORT.md`**.
+
+The finding: IZEN is **truthful in-process and silent-about-commit after process
+death**.
+
+- Every observed failure is typed honestly and cannot be rounded up to success:
+  provider error (`OutcomeFailed`), command non-zero exit (failure), failed
+  authorization (zero delta), apply failure (whole-`MutationSet` rollback),
+  verification failure (shadow restore), and cancellation (`OutcomeCancelled`).
+- The mutation boundary is `MutationSet` + `engine.Transaction` (in-memory
+  snapshots) over `kernelbridge.Apply` (real atomic write with an independent
+  re-read). `MutationSet.Commit` is in-memory; there is no durable commit marker
+  on the autonomous path.
+- The autonomous `autonomy.Driver` durable ledger
+  (`.izen/runtime/ledger.ndjson`) writes a checkpoint at the loop boundary
+  **before execution** and writes `EXECUTION_COMMITTED` only when the objective
+  is **PROVEN** (`objective_completion.go:208`). It never calls `DispatchCursor`,
+  so no precondition/postcondition digest binds the mutation to the journal.
+- A real `kill -9` subprocess test confirms: a fresh runtime sees the
+  non-terminal task and the pre-execution checkpoint, and the workspace bytes
+  survive, but it **cannot** prove whether the mutation committed.
+- Panic: the only domain recovery is `PatchManager.ApplyContext`
+  (`patch.go:1083`), which converts a panic to an error with **no rollback and
+  no terminal publication**; there is no recovery boundary in `executor.go`,
+  the driver, or `cmd/izen`. A post-commit panic leaves no terminal record. No
+  panic can produce a false `PROVEN`.
+
+**One lifecycle defect found and fixed (F1, classification C).**
+`Verifier.runStep` treated a non-nil `Runner.Run` error with `ExitCode == 0` as
+`Passed = true`. That is exactly the shape a command that never started produces
+(the context was already cancelled, or the process could not be started), so a
+**cancelled/unstarted verification step was reported `PASSED`** — and this
+verifier is the mutation apply-gate. Correction: an errored step is never a pass
+(`internal/execution/verify.go`). Regression:
+`TestR6C_Verification_CancelledContextNeverPasses`.
+
+| Critical invariant | Result |
+|---|---|
+| provider failure cannot become `PROVEN` | **yes** |
+| command failure cannot become `PROVEN` | **yes** |
+| authorized ≠ applied | **yes** (zero delta on auth refusal) |
+| mutation failure rolls the whole set back | **yes** |
+| verification failure restores pre-apply bytes | **yes** |
+| verification absence never reads as success | **yes** (after F1) |
+| panic after write is never success | **yes** |
+| process death ≠ success, ≠ `FAILED` by assumption | **yes** (UNKNOWN) |
+| post-crash mutation state provable | **no** (missing commit marker) |
+
+Crash Recovery Decision Boundary: **Case B** — durable evidence exists but
+cannot distinguish "mutation committed" from "mutation never committed" on the
+autonomous path. Crash recovery is **not** a supported contract.
+
+Deterministic proof:
+`go test ./internal/execution/ -run TestR6C_ -v`,
+`go test ./internal/runtime/autonomy/ -run TestR6C_ -v`,
+`go test ./internal/runtime/durable/ -run TestR6C_ -v`.
+
+Verification (after R6-C):
+
+```
+go test -count=1 ./...        PASS  (exit 0; 211 packages ok)
+go test -race -count=1 ./...  PASS  (exit 0; 211 packages ok; no data race, no panic)
+go vet ./...                  PASS  (no findings)
+```
+
+Scope: three new test files, `R6_CRASH_FAILURE_REPORT.md`, and this handoff.
+One production file changed: `internal/execution/verify.go` (F1).
+
+---
+
 ## What is broken RIGHT NOW
 
 Nothing in the repository. Eight defects are fixed:
@@ -665,6 +750,17 @@ NEW  internal/ui/r6b_lifecycle_isolation_test.go                autonomous start
 NEW  docs/report/R6_INTERRUPT_QUEUE_REPORT.md                   the R6-B report
 ```
 
+R6-C added **deterministic tests + one production fix**:
+
+```
+NEW  internal/execution/r6c_crash_failure_test.go          C2/C3/C4/C6/C7 + F1 regression
+NEW  internal/runtime/autonomy/r6c_provider_failure_test.go  C1 provider failure
+NEW  internal/runtime/durable/r6c_process_death_test.go    C5/C8 real kill -9 subprocess
+NEW  docs/report/R6_CRASH_FAILURE_REPORT.md                the R6-C report
+MOD  internal/execution/verify.go                          F1: an errored verification
+                                                           step is never Passed
+```
+
 ---
 
 ## What must NOT be touched
@@ -692,12 +788,25 @@ request → propagation → authoritative cancellation → no resurrection → t
 final state, with one lifetime-semantics defect fixed (F1). R6-B is closed
 **PROVEN** (`R6_INTERRUPT_QUEUE_REPORT.md`): there is no execution queue; a
 second unit is refused; cancellation is execution-scoped and cross-execution
-callbacks are blocked. The remaining lifecycle questions are deliberately **out
-of R6-A/R6-B scope** and MUST NOT be started here: crash recovery, WAL, resume,
-disconnect recovery, and R6-C/D. The one recorded observation gap from R6-A
-(F2: no distinct loop-level cancellation state; `cancel.requested` /
-`cancel.propagated` events absent) is the next candidate decision, not an open
-defect, and was left untouched by R6-B.
+callbacks are blocked. R6-C is closed **PROVEN (audit)**
+(`R6_CRASH_FAILURE_REPORT.md`): in-process failure boundaries are truthful; the
+autonomous path has no durable mutation commit marker, so post-crash mutation
+state is **UNKNOWN** (Decision Case B). One lifecycle defect was found and fixed
+(F1, `verify.go`: a command that never ran was reported `PASSED`). The one
+recorded observation gap from R6-A (F2: no distinct loop-level cancellation
+state; `cancel.requested` / `cancel.propagated` events absent) remains the next
+candidate decision, not an open defect.
+
+**The next EXACT experiment** is **R6-D — Durable Mutation Commit Marker**
+(design/implementation), and it MUST NOT be started here: wire the existing
+`durable.ExecutionCursor` (`DispatchCursor` with precondition/postcondition
+digests, `CommitExecution`) and `Reconcile` (`ALREADY_COMMITTED` / `SAFE_RETRY`
+/ `CONFLICT`) into the `autonomy.Driver`'s mutation boundary, so a fresh runtime
+can resolve post-crash mutation state from the workspace itself. Optionally add a
+durable "verification started" marker and a panic boundary at the executor/driver
+seam. Crash recovery, WAL, resume, replay, disconnect recovery, distributed
+execution, multi-lane execution, queue redesign and provider redesign all remain
+out of scope until R6-D provides the evidence that they are required.
 
 R2 is closed **BLOCKED**; R3 is closed **PROVEN** (`R3_TARGET_PROPOSAL_REPORT.md`);
 R4 is closed **PROVEN** (`R4_BOUNDED_CONTINUATION_REPORT.md`); R5 is closed
