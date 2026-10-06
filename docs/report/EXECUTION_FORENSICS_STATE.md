@@ -6,7 +6,8 @@
 - **Suite:** `go test ./...` green; `-race` green on `internal/execution/...`,
   `internal/events/...`, `internal/architecture`, `internal/runtime/...`,
   `internal/ui/...`, `test/forensics`
-- **Status:** **R1 PROVEN by live execution.** The remaining items are open
+- **Status:** **R1 PROVEN** by live execution. **R2 BLOCKED** by live
+  execution — recorded, not worked around. The remaining items are open
   questions, not open defects.
 
 ---
@@ -17,8 +18,9 @@ The `$prompt` path is fully observable. A bounded run is reconstructable from
 `internal/forensics` — live, or from `.izen/audit/events.ndjson` after the
 process exits.
 
-Seven defects found and fixed. The full trace, evidence and reasoning are in
-`EXECUTION_FORENSICS.md`.
+Seven defects found and fixed by R1. The full trace, evidence and reasoning are
+in `EXECUTION_FORENSICS.md`. R2 (below) found and fixed an eighth and recorded a
+BLOCKED benchmark.
 
 ---
 
@@ -73,9 +75,78 @@ IZEN_LIVE_FORENSICS=1 go test ./test/live_r1/ -v -timeout 900s
 
 ---
 
+## R2 STATUS: BLOCKED
+
+The R2 benchmark asks whether IZEN performs a real multi-step
+discover→inspect→reason→mutate→observe→verify→PROVEN loop on an objective that
+**does not name the target file**:
+
+```
+workspace:  index.html with <h1 id="greeting">Helo</h1>
+objective:  inspect this project, find the incorrect greeting, fix it to "Hello",
+            and verify the result.
+```
+
+It does **not**. The chain stops at `discovery → inspection`:
+
+| Stage | Result |
+|---|---|
+| objective → authorization | reached; verdict `disambiguate` |
+| discovery | **RAN** — bounded scan observed 1 candidate, `index.html` |
+| inspection | **NOT REACHED** — `channels: (none)`, no file bytes sent to the model |
+| model computation | only the read-only requirement pass ran (512 → 2 tokens, `stop`) |
+| decision | `ask_human` |
+| mutation / observation / verification / objective evaluation | **none** — `mutations: 0`, workspace unchanged |
+
+**Why it is correct to stop there, and why it is a block:** discovery
+candidates are evidence, never authority (`I13`), and evidence-bound scope
+derivation binds only files satisfying an artifact kind the objective itself
+declared. The benchmark declares none. Reaching mutation from targetless
+discovery requires a discovery→inspection→decision capability at the
+authorization boundary — a redesign this experiment is forbidden to make. So the
+result is **BLOCKED and recorded**, not hacked green.
+
+**The downstream chain is independently PROVEN.** The same workspace, same
+no-filename shape, same model, with an objective that declares the kind
+(`…the incorrect message in the HTML…`) runs the whole loop:
+
+```
+derivation UNIQUE kinds=html → index.html bound
+→ channels [target:index.html] → mutation call (419-token prompt carrying file bytes)
+→ mutation applied fs_changed=true (+1/-1) → verification STARTED→NOT_APPLICABLE
+→ objective.evaluated PROVEN granted=true → completed
+→ disk holds <h1 id="greeting">Welcome</h1>
+```
+
+So the loop is real; the missing piece is *targetless discovery authority*.
+
+**One defect on the path was found, classified and fixed.** The benchmark
+objective was classified `direct_response` (zero-context casual chat) because the
+replacement value `"Hello"` is also a greeting pattern — a frozen spec with
+`intent=MUTATE` and a read-only strategy. Classification:
+**CAPABILITY_SELECTION_FAILURE**. Fixed in `internal/gateway/chat.go` (a
+workspace-action guard) with two deterministic regressions; re-running the
+benchmark then reaches the same block with the corrected
+`multi_file_planning` mutation contract.
+
+Reproduce:
+
+```
+ollama serve
+IZEN_LIVE_FORENSICS=1 go test ./test/live_r2/ -v -timeout 1200s
+# Observation            PASS (benchmark measurement)
+# DiagnosticDeclaredKind PASS (downstream chain PROVEN)
+# AcceptanceChain        FAIL (R2 blocked at discovery→inspection — expected)
+
+# Deterministic, no model — the same boundary, pinned in the always-run suite:
+go test ./internal/runtime/autonomy/ -run TestR2_TargetlessRepairObservesButDoesNotDispatch -v
+```
+
+---
+
 ## What is broken RIGHT NOW
 
-Nothing in the repository. Seven defects are fixed:
+Nothing in the repository. Eight defects are fixed:
 
 | ID | Defect | Fixed in |
 |---|---|---|
@@ -86,6 +157,7 @@ Nothing in the repository. Seven defects are fixed:
 | R5 | Forensic reader raced its own bus subscription, dropping the verdict tail | `internal/forensics` `Recorder.WaitFor`/`WaitQuiet` |
 | R6 | `COMPLETION_WITHOUT_EVIDENCE` compared against `"proven"` while the canonical value is `PROVEN` — **the detector could never fire** | `forensics/trace.go` |
 | R7 | `UNVERIFIED_MUTATION` fired on the **absence** of any verification record — an accusation manufactured from missing evidence | `forensics/trace.go` |
+| R8 (found by R2) | `IsCasualChat` matched a greeting word **inside a repair instruction** (`fix it to "Hello"`), routing a mutating objective to the zero-context `direct_response` path — the frozen spec showed `intent=MUTATE` with a read-only strategy | `gateway/chat.go` Rule 2b |
 
 Also fixed: a **pre-existing** break where `internal/context` shadowed stdlib
 `context` in `execution_test.go`, which took down the whole `internal/execution`
@@ -165,6 +237,9 @@ NEW  test/forensics/r1_scope_regression_test.go   the R1 regression + control ar
 NEW  test/forensics/verification_observability_test.go  the six states + no-cry-wolf
 NEW  test/live_r1/                           opt-in live experiment (real model)
 NEW  internal/execution/verification_publish_test.go  the executor's routing seam
+NEW  test/live_r2/                           opt-in R2 real-agentic-repair experiment
+NEW  internal/runtime/autonomy/r2_boundary_test.go  deterministic pin of the R2
+                                     blocked boundary (no model)
 NEW  docs/report/EXECUTION_FORENSICS.md
 NEW  docs/report/EXECUTION_FORENSICS_STATE.md
 
@@ -184,6 +259,12 @@ MOD  internal/ui/autonomous_test.go  fake records the directive
 MOD  internal/execution/execution_test.go   pre-existing build break
 MOD  internal/architecture/execution_invariants_test.go  4 verification
                                      constructors pinned to the graph
+MOD  internal/gateway/chat.go        R2: a workspace action in a message is never
+                                     casual chat, even when it writes the value
+                                     "Hello" (Rule 2b)
+MOD  internal/gateway/chat_test.go   R2 regression (repair-with-"Hello" cases)
+MOD  internal/execution/strategy/strategy_test.go  R2 regression: the repair
+                                     objective carries mutation semantics
 ```
 
 ---
@@ -198,33 +279,41 @@ ohgo.
 The evidence did not show a defect in any of them. This work is
 **observability + one propagation fix**, not a redesign.
 
+R2 confirmed the boundary rather than reopening it. The R2 benchmark's blocking
+transition — a discovered candidate cannot be bound as a target for an objective
+that named none and declared no artifact kind — lives in the target-binding /
+admission path, so it was **recorded as BLOCKED**, not redesigned. The single R2
+change is outside it: the `IsCasualChat` classification guard.
+
 ---
 
 ## The next EXACT experiment
 
-R1 is closed. The highest-value remaining question is **§2, item 6**:
+R2 is closed **BLOCKED**. The next experiment is **not** R3 and **not** token
+budgeting (see the R2 result above). When it is started, it must answer this
+singular question:
 
-> The behavioural **repair** path has only been exercised with a scripted
-> proposer. The live run PROVED a clean observation with 0 repairs.
+> Can IZEN turn *discovered evidence* into an authorized target through a
+> bounded **inspection** pass, without letting a scan choose the target?
 
-Concretely: give the live workspace a **genuinely broken** document — an
-unclosed element, or a `<link href>` naming a stylesheet that does not exist —
-and assert on the structured `execution.behavior.observed` record that:
+The design constraint is already stated by the runtime: discovery is evidence,
+never authority (`I13`). So the missing capability is `discovery → inspect →
+decide`: a read-only pass that shows the model the discovered candidate file(s)
+and lets a **decision** (grounded in those bytes, admitted through the existing
+authorization boundary) name the target. The R2 diagnostic proves everything
+after that point already works end to end with a real model.
 
-1. the observation reports a real `Defects` entry with real evidence;
-2. the model proposes a repair;
-3. the runtime selects the target **from the evidence**, not from the proposal;
-4. `repairs > 0` and the re-observation holds;
-5. the mutation is visible **on disk**, and the run still ends `completed`.
-
-The control that makes it meaningful: the same broken workspace with the
-directive withheld must be refused, exactly as the R1 control arm was.
-
-Do **not** guess if it fails. Read `execution.behavior.observed` — its
-`Executed`, `Defects` and `BlockClass` fields name which capability or boundary
-diverged, which is the whole point of R4.
+Concretely, the R3 acceptance is the R2 benchmark passing:
+`inspect this project, find the incorrect greeting, fix it to "Hello", and verify
+the result.` must reach `PROVEN` with `index.html` discovered, inspected, mutated
+on disk, and verified — with the model's text never treated as evidence.
 
 ### Also open
+
+The behavioural repair path (§2, item 6) remains open and distinct: give the live
+workspace a genuinely broken document and assert on `execution.behavior.observed`
+that a real defect, a real repair and a `repairs > 0` re-observation occur. That
+is a separate capability from R2's target discovery.
 
 1. **§14's per-model budget table is still scripted-only.** Every live call in
    the R1 experiment reported `finish=stop` with no truncation, so

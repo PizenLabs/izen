@@ -1,7 +1,8 @@
 # EXECUTION FORENSICS
 
 **Status:** R1 **PROVEN** by live execution — instrumented, benchmarked, root-caused, closed
-**Scope:** `$prompt` execution, runtime loop, continuation, output budgets, evidence, verification, completion
+**R2:** **BLOCKED** — a real-agentic-repair benchmark over the real local model. Discovery runs and finds the file; the runtime then refuses to bind a target it was never given and correctly parks. One independent defect on the path (a repair objective routed to zero-context casual chat) was found and fixed. Full evidence in [§R2 REAL AGENTIC REPAIR](#r2-real-agentic-repair).
+**Scope:** `$prompt` execution, runtime loop, continuation, output budgets, evidence, verification, completion, multi-step discovery
 **Branch:** `fix/runtime` (base `f40f369`)
 **Full repository suite:** green (`go test ./...`); `-race` green on execution, events, forensics, architecture, runtime, ui
 
@@ -145,6 +146,9 @@ trace.
 | `TestForensicReaderAccusesOnlyOnObservedIncompleteness` | …but an entered gate with no verdict does |
 | **`TestCompletionWithoutEvidenceDetectorIsAlive`** | the dead detector can fire again |
 | `TestBehavioralRecordSeparatesGrantedFromExecuted` | a permission is never rendered as an observation |
+| **`TestIsCasualChat_CodingTasks`** (R2) | **a repair objective that writes the value `"Hello"` is not casual chat** |
+| **`TestSelect_RepairObjectiveWithGreetingValueIsNotCasual`** (R2) | **the R2 objective carries mutation semantics, not direct response** |
+| **`TestR2_TargetlessRepairObservesButDoesNotDispatch`** (R2) | **deterministic: targetless repair discovers its candidate, binds nothing, dispatches nothing, mutates nothing, parks** |
 
 `internal/execution/verification_publish_test.go` — pins the executor seam that
 routes a real `VerificationReport` to its own graph transition, and that an
@@ -154,6 +158,13 @@ absent report publishes nothing rather than inventing a verdict.
 needs a local model server and is deliberately **not** part of `go test ./...`,
 which must stay hermetic. The deterministic proof of R1 lives in
 `test/forensics` and runs always; this package is the live confirmation.
+
+`test/live_r2/` — the R2 real-agentic-repair experiment, also opt-in via
+`IZEN_LIVE_FORENSICS=1`. It carries the benchmark measurement
+(`TestLiveR2_Observation`), the downstream-chain diagnostic
+(`TestLiveR2_DiagnosticDeclaredKind`, PROVEN), and the acceptance test
+(`TestLiveR2_AcceptanceChain`, currently FAIL by design — R2 is BLOCKED at
+`discovery→inspection`).
 
 ### Test matrix (§17) — populated from actual runs, not expectations
 
@@ -167,6 +178,8 @@ which must stay hermetic. The deterministic proof of R1 lives in
 | F failure | 1024, 1024 | 2 | 1 | **none** | n/a | `awaiting_human` |
 | **LIVE R1 (`$prompt`)** | **512, 1024** | **2** | **1** | **applied, `fs_changed=true`** | **started → not_applicable** | **`completed`** |
 | **LIVE R1 control (withheld)** | 512, 1024 | 2 | 1 | applied | not_applicable | **`awaiting_human`** (behavioral refusal) |
+| **LIVE R2 benchmark (no filename)** | 512 | 1 (requirement pass only) | 0 | **none** | not entered | **`awaiting_human`** (disambiguate) — **BLOCKED** |
+| **LIVE R2 diagnostic (declares HTML)** | 512, 1024 | 2 | 1 | **applied, `fs_changed=true`, `+1/-1`** | **started → not_applicable** | **`completed`** |
 
 Benchmark B's continuation line, verbatim:
 
@@ -629,6 +642,236 @@ only on rare traces. Both were fixed and pinned.
 
 ---
 
+## R2 REAL AGENTIC REPAIR
+
+**R2 STATUS: BLOCKED.** The benchmark objective names no file, so the runtime
+must *discover* its target. It does — bounded discovery observes `index.html` —
+and then the authorization boundary refuses to bind a target it was never given,
+parks for disambiguation, and no inspection, mutation, observation, verification
+or objective evaluation occurs. The first incorrect transition on the way in (a
+repair objective classified as casual chat) was found, fixed and pinned. The
+**downstream** chain is independently PROVEN with the same real model when the
+objective declares the artifact kind, which isolates the block to targetless
+discovery rather than the loop.
+
+### Setup
+
+| | |
+|---|---|
+| Model | **ollama / `qwen2.5-coder:7b`** — the same real local model as R1 |
+| Workspace | isolated `t.TempDir()`, git-initialised with one commit |
+| Workspace content | `index.html` with an obviously wrong greeting: `<h1 id="greeting">Helo</h1>` |
+| **Benchmark objective** | `inspect this project, find the incorrect greeting, fix it to "Hello", and verify the result.` — **names no file** |
+| Composition | `compose.Wire(WithRoot, WithConfig, WithProvider)` — real driver, real executor, real policy engine, real behavioral stage |
+| Directive | `driver.SetScope("$prompt")` — the exact production push |
+| Harness | `test/live_r2/` (opt-in via `IZEN_LIVE_FORENSICS=1`) |
+
+The harness deliberately does **not** answer a clarification/disambiguation
+boundary. Answering with the filename would substitute human discovery for
+runtime discovery, which is the exact confusion this experiment exists to avoid.
+It answers only an approval boundary (a review of a produced candidate).
+
+### Arm 1 — the benchmark (names no file): BLOCKED
+
+The reconstructed trace is authoritative-runtime-events only:
+
+```text
+AUTHORIZATION
+  verdict:   disambiguate
+  granted:   false  blocked: true
+  authority: preflight_admission_gate
+  intent:    MUTATE   scope: UNRESOLVED   mode: $prompt
+  targets:   (none)
+  reason:    the target is unresolved and the workspace offers 1 candidate(s);
+             the human must name the target before any provider call
+
+EXECUTION SPEC (frozen before dispatch)
+  intent:        MUTATE
+  strategy:      multi_file_planning
+  contract:      agentic_loop  ceiling: execute
+  targets:       (none)
+  boundary:      UNBOUND   evidence: (none)
+  channels:      (none)
+  scope:         UNRESOLVED (the objective declares no artifact kind …)
+  derivation:    UNRESOLVED kinds=(none)
+  req_budget:    1536
+
+MODEL CALLS
+  CALL #1  (the read-only requirement-derivation pass)
+    provider:    ollama / qwen2.5-coder:7b
+    requested:   512 output tokens
+    effective:   unobserved (no truncation observed)
+    prompt:      248 tokens / 1164 chars
+    completion:  2 tokens / 2 chars
+    finish:      stop   truncated: false
+
+EVIDENCE
+  mutations:     (none)
+  verifications: UNKNOWN — the runtime published no verification record.
+
+LOOP TRANSITIONS
+  idle         → observing    continue   user objective: …
+  observing    → deciding     continue   observation consumed
+  deciding     → awaiting_human ask_human  the target is unresolved and the workspace offers 1 candidate(s) …
+
+EXECUTION SUMMARY
+  status:        awaiting_human
+  model_calls:   0 (executor lane); 1 read-only requirement pass
+  continuations: 0
+  patterns:      none detected
+```
+
+The **only** model call is the requirement-derivation pass, and its prompt
+explicitly tells the model `RESOLVED TARGETS: (none resolved yet — propose no
+requirements)`. It receives no file bytes and returns no requirements
+(`[objective] requirement derivation unavailable: … payload carried no
+requirement text`). The workspace is byte-identical to the baseline.
+
+### The fourteen questions, answered from the trace
+
+| # | Question | Authoritative answer |
+|---|---|---|
+| 1 | Did the runtime discover the relevant file? | **YES.** Bounded discovery observed exactly one candidate, `index.html`, and the admission boundary carried it as the disambiguation option (`options=[index.html]`). The activity log records `[discovery] REQUIRED: operation=MODIFY scope=UNRESOLVED target=DEFERRED`. |
+| 2 | Did it inspect the file? | **NO.** `channels: (none)` — no context channel was bound, so the model never received the file bytes. The requirement pass is told the resolved target list is empty. |
+| 3 | Which model call produced the repair decision? | **NONE.** No repair decision exists. The single call was the read-only requirement pass; it produced 2 output tokens and no requirement. |
+| 4 | What context did that call receive? | The requirement-pass system prompt plus `USER OBJECTIVE: <objective>` and `RESOLVED TARGETS: (none resolved yet — propose no requirements)`. 248 prompt tokens / 1164 chars. **No workspace context.** |
+| 5 | Requested output budget? | **512** for call #1 (the requirement-pass ceiling). The frozen spec's mutation budget is 1536. |
+| 6 | Effective output budget? | **Unobserved** — no truncation occurred, so no smaller ceiling was demonstrated. Provider reported 2 completion tokens. |
+| 7 | Normal finish or `length`? | **`stop`**, `truncated=false`. |
+| 8 | If `length`, what next? | **N/A** — no `length`. |
+| 9 | Did the next step have materially new state/context? | **N/A** — there was no continuation. |
+| 10 | Did the next step make progress? | **N/A** — no continuation. |
+| 11 | Was the mutation applied? | **NO.** `mutations: 0`; `index.html` on disk still holds `Helo`. |
+| 12 | Was the changed state observed? | **NO** — there is no changed state to observe. |
+| 13 | Was verification entered? | **NO.** `verifications: UNKNOWN`; the gate was never entered. |
+| 14 | Was the final objective PROVEN? | **NO.** No `objective.evaluated` was published. Final state `awaiting_human`. |
+
+### Continuation analysis
+
+There was **no continuation**. `continuations: 0`, one provider call, and the
+loop moved `deciding → awaiting_human` and stopped. `NON_PROGRESSING_CONTINUATION`
+did **not** fire, and correctly so: there is no repeated call to accuse.
+
+### Token exhaustion
+
+Not reached. Every live call in both arms reported `finish_reason=stop`,
+`truncated=false`. No `length`, therefore no continuation, therefore no
+`call #1`/`call #2` budget comparison. The effective budget remains
+`unobserved` for the same reason as R1: no smaller ceiling was demonstrated.
+
+### The first incorrect transition
+
+The chain was walked transition by transition. The **first incorrect transition
+on the benchmark path was the objective→capability classification**:
+
+```
+objective → authorization → discovery → inspection → model computation → decision → mutation → …
+   OK           OK            OK          ✗
+```
+
+A repair objective was routed to **`direct_response`** — the zero-context casual
+path — because the *value to write*, `"Hello"`, is also a
+`casualGreetingPatterns` entry:
+
+```
+strategy = direct_response
+reason   = "casual greeting / direct chat; answered directly, zero repository context"
+```
+
+The frozen spec recorded `intent: MUTATE` with `strategy: direct_response` — a
+read-only strategy under a mutation intent. This is a **CAPABILITY_SELECTION_FAILURE**:
+the runtime selected a conversational capability for a workspace repair.
+
+Fix (one rule at the identified owner, `internal/gateway/chat.go`): a message
+that contains an explicit workspace action (`fix`, `verify`, `change`, `inspect`,
+…) is never casual. A greeting word inside an instruction is the value to write,
+not small talk. Matching stays whole-word/whole-phrase, exactly like the existing
+`fileRefIndicatorPatterns` and greeting tables, so `address` never matches `add`
+and `created` never matches `create`.
+
+After the fix the benchmark's spec is `strategy: multi_file_planning` (a
+mutation-semantics proposal contract), not `direct_response`. **Re-running the
+same benchmark produces the same block**, one transition later and unchanged in
+cause: the runtime discovers `index.html` but the authorization boundary will not
+bind a target the objective did not name.
+
+### Why the benchmark stays BLOCKED
+
+The blocking transition is `discovery → inspection`. Its cause is a deliberate,
+test-pinned property of the runtime, not an incidental bug:
+
+- discovery candidates are **evidence, never authority** (`I13`); and
+- evidence-bound scope derivation binds only files that satisfy an artifact kind
+  **the objective itself declared** (`internal/execution/derive.go`), and the
+  benchmark declares none.
+
+So the runtime is *structurally* correct to refuse: binding `index.html` because
+a scan happened to return it would be exactly the "arbitrary file" hazard the
+invariant forbids. Enabling targetless discovery to reach mutation means adding a
+discovery→inspection→decision capability at the authorization boundary. That is a
+redesign of the authorization architecture, which this experiment is explicitly
+forbidden to undertake. Hence: **BLOCKED**, recorded, not worked around.
+
+### Arm 2 — the diagnostic (declares the artifact kind): PROVEN
+
+To separate "targetless discovery cannot resolve" from "the downstream chain is
+broken", the same workspace and the same no-filename shape were run with an
+objective that *declares the kind* — the one condition under which discovery can
+bind without a human:
+
+> `inspect this project, find the incorrect message in the HTML, fix it to "Welcome", and verify the result.`
+
+Every stage then executes against the real model:
+
+| Stage | Authoritative evidence |
+|---|---|
+| authorization | `allow`, `granted=true`, `intent=MUTATE`, `scope=RESOLVED`, `targets=[index.html]` |
+| discovery (derivation) | `derivation: UNIQUE kinds=html` → `index.html` bound from OBSERVED files |
+| inspection | spec `channels: [target:index.html]`; context compiled `policy=target_file_only`, `Truncated=false`; the mutation prompt is 419 tokens / 1767 chars (carries file bytes) |
+| model computation | call #1 requirement pass (512 → 42 tokens, `stop`); call #2 mutation (1024 → 51 tokens, `stop`) |
+| decision | 3 continuation decisions; step 3 `complete` **REWRITTEN by `objective_completion_authority`** |
+| mutation | `target=index.html outcome=changed artifact=true apply_executed=true fs_changed=true diff=+1/-1` |
+| observation | workspace read from disk: `<h1 id="greeting">Welcome</h1>` |
+| verification | `STARTED` → `NOT_APPLICABLE` — "no verification configured for language html" |
+| objective evaluation | `objective.evaluated: state=PROVEN granted=true mutations=1` (authority `objective_completion_authority`) |
+| completion | summary `completed` — "objective satisfied: changed; objective PROVEN by evidence" |
+| forensic patterns | none detected |
+
+The mutation is confirmed on disk, never inferred from model text. The
+diagnostic is retained as a live integration test
+(`TestLiveR2_DiagnosticDeclaredKind`), and the benchmark is retained as a live
+acceptance test (`TestLiveR2_AcceptanceChain`) that currently **fails** at
+`discovery→inspection` — the honest red state of a BLOCKED result.
+
+### Reproduce
+
+```
+ollama serve
+IZEN_LIVE_FORENSICS=1 go test ./test/live_r2/ -v -timeout 1200s
+# TestLiveR2_Observation            PASS   — the benchmark measurement (BLOCKED)
+# TestLiveR2_DiagnosticDeclaredKind PASS   — the downstream chain (PROVEN)
+# TestLiveR2_AcceptanceChain        FAIL   — R2 acceptance, blocked at discovery→inspection
+```
+
+The deterministic regression for the classification defect runs always:
+
+```
+go test ./internal/gateway/ ./internal/execution/strategy/
+# TestIsCasualChat_CodingTasks                       (the repair-with-"Hello" cases)
+# TestSelect_RepairObjectiveWithGreetingValueIsNotCasual
+```
+
+Both were verified to fail when the `chat.go` rule is reverted.
+
+The deterministic pin of the BLOCKED boundary also runs always (no model):
+
+```
+go test ./internal/runtime/autonomy/ -run TestR2_TargetlessRepairObservesButDoesNotDispatch -v
+# discovery observed index.html; 0 provider calls; 0 mutations; parked at clarify
+```
+
+---
+
 ## REMAINING UNKNOWN
 
 1. **Benchmark C did not exercise the contract-recovery path.** The scripted
@@ -663,6 +906,21 @@ only on rare traces. Both were fixed and pinned.
    model proposing a fix from a real observed defect — has only been exercised
    with a scripted proposer.
 
+7. **Targetless discovery cannot reach mutation (R2's BLOCKER).** A mutating
+   objective that names no file and declares no artifact kind observes its
+   candidates and then correctly parks at disambiguation; the authorization
+   boundary will not bind evidence as a target (I13), and the evidence-bound
+   derivation binds only declared artifact kinds. This is a recorded,
+   out-of-scope architectural boundary, not a bug fixed here. The R2 diagnostic
+   shows the whole downstream chain is sound when the scope *can* resolve.
+
+8. **The casual-chat classifier was over-eager (R2's fix).** A message that
+   contained a greeting word anywhere — including inside a repair instruction's
+   replacement value — was routed to the zero-context direct-response path. Fixed
+   at `internal/gateway/chat.go` with a workspace-action guard, pinned by
+   `TestIsCasualChat_CodingTasks` and
+   `TestSelect_RepairObjectiveWithGreetingValueIsNotCasual`.
+
 ---
 
 ## WHAT WAS NOT TOUCHED
@@ -674,3 +932,9 @@ demonstrate a defect in any of them:
 `ContextSpec` / `ExecutionSpec` separation · `ObjectiveCompletionAuthority` ·
 `PatchManager` · `MutationSet` · `internal/providers` transport · dynamic model
 discovery · ohgo
+
+R2 is the concrete application of that boundary: the benchmark's blocking
+transition (a discovered candidate cannot be bound as a target for an objective
+that never named one and declared no artifact kind) lives in the target-binding /
+admission path, so it was **recorded as BLOCKED rather than redesigned**. The one
+R2 change is outside it: the `IsCasualChat` classification guard.

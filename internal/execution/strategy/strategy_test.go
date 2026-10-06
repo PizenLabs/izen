@@ -533,3 +533,21 @@ func TestSelectNeverScansRepositoryForTargeted(t *testing.T) {
 		t.Fatal("targeted mutation must not require conversation history")
 	}
 }
+
+// TestSelect_RepairObjectiveWithGreetingValueIsNotCasual pins the R2 defect: an
+// objective that corrects a greeting TO the literal value "Hello" was classified
+// as casual chat, so the whole repair ran under the zero-context direct-response
+// path. In a repair instruction a greeting word is the value to write, not small
+// talk, and the strategy must carry mutation semantics.
+func TestSelect_RepairObjectiveWithGreetingValueIsNotCasual(t *testing.T) {
+	objective := `inspect this project, find the incorrect greeting, fix it to "Hello", and verify the result.`
+	p := Select(objective, deps(t, map[string]string{"index.html": "<h1>Helo</h1>"}))
+	if p.Strategy == DirectResponse {
+		t.Fatalf("strategy = %s — a repair objective was routed to zero-context casual chat (%q)",
+			p.Strategy, p.StrategyReason)
+	}
+	if MutationSemanticsOf(p.Strategy) == MutationSemanticsReadOnly {
+		t.Fatalf("strategy = %s carries %s semantics; the objective asks to fix and verify",
+			p.Strategy, MutationSemanticsOf(p.Strategy))
+	}
+}
