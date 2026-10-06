@@ -211,7 +211,7 @@ func TestRunAllFor_UsesTheTargetsOwnContractWhenItHasOne(t *testing.T) {
 // meaning.
 func TestRunAllStillAnswersForTheEnclosingWorkspace(t *testing.T) {
 	v := NewLanguageVerifier(t.TempDir(), language.HTML)
-	if !v.RunAll(t.Context(), ).Skipped {
+	if !v.RunAll(t.Context()).Skipped {
 		t.Fatal("an html workspace with no contract must remain not-applicable on RunAll")
 	}
 	if v.RunAllFor(t.Context(), "styles.css").Skipped != true {

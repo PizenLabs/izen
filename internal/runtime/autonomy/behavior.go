@@ -3,6 +3,7 @@ package autonomy
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/PizenLabs/izen/internal/core/domain"
@@ -160,19 +161,23 @@ func (s *BehaviorStage) Stage(ctx context.Context, objective string, provenance 
 		// nothing was attempted, and no amount of retrying would supply a
 		// proposer. Reporting it as CAPABILITY_FAILED would send an operator
 		// looking for a transient fault that does not exist.
-		return BehaviorResult{Block: &capability.Block{
+		out := BehaviorResult{Block: &capability.Block{
 			Class:  capability.FailureCapabilityMissing,
 			Reason: "no reasoning backend is bound to the behavioral stage; repairs cannot be proposed",
 		}}
+		s.emitObserved(objective, capability.Grant{}, nil, out)
+		return out
 	}
 	caps, ok := s.adapter.grantSnapshot(provenance)
 	if !ok {
 		// No usable capability set means no grant can be derived. Reporting this
 		// is the truthful outcome; assuming read access would be an escalation.
-		return BehaviorResult{Block: &capability.Block{
+		out := BehaviorResult{Block: &capability.Block{
 			Class:  capability.FailureAuthorizationBlocked,
 			Reason: "no workspace capability set is bound; no capability can be granted",
 		}}
+		s.emitObserved(objective, capability.Grant{}, nil, out)
+		return out
 	}
 	grant := execution.GrantFor(provenance, caps)
 
@@ -191,10 +196,12 @@ func (s *BehaviorStage) Stage(ctx context.Context, objective string, provenance 
 		Bounds:    s.bounds,
 	})
 	if err != nil {
-		return BehaviorResult{Block: &capability.Block{
+		out := BehaviorResult{Block: &capability.Block{
 			Class:  capability.FailureCapabilityFailed,
 			Reason: err.Error(),
 		}}
+		s.emitObserved(objective, grant, nil, out)
+		return out
 	}
 
 	s.publish("[behavior] " + objective)
@@ -208,12 +215,79 @@ func (s *BehaviorStage) Stage(ctx context.Context, objective string, provenance 
 	if n := result.Final.DefectCount(); n > 0 {
 		out.DefectLine = result.Final.DefectLine()
 	}
+	// The pass's own evidence is the record of what it DID, so the structured
+	// event carries it rather than a prose fragment of it. A reader asking
+	// "did the runtime serve the workspace, or did it claim to?" must be able to
+	// answer from a structured field, because the decision reason this evidence
+	// also appears in is bounded and truncates exactly that clause.
+	s.emitObserved(objective, grant, result.Final.Proof, out)
 	if out.Proven {
 		s.publish(fmt.Sprintf("[behavior] PROVEN after %d repair(s); evidence: %s", out.Repairs, out.EvidenceLine))
 	} else {
 		s.publish(fmt.Sprintf("[behavior] UNPROVEN after %d repair(s): %s", out.Repairs, behaviorReason(out)))
 	}
 	return out
+}
+
+// emitObserved publishes the structured record of one behavioral pass.
+//
+// The `Executed` list is derived from the pass's OWN evidence records, never from
+// the grant: the grant says what the pass was ALLOWED to do, and the evidence
+// says what it DID. Collapsing the two would let a reader mistake a permission
+// for an observation — which is the specific confusion this record exists to
+// remove.
+//
+// A REFUSED capability is excluded. `capability.Refuse` returns an evidence
+// record like any other, so a naive derivation would list `runtime.serve` as
+// "executed" for a pass that was refused at the authorization boundary and never
+// started anything. The refusal is recorded faithfully by BlockClass/BlockReason
+// instead, where it cannot be mistaken for a success.
+func (s *BehaviorStage) emitObserved(objective string, grant capability.Grant, proof []capability.Evidence, out BehaviorResult) {
+	if s == nil || s.bus == nil {
+		return
+	}
+	executed := make([]string, 0, len(proof))
+	seen := map[string]bool{}
+	for _, ev := range proof {
+		if ev.Capability == "" || seen[string(ev.Capability)] {
+			continue
+		}
+		if ev.Field("denied") == "true" || ev.Class == capability.FailureAuthorizationBlocked ||
+			ev.Class == capability.FailureCapabilityMissing {
+			continue
+		}
+		seen[string(ev.Capability)] = true
+		executed = append(executed, string(ev.Capability))
+	}
+	sort.Strings(executed)
+
+	payload := events.BehaviorObservedPayload{
+		Proven:          out.Proven,
+		GrantProvenance: grant.Provenance,
+		Granted:         grant.Names(),
+		Executed:        executed,
+		Repairs:         out.Repairs,
+		Defects:         out.DefectLine,
+		Evidence:        behaviorEvidenceLine(out.EvidenceLine),
+		Objective:       behaviorEvidenceLine(objective),
+		Authority:       AuthorityBehaviorGate,
+	}
+	if out.Block != nil {
+		payload.BlockClass = string(out.Block.Class)
+		payload.BlockReason = behaviorEvidenceLine(out.Block.Reason)
+	}
+	s.bus.Publish(events.NewBehaviorObserved(payload))
+}
+
+// behaviorEvidenceLine bounds a behavioral evidence line so the durable record
+// cannot be grown by an unbounded observation log.
+func behaviorEvidenceLine(s string) string {
+	s = strings.TrimSpace(s)
+	const max = 2000
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 func behaviorReason(r BehaviorResult) string {

@@ -100,6 +100,19 @@ const (
 	EventMutationStarted       = "execution.mutation.started"
 	EventMutationCompleted     = "execution.mutation.completed"
 	EventVerificationCompleted = "execution.verification.completed"
+	// EventVerificationStarted is the ENTRY record of the verification stage,
+	// deliberately NOT the completed type.
+	//
+	// `execution.verification.completed` is ordered by the canonical lifecycle:
+	// mutation.started → mutation.completed → verification.completed →
+	// execution.finished. Publishing an entry marker on that type would place a
+	// "verification" record before mutation.completed and break the invariant
+	// that no stage reports completion ahead of the boundary it follows. Entry and
+	// completion are different facts, so they are different events.
+	//
+	// It exists because a run interrupted INSIDE the gate would otherwise leave a
+	// record indistinguishable from one that never reached verification.
+	EventVerificationStarted = "execution.verification.started"
 	// EventExecutionEvidence is the terminal AUTHORITATIVE record of one
 	// execution attempt (Phase 2 P2). It is emitted exactly once per
 	// execution, by the runtime, when the attempt terminates. Downstream
@@ -241,6 +254,40 @@ const (
 	EventStateCommitted        = "reasoning.state.committed"
 	EventStateRejected         = "reasoning.state.rejected"
 	EventBudgetRecalculated    = "reasoning.budget.recalculated"
+
+	// ── EXECUTION FORENSICS: THE CONTROL PLANE ─────────────────────────
+	//
+	// The events above describe ONE execution attempt. They do not, on their
+	// own, answer the questions an operator must be able to answer after the
+	// process exits:
+	//
+	//	Was this run authorized, and under what boundary?
+	//	What ExecutionSpec was frozen before anything was dispatched?
+	//	Why did the runtime choose to execute ANOTHER step?
+	//	Why was the objective declared PROVEN (or not)?
+	//	What were the run's totals — calls, steps, continuations, tokens,
+	//	mutations, verification, termination reason?
+	//
+	// Each event below is emitted at exactly ONE real runtime transition, and
+	// none of them is synthesised by the presentation layer. They are the
+	// control-plane record the LLM stream cannot supply.
+	EventExecutionAuthorized   = "execution.authorized"
+	EventExecutionSpecFrozen   = "execution.spec.frozen"
+	EventContinuationEvaluated = "continuation.evaluated"
+	EventContinuationSelected  = "continuation.selected"
+	EventObjectiveEvaluated    = "objective.evaluated"
+	EventExecutionSummary      = "execution.summary"
+	// EventBehaviorObserved is the authoritative record of ONE behavioral
+	// observation pass: the capability grant the pass executed under, the
+	// capabilities it actually invoked, and its real verdict.
+	//
+	// It exists because a capability execution was otherwise observable only as a
+	// fragment of prose inside a decision reason, where a bounded reason string
+	// truncates it away. "Did the runtime actually serve the workspace, or did it
+	// merely claim to?" is the exact question a forensic reader has to answer,
+	// and it must be answerable from a structured record rather than by
+	// grepping a sentence that may have been cut off mid-clause.
+	EventBehaviorObserved = "execution.behavior.observed"
 )
 
 // FailureClassification is the taxonomy used by EventExecutionFailed. It is
@@ -384,6 +431,184 @@ type BudgetRecalculatedPayload struct {
 	PrevMaxTokens int
 	NextMaxTokens int
 	Reason        string
+}
+
+// ── EXECUTION FORENSICS PAYLOADS ─────────────────────────────────────────────
+//
+// Every payload below is SCALARS AND ENUMS ONLY. No prompt text, no model
+// output, no artifact bytes. That is not a privacy preference alone: a forensic
+// record that carried the content it is meant to explain could not be trusted
+// as independent evidence, and it would bloat the durable audit log with exactly
+// the bytes the control plane is supposed to be able to reason about without
+// re-reading.
+
+// ExecutionAuthorizedPayload records the authorization verdict for one bounded
+// run: what was asked for, what boundary it was admitted under, and which
+// authority granted it. Granted=false with Blocked=true is a REFUSAL and is a
+// first-class outcome, not an absent event.
+type ExecutionAuthorizedPayload struct {
+	RunID        string   `json:"run_id,omitempty"`
+	SessionID    string   `json:"session_id,omitempty"`
+	Granted      bool     `json:"granted"`
+	Blocked      bool     `json:"blocked"`
+	Verdict      string   `json:"verdict,omitempty"` // allow | deny | disambiguate | inadmissible
+	Reason       string   `json:"reason,omitempty"`
+	ReasonCode   string   `json:"reason_code,omitempty"`
+	Scope        string   `json:"scope,omitempty"`
+	Mode         string   `json:"mode,omitempty"`
+	Targets      []string `json:"targets,omitempty"`
+	Intent       string   `json:"intent,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	// Authority names the component that produced the verdict. It is the
+	// answer to "which component decided it?".
+	Authority string `json:"authority,omitempty"`
+	ProtocolTelemetry
+}
+
+// ExecutionSpecFrozenPayload records the ExecutionSpec the runtime committed to
+// BEFORE dispatching anything. Frozen is the load-bearing word: once a spec is
+// frozen, the run's bounds are the ones below, not the ones a later step would
+// prefer.
+type ExecutionSpecFrozenPayload struct {
+	RunID               string   `json:"run_id,omitempty"`
+	SessionID           string   `json:"session_id,omitempty"`
+	Intent              string   `json:"intent,omitempty"`
+	Strategy            string   `json:"strategy,omitempty"`
+	InteractionContract string   `json:"interaction_contract,omitempty"`
+	ContractID          string   `json:"contract_id,omitempty"`
+	AuthorityCeiling    string   `json:"authority_ceiling,omitempty"`
+	Targets             []string `json:"targets,omitempty"`
+	ExplicitTargets     []string `json:"explicit_targets,omitempty"`
+	ContextChannels     []string `json:"context_channels,omitempty"`
+	MutationBoundary    string   `json:"mutation_boundary,omitempty"`
+	WorkspaceEvidence   string   `json:"workspace_evidence,omitempty"`
+	ScopeState          string   `json:"scope_state,omitempty"`
+	ScopeReason         string   `json:"scope_reason,omitempty"`
+	DerivationState     string   `json:"derivation_state,omitempty"`
+	DerivationKinds     []string `json:"derivation_kinds,omitempty"`
+	WorkspaceDigest     string   `json:"workspace_digest,omitempty"`
+	// Evidence is the admission-time evidence axis (PRODUCED / NONE): did the
+	// spec carry authoritative, non-empty workspace evidence?
+	Evidence              string `json:"evidence,omitempty"`
+	RequestedOutputTokens int    `json:"requested_output_tokens,omitempty"`
+	RequestedOutputBudget int    `json:"requested_output_budget,omitempty"`
+	ProtocolTelemetry
+}
+
+// ContinuationDecisionPayload records ONE continuation decision: what the
+// decision matrix proposed, what the authorities changed it to, and why.
+//
+// Proposed vs Selected is the distinction the whole forensic trace turns on. The
+// matrix proposes; the completion authority, the behavioural gate and the
+// contract-recovery circuit breaker may rewrite the proposal before the loop
+// applies it. Publishing only the selected action makes an authority rewrite
+// indistinguishable from the matrix having decided that on its own.
+//
+// Rewritten is true whenever any authority changed the action.
+type ContinuationDecisionPayload struct {
+	RunID         string `json:"run_id,omitempty"`
+	SessionID     string `json:"session_id,omitempty"`
+	Step          int    `json:"step,omitempty"`
+	Attempt       int    `json:"attempt,omitempty"`
+	RecoveryCycle int    `json:"recovery_cycle,omitempty"`
+	Outcome       string `json:"outcome,omitempty"`
+	FailureClass  string `json:"failure_class,omitempty"`
+
+	ProposedAction string `json:"proposed_action,omitempty"`
+	ProposedReason string `json:"proposed_reason,omitempty"`
+	SelectedAction string `json:"selected_action,omitempty"`
+	SelectedReason string `json:"selected_reason,omitempty"`
+	Rewritten      bool   `json:"rewritten"`
+
+	PreviousState string `json:"previous_state,omitempty"`
+	NextState     string `json:"next_state,omitempty"`
+
+	// Authorities names, in order, every authority that inspected or rewrote
+	// the proposal on this decision.
+	Authorities []string `json:"authorities,omitempty"`
+
+	ObjectiveState string   `json:"objective_state,omitempty"`
+	PendingWork    string   `json:"pending_work,omitempty"`
+	Targets        []string `json:"targets,omitempty"`
+	Evidence       string   `json:"evidence,omitempty"`
+	ProtocolTelemetry
+}
+
+// ObjectiveEvaluatedPayload records the completion authority's verdict for one
+// decision point: the canonical objective state, the specific obligation that
+// was or was not discharged, and the evidence the verdict was derived from.
+type ObjectiveEvaluatedPayload struct {
+	RunID           string   `json:"run_id,omitempty"`
+	SessionID       string   `json:"session_id,omitempty"`
+	State           string   `json:"state,omitempty"` // proven | unsubstantiated | partial | unobserved
+	Proposed        string   `json:"proposed,omitempty"`
+	Granted         bool     `json:"granted"`
+	Reason          string   `json:"reason,omitempty"`
+	UnmetClause     string   `json:"unmet_clause,omitempty"`
+	Requirements    int      `json:"requirements,omitempty"`
+	Discharged      int      `json:"discharged,omitempty"`
+	Behaviors       int      `json:"behaviors,omitempty"`
+	BehaviorsProven int      `json:"behaviors_proven,omitempty"`
+	Targets         []string `json:"targets,omitempty"`
+	Mutations       int      `json:"mutations,omitempty"`
+	Verified        bool     `json:"verified"`
+	Authority       string   `json:"authority,omitempty"`
+	ProtocolTelemetry
+}
+
+// ExecutionSummaryPayload is the terminal, self-contained record of one bounded
+// run. It exists so a run can be reconstructed and audited WITHOUT replaying
+// the event stream — and so the counters that answer "how much did this cost"
+// are a runtime-owned fact rather than something a projection counts.
+type ExecutionSummaryPayload struct {
+	RunID     string `json:"run_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	// Revision is the 1-based terminal observation of this run. A run that parks
+	// at a human boundary publishes one summary for the park and another when the
+	// resume reaches a terminal state, so the LAST revision is the outcome.
+	Revision int `json:"revision"`
+
+	Objective string `json:"objective,omitempty"`
+	// Status is the terminal runtime state: completed | unsubstantiated |
+	// aborted | awaiting_human.
+	Status string `json:"status,omitempty"`
+	// TerminationReason is the runtime's OWN reason string for the terminal
+	// transition.
+	TerminationReason string `json:"termination_reason,omitempty"`
+	TerminationState  string `json:"termination_state,omitempty"`
+	Parked            bool   `json:"parked"`
+	BoundaryAction    string `json:"boundary_action,omitempty"`
+
+	ModelCalls      int `json:"model_calls"`
+	ModelFailures   int `json:"model_failures"`
+	OutputExhausted int `json:"output_exhausted"`
+	RuntimeSteps    int `json:"runtime_steps"`
+	Continuations   int `json:"continuations"`
+	Attempts        int `json:"attempts"`
+	RecoveryCycles  int `json:"recovery_cycles"`
+
+	InputTokens           int      `json:"input_tokens"`
+	OutputTokens          int      `json:"output_tokens"`
+	TotalTokens           int      `json:"total_tokens"`
+	UsageKnown            bool     `json:"usage_known"`
+	RequestedOutputBudget int      `json:"requested_output_budget,omitempty"`
+	EffectiveOutputBudget int      `json:"effective_output_budget,omitempty"`
+	ObservedFinishReasons []string `json:"observed_finish_reasons,omitempty"`
+
+	Mutations            int      `json:"mutations"`
+	MutationOutcomes     []string `json:"mutation_outcomes,omitempty"`
+	Verifications        int      `json:"verifications"`
+	VerificationPassed   bool     `json:"verification_passed"`
+	VerificationObserved bool     `json:"verification_observed"`
+
+	Providers []string `json:"providers,omitempty"`
+	Models    []string `json:"models,omitempty"`
+
+	// Patterns lists the anti-patterns the run exhibited, by stable name
+	// (PREMATURE_TERMINATION, REPEATED_IDENTICAL_EXECUTION, ...). Empty means
+	// the trace exhibited none of the known failure shapes.
+	Patterns []string `json:"patterns,omitempty"`
+	ProtocolTelemetry
 }
 
 // StageCompletedPayload carries the completion of a pipeline stage.
@@ -584,34 +809,54 @@ type ContextCompilationPayload struct {
 // record. It intentionally omits raw prompt/response bytes and instead records
 // structural counts, timing and a prompt fingerprint.
 type ProviderExecutionPayload struct {
-	RequestID          string        `json:"request_id,omitempty"`
-	SessionID          string        `json:"session_id,omitempty"`
-	Provider           string        `json:"provider,omitempty"`
-	Model              string        `json:"model,omitempty"`
-	RequestStartedAt   time.Time     `json:"request_started_at,omitempty"`
-	FirstTokenAt       time.Time     `json:"first_token_at,omitempty"`
-	CompletedAt        time.Time     `json:"completed_at,omitempty"`
-	RequestDuration    time.Duration `json:"request_duration_ns,omitempty"`
-	Duration           time.Duration `json:"duration_ns,omitempty"`
-	FirstTokenLatency  time.Duration `json:"first_token_latency_ns,omitempty"`
-	StreamingDuration  time.Duration `json:"streaming_duration_ns,omitempty"`
-	UsageKnown         bool          `json:"usage_known"`
-	PromptTokens       int           `json:"prompt_tokens,omitempty"`
-	CompletionTokens   int           `json:"completion_tokens,omitempty"`
-	TotalTokens        int           `json:"total_tokens,omitempty"`
-	CachedTokens       int           `json:"cached_tokens,omitempty"`
-	ReasoningTokens    int           `json:"reasoning_tokens,omitempty"`
-	FinishReason       string        `json:"finish_reason,omitempty"`
-	Truncated          bool          `json:"truncated,omitempty"`
-	NativeSchema       bool          `json:"native_schema,omitempty"`
-	SchemaMode         string        `json:"schema_mode,omitempty"`
-	SchemaFallback     bool          `json:"schema_fallback,omitempty"`
-	PromptChars        int           `json:"prompt_chars,omitempty"`
-	OutputChars        int           `json:"output_chars,omitempty"`
-	PromptFingerprint  string        `json:"prompt_fingerprint,omitempty"`
-	HTTPAttempts       int           `json:"http_attempts,omitempty"`
-	RateLimitedRetries int           `json:"rate_limited_retries,omitempty"`
-	ErrorCode          string        `json:"error_code,omitempty"`
+	RequestID         string        `json:"request_id,omitempty"`
+	SessionID         string        `json:"session_id,omitempty"`
+	Provider          string        `json:"provider,omitempty"`
+	Model             string        `json:"model,omitempty"`
+	RequestStartedAt  time.Time     `json:"request_started_at,omitempty"`
+	FirstTokenAt      time.Time     `json:"first_token_at,omitempty"`
+	CompletedAt       time.Time     `json:"completed_at,omitempty"`
+	RequestDuration   time.Duration `json:"request_duration_ns,omitempty"`
+	Duration          time.Duration `json:"duration_ns,omitempty"`
+	FirstTokenLatency time.Duration `json:"first_token_latency_ns,omitempty"`
+	StreamingDuration time.Duration `json:"streaming_duration_ns,omitempty"`
+	UsageKnown        bool          `json:"usage_known"`
+	PromptTokens      int           `json:"prompt_tokens,omitempty"`
+	CompletionTokens  int           `json:"completion_tokens,omitempty"`
+	TotalTokens       int           `json:"total_tokens,omitempty"`
+	CachedTokens      int           `json:"cached_tokens,omitempty"`
+	ReasoningTokens   int           `json:"reasoning_tokens,omitempty"`
+	FinishReason      string        `json:"finish_reason,omitempty"`
+	Truncated         bool          `json:"truncated,omitempty"`
+	// RequestedOutputTokens is the output budget the runtime ASKED for on this
+	// exact call (the request's max_tokens), not a capability claim and not a
+	// profile default. It is the only place a consumer can learn what the
+	// runtime believed the model would be allowed to produce; without it a
+	// finish_reason="length" is unattributable.
+	RequestedOutputTokens int `json:"requested_output_tokens,omitempty"`
+	// EffectiveOutputTokens is the ceiling the provider ACTUALLY enforced,
+	// observed rather than assumed:
+	//
+	//	known            → the provider-reported completion count at truncation
+	//	                  (a response cut at a ceiling IS that ceiling)
+	//	truncated, count
+	//	unknown          → RequestedOutputTokens, because no smaller ceiling was
+	//	                  ever demonstrated
+	//
+	// When EffectiveOutputTokens < RequestedOutputTokens the provider silently
+	// capped the call: the budget was refused or reduced. That difference is the
+	// single most load-bearing number in an output-limit investigation.
+	EffectiveOutputTokens int    `json:"effective_output_tokens,omitempty"`
+	EffectiveOutputKnown  bool   `json:"effective_output_known"`
+	NativeSchema          bool   `json:"native_schema,omitempty"`
+	SchemaMode            string `json:"schema_mode,omitempty"`
+	SchemaFallback        bool   `json:"schema_fallback,omitempty"`
+	PromptChars           int    `json:"prompt_chars,omitempty"`
+	OutputChars           int    `json:"output_chars,omitempty"`
+	PromptFingerprint     string `json:"prompt_fingerprint,omitempty"`
+	HTTPAttempts          int    `json:"http_attempts,omitempty"`
+	RateLimitedRetries    int    `json:"rate_limited_retries,omitempty"`
+	ErrorCode             string `json:"error_code,omitempty"`
 	ProtocolTelemetry
 }
 
@@ -788,12 +1033,71 @@ type MutationCompletedPayload struct {
 // VerificationCompletedPayload records the deterministic verification result of
 // a mutation. Passed is the verifier's real verdict; Steps lists the executed
 // step names. It is never rendered "verified" without this real result.
+//
+// ── WHY THIS CARRIES A VERIFICATION OUTCOME AND NOT A BOOL ────────────────
+//
+// The forensic reader must be able to tell six real situations apart:
+//
+//	not_applicable  a verification contract was consulted and none exists for
+//	                this artifact's language (Applicable=false)
+//	skipped         the verification boundary was never reached at all
+//	started         the gate was entered and produced no verdict yet
+//	passed          the gate ran and every step held
+//	failed          the gate ran and a step did not hold
+//	unknown         the runtime published no verification record whatsoever
+//
+// `Applicable` alone cannot express the first two: BOTH are "no verdict", and
+// they mean opposite things. "Not applicable" is an OBSERVATION — the runtime
+// asked and found that verification does not exist for this artifact, so the
+// mutation is as verified as this toolchain can make it. "Skipped" is the
+// ABSENCE of an observation: the boundary was never crossed. A forensic reader
+// that renders both as one state cannot distinguish a runtime that correctly
+// reported a missing gate from one that never consulted it, and the
+// UNVERIFIED_MUTATION detector then fires on every plain-text edit.
+//
+// `Outcome` is the EXISTING contract's vocabulary, not a new one: it is
+// `execution.VerifierVerdict()`'s PASS / NOT_APPLICABLE / FAIL / NOT_RUN
+// projection plus the two boundary facts this payload alone can carry (the gate
+// was skipped, or it was entered without a verdict). Outcome is authoritative
+// when non-empty; the legacy `Applicable`/`Passed` pair remains readable for
+// consumers written before Outcome existed.
 type VerificationCompletedPayload struct {
 	RequestID string
-	Passed    bool
-	Steps     []string
+	// Outcome is the canonical verification state label. Empty means "not
+	// recorded", which a reader must render as unknown rather than as a verdict.
+	Outcome    string
+	Passed     bool
+	Applicable bool
+	Reason     string
+	Steps      []string
 	ProtocolTelemetry
 }
+
+// ── Verification outcome vocabulary ─────────────────────────────────────────
+//
+// These labels are the projection of `execution.VerifierVerdict()`'s existing
+// PASS / NOT_APPLICABLE / FAIL / NOT_RUN set, plus SKIPPED and STARTED for the
+// two boundary facts only the verification stage itself can observe. They are
+// strings, not a new Go type: the runtime already owns the vocabulary and a
+// second type would let the two drift.
+const (
+	// VerificationNotApplicable: a verification contract was consulted and none
+	// exists for this artifact. Applicable=false, Passed=false.
+	VerificationNotApplicable = "NOT_APPLICABLE"
+	// VerificationSkipped: the verification boundary was never reached. This is
+	// an absence of observation, not an observation of absence.
+	VerificationSkipped = "SKIPPED"
+	// VerificationStarted: the gate was entered and produced no verdict. Only a
+	// run interrupted mid-gate is in this state.
+	VerificationStarted = "STARTED"
+	// VerificationPassed: the gate ran and every step held.
+	VerificationPassed = "PASSED"
+	// VerificationFailed: the gate ran and a step did not hold.
+	VerificationFailed = "FAILED"
+	// VerificationUnknown: the runtime published no verification record. A
+	// reader must never treat this as proof that verification did not happen.
+	VerificationUnknown = "UNKNOWN"
+)
 
 // ExecutionFinishedPayload is the terminal event of a runtime execution.
 // Success is true only when every stage reached a real terminal success.
@@ -1421,6 +1725,124 @@ func NewProviderExecution(payload ProviderExecutionPayload) DomainEvent {
 	return newEvent(EventProviderExecution, payload)
 }
 
+// ── Execution forensics constructors ─────────────────────────────────────────
+
+// NewExecutionAuthorized publishes the authorization verdict for one bounded
+// run. A refusal is published with Granted=false and Blocked=true: the absence
+// of an event must never be the only way to learn that a run was denied.
+func NewExecutionAuthorized(payload ExecutionAuthorizedPayload) DomainEvent {
+	payload.Targets = append([]string(nil), payload.Targets...)
+	payload.Capabilities = append([]string(nil), payload.Capabilities...)
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventExecutionAuthorized, payload)
+}
+
+// NewExecutionSpecFrozen publishes the ExecutionSpec committed to before
+// dispatch. Targets/slices are detached so a later mutation of the caller's
+// slice cannot rewrite history.
+func NewExecutionSpecFrozen(payload ExecutionSpecFrozenPayload) DomainEvent {
+	payload.Targets = append([]string(nil), payload.Targets...)
+	payload.ExplicitTargets = append([]string(nil), payload.ExplicitTargets...)
+	payload.ContextChannels = append([]string(nil), payload.ContextChannels...)
+	payload.DerivationKinds = append([]string(nil), payload.DerivationKinds...)
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventExecutionSpecFrozen, payload)
+}
+
+// NewContinuationEvaluated publishes the continuation proposal BEFORE any
+// authority may rewrite it: the matrix's action and reason, the state it was
+// decided from, and the observation it decided on.
+func NewContinuationEvaluated(payload ContinuationDecisionPayload) DomainEvent {
+	payload.Targets = append([]string(nil), payload.Targets...)
+	payload.Authorities = append([]string(nil), payload.Authorities...)
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventContinuationEvaluated, payload)
+}
+
+// NewContinuationSelected publishes the decision the loop actually applied,
+// together with the proposed action it replaced when an authority intervened.
+func NewContinuationSelected(payload ContinuationDecisionPayload) DomainEvent {
+	payload.Targets = append([]string(nil), payload.Targets...)
+	payload.Authorities = append([]string(nil), payload.Authorities...)
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventContinuationSelected, payload)
+}
+
+// NewObjectiveEvaluated publishes the completion authority's verdict for one
+// decision point.
+func NewObjectiveEvaluated(payload ObjectiveEvaluatedPayload) DomainEvent {
+	payload.Targets = append([]string(nil), payload.Targets...)
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventObjectiveEvaluated, payload)
+}
+
+// BehaviorObservedPayload is the structured record of ONE behavioral observation
+// pass: what authority the pass ran under, what it actually did, and what it
+// concluded.
+//
+// Every field is an observation the pass itself produced. Nothing here is derived
+// from model output, and the verdict is the pass's own — a reader must never have
+// to infer "the workspace ran" from prose in a decision reason, because a bounded
+// reason string truncates exactly the clause that proves it.
+type BehaviorObservedPayload struct {
+	RunID string
+	// Proven reports whether every observed requirement held.
+	Proven bool
+	// GrantProvenance is the directive that authorized the pass ($prompt /
+	// $hot / read_only), projected by the SAME authority the grant was derived
+	// from — never a second label vocabulary.
+	GrantProvenance string
+	// Granted lists the capability identifiers the derived grant permitted, in the
+	// capability layer's canonical order.
+	Granted []string
+	// Executed lists the capability identifiers the pass actually invoked, from
+	// its own evidence records. This is the field that answers "did it execute?"
+	// as opposed to "was it allowed to?".
+	Executed []string
+	// Repairs counts proposals that actually changed the workspace.
+	Repairs int
+	// Defects is the bounded evidence-backed defect summary, "" when none remained.
+	Defects string
+	// Evidence is the bounded evidence log the pass collected.
+	Evidence string
+	// BlockClass / BlockReason carry the truthful stop when the pass could not
+	// establish anything. BlockClass is the canonical capability failure taxonomy.
+	BlockClass  string
+	BlockReason string
+	// Objective is the objective the pass was proving.
+	Objective string
+	// Authority names the gate this record belongs to.
+	Authority string
+	ProtocolTelemetry
+}
+
+// NewBehaviorObserved publishes one behavioral observation pass.
+func NewBehaviorObserved(payload BehaviorObservedPayload) DomainEvent {
+	payload.Granted = append([]string(nil), payload.Granted...)
+	payload.Executed = append([]string(nil), payload.Executed...)
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventBehaviorObserved, payload)
+}
+
+// NewExecutionSummary publishes the terminal, self-contained record of one
+// bounded run.
+func NewExecutionSummary(payload ExecutionSummaryPayload) DomainEvent {
+	payload.Providers = append([]string(nil), payload.Providers...)
+	payload.Models = append([]string(nil), payload.Models...)
+	payload.ObservedFinishReasons = append([]string(nil), payload.ObservedFinishReasons...)
+	payload.MutationOutcomes = append([]string(nil), payload.MutationOutcomes...)
+	payload.Patterns = append([]string(nil), payload.Patterns...)
+	binding := payload.ProtocolTelemetry
+	payload.ProtocolTelemetry = binding.Normalize()
+	return newEvent(EventExecutionSummary, payload)
+}
+
 // NewArtifactProduced publishes a parsed artifact from a model invocation.
 func NewArtifactProduced(requestID, kind, target string, bindings ...protocol.ObservabilityBinding) DomainEvent {
 	payload := ArtifactProducedPayload{RequestID: requestID, Kind: kind, Target: target}
@@ -1499,12 +1921,107 @@ type MutationEvidence struct {
 }
 
 // NewVerificationCompleted publishes the verifier's real result.
+//
+// The gate was consulted and returned a verdict, so Applicable is true by
+// construction: a not-applicable artifact never reaches this constructor.
 func NewVerificationCompleted(requestID string, passed bool, steps []string, bindings ...protocol.ObservabilityBinding) DomainEvent {
-	payload := VerificationCompletedPayload{RequestID: requestID, Passed: passed, Steps: append([]string(nil), steps...)}
+	outcome := VerificationFailed
+	if passed {
+		outcome = VerificationPassed
+	}
+	payload := VerificationCompletedPayload{
+		RequestID:  requestID,
+		Outcome:    outcome,
+		Passed:     passed,
+		Applicable: true,
+		Steps:      append([]string(nil), steps...),
+	}
 	if len(bindings) > 0 {
 		payload.ProtocolTelemetry = bindings[0].Normalize()
 	}
 	return newEvent(EventVerificationCompleted, payload)
+}
+
+// NewVerificationNotApplicable publishes the OBSERVED absence of a verification
+// contract for this artifact.
+//
+// It is distinct from NewVerificationSkipped, and the distinction is load-bearing.
+// This one means "the runtime consulted the verification contract and none
+// exists for this language" — a legitimate, truthful terminal fact that leaves
+// the mutation as verified as this toolchain can make it. Skipped means the
+// verification boundary was never crossed at all, which is an ABSENCE of
+// observation. Reporting both as one state makes every plain-text edit
+// indistinguishable from an unverified one, and the forensic
+// UNVERIFIED_MUTATION detector then accuses a correct runtime.
+func NewVerificationNotApplicable(requestID, reason string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := VerificationCompletedPayload{
+		RequestID:  requestID,
+		Outcome:    VerificationNotApplicable,
+		Passed:     false,
+		Applicable: false,
+		Reason:     reason,
+	}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventVerificationCompleted, payload)
+}
+
+// NewVerificationSkipped publishes that the verification boundary was NEVER
+// REACHED — a real transition the runtime performs, and one it must publish
+// rather than omit.
+//
+// Skipping a verification stage is not the same fact as finding no verification
+// contract. `Skip(StageVerification, …)` means the runtime never crossed the
+// boundary: a read-only execution, a no-op that required review, an OCC abort
+// before any apply, a clarification. Publishing nothing for it made "verification
+// does not apply to this artifact" indistinguishable from "verification never
+// ran", and those two facts have opposite consequences for every reader of the
+// record.
+func NewVerificationSkipped(requestID, reason string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := VerificationCompletedPayload{
+		RequestID:  requestID,
+		Outcome:    VerificationSkipped,
+		Passed:     false,
+		Applicable: false,
+		Reason:     reason,
+	}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventVerificationCompleted, payload)
+}
+
+// NewVerificationStarted publishes that the verification gate was ENTERED.
+//
+// It is emitted when the stage begins rather than when it ends, so a run
+// interrupted mid-verification leaves a trace that says so. Without it, a
+// process killed inside the gate is indistinguishable from one that never
+// reached verification — the same missing-evidence ambiguity the SKIPPED record
+// exists to close.
+//
+// It carries EventVerificationStarted, NOT EventVerificationCompleted: the
+// canonical lifecycle orders completion after mutation.completed, and an entry
+// marker on the completion type would violate that ordering.
+func NewVerificationStarted(requestID string, bindings ...protocol.ObservabilityBinding) DomainEvent {
+	payload := VerificationStartedPayload{RequestID: requestID}
+	if len(bindings) > 0 {
+		payload.ProtocolTelemetry = bindings[0].Normalize()
+	}
+	return newEvent(EventVerificationStarted, payload)
+}
+
+// VerificationStartedPayload records that the verification gate was ENTERED.
+//
+// It is a distinct payload — and a distinct event type — from
+// VerificationCompletedPayload because the canonical lifecycle orders completion
+// strictly after mutation.completed. An entry marker published on the completion
+// type would place a verification record before the mutation boundary it
+// follows, breaking an invariant that exists so no stage can report completion
+// ahead of the work it completes.
+type VerificationStartedPayload struct {
+	RequestID string
+	ProtocolTelemetry
 }
 
 // NewExecutionFinished publishes the terminal outcome of a runtime execution.

@@ -29,7 +29,14 @@ var lifecycleConstructors = []string{
 	"NewApprovalRequired",
 	"NewMutationStarted",
 	"NewMutationCompleted",
+	// The verification stage has FOUR terminal/entry transitions, not one, and
+	// the graph must emit every one of them. Pinning only NewVerificationCompleted
+	// would leave the graph free to publish "not applicable" as "skipped" — which
+	// is precisely the conflation this list now prevents.
 	"NewVerificationCompleted",
+	"NewVerificationNotApplicable",
+	"NewVerificationSkipped",
+	"NewVerificationStarted",
 	"NewExecutionFinished",
 }
 

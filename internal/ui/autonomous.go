@@ -82,6 +82,13 @@ type autonomousDriver interface {
 	Termination() *autonomy.LoopTermination
 	SetStreamCallback(cb execution.StreamCallback)
 	AggregatedUsage() (input, output int, known bool)
+	// SetScope hands the runtime the human directive that authorized this run
+	// ("$prompt" / "$hot"). The driver derives the behavioral completion gate's
+	// capability vector from it, so without it a `$prompt` run executes under
+	// read-only authority and that gate can never observe the workspace it is
+	// being asked to prove. The UI binds the directive per input, so it cannot
+	// be supplied once at composition time.
+	SetScope(scope string)
 	// RunID is the runtime's stable identity for the current execution run. It
 	// is what a human is told when asked "which run is parked?" — a parked
 	// boundary is only actionable if the operator can name it.
@@ -138,6 +145,11 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 	m.autonomousBoundary = nil
 	m.autonomousSelect = 0
 	m.autonomousObjective = objective
+	// The authorizing directive must reach the runtime, not just the
+	// presentation layer. The driver derives the behavioral completion gate's
+	// capability vector from it, so a run that received an empty scope would
+	// silently execute under read-only authority and could never prove a result.
+	m.autonomousDriver.SetScope(m.scopeProvenanceDirective())
 	m.beginOperation(OpAutonomous)
 	m.agentLabel = ""
 	m.startShimmer("", "autonomy")

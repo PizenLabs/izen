@@ -47,6 +47,9 @@ type fakeAutonomousDriver struct {
 	resumeClarify int
 	lastClarify   string
 
+	// scope is the human directive the UI handed the runtime for the run.
+	scope string
+
 	// rejectCandidate is the executor seam the real driver drains on reject. Nil
 	// leaves the held candidate in place, which is correct for a test that only
 	// cares about the driver call count.
@@ -127,6 +130,12 @@ func (f *fakeAutonomousDriver) Boundary() *autonomy.HumanBoundary {
 func (f *fakeAutonomousDriver) Termination() *autonomy.LoopTermination { return f.term }
 
 func (f *fakeAutonomousDriver) SetStreamCallback(cb execution.StreamCallback) {}
+
+// SetScope records the directive the UI handed the runtime. It is recorded
+// rather than discarded so a test can assert the directive actually reached the
+// driver: a `$prompt` run that arrived with an empty scope executes under
+// read-only authority, and that is invisible unless the value is captured here.
+func (f *fakeAutonomousDriver) SetScope(scope string) { f.scope = scope }
 
 // AggregatedUsage reports what the run actually spent, in the same shape the real
 // driver does: counts plus a KNOWN flag. The flag is what lets the UI distinguish

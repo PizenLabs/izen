@@ -2577,6 +2577,13 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	}
 
 	// ── Apply EVERY held patch inside the single MutationSet transaction ──
+	//
+	// The verification gate runs INSIDE this boundary (it is the apply gate, see
+	// below), so this is the point at which the verification stage is entered.
+	// Publishing the entry record here is what lets a run killed mid-gate leave a
+	// trace saying so, instead of a trace indistinguishable from one that never
+	// reached verification at all.
+	g.BeginVerification()
 	applyCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	var applyErr error
@@ -2633,11 +2640,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 			publishMutationOutcome(g, ms, p.File, o)
 		}
 		if ms.Verification != nil {
-			if ms.Verification.Skipped {
-				g.Skip(runtimegraph.StageVerification, ms.Verification.Reason)
-			} else {
-				g.CompleteVerification(ms.Verification.Passed, verificationSteps)
-			}
+			publishVerification(g, ms.Verification, verificationSteps)
 		}
 		g.FailExecution(events.FailureRecoverable, applyErr, "executor.mutation")
 		res.Err = applyErr
@@ -2666,11 +2669,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		publishMutationOutcome(g, ms, p.File, o)
 	}
 	if ms.Verification != nil {
-		if ms.Verification.Skipped {
-			g.Skip(runtimegraph.StageVerification, ms.Verification.Reason)
-		} else {
-			g.CompleteVerification(ms.Verification.Passed, verificationSteps)
-		}
+		publishVerification(g, ms.Verification, verificationSteps)
 	} else {
 		g.Skip(runtimegraph.StageVerification, "no verifier gate ran during apply")
 	}
@@ -4004,38 +4003,58 @@ func providerExecutionPayload(providerName string, req ai.Request, usage ai.Prov
 	if errorCode == "" && truncated {
 		errorCode = "output_truncated"
 	}
+	// ── OUTPUT BUDGET OBSERVATION (§5) ─────────────────────────────────
+	// requested is the budget this exact request asked for; effective is the
+	// ceiling the provider actually allowed. They are OBSERVED, not assumed:
+	//
+	//   - a truncated response with authoritative usage reports the provider's
+	//     completion count, which IS the ceiling it enforced;
+	//   - anything else reports the requested budget, because no smaller
+	//     ceiling was ever demonstrated.
+	//
+	// The two are equal on every call except a provider that silently capped
+	// the request — which is the exact case an operator must be able to see
+	// and which previously existed nowhere in the record.
+	requested := req.MaxTokens
+	effective, effectiveKnown := requested, false
+	if truncated && metadata.Usage.Known && metadata.Usage.CompletionTokens > 0 {
+		effective, effectiveKnown = metadata.Usage.CompletionTokens, true
+	}
 	descriptor := metadata.Contract
 	if descriptor == nil {
 		descriptor = req.Contract
 	}
 	return events.ProviderExecutionPayload{
-		Provider:           metadata.Provider,
-		Model:              metadata.Model,
-		RequestStartedAt:   metadata.Usage.RequestStartedAt,
-		FirstTokenAt:       metadata.Usage.FirstTokenAt,
-		CompletedAt:        metadata.Usage.CompletedAt,
-		RequestDuration:    metadata.RequestDuration,
-		Duration:           metadata.Duration,
-		FirstTokenLatency:  metadata.FirstTokenLatency,
-		StreamingDuration:  metadata.StreamingDuration,
-		UsageKnown:         metadata.Usage.Known,
-		PromptTokens:       metadata.Usage.PromptTokens,
-		CompletionTokens:   metadata.Usage.CompletionTokens,
-		TotalTokens:        metadata.Usage.TotalTokens,
-		CachedTokens:       metadata.Usage.CachedTokens,
-		ReasoningTokens:    metadata.Usage.ReasoningTokens,
-		FinishReason:       metadata.FinishReason,
-		Truncated:          truncated,
-		NativeSchema:       metadata.NativeSchema,
-		SchemaMode:         string(metadata.SchemaMode),
-		SchemaFallback:     metadata.SchemaFallback,
-		PromptChars:        metadata.PromptChars,
-		OutputChars:        metadata.OutputChars,
-		PromptFingerprint:  metadata.PromptFingerprint,
-		HTTPAttempts:       metadata.Usage.HTTPAttempts,
-		RateLimitedRetries: metadata.Usage.RateLimitedRetries,
-		ErrorCode:          errorCode,
-		ProtocolTelemetry:  protocol.NewObservabilityBinding(metadata.InteractionContract, descriptor, metadata.ContractID, metadata.Mode, string(metadata.SchemaMode)),
+		Provider:              metadata.Provider,
+		Model:                 metadata.Model,
+		RequestStartedAt:      metadata.Usage.RequestStartedAt,
+		FirstTokenAt:          metadata.Usage.FirstTokenAt,
+		CompletedAt:           metadata.Usage.CompletedAt,
+		RequestDuration:       metadata.RequestDuration,
+		Duration:              metadata.Duration,
+		FirstTokenLatency:     metadata.FirstTokenLatency,
+		StreamingDuration:     metadata.StreamingDuration,
+		UsageKnown:            metadata.Usage.Known,
+		PromptTokens:          metadata.Usage.PromptTokens,
+		CompletionTokens:      metadata.Usage.CompletionTokens,
+		TotalTokens:           metadata.Usage.TotalTokens,
+		CachedTokens:          metadata.Usage.CachedTokens,
+		ReasoningTokens:       metadata.Usage.ReasoningTokens,
+		FinishReason:          metadata.FinishReason,
+		Truncated:             truncated,
+		RequestedOutputTokens: requested,
+		EffectiveOutputTokens: effective,
+		EffectiveOutputKnown:  effectiveKnown,
+		NativeSchema:          metadata.NativeSchema,
+		SchemaMode:            string(metadata.SchemaMode),
+		SchemaFallback:        metadata.SchemaFallback,
+		PromptChars:           metadata.PromptChars,
+		OutputChars:           metadata.OutputChars,
+		PromptFingerprint:     metadata.PromptFingerprint,
+		HTTPAttempts:          metadata.Usage.HTTPAttempts,
+		RateLimitedRetries:    metadata.Usage.RateLimitedRetries,
+		ErrorCode:             errorCode,
+		ProtocolTelemetry:     protocol.NewObservabilityBinding(metadata.InteractionContract, descriptor, metadata.ContractID, metadata.Mode, string(metadata.SchemaMode)),
 	}
 }
 
@@ -5191,6 +5210,27 @@ func stampContractIdentity(res *ExecutionResult, c *ExecutionContract, attempt A
 			res.Proof.CausalAncestry = append(res.Proof.CausalAncestry, id.String())
 		}
 	}
+}
+
+// publishVerification projects the verification gate's REAL report onto the
+// execution graph, choosing between the two terminal verification transitions.
+//
+// The distinction is the whole point. `VerificationReport.Skipped` means the
+// gate WAS consulted and found no contract for this artifact — an observation.
+// A nil report means no gate ran at all — an absence of observation, which the
+// caller publishes as Skip. Collapsing both into Skip made "this artifact has no
+// verification contract" and "verification never ran" the same record, and a
+// forensic reader could not then tell a correctly-reported plain-text edit from
+// an unverified mutation.
+func publishVerification(g *runtimegraph.Graph, report *VerificationReport, steps []string) {
+	if g == nil || report == nil {
+		return
+	}
+	if report.Skipped {
+		g.NotApplicableVerification(report.Reason)
+		return
+	}
+	g.CompleteVerification(report.Passed, steps)
 }
 
 // verificationGateState reports whether a real verification gate executed and

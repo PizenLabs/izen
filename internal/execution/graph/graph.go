@@ -489,11 +489,34 @@ func (g *Graph) CompleteMutationWithEvidence(ev events.MutationEvidence) {
 	g.emitEvent(events.NewMutationCompletedWithEvidence(g.RequestID, ev, g.ProtocolBinding()))
 }
 
+// BeginVerification opens the verification stage and emits
+// verification.completed with outcome=STARTED.
+//
+// The record is published on ENTRY, not on exit, so a run interrupted inside the
+// gate leaves a trace that says the gate was entered and produced no verdict.
+// A reader must never infer from that silence that verification never ran.
+func (g *Graph) BeginVerification() {
+	g.Begin(StageVerification)
+	g.emitEvent(events.NewVerificationStarted(g.RequestID, g.ProtocolBinding()))
+}
+
 // CompleteVerification closes the verification stage and emits
 // verification.completed with the real verifier result.
 func (g *Graph) CompleteVerification(passed bool, steps []string) {
 	g.Complete(StageVerification, fmt.Sprintf("passed=%t", passed))
 	g.emitEvent(events.NewVerificationCompleted(g.RequestID, passed, steps, g.ProtocolBinding()))
+}
+
+// NotApplicableVerification closes the verification stage with the OBSERVED
+// fact that no verification contract exists for this artifact.
+//
+// It is a DIFFERENT transition from Skip, and conflating them is what made
+// "verification is not applicable to this file" indistinguishable from
+// "verification never ran". The executor reaches this only from a real
+// VerificationReport whose own Skipped flag the verifier set.
+func (g *Graph) NotApplicableVerification(reason string) {
+	g.Complete(StageVerification, "not applicable: "+reason)
+	g.emitEvent(events.NewVerificationNotApplicable(g.RequestID, reason, g.ProtocolBinding()))
 }
 
 // RejectApproval records the human's explicit rejection of the held proposal
@@ -513,6 +536,20 @@ func (g *Graph) RejectApproval(target, reason string) {
 }
 
 // Skip marks a stage as cleanly unnecessary (its boundary is never reached).
+//
+// A skipped VERIFICATION stage publishes verification.completed with
+// outcome=SKIPPED. That is not an added event — `Skip(StageVerification, …)` is a
+// real transition the runtime performs, and it means something precise: the
+// verification boundary was NEVER CROSSED. A read-only execution, a no-op
+// requiring review, an OCC abort before any apply, a clarification — each is a
+// boundary the runtime deliberately did not reach.
+//
+// It is deliberately NOT the same record as NotApplicableVerification. "The gate
+// was never consulted" is an ABSENCE of observation; "the gate was consulted and
+// no contract exists" is an OBSERVATION. Publishing nothing for a skip made them
+// indistinguishable, and a forensic reader that cannot tell them apart reports
+// every text-file edit as an UNVERIFIED_MUTATION — a reader that cries wolf is
+// worse than no reader.
 func (g *Graph) Skip(kind StageKind, reason string) {
 	if g == nil {
 		return
@@ -522,6 +559,9 @@ func (g *Graph) Skip(kind StageKind, reason string) {
 		s.Evidence = reason
 		s.StartedAt = time.Now()
 		s.FinishedAt = time.Now()
+	}
+	if kind == StageVerification {
+		g.emitEvent(events.NewVerificationSkipped(g.RequestID, reason, g.ProtocolBinding()))
 	}
 }
 

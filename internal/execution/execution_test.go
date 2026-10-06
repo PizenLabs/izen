@@ -1,6 +1,11 @@
 package execution
 
 import (
+	// The standard library is aliased explicitly because this file also imports
+	// github.com/PizenLabs/izen/internal/context as `context`, which shadows it.
+	// The shadowing made context.Background() at TestShellRunner below a compile
+	// error, which took the whole package's test binary down with it.
+	stdcontext "context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -484,7 +489,7 @@ func TestRunnerCommand(t *testing.T) {
 func TestRunnerDir(t *testing.T) {
 	r := &Runner{}
 	r.SetAuthorization(testAuth())
-	result, err := r.run(context.Background(), "pwd", "/tmp")
+	result, err := r.run(stdcontext.Background(), "pwd", "/tmp")
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
