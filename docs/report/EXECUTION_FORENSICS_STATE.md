@@ -27,6 +27,14 @@
   mutation is not rolled back. One lifecycle-semantics defect was found and
   fixed (a cancel at the mutation boundary reported `apply_failed` instead of
   `cancelled`). Full report: `R6_CANCELLATION_REPORT.md`.
+  **R6-B PROVEN** — interruption is execution-scoped and cannot cross an
+  execution boundary. The runtime has **no queue of independent executions**: a
+  second unit is refused at the driver, the UI admission and the kernel. Parked
+  abort (`Driver.Abort`) is terminal/non-resumable and distinct from a running
+  cancel; a continuation keeps its original execution identity; a late decision
+  from a terminated run cannot mutate the next run. No lifecycle defect was
+  found and **no production code was changed**. Full report:
+  `R6_INTERRUPT_QUEUE_REPORT.md`.
   The remaining items are open questions, not open defects.
 
 ---
@@ -425,6 +433,68 @@ Deterministic proof: `go test ./internal/execution/ -run TestR6_ -v` and
 
 ---
 
+## R6-B STATUS: PROVEN
+
+R6-B asks whether an interrupt/cancel applies to exactly the intended execution,
+or whether active, queued and parked work can interfere. Full report:
+**`R6_INTERRUPT_QUEUE_REPORT.md`**.
+
+The finding: **there is no queue of independent executions.** IZEN is
+single-lane at every owner, and a second unit of work is *refused*, never
+enqueued:
+
+- `autonomy.Driver.Run` refuses while the loop is active **or** parked
+  (`driver.go:589-591`);
+- the UI `runAutonomousDriver` refuses while active or parked
+  (`autonomous.go:131-136`), and `admitNewExecutionRun` refuses a new execution
+  run from the driver's own boundary (`execution_admission.go:155-162`;
+  already pinned by `TestInvariant6_NewExecutionIsRefusedAtAdmissionWhileARunIsParked`);
+- `runtime.kernel.Engine.Open` refuses a second execution per engine
+  (`kernel/engine.go:245-247`); `RuntimeEngine` is bound to one task.
+
+Queues that do exist — the plan `TaskLedger` sliding window, the DAG ready set +
+worker pool, the bounded compaction runner, the event-bus queues — are all
+**intra-execution sub-work** governed by one execution's context, not
+independent executions.
+
+| Critical invariant | Result |
+|---|---|
+| cancellation is execution-scoped (per-run ctx / per-engine flag) | **yes** |
+| one execution's context cannot cancel another | **yes** |
+| late callbacks/decisions cannot cross execution boundaries | **yes** |
+| cancelling active work does not cancel queued work | **yes** (no queue; a second unit is refused) |
+| cancelling parked work does not interrupt active work | **yes** |
+| parked abort cannot silently resume | **yes** |
+| continuation keeps its original execution identity | **yes** (`RunID()` stable across `Resume*`) |
+| terminal state immutable wrt unrelated executions | **yes** |
+
+**No lifecycle defect found (no classification C); no production code changed.**
+One observability/generality limitation is recorded (B): the UI
+`handleEmergencyInterrupt` teardown is model/process-scoped
+(`cancelAllBackgroundContexts`, `KillAllOrphans`, shared workflow-SM reset). It
+cannot cross an execution boundary today because admission refuses a second run,
+but it is the "global cancellation side effect" shape and would need scoping if a
+second lane were ever admitted. The smallest boundary is recorded as a
+recommendation only.
+
+Deterministic proof:
+`go test ./internal/runtime/autonomy/ -run TestR6B_ -v`,
+`go test ./runtime/kernel/ -run TestR6B_ -v`,
+`go test ./internal/ui/ -run TestR6B_ -v`.
+
+Verification (after R6-B):
+
+```
+go test -count=1 ./...        PASS  (exit 0; all packages)
+go test -race -count=1 ./...  PASS  (exit 0; 211 packages ok; no data race, no panic)
+go vet ./...                  PASS  (no findings)
+```
+
+Scope: three new test files, `R6_INTERRUPT_QUEUE_REPORT.md`, and this handoff.
+No production file changed.
+
+---
+
 ## What is broken RIGHT NOW
 
 Nothing in the repository. Eight defects are fixed:
@@ -571,6 +641,30 @@ MOD  internal/runtime/autonomy/driver.go                 per-run progress reset
 MOD  internal/forensics/trace.go                         render progress transitions
 ```
 
+R6-A added the cancellation proof plus one production correction:
+
+```
+NEW  internal/execution/r6_cancellation_test.go            mutation boundary A/B + streaming late chunk
+NEW  internal/runtime/autonomy/r6_cancellation_test.go     cancel active/before/late/continuation/race/terminal
+NEW  test/live_r6/probe_test.go                            opt-in real-provider cancellation benchmark
+NEW  docs/report/R6_CANCELLATION_REPORT.md                 the R6-A report
+MOD  internal/execution/executor.go                        F1: cancel at the mutation boundary is
+                                                           OutcomeCancelled, not apply_failed
+```
+
+R6-B added **deterministic tests only** (no production change):
+
+```
+NEW  internal/runtime/autonomy/r6b_lifecycle_isolation_test.go  single-lane refusal, execution-scoped
+                                                                cancel, parked abort, late decision,
+                                                                continuation identity
+NEW  runtime/kernel/r6b_engine_isolation_test.go                per-engine cancel scoping, one execution
+                                                                per engine, terminal immutability
+NEW  internal/ui/r6b_lifecycle_isolation_test.go                autonomous start refusal while parked,
+                                                                parked Ctrl+C does not touch other work
+NEW  docs/report/R6_INTERRUPT_QUEUE_REPORT.md                   the R6-B report
+```
+
 ---
 
 ## What must NOT be touched
@@ -595,12 +689,15 @@ change is outside it: the `IsCasualChat` classification guard.
 
 R6-A is closed **PROVEN** (`R6_CANCELLATION_REPORT.md`). It established: cancel
 request → propagation → authoritative cancellation → no resurrection → truthful
-final state, with one lifetime-semantics defect fixed (F1). The remaining
-lifecycle questions are deliberately **out of R6-A scope** and MUST NOT be
-started here: crash recovery, WAL, resume, disconnect recovery, queue redesign,
-and R6-B/C/D. The one recorded observation gap (F2: no distinct loop-level
-cancellation state; `cancel.requested` / `cancel.propagated` events absent) is
-the next candidate decision, not an open defect.
+final state, with one lifetime-semantics defect fixed (F1). R6-B is closed
+**PROVEN** (`R6_INTERRUPT_QUEUE_REPORT.md`): there is no execution queue; a
+second unit is refused; cancellation is execution-scoped and cross-execution
+callbacks are blocked. The remaining lifecycle questions are deliberately **out
+of R6-A/R6-B scope** and MUST NOT be started here: crash recovery, WAL, resume,
+disconnect recovery, and R6-C/D. The one recorded observation gap from R6-A
+(F2: no distinct loop-level cancellation state; `cancel.requested` /
+`cancel.propagated` events absent) is the next candidate decision, not an open
+defect, and was left untouched by R6-B.
 
 R2 is closed **BLOCKED**; R3 is closed **PROVEN** (`R3_TARGET_PROPOSAL_REPORT.md`);
 R4 is closed **PROVEN** (`R4_BOUNDED_CONTINUATION_REPORT.md`); R5 is closed
