@@ -94,6 +94,11 @@ type decisionRecord struct {
 	// anything — they exist so a forensic reader can answer "what changed
 	// between attempt N and N+1?" and "why was another attempt authorized?"
 	// from the record instead of reconstructing it.
+	//
+	// progressDelta is the R5.1 continuation-router comparison: true when the
+	// objective's authoritative progress fingerprint advanced since the last
+	// continuation evaluation. It is the composite the router consumes; the
+	// individual flags below describe the same transition in more detail.
 	progress             string
 	previousProgress     string
 	newEvidence          bool
@@ -101,6 +106,7 @@ type decisionRecord struct {
 	mutationApplied      bool
 	verificationAdvanced bool
 	objectiveAdvanced    bool
+	progressDelta        bool
 	prevSnapshot         progressSnapshot
 	havePrevSnapshot     bool
 }
@@ -188,6 +194,7 @@ func (r *decisionRecord) resetProgress() {
 	r.mutationApplied = false
 	r.verificationAdvanced = false
 	r.objectiveAdvanced = false
+	r.progressDelta = false
 	r.prevSnapshot = progressSnapshot{}
 	r.havePrevSnapshot = false
 }
@@ -238,6 +245,10 @@ func (d *Driver) beginDecision(proposed autonomy.LoopDecision) {
 	// R5: classify the authoritative progress at THIS decision point before
 	// any authority may rewrite the proposal.
 	d.forensics.captureProgress(d.snapshotProgress())
+	// R5.1: record whether the authoritative progress fingerprint advanced
+	// since the previous continuation evaluation. Observability only; the
+	// router re-reads the same pure function when it acts.
+	_, d.forensics.progressDelta = d.progressFingerprintAndDelta()
 
 	d.bus.Publish(events.NewContinuationEvaluated(d.continuationPayload(proposed, "", false)))
 }
@@ -336,6 +347,7 @@ func (d *Driver) continuationPayload(decision autonomy.LoopDecision, nextState s
 	payload.MutationApplied = d.forensics.mutationApplied
 	payload.VerificationAdvanced = d.forensics.verificationAdvanced
 	payload.ObjectiveAdvanced = d.forensics.objectiveAdvanced
+	payload.ProgressDelta = d.forensics.progressDelta
 	return payload
 }
 

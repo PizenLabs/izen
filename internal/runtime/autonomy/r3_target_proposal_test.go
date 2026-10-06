@@ -120,18 +120,6 @@ func (l *r3EventLog) authorization() (events.ExecutionAuthorizedPayload, bool) {
 	return out, found
 }
 
-func (l *r3EventLog) spec() (events.ExecutionSpecFrozenPayload, bool) {
-	var out events.ExecutionSpecFrozenPayload
-	found := false
-	for _, ev := range l.snapshot() {
-		if p, ok := ev.Payload().(events.ExecutionSpecFrozenPayload); ok {
-			out = p
-			found = true
-		}
-	}
-	return out, found
-}
-
 func (l *r3EventLog) sawMutationCompleted() bool {
 	for _, ev := range l.snapshot() {
 		if _, ok := ev.Payload().(events.MutationCompletedPayload); ok {

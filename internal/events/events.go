@@ -573,6 +573,14 @@ type ContinuationDecisionPayload struct {
 	VerificationAdvanced bool `json:"verification_advanced,omitempty"`
 	ObjectiveAdvanced    bool `json:"objective_advanced,omitempty"`
 
+	// ProgressDelta is the R5.1 continuation-router verdict: the objective's
+	// authoritative progress fingerprint advanced since the previous
+	// continuation evaluation. It is the composite the router consumes to
+	// decide whether a PARTIALLY_SATISFIED objective may be re-opened; the
+	// flags above describe the same transition in more detail. False means
+	// "no authoritative delta observed", never a negative observation.
+	ProgressDelta bool `json:"progress_delta,omitempty"`
+
 	ProtocolTelemetry
 }
 

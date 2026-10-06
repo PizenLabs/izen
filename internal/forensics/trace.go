@@ -399,6 +399,7 @@ func (t *Trace) add(ev events.DomainEvent) {
 		// only rendered when true, so an absent flag reads as "not observed",
 		// never as a negative observation.
 		put(d, "progress", p.Progress, "prev_progress", p.PreviousProgress,
+			"progress_delta", boolLabel(p.ProgressDelta),
 			"new_evidence", boolLabel(p.NewEvidence), "new_artifact", boolLabel(p.NewArtifact),
 			"mutation_applied", boolLabel(p.MutationApplied),
 			"verification_advanced", boolLabel(p.VerificationAdvanced),

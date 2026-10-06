@@ -15,9 +15,12 @@
   remains evidence-gated. **R5 PROVEN** — IZEN already owns a runtime-side
   definition of progress (evidence-reduced completion conditions + the failure
   ledger), the five non-progress scenarios are bounded and proven, and one
-  precisely-bounded missing transition is recorded (the per-attempt progress
-  delta on the successful-partial path). The remaining items are open questions,
-  not open defects.
+  precisely-bounded missing transition was recorded (the per-attempt progress
+  delta on the successful-partial path). **R5.1 PROVEN** — that boundary is
+  closed: the continuation router now compares the objective's authoritative
+  progress fingerprint across lifecycle attempts, so a repeated partial state is
+  not re-opened, while the `MaxIdenticalDecisions` safety ceiling is unchanged.
+  The remaining items are open questions, not open defects.
 
 ---
 
@@ -276,30 +279,37 @@ The five required scenarios are pinned deterministically:
 | D repeated mutation attempt | **PASS** — the repeat is named non-progressing and terminates |
 | E progress then stall | **PASS (bounded)** — progress clears one epoch; the stall is bounded |
 
-**One missing transition, recorded not implemented.** On the
-**successful-but-partial** path, `routeObjectiveContinuation` re-opens on the
-*static* `PARTIALLY_SATISFIED` projection; it does not compare attempt N to
-attempt N−1. So stall-after-progress is bounded by the action-based
-`MaxIdenticalDecisions` ceiling, which is not progress-aware (it would also
-curtail a genuinely progressing multi-step objective). The state-delta detector
-`internal/progress.Detector` already implements the missing semantic but is
-wired only to the behavioral loop. The smallest boundary — a per-lifecycle
-previous-progress fingerprint plus a delta predicate at the router — is recorded
-in the report §5 and **not** implemented, because R5 was instructed not to add a
-generic loop detector and the existing stop is truthful (`NOT PROVEN`).
+**The one missing transition — closed by R5.1.** On the
+**successful-but-partial** path, `routeObjectiveContinuation` used to re-open on
+the *static* `PARTIALLY_SATISFIED` projection without comparing attempt N to
+attempt N−1, so stall-after-progress was bounded only by the action-based
+`MaxIdenticalDecisions` ceiling. R5.1 adds the per-lifecycle authoritative
+progress fingerprint and a delta predicate at the router: a continuation is
+admissible only when the objective's authoritative state advanced (a newly
+satisfied condition, a new verification state, a new evidence epoch, or a new
+durable-ledger entry). A repeated partial state keeps the existing typed
+non-success (`UNSUBSTANTIATED`); it is never converted into a completion. The
+safety ceiling is untouched. Proof: `TestR5_1_CaseA_ProgressThenProgressContinues`,
+`TestR5_1_CaseB_IdenticalPartialStateDoesNotReopen`,
+`TestR5_1_CaseB_RepeatedStallIsBoundedByTheExistingCeiling`,
+`TestR5_1_CaseC_ProvenObjectiveIsUntouched`. See `R5_NON_PROGRESS_REPORT.md` §5.1.
 
 **Forensic coverage added (observability only).** `continuation.evaluated` /
 `continuation.selected` now carry `progress`, `previous_progress`,
-`new_evidence`, `new_artifact`, `mutation_applied`, `verification_advanced` and
-`objective_advanced`, computed from the same evidence the authority judges.
-Nothing reads them to decide anything.
+`progress_delta`, `new_evidence`, `new_artifact`, `mutation_applied`,
+`verification_advanced` and `objective_advanced`, computed from the same evidence
+the authority judges. `progress_delta` (R5.1) is the composite the router
+consumes; the individual flags describe the same transition in more detail.
+Nothing reads these fields to decide anything — the router computes its own
+delta from the same pure function.
 
 | Critical invariant | Result |
 |---|---|
 | model output alone counts as progress | **no** (`TestR5_P1_ModelOutputAloneIsNeverProgress`) |
 | successful no-op counts as progress | **no** (`TestR5_CaseC_NoOpCapabilitySatisfiesNoCondition`) |
 | repeated identical failure stops semantically | **yes** (failure ledger) |
-| repeated identical decisions are bounded | **yes** (`RuntimeLoop`) |
+| repeated partial success without a delta stops semantically | **yes** (R5.1 router fingerprint) |
+| repeated identical decisions are bounded | **yes** (`RuntimeLoop`, unchanged) |
 | completion remains evidence-gated | **yes** (authority is downgrade-only) |
 | live low-progress run stops boundedly | **yes** (see report §7) |
 
@@ -313,6 +323,37 @@ go test ./internal/execution/        -run TestR5_ -v
 go test ./internal/runtime/autonomy/ -run TestR5_ -v
 go test ./internal/progress/         -run TestR5_ -v
 ```
+
+---
+
+## R5.1 STATUS: PROVEN
+
+R5.1 closes the one boundary R5 recorded. The continuation router now compares
+the objective's **authoritative progress fingerprint** across lifecycle attempts
+before re-opening a `PARTIALLY_SATISFIED` objective.
+
+**Corrected invariant.**
+
+```text
+activity       ≠ continuation
+continuation   ≠ progress
+continuation requires an authoritative progress delta since the previous
+               continuation evaluation
+completion     requires PROVEN evidence
+stall          ≠ success, and cannot earn an unbounded continuation
+```
+
+The fingerprint is built only from runtime-owned cumulative facts — the
+recomputed condition set (status + verification state), the `FailureLedger`
+evidence epoch, and the durable post-mutation / requirement-discharge ledgers.
+No model text, token count, timestamp, provider call id or attempt id
+participates. A repeated partial state keeps the existing typed non-success
+(`UNSUBSTANTIATED`); it is never converted into a completion. The
+`RuntimeLoop.MaxIdenticalDecisions` ceiling is unchanged and remains an
+independent safety bound.
+
+Proof: `go test ./internal/runtime/autonomy/ -run TestR5_1_ -v` (plus the full
+suite). Rationale: `R5_NON_PROGRESS_REPORT.md` §5.1.
 
 ---
 
@@ -537,13 +578,11 @@ is a separate capability from R2's target discovery.
 5. **Contract recovery (§1, Benchmark C)** was never exercised: the scripted
    prose answer reached an approval gate, so only one call happened. Whether
    `authorizeContractRecovery` produces a *useful* second prompt is untested.
-6. **The successful-partial progress delta is not yet a router input (R5).**
-   `routeObjectiveContinuation` re-opens on the static `PARTIALLY_SATISFIED`
-   projection rather than on an advance since the previous attempt, so
-   stall-after-progress is bounded by the action-based
-   `RuntimeLoop.MaxIdenticalDecisions` ceiling, which is not progress-aware.
-   The smallest boundary (a per-lifecycle previous-progress fingerprint plus a
-   delta predicate at the router) is in `R5_NON_PROGRESS_REPORT.md` §5. The
-   state-delta detector `internal/progress.Detector` already implements the
-   semantic and is wired only to the behavioral loop. **Reported, not
-   implemented**: R5 was instructed not to add a generic loop detector.
+6. **The successful-partial progress delta is a router input (R5.1 — CLOSED).**
+   `routeObjectiveContinuation` now re-opens only when the objective's
+   authoritative progress fingerprint advanced since the previous continuation
+   evaluation; a repeated partial state keeps the existing typed non-success
+   (`UNSUBSTANTIATED`). The action-based `RuntimeLoop.MaxIdenticalDecisions`
+   ceiling remains as an independent safety bound. Proof:
+   `internal/runtime/autonomy/r5_1_progress_delta_test.go`; rationale in
+   `R5_NON_PROGRESS_REPORT.md` §5.1.
