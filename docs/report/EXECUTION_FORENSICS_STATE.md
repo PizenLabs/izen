@@ -3,9 +3,8 @@
 **Read `EXECUTION_FORENSICS.md` first.** This file is the handoff.
 
 - **Branch:** `fix/runtime` (base `f40f369`)
-- **Suite:** `go test ./...` green; `-race` green on `internal/execution/...`,
-  `internal/events/...`, `internal/architecture`, `internal/runtime/...`,
-  `internal/ui/...`, `test/forensics`
+- **Suite:** `go test ./...` green; `go test -race ./...` green (full tree);
+  `go vet ./...` clean. Verified after R6-A.
 - **Status:** **R1 PROVEN** by live execution. **R2 BLOCKED** by live
   execution — recorded, not worked around. **R3 PROVEN** — the target-proposal
   authority boundary is identified and pinned; DISCOVERED/PROPOSED/AUTHORIZED
@@ -20,6 +19,14 @@
   closed: the continuation router now compares the objective's authoritative
   progress fingerprint across lifecycle attempts, so a repeated partial state is
   not re-opened, while the `MaxIdenticalDecisions` safety ceiling is unchanged.
+  **R6-A PROVEN** — cancellation is a real runtime-owned boundary: Esc×2 /
+  Ctrl+C / OS signal withdraw the operation context, the driver owns two
+  linearization points (the inter-step gate and `RuntimeLoop.Step`), a cancelled
+  execution terminates `RuntimeAborted` and can never become `PROVEN`, late
+  provider/stream/capability results cannot resurrect it, and a committed
+  mutation is not rolled back. One lifecycle-semantics defect was found and
+  fixed (a cancel at the mutation boundary reported `apply_failed` instead of
+  `cancelled`). Full report: `R6_CANCELLATION_REPORT.md`.
   The remaining items are open questions, not open defects.
 
 ---
@@ -357,6 +364,67 @@ suite). Rationale: `R5_NON_PROGRESS_REPORT.md` §5.1.
 
 ---
 
+## R6-A STATUS: PROVEN
+
+R6-A asks whether IZEN has a real runtime-owned **cancellation** boundary. Full
+report: **`R6_CANCELLATION_REPORT.md`**.
+
+The finding: cancellation is a real boundary with **two linearization points**,
+and it already reuses an existing typed cancellation state at the attempt level.
+
+- **Request owner:** the UI operation (`operation.Cancel`, driven by Esc×2 /
+  Ctrl+C / Ctrl+D / OS SIGINT-SIGTERM) or `Driver.Abort` for a parked run.
+- **State:** the withdrawn `context.Context`
+  (`m.activeOp.Ctx → Driver.runCtx`). A separate kernel/task path uses
+  `TaskRuntime.canceled`.
+- **Propagation:** `activeOp.Ctx → runCtx → adapter → RuntimeExecutor →
+  provider HTTP / shell / mutation boundary`.
+- **Linearization:** the inter-step gate (`observeAndRun`, driver.go:2244) and
+  `RuntimeLoop.Step` (`runtime_loop.go:947`). Whichever observes the withdrawal
+  first wins.
+- **Final state:** loop `RuntimeAborted` + `FailurePermanent` + reason
+  `"context cancelled"`; attempt `OutcomeCancelled` (`"cancelled"`) emitted as
+  `execution.finished(success=false, outcome="cancelled")`. There is **no**
+  distinct loop-level cancellation state — recorded as observation gap (B), not
+  a defect.
+- **Provider cancellation:** real — `http.NewRequestWithContext`; observed live
+  with `error=cancelled` on a real in-flight call.
+- **Capability cancellation:** shell yes (`exec.CommandContext`); the read-only
+  `CapabilityToolRunner` seam ignores ctx (bounded, non-mutating) — limitation
+  (E).
+- **Late callbacks:** a late provider/stream/capability result is consumed into
+  an already-terminal (or about-to-terminate) loop; it can never become
+  `PROVEN`.
+- **Mutation already committed:** never rolled back by cancellation.
+  `cancel != rollback`. (An open `MutationSet` and an in-flight DAG plan roll
+  back by transaction semantics; that is atomicity, not `cancel == rollback`.)
+
+| Critical invariant | Result |
+|---|---|
+| cancel while provider active → typed abort, zero delta | **yes** |
+| cancelled execution cannot become `PROVEN` via late callback | **yes** |
+| committed mutation survives cancellation | **yes** |
+| late stream chunk cannot resurrect execution | **yes** |
+| selected continuation does not start after cancel | **yes** |
+| completion/cancel race deterministic | **yes** (cancel observed at `Step` wins) |
+
+**One defect found and fixed (F1, classification C — lifecycle semantics).** A
+cancellation at the mutation boundary was reported as `apply_failed` (graph
+`execution.failed`), indistinguishable from a genuine write failure. The
+smallest correction is in `RuntimeExecutor.Approve`: a `context.Canceled` apply
+error is classified `OutcomeCancelled` and the graph is cancelled (nil error),
+while a `context.DeadlineExceeded` apply timeout keeps its failure
+classification. Regression:
+`TestR6_MutationBoundary_CancelBeforeAuthorizationLeavesZeroDelta`.
+
+Deterministic proof: `go test ./internal/execution/ -run TestR6_ -v` and
+`go test ./internal/runtime/autonomy/ -run TestR6_ -v`. Live proof:
+`IZEN_LIVE_FORENSICS=1 go test ./test/live_r6/ -v -timeout 500s` (real
+`ollama/qwen2.5-coder:7b`; observed a real in-flight call cancelled, terminal
+`aborted`, workspace byte-identical, no `PROVEN`).
+
+---
+
 ## What is broken RIGHT NOW
 
 Nothing in the repository. Eight defects are fixed:
@@ -524,6 +592,15 @@ change is outside it: the `IsCasualChat` classification guard.
 ---
 
 ## The next EXACT experiment
+
+R6-A is closed **PROVEN** (`R6_CANCELLATION_REPORT.md`). It established: cancel
+request → propagation → authoritative cancellation → no resurrection → truthful
+final state, with one lifetime-semantics defect fixed (F1). The remaining
+lifecycle questions are deliberately **out of R6-A scope** and MUST NOT be
+started here: crash recovery, WAL, resume, disconnect recovery, queue redesign,
+and R6-B/C/D. The one recorded observation gap (F2: no distinct loop-level
+cancellation state; `cancel.requested` / `cancel.propagated` events absent) is
+the next candidate decision, not an open defect.
 
 R2 is closed **BLOCKED**; R3 is closed **PROVEN** (`R3_TARGET_PROPOSAL_REPORT.md`);
 R4 is closed **PROVEN** (`R4_BOUNDED_CONTINUATION_REPORT.md`); R5 is closed
