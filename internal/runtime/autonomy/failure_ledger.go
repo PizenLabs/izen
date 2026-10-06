@@ -138,6 +138,16 @@ func (l *FailureLedger) AdvanceEvidence() {
 	l.evidenceEpoch++
 }
 
+// epoch returns the current evidence epoch. It is a nil-safe read of the
+// runtime-owned counter, used by the continuation router to fingerprint the
+// authoritative evidence state across lifecycle attempts.
+func (l *FailureLedger) epoch() int {
+	if l == nil {
+		return 0
+	}
+	return l.evidenceEpoch
+}
+
 // NonProgressing reports whether a failure fingerprint has been observed more
 // than once under the current evidence epoch.
 func (l *FailureLedger) NonProgressing(f execution.ExecutionFailure) bool {

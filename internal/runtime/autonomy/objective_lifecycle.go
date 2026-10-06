@@ -539,6 +539,67 @@ func boundContinuationEvidence(s string) string {
 
 // ── Continuation routing ────────────────────────────────────────────────────
 
+// authoritativeProgressFingerprint is the deterministic identity of the
+// objective's AUTHORITATIVE progress state at one continuation evaluation.
+//
+// It is a comparison key over the progress model the runtime already owns — not
+// a second progress representation. Every component is a cumulative,
+// runtime-observed fact the completion authority and the continuation reducer
+// already consume:
+//
+//	condition set     the recomputed status AND verification state of every
+//	                  authored condition (P5/P6: which obligations hold)
+//	evidence epoch    the failure ledger's count of distinct durable evidence
+//	                  states (P2/P4: a real workspace/artifact advance)
+//	durable ledgers   the post-mutation re-inspected target set and the
+//	                  discharged requirement set (P2/P4/P6)
+//
+// Nothing here is model text, a token count, a timestamp, a provider call id or
+// an attempt id. Two attempts that reach the SAME partial state therefore
+// produce the SAME fingerprint, and any genuine authoritative advance changes
+// it.
+func (d *Driver) authoritativeProgressFingerprint() string {
+	if d == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range d.ObjectiveConditions() {
+		b.WriteString(c.ID)
+		b.WriteByte('=')
+		b.WriteString(string(c.Status))
+		b.WriteByte('/')
+		b.WriteString(string(c.VerificationState))
+		b.WriteByte('\x00')
+	}
+	fmt.Fprintf(&b, "epoch=%d\x00", d.failures.epoch())
+	for _, t := range d.objective.postMutation {
+		fmt.Fprintf(&b, "inspected=%s\x00", t)
+	}
+	for _, id := range sortedObjectiveKeys(d.objective.discharged) {
+		fmt.Fprintf(&b, "discharged=%s\x00", id)
+	}
+	return b.String()
+}
+
+// progressFingerprintAndDelta returns the current authoritative progress
+// fingerprint together with whether it ADVANCED since the previous continuation
+// evaluation. The first evaluation has no predecessor and is therefore always a
+// delta: there is nothing to compare against, and refusing the first partial
+// result would collapse a legitimately advancing objective.
+//
+// It is a pure read. Advancing the stored baseline is the router's job, so a
+// decision point that is never routed cannot consume the comparison.
+func (d *Driver) progressFingerprintAndDelta() (current string, advanced bool) {
+	if d == nil {
+		return "", false
+	}
+	current = d.authoritativeProgressFingerprint()
+	if !d.objective.haveProgressFingerprint {
+		return current, true
+	}
+	return current, current != d.objective.progressFingerprint
+}
+
 // routeObjectiveContinuation turns a REFUSED completion claim into the next
 // action the objective's own progress calls for.
 //
@@ -564,6 +625,17 @@ func boundContinuationEvidence(s string) string {
 // The rule is a function of OBSERVED condition states only. There is no
 // threshold, no score and no notion of "enough" — one satisfied obligation out
 // of two is as much a partial result as nine out of ten.
+//
+// R5.1 — PROGRESS-DELTA REQUIREMENT. PARTIALLY_SATISFIED is monotone: once one
+// condition holds it keeps holding, so the projection alone would re-open the
+// loop on the SAME partial state forever. A continuation is therefore admissible
+// only when the objective's AUTHORITATIVE progress advanced since the previous
+// continuation evaluation. "Advanced" means a changed authoritative fingerprint
+// (see authoritativeProgressFingerprint): a newly satisfied condition, a new
+// verification state, a new evidence epoch or a new durable-ledger entry — never
+// model output, tokens, timestamps or attempt ids. When the state repeats with
+// no delta the refusal stands (UNSUBSTANTIATED): a stall is not a success and it
+// cannot earn an unbounded continuation.
 func (d *Driver) routeObjectiveContinuation(decision *autonomy.LoopDecision) {
 	if d == nil || decision == nil {
 		return
@@ -587,17 +659,41 @@ func (d *Driver) routeObjectiveContinuation(decision *autonomy.LoopDecision) {
 	if next.Progress != execution.ProgressPartiallySatisfied {
 		return
 	}
+	// ── R5.1 — compare authoritative progress across lifecycle attempts ──
+	// Re-opening on the projection alone would repeat the same partial state.
+	// Consume the fingerprint delta and advance the baseline only when the
+	// router actually acts on it, so a decision point that is never routed
+	// cannot consume the comparison.
+	current, advanced := d.progressFingerprintAndDelta()
+	d.forensics.progressDelta = advanced
+	if !advanced {
+		// The attempt reached the same authoritative partial state as its
+		// predecessor. Leave the existing typed non-success in place: the
+		// decision already carries LoopUnsubstantiate, which terminates the
+		// objective truthfully. stall != success, and this is bounded.
+		decision.Reason = strings.TrimSpace(decision.Reason +
+			"; objective PARTIALLY_SATISFIED without an authoritative progress delta — " +
+			"continuation not re-opened")
+		return
+	}
 	switch next.Decision {
 	case execution.ContinueComputation:
 		decision.Action = autonomy.LoopContinue
 		decision.Reason = "objective PARTIALLY_SATISFIED — " + next.Reason
-		d.carryObjectiveForward()
 	case execution.Replan:
 		decision.Action = autonomy.LoopRepair
 		decision.Reason = "objective PARTIALLY_SATISFIED, current approach unsupported by the evidence — " +
 			next.Reason
-		d.carryObjectiveForward()
+	default:
+		// No partial-continuation action to apply; the refusal stands.
+		return
 	}
+	// The router actually re-opened, so the delta is consumed: the baseline
+	// becomes the state this attempt reached. A decision point that is never
+	// routed therefore cannot consume the comparison.
+	d.objective.progressFingerprint = current
+	d.objective.haveProgressFingerprint = true
+	d.carryObjectiveForward()
 }
 
 // markHumanGated records that the current observation came back through a human
@@ -810,6 +906,14 @@ type objectiveLifecycle struct {
 	// boundary. Continuation routing stands down while it is set: a human-gated
 	// step is a decision, not a bounded computation the runtime may extend.
 	humanGated bool
+
+	// progressFingerprint is the authoritative progress identity at the last
+	// continuation evaluation. haveProgressFingerprint distinguishes "never
+	// evaluated" from the zero fingerprint. The pair is what lets the router
+	// tell a genuinely advancing partial objective from one that keeps
+	// re-reaching the SAME partial state (R5.1).
+	progressFingerprint     string
+	haveProgressFingerprint bool
 }
 
 func (d *Driver) objectiveState() *objectiveLifecycle {

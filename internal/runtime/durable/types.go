@@ -304,4 +304,40 @@ const (
 	// DecisionConflict: digest matches neither; third-party mutation or
 	// partial write. Set CONFLICT, emit TARGET_CONFLICT, go RE_PLAN.
 	DecisionConflict ReconcileDecision = "CONFLICT"
+	// DecisionUnknown is the honest result when NO durable cursor evidence
+	// exists for a task: the process died before a cursor was dispatched, so
+	// neither the pre-state nor the post-state can be compared. It is
+	// deliberately NOT SafeRetry — absence of evidence is not proof that no
+	// mutation occurred — and NOT Conflict — absence is not a confirmed
+	// mismatch, either. Note that Reconcile NEVER returns it; only the
+	// read-only inspection of surviving cursors does.
+	DecisionUnknown ReconcileDecision = "UNKNOWN"
 )
+
+// CursorInspection is the READ-ONLY reconciliation of one task's durable
+// mutation cursor against the live workspace digest. It appends no event and
+// transitions no task, so a fresh runtime can learn the state of an
+// interrupted mutation without resuming or retrying it. Decision is computed
+// by the SAME durable.Reconcile rule the runtime uses everywhere else, except
+// that a durable commit marker (CursorCommitted) is itself authoritative:
+//
+//   - committed + recorded postcondition digest matching the workspace ->
+//     ALREADY_COMMITTED;
+//   - committed + recorded postcondition digest NOT matching -> CONFLICT
+//     (a third party changed the workspace after the operation committed);
+//   - committed with no recorded digest (legacy/scopeguard commit) ->
+//     ALREADY_COMMITTED from the marker alone;
+//   - dispatched -> Reconcile(cursor, currentDigest) (SAFE_RETRY / CONFLICT);
+//   - no cursor at all -> UNKNOWN.
+type CursorInspection struct {
+	TaskID              string            `json:"taskId"`
+	OperationID         string            `json:"operationId,omitempty"`
+	StepID              string            `json:"stepId,omitempty"`
+	Phase               CursorPhase       `json:"phase,omitempty"`
+	Status              CursorStatus      `json:"status,omitempty"`
+	PreconditionDigest  string            `json:"preconditionDigest,omitempty"`
+	PostconditionDigest string            `json:"postconditionDigest,omitempty"`
+	Committed           bool              `json:"committed"`
+	CurrentDigest       string            `json:"currentDigest,omitempty"`
+	Decision            ReconcileDecision `json:"decision"`
+}

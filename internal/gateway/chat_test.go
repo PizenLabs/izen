@@ -103,6 +103,13 @@ func TestIsCasualChat_CodingTasks(t *testing.T) {
 		{"npm install lodash", false},
 		{"go mod tidy", false},
 		{"import json", false},
+		// A greeting word inside a repair instruction is the value to write, not
+		// small talk. These are the R2 regression: the objective below was routed
+		// to the zero-context casual path because it contains "Hello".
+		{`inspect this project, find the incorrect greeting, fix it to "Hello", and verify the result.`, false},
+		{`fix it to Hello`, false},
+		{"update the greeting to hello", false},
+		{"change the title to goodbye", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {

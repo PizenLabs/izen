@@ -213,6 +213,14 @@ type Derivation struct {
 	// the DISAMBIGUATION CANDIDATE SET and never a scope). Status is the field
 	// that distinguishes the two; Targets alone must never be read as a scope.
 	Targets []string
+	// Candidates is the DISCOVERED evidence set: the workspace files bounded
+	// discovery observed, filtered by the artifact kinds the objective declared
+	// when it declared any. It is populated for EVERY status — including an
+	// objective that declares no kind, where it records "these files exist"
+	// without deriving a target. Candidates is never a target and never
+	// authority; it exists so a run can record its DISCOVERED stage even when no
+	// target is bound. Only a UNIQUE Status may become a mutation scope.
+	Candidates []string
 	// Kinds are the artifact kinds the objective declared, in canonical order.
 	Kinds []string
 	// Resolutions is the per-kind breakdown that produced Status.
@@ -277,9 +285,14 @@ func DeriveScope(req DerivationRequest) Derivation {
 	}
 	kinds := DeclareArtifactKinds(req.Prompt)
 	if len(kinds) == 0 {
+		// The objective declares no kind, so no target can be DERIVED. The
+		// observed candidate set is still recorded: "which files exist" is
+		// evidence, and a run that can say it looked is different from one that
+		// never looked. It is not a target and it authorizes nothing.
 		return Derivation{
-			Status: DerivationUnresolved,
-			Reason: "the objective declares no artifact kind, so there is nothing to derive a target from; naming a file is the only way to proceed",
+			Status:     DerivationUnresolved,
+			Candidates: req.Profile.CandidatePaths(),
+			Reason:     "the objective declares no artifact kind, so there is nothing to derive a target from; naming a file is the only way to proceed",
 		}
 	}
 	candidates := req.Profile.CandidatePaths()
@@ -352,6 +365,7 @@ func DeriveScope(req DerivationRequest) Derivation {
 		return Derivation{
 			Status:      DerivationAmbiguous,
 			Targets:     derived,
+			Candidates:  append([]string(nil), derived...),
 			Kinds:       kinds,
 			Resolutions: resolutions,
 			Derivable:   true,
@@ -362,6 +376,7 @@ func DeriveScope(req DerivationRequest) Derivation {
 	if len(derived) == 0 {
 		return Derivation{
 			Status:      DerivationUnresolved,
+			Candidates:  append([]string(nil), derived...),
 			Kinds:       kinds,
 			Resolutions: resolutions,
 			Reason: "the objective declares artifact kind(s) " + strings.Join(kinds, ",") +
@@ -374,6 +389,7 @@ func DeriveScope(req DerivationRequest) Derivation {
 	return Derivation{
 		Status:      DerivationUnique,
 		Targets:     derived,
+		Candidates:  append([]string(nil), derived...),
 		Kinds:       kinds,
 		Resolutions: resolutions,
 		Derivable:   true,

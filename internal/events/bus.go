@@ -41,7 +41,21 @@ func IsControlEventType(eventType string) bool {
 	case EventTaskStarted, EventTaskCompleted, EventTaskFailed, EventTaskCanceled,
 		EventClarificationRequired, EventStateCheckpoint,
 		EventAdmissionDecision, EventContextCompilation, EventProviderExecution,
-		EventExecutionFailed:
+		EventExecutionFailed,
+		// Execution forensics: the control-plane decision record. These are low
+		// frequency (a handful per bounded run) and they are the ONLY record of
+		// why the runtime acted, so losing one to telemetry back-pressure would
+		// leave the run unexplainable after the fact. Guaranteed delivery is the
+		// correct trade here precisely because the volume is negligible.
+		EventExecutionAuthorized, EventExecutionSpecFrozen,
+		EventContinuationEvaluated, EventContinuationSelected,
+		EventObjectiveEvaluated, EventExecutionSummary,
+		// The behavioral observation is the ONLY structured record of whether the
+		// runtime actually executed a capability. Losing one to telemetry
+		// back-pressure would turn "it served the workspace" into "the record does
+		// not say", which is exactly the accusation-from-silence this reader must
+		// never make.
+		EventBehaviorObserved:
 		return true
 	}
 	return false

@@ -214,15 +214,32 @@ func (s *TaskStore) DispatchCursor(c ExecutionCursor) error {
 }
 
 // CommitExecution appends EXECUTION_COMMITTED (truth boundary: fsync)
-// and advances the cursor to COMMITTED.
+// and advances the cursor to COMMITTED. It records no postcondition digest:
+// callers that observed one use CommitExecutionWithDigest.
 func (s *TaskStore) CommitExecution(taskID, operationID string) error {
+	return s.CommitExecutionWithDigest(taskID, operationID, "")
+}
+
+// CommitExecutionWithDigest appends EXECUTION_COMMITTED (truth boundary:
+// fsync), advances the cursor to COMMITTED, and — when postconditionDigest is
+// non-empty — records the observed post-state on the cursor. The digest is
+// what makes a fresh runtime able to answer ALREADY_COMMITTED vs CONFLICT
+// from surviving evidence: the commit marker proves the operation committed,
+// and the digest binds that commitment to the exact workspace bytes it
+// produced. An empty digest preserves the pre-existing behavior (a commit
+// with no recorded post-state, as the scopeguard path writes).
+func (s *TaskStore) CommitExecutionWithDigest(taskID, operationID, postconditionDigest string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ev := newEvent(taskID, EventExecutionCommitted, map[string]any{
+	payload := map[string]any{
 		"operationId": operationID,
 		"phase":       string(PhaseCommitted),
 		"status":      string(CursorCommitted),
-	})
+	}
+	if strings.TrimSpace(postconditionDigest) != "" {
+		payload["postconditionDigest"] = postconditionDigest
+	}
+	ev := newEvent(taskID, EventExecutionCommitted, payload)
 	if err := s.withLock(func() error { return s.appendLocked(ev) }); err != nil {
 		return err
 	}
@@ -777,6 +794,92 @@ func (s *TaskStore) ReconcileAll(digestOf func(taskID string) (string, error)) (
 	return out, nil
 }
 
+// InspectCursors is the READ-ONLY reconciliation surface a fresh runtime uses
+// to classify an interrupted mutation WITHOUT resuming or retrying it.
+//
+// Unlike ReconcileAll it (a) transitions nothing — it appends no event and
+// mutates no task — and (b) also reports tasks whose cursor already carries a
+// durable commit marker, so a committed-but-abandoned operation is
+// inspectable after a restart. digestOf computes the live workspace digest for
+// a task; every NON-TERMINAL task yields exactly one entry (a terminal task
+// already has an authoritative end). Absence of evidence yields
+// DecisionUnknown, never SafeRetry and never AlreadyCommitted.
+//
+// It is deliberately separate from ReconcileAll: the autonomous crash question
+// ("did the mutation commit?") is answered by a fresh runtime that must not
+// silently act on the answer.
+func (s *TaskStore) InspectCursors(digestOf func(taskID string) (string, error)) ([]CursorInspection, error) {
+	if s == nil {
+		return nil, fmt.Errorf("durable: nil TaskStore")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]string, 0, len(s.tasks))
+	for id, t := range s.tasks {
+		if t == nil {
+			continue
+		}
+		// Only INTERRUPTED work needs reconciling: a task that reached a
+		// durable terminal state already has an authoritative end, so it is
+		// not offered back as unfinished. Every non-terminal task is surfaced
+		// — with its cursor decision when one exists, and UNKNOWN when none
+		// does.
+		if t.Status.Terminal() {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]CursorInspection, 0, len(ids))
+	for _, id := range ids {
+		t := s.tasks[id]
+		insp := CursorInspection{TaskID: id, Decision: DecisionUnknown}
+		if t.Cursor != nil {
+			c := t.Cursor
+			insp.OperationID = c.OperationID
+			insp.StepID = c.StepID
+			insp.Phase = c.Phase
+			insp.Status = c.Status
+			insp.PreconditionDigest = c.PreconditionDigest
+			insp.PostconditionDigest = c.PostconditionDigest
+			insp.Committed = c.Status == CursorCommitted
+			if digestOf != nil {
+				current, err := digestOf(id)
+				if err != nil {
+					return nil, err
+				}
+				insp.CurrentDigest = current
+				insp.Decision = inspectDecision(*c, current)
+			}
+		}
+		out = append(out, insp)
+	}
+	return out, nil
+}
+
+// inspectDecision maps a durable cursor plus the live workspace digest onto the
+// reconciliation vocabulary. A durable commit marker is authoritative: the
+// operation committed, and the recorded postcondition digest (when present)
+// only distinguishes "workspace still matches" (ALREADY_COMMITTED) from "a
+// third party changed it after the commit" (CONFLICT). A dispatched cursor is
+// judged by the existing Reconcile rule; a conflicted one stays CONFLICT.
+func inspectDecision(c ExecutionCursor, current string) ReconcileDecision {
+	switch c.Status {
+	case CursorCommitted:
+		if strings.TrimSpace(c.PostconditionDigest) != "" {
+			if current == c.PostconditionDigest {
+				return DecisionAlreadyCommitted
+			}
+			return DecisionConflict
+		}
+		return DecisionAlreadyCommitted
+	case CursorConflict:
+		return DecisionConflict
+	default:
+		return Reconcile(c, current)
+	}
+}
+
 // ── internals ──
 
 // withLock acquires the runtime FileLock for the duration of fn when this
@@ -1009,6 +1112,13 @@ func (s *TaskStore) apply(ev LedgerEvent) {
 				t.Cursor.Phase = CursorPhase(ph)
 			} else {
 				t.Cursor.Phase = PhaseCommitted
+			}
+			// The observed post-state, when the committing caller recorded
+			// it, is durable with the marker. It is what a fresh runtime
+			// compares against to distinguish ALREADY_COMMITTED from a
+			// post-commit third-party change (CONFLICT).
+			if post := strField(ev.Payload, "postconditionDigest"); post != "" {
+				t.Cursor.PostconditionDigest = post
 			}
 		}
 		s.currentID = ev.TaskID

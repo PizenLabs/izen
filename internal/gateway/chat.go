@@ -56,6 +56,23 @@ var fileRefIndicatorPatterns = []string{
 	"pip install", "docker ", "k8s ", "terraform ",
 }
 
+// codingActionPatterns are imperative workspace actions. Their presence means the
+// message is a coding request, not small talk — even when it also contains a
+// greeting word, because in a repair instruction a greeting is the VALUE to
+// write, not a greeting:
+//
+//	inspect this project, find the incorrect greeting, fix it to "Hello", and verify the result.
+//
+// The casual patterns would otherwise match "hello" and route an entire repair
+// objective to the zero-context direct-response path. Matching is whole-word or
+// whole-phrase, like every other table in this classifier, so "address" never
+// matches "add" and "created" never matches "create".
+var codingActionPatterns = []string{
+	"fix", "repair", "correct", "change", "update", "modify", "edit",
+	"replace", "rewrite", "refactor", "rename", "remove", "delete",
+	"implement", "create", "add", "verify", "inspect", "review",
+}
+
 // IsCasualChat classifies whether the user message is a casual
 // greeting / general question (non-coding chatter) that should
 // receive a lightweight system prompt and minimal token budget,
@@ -66,6 +83,9 @@ var fileRefIndicatorPatterns = []string{
 //     /plan, /hotfix) are ALWAYS coding tasks, never casual.
 //  2. Messages containing file references (@file, .go, error:, import, etc.)
 //     are ALWAYS coding tasks.
+//     2b. Messages containing an explicit workspace action (fix, verify, change,
+//     inspect, ...) are ALWAYS coding tasks. A greeting word inside an
+//     instruction is a value to write, not small talk.
 //  3. Messages matching known casual greeting / small-talk patterns
 //     are classified as casual chat.
 //  4. Everything else defaults to coding task (safe conservative
@@ -88,6 +108,16 @@ func IsCasualChat(input string) bool {
 	lower := strings.ToLower(trimmed)
 	for _, p := range fileRefIndicatorPatterns {
 		if strings.Contains(lower, p) {
+			return false
+		}
+	}
+
+	// Rule 2b: an explicit workspace action → coding task, not casual. This is
+	// the conservative direction: a message the runtime cannot confidently read
+	// as small talk gets the full context-injection path, not the zero-context
+	// one.
+	for _, p := range codingActionPatterns {
+		if isCasualMatch(lower, p) {
 			return false
 		}
 	}

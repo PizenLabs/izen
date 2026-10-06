@@ -341,3 +341,24 @@ func (m *model) bindScopeProvenance(scope intentdomain.ScopeProvenance) {
 		}
 	}
 }
+
+// scopeProvenanceDirective renders the session's bound scope directive as the
+// string the runtime autonomy driver reads.
+//
+// The driver's `scopeProvenance` compares this against the literal directive
+// names, so the spelling is a contract, not a display choice. An unauthorized
+// session yields "" — which the runtime reads as read-only, exactly as it
+// should: a run nobody declared a directive for must not inherit one.
+func (m *model) scopeProvenanceDirective() string {
+	if m.sess == nil {
+		return ""
+	}
+	switch m.sess.ScopeProvenance {
+	case intentdomain.ScopeDynamic:
+		return "$prompt"
+	case intentdomain.ScopeDeclared:
+		return "$hot"
+	default:
+		return ""
+	}
+}

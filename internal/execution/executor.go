@@ -2577,6 +2577,13 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	}
 
 	// ── Apply EVERY held patch inside the single MutationSet transaction ──
+	//
+	// The verification gate runs INSIDE this boundary (it is the apply gate, see
+	// below), so this is the point at which the verification stage is entered.
+	// Publishing the entry record here is what lets a run killed mid-gate leave a
+	// trace saying so, instead of a trace indistinguishable from one that never
+	// reached verification at all.
+	g.BeginVerification()
 	applyCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	var applyErr error
@@ -2603,18 +2610,34 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 	}
 
 	if applyErr != nil {
-		// ── FAILURE: roll back the WHOLE transaction ─────────────────
+		// ── FAILURE / CANCELLATION: roll back the WHOLE transaction ──
 		// A failure at any point rolls back the entire boundary. The
 		// aggregate outcome is a FAILURE outcome — never "changed", even when
 		// a sibling file applied before the failure (the rollback restored
-		// it). Per-file evidence is corrected to the actual post-rollback
-		// filesystem state so nothing overclaims a mutation.
+		// it) — EXCEPT when the apply was stopped by a withdrawn context
+		// (R6-A): that is a clean CANCELLATION of an open (uncommitted)
+		// transaction, not a write failure. Per-file evidence is corrected to
+		// the actual post-rollback filesystem state so nothing overclaims a
+		// mutation.
 		_ = ms.RollbackTo(MutationFailed)
 		// Reconcile per-file evidence to the actual post-rollback filesystem
 		// state BEFORE it is copied into the result/proof.
 		x.correctEvidenceAfterRollback(ms, pm.patches)
+		// ── CANCELLATION IS NOT AN APPLY FAILURE (R6-A) ────────────────
+		// A withdrawn context (Esc / Ctrl+C / OS signal, or a cancelled
+		// parent) that stops the apply is a CLEAN cancellation of an OPEN
+		// transaction: the rollback above is the atomicity guarantee for an
+		// uncommitted mutation, not a verdict that a write failed. Reporting
+		// it as apply_failed made a cancellation indistinguishable from a
+		// genuine apply failure. The deadline case (a 90s apply timeout) is
+		// deliberately NOT folded in here: a timeout is not a user cancel and
+		// keeps its failure classification.
+		cancelled := errors.Is(applyErr, context.Canceled)
 		outcome := OutcomeApplyFailed
-		if ms.Verification != nil && !ms.Verification.Passed && !ms.Verification.Skipped {
+		switch {
+		case cancelled:
+			outcome = OutcomeCancelled
+		case ms.Verification != nil && !ms.Verification.Passed && !ms.Verification.Skipped:
 			// Only a gate that actually ran and failed is a verify failure; a
 			// not-applicable (Skipped) gate never makes an apply failure a
 			// verify failure (Phase 7 P1).
@@ -2630,14 +2653,27 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 			if o == OutcomeNoArtifact {
 				o = OutcomeApplyFailed
 			}
+			if cancelled {
+				// Nothing is applied on the cancellation path; the boundary
+				// record must not claim an apply that never happened.
+				o = OutcomeCancelled
+			}
 			publishMutationOutcome(g, ms, p.File, o)
 		}
 		if ms.Verification != nil {
-			if ms.Verification.Skipped {
-				g.Skip(runtimegraph.StageVerification, ms.Verification.Reason)
-			} else {
-				g.CompleteVerification(ms.Verification.Passed, verificationSteps)
-			}
+			publishVerification(g, ms.Verification, verificationSteps)
+		}
+		if cancelled {
+			// Clean cancellation: the graph terminates CANCELLED, never
+			// failed, and the attempt carries no error — mirroring the
+			// executor's other cancellation paths (invokeMutation /
+			// invokeReadOnly / streaming). The rollback above already
+			// guaranteed the zero-delta atomicity of the open transaction.
+			g.CancelExecution(string(OutcomeCancelled))
+			res.Err = nil
+			res.Proof.FinishedAt = time.Now()
+			setProofGraph(res, g)
+			return x.finalizeResult(res), nil
 		}
 		g.FailExecution(events.FailureRecoverable, applyErr, "executor.mutation")
 		res.Err = applyErr
@@ -2666,11 +2702,7 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		publishMutationOutcome(g, ms, p.File, o)
 	}
 	if ms.Verification != nil {
-		if ms.Verification.Skipped {
-			g.Skip(runtimegraph.StageVerification, ms.Verification.Reason)
-		} else {
-			g.CompleteVerification(ms.Verification.Passed, verificationSteps)
-		}
+		publishVerification(g, ms.Verification, verificationSteps)
 	} else {
 		g.Skip(runtimegraph.StageVerification, "no verifier gate ran during apply")
 	}
@@ -4004,38 +4036,58 @@ func providerExecutionPayload(providerName string, req ai.Request, usage ai.Prov
 	if errorCode == "" && truncated {
 		errorCode = "output_truncated"
 	}
+	// ── OUTPUT BUDGET OBSERVATION (§5) ─────────────────────────────────
+	// requested is the budget this exact request asked for; effective is the
+	// ceiling the provider actually allowed. They are OBSERVED, not assumed:
+	//
+	//   - a truncated response with authoritative usage reports the provider's
+	//     completion count, which IS the ceiling it enforced;
+	//   - anything else reports the requested budget, because no smaller
+	//     ceiling was ever demonstrated.
+	//
+	// The two are equal on every call except a provider that silently capped
+	// the request — which is the exact case an operator must be able to see
+	// and which previously existed nowhere in the record.
+	requested := req.MaxTokens
+	effective, effectiveKnown := requested, false
+	if truncated && metadata.Usage.Known && metadata.Usage.CompletionTokens > 0 {
+		effective, effectiveKnown = metadata.Usage.CompletionTokens, true
+	}
 	descriptor := metadata.Contract
 	if descriptor == nil {
 		descriptor = req.Contract
 	}
 	return events.ProviderExecutionPayload{
-		Provider:           metadata.Provider,
-		Model:              metadata.Model,
-		RequestStartedAt:   metadata.Usage.RequestStartedAt,
-		FirstTokenAt:       metadata.Usage.FirstTokenAt,
-		CompletedAt:        metadata.Usage.CompletedAt,
-		RequestDuration:    metadata.RequestDuration,
-		Duration:           metadata.Duration,
-		FirstTokenLatency:  metadata.FirstTokenLatency,
-		StreamingDuration:  metadata.StreamingDuration,
-		UsageKnown:         metadata.Usage.Known,
-		PromptTokens:       metadata.Usage.PromptTokens,
-		CompletionTokens:   metadata.Usage.CompletionTokens,
-		TotalTokens:        metadata.Usage.TotalTokens,
-		CachedTokens:       metadata.Usage.CachedTokens,
-		ReasoningTokens:    metadata.Usage.ReasoningTokens,
-		FinishReason:       metadata.FinishReason,
-		Truncated:          truncated,
-		NativeSchema:       metadata.NativeSchema,
-		SchemaMode:         string(metadata.SchemaMode),
-		SchemaFallback:     metadata.SchemaFallback,
-		PromptChars:        metadata.PromptChars,
-		OutputChars:        metadata.OutputChars,
-		PromptFingerprint:  metadata.PromptFingerprint,
-		HTTPAttempts:       metadata.Usage.HTTPAttempts,
-		RateLimitedRetries: metadata.Usage.RateLimitedRetries,
-		ErrorCode:          errorCode,
-		ProtocolTelemetry:  protocol.NewObservabilityBinding(metadata.InteractionContract, descriptor, metadata.ContractID, metadata.Mode, string(metadata.SchemaMode)),
+		Provider:              metadata.Provider,
+		Model:                 metadata.Model,
+		RequestStartedAt:      metadata.Usage.RequestStartedAt,
+		FirstTokenAt:          metadata.Usage.FirstTokenAt,
+		CompletedAt:           metadata.Usage.CompletedAt,
+		RequestDuration:       metadata.RequestDuration,
+		Duration:              metadata.Duration,
+		FirstTokenLatency:     metadata.FirstTokenLatency,
+		StreamingDuration:     metadata.StreamingDuration,
+		UsageKnown:            metadata.Usage.Known,
+		PromptTokens:          metadata.Usage.PromptTokens,
+		CompletionTokens:      metadata.Usage.CompletionTokens,
+		TotalTokens:           metadata.Usage.TotalTokens,
+		CachedTokens:          metadata.Usage.CachedTokens,
+		ReasoningTokens:       metadata.Usage.ReasoningTokens,
+		FinishReason:          metadata.FinishReason,
+		Truncated:             truncated,
+		RequestedOutputTokens: requested,
+		EffectiveOutputTokens: effective,
+		EffectiveOutputKnown:  effectiveKnown,
+		NativeSchema:          metadata.NativeSchema,
+		SchemaMode:            string(metadata.SchemaMode),
+		SchemaFallback:        metadata.SchemaFallback,
+		PromptChars:           metadata.PromptChars,
+		OutputChars:           metadata.OutputChars,
+		PromptFingerprint:     metadata.PromptFingerprint,
+		HTTPAttempts:          metadata.Usage.HTTPAttempts,
+		RateLimitedRetries:    metadata.Usage.RateLimitedRetries,
+		ErrorCode:             errorCode,
+		ProtocolTelemetry:     protocol.NewObservabilityBinding(metadata.InteractionContract, descriptor, metadata.ContractID, metadata.Mode, string(metadata.SchemaMode)),
 	}
 }
 
@@ -5191,6 +5243,27 @@ func stampContractIdentity(res *ExecutionResult, c *ExecutionContract, attempt A
 			res.Proof.CausalAncestry = append(res.Proof.CausalAncestry, id.String())
 		}
 	}
+}
+
+// publishVerification projects the verification gate's REAL report onto the
+// execution graph, choosing between the two terminal verification transitions.
+//
+// The distinction is the whole point. `VerificationReport.Skipped` means the
+// gate WAS consulted and found no contract for this artifact — an observation.
+// A nil report means no gate ran at all — an absence of observation, which the
+// caller publishes as Skip. Collapsing both into Skip made "this artifact has no
+// verification contract" and "verification never ran" the same record, and a
+// forensic reader could not then tell a correctly-reported plain-text edit from
+// an unverified mutation.
+func publishVerification(g *runtimegraph.Graph, report *VerificationReport, steps []string) {
+	if g == nil || report == nil {
+		return
+	}
+	if report.Skipped {
+		g.NotApplicableVerification(report.Reason)
+		return
+	}
+	g.CompleteVerification(report.Passed, steps)
 }
 
 // verificationGateState reports whether a real verification gate executed and

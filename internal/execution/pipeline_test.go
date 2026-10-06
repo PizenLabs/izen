@@ -83,7 +83,7 @@ func TestVerifierDefaultSteps(t *testing.T) {
 	if len(v.steps) != 0 {
 		t.Fatalf("expected 0 default steps (no implicit Go fallback), got %d", len(v.steps))
 	}
-	report := v.RunAll(t.Context(), )
+	report := v.RunAll(t.Context())
 	if !report.Skipped {
 		t.Fatal("expected the no-step verifier to report Skipped, not a pass or failure")
 	}
@@ -100,7 +100,7 @@ func TestVerifierCustomSteps(t *testing.T) {
 	}
 	v.SetCustomSteps(custom)
 
-	report := v.RunAll(t.Context(), )
+	report := v.RunAll(t.Context())
 	if len(report.Results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(report.Results))
 	}
@@ -116,7 +116,7 @@ func TestVerifierCustomStepsFailure(t *testing.T) {
 	}
 	v.SetCustomSteps(custom)
 
-	report := v.RunAll(t.Context(), )
+	report := v.RunAll(t.Context())
 	if report.Passed {
 		t.Fatal("expected verification to fail")
 	}
@@ -137,7 +137,7 @@ func TestVerifierOptionalFailure(t *testing.T) {
 	}
 	v.SetCustomSteps(custom)
 
-	report := v.RunAll(t.Context(), )
+	report := v.RunAll(t.Context())
 	if !report.Passed {
 		t.Fatal("optional step failure should not cause overall failure")
 	}

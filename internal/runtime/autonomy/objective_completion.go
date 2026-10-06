@@ -207,6 +207,7 @@ func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
 		// must hold before the loop is allowed to move on.
 		d.ledgerExecutionCommitted()
 		decision.Reason = strings.TrimSpace(decision.Reason + "; objective PROVEN by evidence")
+		d.emitObjectiveEvaluated(evaluation, string(autonomy.LoopComplete), true)
 		return
 	}
 
@@ -217,6 +218,9 @@ func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
 
 	reason := fmt.Sprintf("objective UNPROVEN (%s): %s — refused completion claim over outcome %q",
 		evaluation.Outcome, evaluation.Reason, string(d.obs.Outcome))
+	// The refusal is published BEFORE the rewrite so the record carries the
+	// verdict the authority reached, not merely the action it downgraded to.
+	d.emitObjectiveEvaluated(evaluation, string(autonomy.LoopComplete), false)
 	switch evaluation.Outcome {
 	case execution.ObjectiveFailed:
 		decision.Action = autonomy.LoopAbort

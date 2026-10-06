@@ -497,12 +497,15 @@ func (v *Verifier) runStep(ctx context.Context, step VerificationStep) Verificat
 				result.Output = rawResult.Stdout
 			}
 		}
-		if rawResult != nil && rawResult.ExitCode == 0 {
-			result.Passed = true
-		}
-		if !result.Passed {
-			result.SyntaxErrors = ParseSyntaxErrors(result.Output)
-		}
+		// A step that returned an error is NEVER a pass. The only shape where
+		// Runner.Run yields a non-nil error with ExitCode == 0 is a command
+		// that never ran at all: the context was already withdrawn before
+		// exec.Start, or the process could not be started. Treating that as a
+		// pass would let a cancelled or unstarted verification gate a mutation
+		// as verified — verification absence must never become verification
+		// success (R6-C).
+		result.Passed = false
+		result.SyntaxErrors = ParseSyntaxErrors(result.Output)
 		return result
 	}
 

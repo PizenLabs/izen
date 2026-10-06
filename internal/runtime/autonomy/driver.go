@@ -299,12 +299,43 @@ type Driver struct {
 	// ledgerTask is the current run's durable task id, empty when no ledger
 	// is bound.
 	ledgerTask string
+	// ledgerCommittedOp is the operationID whose durable mutation commit
+	// marker this run has already written. The mutation boundary commits as
+	// soon as a mutation is observed to have landed (changed/created), and
+	// the objective authority commits again when it PROVES the objective; this
+	// field keeps that second, weaker act from appending a duplicate truth
+	// boundary for the same operation.
+	ledgerCommittedOp string
+	// ledgerPendingOp is the operationID of the cursor most recently dispatched
+	// by ledgerMutationPrepared. The commit marker binds to this exact cursor,
+	// independent of any loop attempt-counter movement between the pre-digest
+	// dispatch and the commit.
+	ledgerPendingOp string
 	// ledgerLastState is the last loop state written to the journal. Every
 	// return path funnels through term(), so this is what keeps a single
 	// transition from being appended twice while still recording every
 	// genuine state change. The zero value means "nothing written yet" — it
 	// is not a valid autonomy.RuntimeState.
 	ledgerLastState autonomy.RuntimeState
+
+	// ── Execution forensics ─────────────────────────────────────────────
+	// forensics is the run's control-plane record: the continuation decision
+	// currently travelling through the authority chain, and the number of
+	// executed steps observed. It is observability state only — no decision
+	// reads it, and no decision would change if it were deleted. See
+	// forensics.go.
+	forensics decisionRecord
+	// forensicsSteps counts the runtime steps this run actually EXECUTED,
+	// distinct from the loop's structural bound. It is the runtime's own
+	// count, so the run summary cannot disagree with the loop.
+	forensicsSteps int
+
+	// scope is the human directive that authorized this run ("$prompt" /
+	// "$hot"). It is copied onto every LoopRequest the driver builds, because
+	// the request is the one record that travels with the run; without it the
+	// behavioral completion gate derives a read-only capability vector and can
+	// never observe the workspace it is being asked to prove. See WithScope.
+	scope string
 }
 
 // MaxContractRecoveryAttempts bounds how many times one execution lifecycle
@@ -433,6 +464,39 @@ func WithSubcommand(s string) Option {
 	return func(d *Driver) { d.subcommand = s }
 }
 
+// WithScope records the human directive that authorized this run ("$prompt" or
+// "$hot").
+//
+// ── WHY THIS IS NOT COSMETIC ────────────────────────────────────────────────
+//
+// `scopeProvenance` reads this to decide which capability vector the behavioral
+// completion gate may use (`execution.GrantFor`). Without it every run reads as
+// `read_only`, which grants Read and withholds Execute and Network — and a
+// behavioral gate that may not start a process can never observe the workspace
+// running. That gate runs whenever the objective asks for a verifiable result
+// ("fix", "renders", "correct", "verify"), so a `$prompt` run that mutated
+// correctly could not be completed: it was downgraded to BEHAVIORALLY UNPROVEN
+// on evidence the gate was never able to gather.
+//
+// It is the SAME value the UI already binds (`bindScopeProvenance`) and the SAME
+// string WithSubcommand already accepts. It is carried here because the Driver's
+// LoopRequest is the one record that travels with the run; the UI's binding is
+// local to the presentation layer and never reached it.
+func WithScope(s string) Option {
+	return func(d *Driver) { d.scope = s }
+}
+
+// SetScope records the human directive for a run already in flight or about to
+// start. It is the push form of WithScope, for a caller (the TUI) whose
+// directive is bound per input rather than at composition time.
+func (d *Driver) SetScope(s string) {
+	if d == nil {
+		return
+	}
+	d.scope = s
+	d.req.Scope = s
+}
+
 // WithInteractionContract binds the semantic interaction contract used by the
 // driver and all of its dispatch/recovery requests.  The descriptor is
 // optional; when omitted the contract's conservative default is used.  The
@@ -524,6 +588,11 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	if d.adapter == nil {
 		return nil, errors.New("autonomy: driver requires an executor adapter")
 	}
+	// FORENSICS: one terminal record per run, on every return path — including
+	// the early refusals above the loop and the parks below it. A summary that
+	// only appears on the happy path is a summary that is absent exactly when
+	// something went wrong.
+	defer d.emitRunSummary()
 	// ── DUPLICATE-START PROTECTION (§18 / §21-I) ──────────────────────
 	// Exactly one run at a time: a second Run while the current loop is still
 	// active (executing) OR parked (awaiting human) must never silently
@@ -560,6 +629,10 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.contractRecoveries = 0
 	d.contractRecoveryExhausted = false
 	d.derivationNote = ""
+	// R5: a new run is a new progress lifecycle. Carrying the previous run's
+	// satisfied-condition snapshot forward would render one objective's
+	// first decision as an advance over another objective.
+	d.forensics.resetProgress()
 	// The run's derived SCOPE state is not reset here but by the single owner of
 	// target binding: bindAuthoritativeTargets below invalidates the previous
 	// verdict, the scope record and the objective contract together and then
@@ -626,6 +699,8 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.bindAuthoritativeTargets(nil, "a new run resolves and derives its own scope")
 	interaction, interactionDescriptor, contractErr := d.selectInteractionContract(objective)
 	if contractErr != nil {
+		d.emitAuthorization("deny", "interaction contract binding failed: "+contractErr.Error(),
+			"CONTRACT_BINDING", false, true)
 		_, _ = d.loop.Abort("interaction contract binding failed: "+contractErr.Error(), autonomy.FailurePermanent)
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 		d.releaseRunResources()
@@ -650,6 +725,12 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		WorkspaceDigest:     d.adapter.WorkspaceVersion(d.resolved.Targets),
 		InteractionContract: interaction,
 		Contract:            interactionDescriptor,
+		// The authorizing directive travels with the run. It is the input the
+		// behavioral completion gate derives its capability vector from, so
+		// leaving it empty here would silently downgrade every `$prompt` run to
+		// read-only authority and make the gate's verdict unprovable by
+		// construction.
+		Scope: d.scope,
 	}
 	// The durable execution record opens HERE: once the objective and its
 	// resolved targets are known, and before anything can be dispatched, so
@@ -685,6 +766,15 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// Clear the callback after capturing it for this run.
 	d.streamCb = nil
 	if d.resolved.Ambiguous {
+		// The run is NOT authorized: no target is bound, so nothing may act.
+		// Publishing the refusal here — at the park, not only at the admission
+		// gate — is what makes "authorization was refused" distinguishable from
+		// "authorization was never attempted". A scope clarification parks BEFORE
+		// the gate is ever reached, so a record published only at the gate would
+		// be absent for every ambiguous-scope run.
+		d.emitAuthorization("disambiguate",
+			"target clarification required before any execution: "+d.derivationNote,
+			"AMBIGUOUS_SCOPE", false, true)
 		d.loop.AwaitHuman(autonomy.HumanBoundary{
 			Reason:  "target clarification required before any execution",
 			Options: d.resolved.Options,
@@ -694,6 +784,8 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		return d.term(), nil
 	}
 	if err := ValidateObjectiveContract(objective, interaction, interactionDescriptor); err != nil {
+		d.emitAuthorization("deny", "interaction contract authority ceiling: "+err.Error(),
+			"CONTRACT_CEILING", false, true)
 		_, _ = d.loop.Abort("interaction contract authority ceiling: "+err.Error(), autonomy.FailurePermanent)
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 		d.releaseRunResources()
@@ -717,6 +809,10 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		})
 		d.enrichBoundary()
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
+		d.emitAuthorization("deny",
+			"canonical intent revision incomplete — the run holds intent "+string(canonical)+
+				" with no valid workspace context for it: "+err.Error(),
+			"CONTEXT_UNAVAILABLE", false, true)
 		// A parked run terminates nothing, exactly like the preflight-infeasible
 		// and NO-OP-escalation paths: the reason travels on the boundary, not
 		// as a raw error, so the human gets a decision instead of a stack.
@@ -745,6 +841,7 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 // Abort the loop is terminal and a fresh Run may start. Aborting a loop that
 // has not started or is already terminal is a no-op.
 func (d *Driver) Abort(reason string) (*autonomy.LoopTermination, error) {
+	defer d.emitRunSummary()
 	if d.loop == nil {
 		return nil, errors.New("autonomy: abort requires a started run")
 	}
@@ -784,6 +881,7 @@ var ErrNoHeldPatch = errors.New("no held patch to approve")
 // regeneration). A hard approve error (no result, e.g. double-approve)
 // aborts the run so it can never park at a stale awaiting_human.
 func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, error) {
+	defer d.emitRunSummary()
 	if err := ValidateDispatchContract(autonomy.LoopRequest{
 		Prompt:              d.prompt,
 		Target:              firstTarget(d.req.Targets),
@@ -819,6 +917,14 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 		return d.term(), nil
 	}
 	d.obs = obs
+	// ── DURABLE MUTATION EVIDENCE: COMMITTED (APPROVAL PATH) ─────────
+	// The human gate is a real mutation seam too: the held patch was applied
+	// here. Record the same commit marker the autonomous dispatch records, so
+	// a crash after "approve" but before the objective terminal is
+	// reconcilable exactly like any other committed mutation.
+	if mutationObservedCommitted(obs) {
+		d.ledgerMutationCommitted(d.objectiveTargets())
+	}
 	// The apply landed through the human gate, so the runtime — not an executor
 	// dispatch — is what produced this observation. Fold it into the objective
 	// lifecycle here: the result must be re-inspected and the step's evidence
@@ -855,6 +961,7 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 // through the executor; the rejection is a terminal human decision, never a
 // re-execution.
 func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.LoopTermination, error) {
+	defer d.emitRunSummary()
 	pid, err := d.approvalPatchID()
 	if err != nil {
 		return d.term(), err
@@ -896,6 +1003,7 @@ func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.Loo
 // target. No mutation ever happened before the boundary, so a bounded
 // re-resolution and re-execution is safe.
 func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.LoopTermination, error) {
+	defer d.emitRunSummary()
 	if d.loop == nil || d.loop.State() != autonomy.RuntimeAwaitingHuman {
 		return d.term(), errors.New("autonomy: clarify requires a parked clarification boundary")
 	}
@@ -1723,6 +1831,22 @@ func (d *Driver) deriveEvidenceScope() {
 	derivation := d.adapter.DeriveScope(d.prompt, d.resolved.Targets)
 	d.scopeDerivation = derivation
 
+	// ── DISCOVERED ─────────────────────────────────────────────────────
+	// Record the observed candidate set as EVIDENCE before anything is
+	// proposed. This is the step that makes "index.html exists" a legible fact
+	// even when no target is ever bound: DISCOVERED is a question, and the
+	// authority decision below never reads it as a scope.
+	if len(derivation.Candidates) > 0 {
+		diagnosticf("[discovery] observed %d candidate(s): %v (kinds=%v)",
+			len(derivation.Candidates), derivation.Candidates, derivation.Kinds)
+		d.noteScopeTransition(ScopeResolution{
+			State:      ScopeDiscovered,
+			Candidates: append([]string(nil), derivation.Candidates...),
+			Kinds:      append([]string(nil), derivation.Kinds...),
+			Reason:     "bounded workspace discovery observed candidate file(s); they are evidence and nothing is bound",
+		})
+	}
+
 	// ── AMBIGUOUS ──────────────────────────────────────────────────────
 	// Candidates were observed and none is proven. This is a QUESTION for a
 	// human, so it is recorded as a typed scope position carrying the candidate
@@ -1745,14 +1869,51 @@ func (d *Driver) deriveEvidenceScope() {
 		return
 	}
 
+	// ── PROPOSED (sole observed candidate, no declared evidence) ───────
+	// The objective declared no artifact kind that could DERIVE a target, but
+	// bounded discovery observed exactly ONE candidate. A unique candidate can
+	// justify a TARGET PROPOSAL — and only a proposal. It is recorded as
+	// PROPOSED, it binds nothing (d.resolved.Targets stays empty), and the
+	// authority boundary decides whether it may become a target. This is the
+	// line that must never become "scan → one file → mutate".
+	if len(derivation.Kinds) == 0 && len(derivation.Candidates) == 1 {
+		sole := derivation.Candidates[0]
+		d.derivationNote = "the workspace offers exactly one observed candidate (" + sole +
+			"); the objective declares no artifact kind, so this is a NON-AUTHORITATIVE target proposal for the authority boundary to confirm"
+		diagnosticf("[scope] PROPOSED sole candidate %q — no target bound; the admission gate decides", sole)
+		d.noteScopeTransition(ScopeResolution{
+			State:      ScopeProposed,
+			Targets:    append([]string(nil), sole),
+			Candidates: append([]string(nil), derivation.Candidates...),
+			Reason:     d.derivationNote,
+		})
+		return
+	}
+
 	if !derivation.IsUnique() || len(derivation.Targets) == 0 {
-		if derivation.Reason != "" {
+		// Nothing was observed, or several candidates were observed and the
+		// DISCOVERED record above already carries them. No proposal exists and
+		// nothing is bound.
+		if len(derivation.Candidates) == 0 && derivation.Reason != "" {
 			d.derivationNote = derivation.Reason
 			diagnosticf("[scope] no evidence-bound target derived: %s", derivation.Reason)
 			d.noteScopeTransition(ScopeResolution{State: ScopeUnresolved, Reason: derivation.Reason})
 		}
 		return
 	}
+
+	// ── PROPOSED (objective-declared evidence) ─────────────────────────
+	// Every declared kind matched at most one observed file, so the evidence
+	// determines a target set. That is a TARGET PROPOSAL, not authority: the
+	// strategy gateway must still accept it as a mutation contract before
+	// anything binds.
+	d.noteScopeTransition(ScopeResolution{
+		State:      ScopeProposed,
+		Targets:    append([]string(nil), derivation.Targets...),
+		Candidates: append([]string(nil), derivation.Candidates...),
+		Kinds:      append([]string(nil), derivation.Kinds...),
+		Reason:     "the objective-declared artifact kind(s) matched one observed file per kind; the target set is PROPOSED and awaits the strategy gateway",
+	})
 
 	// Re-resolve the strategy over the DERIVED objective. This is what keeps
 	// strategy selection in its existing authority: the gateway still decides
@@ -1802,21 +1963,17 @@ func (d *Driver) deriveEvidenceScope() {
 	d.derivationNote = derivation.Reason
 	diagnosticf("[scope] evidence-bound derivation: %v (kinds=%v) — %s",
 		proven, derivation.Kinds, derivation.Reason)
-	// The two-step transition is recorded explicitly: DISCOVERED is the
-	// observation, RESOLVED is the gateway's authority. Publishing only the end
-	// state is what made `targets=[]` look like a value that had been silently
-	// overwritten.
+	// The three-stage transition is recorded explicitly and in order:
+	// DISCOVERED (observation, above) → PROPOSED (this run's target set,
+	// recorded before the gateway ran) → RESOLVED (the gateway's authority,
+	// below). Publishing only the end state is what made `targets=[]` look
+	// like a value that had been silently overwritten.
 	d.noteScopeTransition(ScopeResolution{
-		State:   ScopeDiscovered,
-		Targets: append([]string(nil), proven...),
-		Kinds:   append([]string(nil), derivation.Kinds...),
-		Reason:  derivation.Reason,
-	})
-	d.noteScopeTransition(ScopeResolution{
-		State:   ScopeResolved,
-		Targets: append([]string(nil), proven...),
-		Kinds:   append([]string(nil), derivation.Kinds...),
-		Reason:  "the strategy gateway accepted the observed files as this run's mutation scope",
+		State:      ScopeResolved,
+		Targets:    append([]string(nil), proven...),
+		Candidates: append([]string(nil), derivation.Candidates...),
+		Kinds:      append([]string(nil), derivation.Kinds...),
+		Reason:     "the strategy gateway accepted the observed files as this run's mutation scope",
 	})
 }
 
@@ -1946,6 +2103,24 @@ func (d *Driver) preflightExecutionSpec(ctx context.Context) ExecutionSpec {
 //	                    the mutation contract, so canonical intent elevates while
 //	                    admission stays read-only for THIS turn)
 //	READ-ONLY → ASK / INVESTIGATE
+//
+// frozenSpec builds the admission-time ExecutionSpec and publishes it as the
+// run's frozen spec — exactly once, on the first call.
+//
+// It wraps preflightExecutionSpec rather than replacing it: the gate still reads
+// a pure value built the same way, and the published event is a projection of
+// that value rather than a second derivation. A spec that were computed twice
+// could differ between the record and the gate's own verdict, which is the one
+// disagreement a forensic record cannot afford.
+func (d *Driver) frozenSpec(ctx context.Context) ExecutionSpec {
+	spec := d.preflightExecutionSpec(ctx)
+	if d.bus != nil && !d.forensics.specPublished {
+		d.forensics.specPublished = true
+		d.emitSpecFrozen(spec)
+	}
+	return spec
+}
+
 func intentClassForStrategy(s strategy.ExecutionStrategy) IntentClass {
 	switch strategy.MutationSemanticsOf(s) {
 	case strategy.MutationSemanticsApplied:
@@ -2022,8 +2197,14 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 	// authoritative evidence parks at a human boundary or aborts — no provider
 	// token is billed. A directory target (I11) can never be promoted to a file
 	// on the way through.
-	if outcome := EvaluatePreflightAdmission(d.preflightExecutionSpec(ctx)); outcome.Blocked() {
+	if outcome := EvaluatePreflightAdmission(d.frozenSpec(ctx)); outcome.Blocked() {
 		if outcome.Verdict == AdmissionDisambiguate {
+			// A REFUSAL is published exactly as a grant would be. An absent
+			// authorization event and an authorization that was never attempted
+			// look identical after the process exits; only an explicit blocked
+			// record distinguishes them.
+			d.emitAuthorization("disambiguate", outcome.Reason,
+				string(outcome.FailureClass), false, true)
 			if d.bus != nil {
 				d.bus.Publish(events.NewActivity("[preflight] target unresolved — awaiting disambiguation: " + outcome.Reason))
 			}
@@ -2056,8 +2237,16 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 		if d.bus != nil {
 			d.bus.Publish(events.NewActivity("[preflight] inadmissible target: " + outcome.Reason))
 		}
+		d.emitAuthorization("deny", outcome.Reason,
+			string(outcome.FailureClass), false, true)
+		d.emitRunSummary()
 		return d.terminateAbort(ctx, "preflight inadmissible target: "+outcome.Reason, autonomy.FailurePermanent), nil
 	}
+	// ADMITTED. The spec the gate just approved is published before the first
+	// provider call, so the record names the bounds the run was admitted under
+	// rather than the bounds it happened to finish with.
+	d.emitAuthorization("allow", "admitted: proven target, admissible mutation boundary, authoritative evidence",
+		"", true, false)
 	for !d.loop.State().IsTerminal() {
 		// Loop boundary: snapshot the durable view so "where was this run
 		// when the process stopped" is readable without a full replay.
@@ -2086,6 +2275,13 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			d.obs.AttemptNum = d.loop.Attempts()
 			d.obs.RecoveryCycle = d.loop.RecoveryCycles()
 			decision := d.decideWithObjective(d.obs, d.loop.Bounds())
+			// ── FORENSICS: the PROPOSAL, before any authority sees it ──
+			// Published here because this is the last point at which the
+			// matrix's own action and reason are still intact. Every
+			// authority below may rewrite them; recording only the winner
+			// would make an authority rewrite indistinguishable from the
+			// matrix having chosen that action itself.
+			d.beginDecision(decision)
 			// ── PHASE 14: OBJECTIVE COMPLETION AUTHORITY ────────────────
 			// The decision matrix proposes; the authority disposes. A proposed
 			// completion is rewritten into the terminal state that matches WHY
@@ -2093,7 +2289,9 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// only when the Task Contract was actually satisfied. A provider
 			// that returned, a step that came back nil and a verifier that
 			// merely ran are structurally incapable of producing it.
+			pre := decision
 			d.authorizeObjectiveCompletion(&decision)
+			d.forensics.noteAuthority(AuthorityCompletionGate, pre, decision)
 			// ── OBJECTIVE EVIDENCE-CARRY-OVER ──────────────────────
 			// When the completion gate REFUSED a claim, the lifecycle is not
 			// finished — it is incomplete. This is where that fact becomes the
@@ -2103,7 +2301,9 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// objective unsubstantiated. A refused claim is never silently
 			// converted into a terminal verdict when the bounds allow another
 			// step, and it is never converted into a success either.
+			pre = decision
 			d.routeObjectiveContinuation(&decision)
+			d.forensics.noteAuthority(AuthorityContinuationRouter, pre, decision)
 			// ── BEHAVIORAL PROOF GATE ────────────────────────────────────
 			// An objective that asks for a verifiable RESULT cannot be declared
 			// complete on the strength of an applied mutation alone. The workspace
@@ -2116,14 +2316,18 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// require behavioural proof (a read, a document write) is untouched,
 			// and a run with no behavioral stage wired keeps its exact prior
 			// behaviour.
+			pre = decision
 			d.authorizeBehavioralCompletion(ctx, &decision)
+			d.forensics.noteAuthority(AuthorityBehaviorGate, pre, decision)
 			// ── PHASE 15: CONTRACT RECOVERY CIRCUIT BREAKER ───────────────
 			// A prose-only response is repromptable, but only a bounded number
 			// of times. Once the bound is spent the proposed repair is rewritten
 			// into the terminal UNSUBSTANTIATED state, so the loop can neither
 			// claim the objective nor burn the remaining budget asking a model
 			// that has already declined to speak the contract twice.
+			pre = decision
 			d.authorizeContractRecovery(&decision)
+			d.forensics.noteAuthority(AuthorityContractRecovery, pre, decision)
 			// ── PHASE 12: CANONICAL CONTINUATION CONSULTATION ────────────
 			// An exhausted invocation is an INVOCATION outcome, not a task
 			// failure. Before the matrix acts on it, the pure continuation
@@ -2173,6 +2377,14 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				term := d.terminateAbort(ctx, "interaction contract authority ceiling: "+contractErr.Error(), autonomy.FailurePermanent)
 				return term, contractErr
 			}
+			// ── DURABLE MUTATION EVIDENCE: PREPARED ──────────────────────
+			// Record the workspace PRE-state durably BEFORE the mutation
+			// boundary is crossed. If the process dies before the commit
+			// marker below, a fresh runtime compares the surviving digest to
+			// this pre-digest: an unchanged workspace is SAFE_RETRY, anything
+			// else is CONFLICT — never a silent retry. This is dispatched at
+			// the ONE autonomous mutation seam, not scattered across the loop.
+			d.ledgerMutationPrepared(d.objectiveTargets())
 			obs, err := d.adapter.Execute(ctx, d.req)
 			// Late-result guard: if the run was aborted/superseded while we were
 			// executing, discard the result and return the terminal state.
@@ -2183,6 +2395,16 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 				return nil, fmt.Errorf("autonomy: execute: %w", err)
 			}
 			d.obs = obs
+			// ── DURABLE MUTATION EVIDENCE: COMMITTED ─────────────────────
+			// The mutation boundary has been crossed. If a real change landed
+			// (changed/created), record the commit marker and the observed
+			// POST-state now — before any further observation or decision — so
+			// the gap between the kernel write and durable commit evidence is
+			// as small as the architecture allows. This commits the OPERATION,
+			// never the objective.
+			if mutationObservedCommitted(obs) {
+				d.ledgerMutationCommitted(d.objectiveTargets())
+			}
 			// ── OBJECTIVE EVIDENCE BINDING ───────────────────────
 			// Fold this step's facts into the objective lifecycle: re-read the
 			// declared targets so the RESULT is observed (not just requested),
@@ -2244,6 +2466,11 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			}
 			d.loop.ConsumeExecution(obs)
 			d.loop.ConsumeVerification(obs)
+			// One RUNTIME STEP was executed and consumed. Counted here, at the
+			// execution boundary, because this is the only point at which "a
+			// step happened" is a fact rather than an inference from a loop
+			// transition.
+			d.forensicsSteps++
 			// The step's observation is the only thing that happened to the
 			// workspace; it goes into the journal before the loop can decide
 			// anything about it.
@@ -2667,6 +2894,12 @@ func (d *Driver) enrichBoundary() {
 // publish emits every not-yet-published loop transition as a canonical
 // loop.transition event. The driver is the single owner of these events;
 // consumers (UI projection, tests) only observe.
+//
+// It is ALSO the single place a continuation decision becomes observable, because
+// it is the single place every APPLIED decision passes through — including the
+// parks that never reach Driver.step. Settling the forensic record here is what
+// keeps continuation.selected honest: it is emitted from the loop's own
+// transition history rather than from the call site that happened to step.
 func (d *Driver) publish(_ context.Context) {
 	if d.bus == nil || d.loop == nil {
 		return
@@ -2674,6 +2907,7 @@ func (d *Driver) publish(_ context.Context) {
 	history := d.loop.History()
 	for i := d.published; i < len(history); i++ {
 		t := history[i]
+		d.settleDecision(t)
 		d.bus.Publish(events.NewLoopTransition(t.From.String(), t.To.String(), string(t.Action), t.Reason))
 	}
 	d.published = len(history)

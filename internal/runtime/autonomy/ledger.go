@@ -108,6 +108,8 @@ func (d *Driver) ledgerBeginRun(objective string) {
 	id := d.ledgerTaskID(objective)
 	d.ledgerTask = id
 	d.ledgerLastState = ""
+	d.ledgerCommittedOp = ""
+	d.ledgerPendingOp = ""
 	if st, ok := d.ledger.State(id); ok && !st.Status.Terminal() {
 		return
 	}
@@ -134,9 +136,155 @@ func (d *Driver) ledgerExecutionCommitted() {
 	if !d.ledgerReady() {
 		return
 	}
-	if err := d.ledger.CommitExecution(d.ledgerTask, d.ledgerOperationID()); err != nil {
-		ledgerFail("EXECUTION_COMMITTED refused for %s: %v", d.ledgerTask, err)
+	op := d.ledgerPendingOp
+	if op == "" {
+		op = d.ledgerOperationID()
 	}
+	// The mutation boundary already recorded this operation's commit with the
+	// observed post-state. Objective PROVEN is a different fact (the OUTCOME
+	// contract), never a second mutation commit; appending another truth
+	// boundary for the same operation would claim the operation committed
+	// twice.
+	if d.ledgerCommittedOp == op {
+		return
+	}
+	if err := d.ledger.CommitExecution(d.ledgerTask, op); err != nil {
+		ledgerFail("EXECUTION_COMMITTED refused for %s: %v", d.ledgerTask, err)
+		return
+	}
+	d.ledgerCommittedOp = op
+}
+
+// ledgerMutationPrepared durably records the workspace PRE-state BEFORE a
+// side-effecting dispatch, so a crash between the mutation and its commit
+// marker is reconcilable from the surviving digest. It returns the recorded
+// pre-digest ("" when no ledger is bound, when the scope is empty, or when the
+// digest could not be computed — in which case no cursor is dispatched and the
+// post-crash state honestly remains UNKNOWN rather than SAFE_RETRY).
+//
+// Dispatch alone NEVER means the mutation committed: it is the durable
+// `PREPARED` boundary the commit marker later completes.
+func (d *Driver) ledgerMutationPrepared(scope []string) string {
+	if !d.ledgerReady() {
+		return ""
+	}
+	pre, ok := d.cursorDigest(scope)
+	if !ok {
+		return ""
+	}
+	op := d.ledgerOperationID()
+	cursor := durable.ExecutionCursor{
+		TaskID:             d.ledgerTask,
+		StepID:             op,
+		OperationID:        op,
+		PreconditionDigest: pre,
+		// The postcondition is deliberately unestablished at dispatch time:
+		// this path has no execution proof yet, and a fabricated one would let
+		// a fresh runtime skip work that never happened. It is recorded by
+		// ledgerMutationCommitted once the mutation is observed to have landed.
+		PostconditionDigest: "",
+	}
+	if err := d.ledger.DispatchCursor(cursor); err != nil {
+		ledgerFail("CURSOR_DISPATCHED refused for %s: %v", d.ledgerTask, err)
+		return ""
+	}
+	// Bind the later commit to THIS cursor. The loop's attempt counter can
+	// move between the dispatch and the commit (it is a progress counter, not
+	// an operation identity), so the operation id is latched here rather than
+	// recomputed at commit time.
+	d.ledgerPendingOp = op
+	return pre
+}
+
+// ledgerMutationCommitted durably records that a mutation LANDED, together
+// with the observed POST-state. It is the commit marker the R6-C gap lacked:
+// it is written after the workspace mutation and is independent of whether the
+// objective was later PROVEN, because "the mutation committed" and "the
+// objective was satisfied" are different facts. It fsyncs (EXECUTION_COMMITTED
+// is a truth boundary).
+func (d *Driver) ledgerMutationCommitted(scope []string) {
+	if !d.ledgerReady() {
+		return
+	}
+	op := d.ledgerPendingOp
+	if op == "" {
+		op = d.ledgerOperationID()
+	}
+	if d.ledgerCommittedOp == op {
+		return
+	}
+	post, ok := d.cursorDigest(scope)
+	if !ok {
+		post = ""
+	}
+	if err := d.ledger.CommitExecutionWithDigest(d.ledgerTask, op, post); err != nil {
+		ledgerFail("EXECUTION_COMMITTED refused for %s: %v", d.ledgerTask, err)
+		return
+	}
+	d.ledgerCommittedOp = op
+}
+
+// mutationObservedCommitted reports whether an observation is positive
+// evidence that a workspace mutation actually landed. Changed and Created are
+// the ONLY outcomes that prove a real filesystem change; a no-op, a pending
+// approval, a failure and a control-plane refusal are NOT commits. Absence of
+// a mutation is never rounded up to a commit marker.
+func mutationObservedCommitted(obs autonomy.Observation) bool {
+	switch obs.Outcome {
+	case autonomy.OutcomeChanged, autonomy.OutcomeCreated:
+		return true
+	default:
+		return false
+	}
+}
+
+// cursorDigest computes the durable worktree digest over the run's declared
+// scope, rooted at the adapter's workspace. It uses the SAME digest function
+// the reconciliation reads use (durable.ComputeTreeDigest), so a pre-digest
+// recorded here and the digest a fresh runtime computes later are directly
+// comparable. ok is false when the digest is unavailable.
+func (d *Driver) cursorDigest(scope []string) (string, bool) {
+	if d == nil || d.adapter == nil {
+		return "", false
+	}
+	root := d.adapter.Root()
+	if strings.TrimSpace(root) == "" {
+		return "", false
+	}
+	digest, err := durable.ComputeTreeDigest(root, scope...)
+	if err != nil || strings.TrimSpace(digest) == "" {
+		return "", false
+	}
+	return digest, true
+}
+
+// ReconcileInterrupted is the FRESH-RUNTIME reconciliation surface. It reads
+// the durable mutation evidence of every task in the bound ledger, compares it
+// against the live workspace digest, and returns the per-task decision
+// (ALREADY_COMMITTED / SAFE_RETRY / CONFLICT / UNKNOWN). It is READ-ONLY: it
+// never resumes, retries or mutates anything. A decision is a fact the caller
+// may act on at a human boundary — SAFE_RETRY does NOT mean "retry now", and
+// ALREADY_COMMITTED does NOT mean "the objective is PROVEN".
+func (d *Driver) ReconcileInterrupted() ([]durable.CursorInspection, error) {
+	if d == nil || d.ledger == nil {
+		return nil, fmt.Errorf("durable: reconcile requires a bound ledger")
+	}
+	root := ""
+	if d.adapter != nil {
+		root = d.adapter.Root()
+	}
+	if strings.TrimSpace(root) == "" {
+		return nil, fmt.Errorf("durable: reconcile requires a workspace root")
+	}
+	// Snapshot scopes BEFORE InspectCursors: it holds the store lock while
+	// invoking the digest func, so consulting the store here would deadlock.
+	scopes := d.ledger.TaskScopes()
+	return d.ledger.InspectCursors(func(taskID string) (string, error) {
+		if scope, ok := scopes[taskID]; ok && len(scope) > 0 {
+			return durable.ComputeTreeDigest(root, scope...)
+		}
+		return durable.ComputeTreeDigest(root)
+	})
 }
 
 // ledgerObserved records the outcome of one executed step. A step that failed
