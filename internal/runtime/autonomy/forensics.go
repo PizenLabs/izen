@@ -242,11 +242,22 @@ func (d *Driver) emitAuthorization(verdict, reason, reasonCode string, granted, 
 		// re-spelled: a second label vocabulary would let the forensic record
 		// and the behavioral grant's own evidence disagree about which authority
 		// was in force.
-		Mode:      execution.ScopeProvenanceLabel(d.scopeProvenance()),
-		Intent:    string(d.admissionIntent()),
-		Scope:     string(d.scopeResolution.State),
-		Targets:   append([]string(nil), d.resolved.Targets...),
-		Authority: AuthorityAdmissionGate,
+		Mode:    execution.ScopeProvenanceLabel(d.scopeProvenance()),
+		Intent:  string(d.admissionIntent()),
+		Scope:   string(d.scopeResolution.State),
+		Targets: append([]string(nil), d.resolved.Targets...),
+		// The DISCOVERED evidence and the PROPOSED set are published beside the
+		// verdict so a refusal explains itself from its own record: a run parked
+		// for disambiguation shows the candidates it observed and the proposal
+		// it formed (if any), rather than an empty target list. ProposedTargets
+		// is deliberately empty once the scope is RESOLVED — an authorized
+		// target travels in Targets, and a proposal must never be readable as an
+		// authorization.
+		Candidates: append([]string(nil), d.scopeResolution.Candidates...),
+		Authority:  AuthorityAdmissionGate,
+	}
+	if d.scopeResolution.State != ScopeResolved {
+		payload.ProposedTargets = append([]string(nil), d.scopeResolution.Targets...)
 	}
 	if payload.Mode == "" {
 		payload.Mode = string(d.resolved.Profile.Strategy)
@@ -291,8 +302,10 @@ func (d *Driver) emitSpecFrozen(spec ExecutionSpec) {
 		Evidence:              string(spec.Evidence),
 		ScopeState:            string(d.scopeResolution.State),
 		ScopeReason:           bounded(d.scopeResolution.Reason, 300),
+		ScopeTargets:          append([]string(nil), d.scopeResolution.Targets...),
 		DerivationState:       string(spec.Derivation.Status),
 		DerivationKinds:       append([]string(nil), spec.Derivation.Kinds...),
+		DerivationCandidates:  append([]string(nil), spec.Derivation.Candidates...),
 		WorkspaceDigest:       d.req.WorkspaceDigest,
 		RequestedOutputTokens: d.resolved.Profile.MaxOutputTokens,
 	}

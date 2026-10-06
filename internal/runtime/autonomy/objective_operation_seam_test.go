@@ -351,8 +351,20 @@ func TestSeamLiteralFailingPromptFailsClosed(t *testing.T) {
 	if len(d.resolved.Targets) != 0 {
 		t.Fatalf("discovery invented targets for an objective that declared no artifact kind: %v", d.resolved.Targets)
 	}
-	if d.scopeResolution.State != ScopeUnresolved {
-		t.Fatalf("scope resolution = %s, want UNRESOLVED", d.scopeResolution.State)
+	// The candidates WERE observed, so the honest position is DISCOVERED —
+	// evidence recorded, nothing bound. It is not UNRESOLVED (the runtime did
+	// look) and it must not authorize mutation.
+	if d.scopeResolution.State != ScopeDiscovered {
+		t.Fatalf("scope resolution = %s, want DISCOVERED (candidates observed, nothing bound)", d.scopeResolution.State)
+	}
+	if d.scopeResolution.AuthorizesMutation() {
+		t.Fatal("a DISCOVERED scope claimed mutation authority")
+	}
+	if len(d.scopeResolution.Targets) != 0 {
+		t.Fatalf("a DISCOVERED scope bound targets %v; candidates are evidence", d.scopeResolution.Targets)
+	}
+	if len(d.scopeResolution.Candidates) == 0 {
+		t.Fatal("a DISCOVERED scope recorded no candidates; DISCOVERED must be grounded in an observation")
 	}
 
 	// The compiled objective is a deferred MODIFY, never a CREATE.

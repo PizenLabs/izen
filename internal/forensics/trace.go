@@ -371,10 +371,13 @@ func (t *Trace) add(ev events.DomainEvent) {
 	switch p := ev.Payload().(type) {
 	case events.ExecutionAuthorizedPayload:
 		e.Summary = fmt.Sprintf("authorization %s (granted=%t)", orNone(p.Verdict), p.Granted)
-		put(d, "reason", p.Reason, "authority", p.Authority, "scope", p.Scope)
+		put(d, "reason", p.Reason, "authority", p.Authority, "scope", p.Scope,
+			"candidates", strings.Join(p.Candidates, ","),
+			"proposed", strings.Join(p.ProposedTargets, ","))
 	case events.ExecutionSpecFrozenPayload:
 		e.Summary = fmt.Sprintf("spec frozen: intent=%s boundary=%s", orNone(p.Intent), orNone(p.MutationBoundary))
 		put(d, "targets", strings.Join(p.Targets, ","), "scope", p.ScopeState,
+			"candidates", strings.Join(p.DerivationCandidates, ","),
 			"req_budget", itoa(p.RequestedOutputTokens))
 	case events.ContinuationDecisionPayload:
 		// evaluated and selected share one payload type; the event type
@@ -829,6 +832,8 @@ func (t *Trace) Render() string {
 		fmt.Fprintf(&b, "  intent:    %s   scope: %s   mode: %s\n",
 			orNone(a.Intent), orNone(a.Scope), orNone(a.Mode))
 		fmt.Fprintf(&b, "  targets:   %s\n", orList(a.Targets))
+		fmt.Fprintf(&b, "  candidates:%s\n", " "+orList(a.Candidates))
+		fmt.Fprintf(&b, "  proposed:  %s\n", orList(a.ProposedTargets))
 		fmt.Fprintf(&b, "  reason:    %s\n", orNone(bounded(a.Reason, 200)))
 	}
 
@@ -843,6 +848,8 @@ func (t *Trace) Render() string {
 		fmt.Fprintf(&b, "  channels:      %s\n", orList(s.ContextChannels))
 		fmt.Fprintf(&b, "  scope:         %s (%s)\n", orNone(s.ScopeState), orNone(bounded(s.ScopeReason, 120)))
 		fmt.Fprintf(&b, "  derivation:    %s kinds=%s\n", orNone(s.DerivationState), orList(s.DerivationKinds))
+		fmt.Fprintf(&b, "  candidates:    %s\n", orList(s.DerivationCandidates))
+		fmt.Fprintf(&b, "  scope targets: %s\n", orList(s.ScopeTargets))
 		fmt.Fprintf(&b, "  req_budget:    %d\n", s.RequestedOutputTokens)
 		fmt.Fprintf(&b, "  digest:        %s\n", orNone(s.WorkspaceDigest))
 	}

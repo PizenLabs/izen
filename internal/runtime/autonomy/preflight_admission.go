@@ -265,6 +265,13 @@ func TransitionToAwaitingDisambiguation(spec ExecutionSpec) PreflightOutcome {
 	if len(candidates) == 0 && spec.WorkspaceEvidence != nil {
 		candidates = spec.WorkspaceEvidence.CandidatePaths()
 	}
+	// Last resort: the derivation's own observed set. It is only consulted when
+	// no scoped binding and no workspace evidence produced a candidate at all,
+	// so a directory-scoped question is never widened by the global scan. The
+	// DISCOVERED record and this question are then the same evidence.
+	if len(candidates) == 0 {
+		candidates = append(candidates, spec.Derivation.Candidates...)
+	}
 	return PreflightOutcome{
 		Verdict:    AdmissionDisambiguate,
 		Candidates: candidates,

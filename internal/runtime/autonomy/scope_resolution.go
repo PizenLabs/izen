@@ -59,9 +59,17 @@ const (
 	// are distinguishable precisely because the state records that the runtime
 	// looked.
 	ScopeUnresolved ScopeResolutionState = "UNRESOLVED"
-	// ScopeDiscovered: candidates were observed in the workspace but the
-	// strategy gateway has not yet accepted them as this run's authority.
+	// ScopeDiscovered: candidates were observed in the workspace but no
+	// proposal has been formed and nothing is bound. This is the DISCOVERED
+	// stage: "these files exist" is recorded as EVIDENCE so a run that looked
+	// is distinguishable from one that never looked.
 	ScopeDiscovered ScopeResolutionState = "DISCOVERED"
+	// ScopeProposed: the observed evidence offers exactly one candidate and the
+	// runtime has formed a TARGET PROPOSAL from it. PROPOSED IS NOT AUTHORIZED:
+	// the proposal is a question put to the authority boundary, it binds
+	// nothing, and only a RESOLVED scope may become a mutation scope. A unique
+	// candidate can justify a proposal; it cannot, by itself, justify authority.
+	ScopeProposed ScopeResolutionState = "PROPOSED"
 	// ScopeAmbiguous: SEVERAL observed files satisfy the artifact kinds the
 	// objective DECLARED, and the evidence does not establish which one(s) the
 	// objective is about. The candidates are carried as evidence and NOTHING
@@ -82,6 +90,7 @@ func AllScopeResolutionStates() []ScopeResolutionState {
 	return []ScopeResolutionState{
 		ScopeUnresolved,
 		ScopeDiscovered,
+		ScopeProposed,
 		ScopeAmbiguous,
 		ScopeResolved,
 		ScopeRefused,
@@ -103,7 +112,9 @@ func (s ScopeResolutionState) AuthorizesMutation() bool { return s == ScopeResol
 type ScopeResolution struct {
 	// State is the lifecycle position.
 	State ScopeResolutionState
-	// Targets are the authoritative (RESOLVED) or proposed (DISCOVERED) targets.
+	// Targets are the authoritative (RESOLVED) or proposed (PROPOSED) targets.
+	// A non-empty Targets on a non-RESOLVED state is a PROPOSAL, not a scope;
+	// AuthorizesMutation is the field that distinguishes them.
 	Targets []string
 	// Kinds are the artifact kinds the objective declared, when derivation ran.
 	Kinds []string

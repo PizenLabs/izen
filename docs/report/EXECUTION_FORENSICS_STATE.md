@@ -7,8 +7,10 @@
   `internal/events/...`, `internal/architecture`, `internal/runtime/...`,
   `internal/ui/...`, `test/forensics`
 - **Status:** **R1 PROVEN** by live execution. **R2 BLOCKED** by live
-  execution — recorded, not worked around. The remaining items are open
-  questions, not open defects.
+  execution — recorded, not worked around. **R3 PROVEN** — the target-proposal
+  authority boundary is identified and pinned; DISCOVERED/PROPOSED/AUTHORIZED
+  are now separate, single-sourced control-plane facts. The remaining items are
+  open questions, not open defects.
 
 ---
 
@@ -140,6 +142,41 @@ IZEN_LIVE_FORENSICS=1 go test ./test/live_r2/ -v -timeout 1200s
 
 # Deterministic, no model — the same boundary, pinned in the always-run suite:
 go test ./internal/runtime/autonomy/ -run TestR2_TargetlessRepairObservesButDoesNotDispatch -v
+```
+
+---
+
+## R3 STATUS: PROVEN
+
+R3 asks whether IZEN can turn discovery evidence into a **target proposal** —
+and, where policy permits, authority — without conflating DISCOVERED with
+AUTHORIZED. Full report: **`R3_TARGET_PROPOSAL_REPORT.md`**.
+
+The finding: the one authoritative decision boundary is
+`EvaluatePreflightAdmission`; the proposal is produced by `execution.DeriveScope`
+and offered through the strategy gateway; a unique candidate can justify a
+**proposal** but not authority. For an objective that declares no artifact kind,
+the correct authoritative outcome is an explicit clarification — and R3 proves
+it is explicit and grounded, not an accidental zero-scope fallback.
+
+| Scenario | DISCOVERED | PROPOSED | authorizes | AUTHORITY | calls | fs | final |
+|---|---|---|---|---|---|---|---|
+| R3-A one file, no kind | `index.html` | `[index.html]` | **false** | DISAMBIGUATE | **0** | none | clarify |
+| R3-B three files, no kind | 3 candidates | none | **false** | DISAMBIGUATE | **0** | none | clarify |
+| R3-C explicit `index.html` | — | `[index.html]` | **true** | ADMIT | 1 | applied | PROVEN |
+
+R3 grants **no new authority**. It makes DISCOVERED and PROPOSED first-class and
+single-sourced: `Derivation.Candidates`, a non-authorizing `ScopeProposed`
+scope position, and `derivation_candidates` / `candidates` / `proposed_targets`
+on the canonical events and the forensic trace.
+
+Reproduce (no model):
+
+```
+go test ./internal/runtime/autonomy/ -run TestR3_ -v
+# live acceptance (real local model):
+ollama serve
+IZEN_LIVE_FORENSICS=1 go test ./test/live_r2/ -run TestLiveR3_ -v
 ```
 
 ---
@@ -289,24 +326,25 @@ change is outside it: the `IsCasualChat` classification guard.
 
 ## The next EXACT experiment
 
-R2 is closed **BLOCKED**. The next experiment is **not** R3 and **not** token
-budgeting (see the R2 result above). When it is started, it must answer this
-singular question:
+R2 is closed **BLOCKED**; R3 is closed **PROVEN** (`R3_TARGET_PROPOSAL_REPORT.md`).
+R3 identified the single authority boundary (`EvaluatePreflightAdmission`) and
+made DISCOVERED/PROPOSED/AUTHORIZED explicit without granting authority. It did
+**not** make the R2 benchmark reach `PROVEN`, and deliberately so: a no-kind
+objective that names no file still cannot become an authorized target.
 
-> Can IZEN turn *discovered evidence* into an authorized target through a
-> bounded **inspection** pass, without letting a scan choose the target?
+The remaining open question is therefore a *policy* question, not an execution
+one, and it is explicitly out of R3 scope:
 
-The design constraint is already stated by the runtime: discovery is evidence,
-never authority (`I13`). So the missing capability is `discovery → inspect →
-decide`: a read-only pass that shows the model the discovered candidate file(s)
-and lets a **decision** (grounded in those bytes, admitted through the existing
-authorization boundary) name the target. The R2 diagnostic proves everything
-after that point already works end to end with a real model.
+> Should IZEN ever accept a *content-grounded* proposal — a bounded, read-only
+> inspection pass that establishes a discovered candidate is what the objective
+> is about — and if so, under what contract?
 
-Concretely, the R3 acceptance is the R2 benchmark passing:
-`inspect this project, find the incorrect greeting, fix it to "Hello", and verify
-the result.` must reach `PROVEN` with `index.html` discovered, inspected, mutated
-on disk, and verified — with the model's text never treated as evidence.
+Today the only objective-compatible semantic evidence the authority model
+accepts is an **artifact kind the objective declares**, matched by extension
+against files read from disk. Inventing a content-grounded proposal would be a
+new authority contract, and R3 was instructed not to invent it. If it is ever
+pursued, it must pass through the same single boundary and keep model text out
+of target resolution.
 
 ### Also open
 

@@ -1807,6 +1807,22 @@ func (d *Driver) deriveEvidenceScope() {
 	derivation := d.adapter.DeriveScope(d.prompt, d.resolved.Targets)
 	d.scopeDerivation = derivation
 
+	// ── DISCOVERED ─────────────────────────────────────────────────────
+	// Record the observed candidate set as EVIDENCE before anything is
+	// proposed. This is the step that makes "index.html exists" a legible fact
+	// even when no target is ever bound: DISCOVERED is a question, and the
+	// authority decision below never reads it as a scope.
+	if len(derivation.Candidates) > 0 {
+		diagnosticf("[discovery] observed %d candidate(s): %v (kinds=%v)",
+			len(derivation.Candidates), derivation.Candidates, derivation.Kinds)
+		d.noteScopeTransition(ScopeResolution{
+			State:      ScopeDiscovered,
+			Candidates: append([]string(nil), derivation.Candidates...),
+			Kinds:      append([]string(nil), derivation.Kinds...),
+			Reason:     "bounded workspace discovery observed candidate file(s); they are evidence and nothing is bound",
+		})
+	}
+
 	// ── AMBIGUOUS ──────────────────────────────────────────────────────
 	// Candidates were observed and none is proven. This is a QUESTION for a
 	// human, so it is recorded as a typed scope position carrying the candidate
@@ -1829,14 +1845,51 @@ func (d *Driver) deriveEvidenceScope() {
 		return
 	}
 
+	// ── PROPOSED (sole observed candidate, no declared evidence) ───────
+	// The objective declared no artifact kind that could DERIVE a target, but
+	// bounded discovery observed exactly ONE candidate. A unique candidate can
+	// justify a TARGET PROPOSAL — and only a proposal. It is recorded as
+	// PROPOSED, it binds nothing (d.resolved.Targets stays empty), and the
+	// authority boundary decides whether it may become a target. This is the
+	// line that must never become "scan → one file → mutate".
+	if len(derivation.Kinds) == 0 && len(derivation.Candidates) == 1 {
+		sole := derivation.Candidates[0]
+		d.derivationNote = "the workspace offers exactly one observed candidate (" + sole +
+			"); the objective declares no artifact kind, so this is a NON-AUTHORITATIVE target proposal for the authority boundary to confirm"
+		diagnosticf("[scope] PROPOSED sole candidate %q — no target bound; the admission gate decides", sole)
+		d.noteScopeTransition(ScopeResolution{
+			State:      ScopeProposed,
+			Targets:    append([]string(nil), sole),
+			Candidates: append([]string(nil), derivation.Candidates...),
+			Reason:     d.derivationNote,
+		})
+		return
+	}
+
 	if !derivation.IsUnique() || len(derivation.Targets) == 0 {
-		if derivation.Reason != "" {
+		// Nothing was observed, or several candidates were observed and the
+		// DISCOVERED record above already carries them. No proposal exists and
+		// nothing is bound.
+		if len(derivation.Candidates) == 0 && derivation.Reason != "" {
 			d.derivationNote = derivation.Reason
 			diagnosticf("[scope] no evidence-bound target derived: %s", derivation.Reason)
 			d.noteScopeTransition(ScopeResolution{State: ScopeUnresolved, Reason: derivation.Reason})
 		}
 		return
 	}
+
+	// ── PROPOSED (objective-declared evidence) ─────────────────────────
+	// Every declared kind matched at most one observed file, so the evidence
+	// determines a target set. That is a TARGET PROPOSAL, not authority: the
+	// strategy gateway must still accept it as a mutation contract before
+	// anything binds.
+	d.noteScopeTransition(ScopeResolution{
+		State:      ScopeProposed,
+		Targets:    append([]string(nil), derivation.Targets...),
+		Candidates: append([]string(nil), derivation.Candidates...),
+		Kinds:      append([]string(nil), derivation.Kinds...),
+		Reason:     "the objective-declared artifact kind(s) matched one observed file per kind; the target set is PROPOSED and awaits the strategy gateway",
+	})
 
 	// Re-resolve the strategy over the DERIVED objective. This is what keeps
 	// strategy selection in its existing authority: the gateway still decides
@@ -1886,21 +1939,17 @@ func (d *Driver) deriveEvidenceScope() {
 	d.derivationNote = derivation.Reason
 	diagnosticf("[scope] evidence-bound derivation: %v (kinds=%v) — %s",
 		proven, derivation.Kinds, derivation.Reason)
-	// The two-step transition is recorded explicitly: DISCOVERED is the
-	// observation, RESOLVED is the gateway's authority. Publishing only the end
-	// state is what made `targets=[]` look like a value that had been silently
-	// overwritten.
+	// The three-stage transition is recorded explicitly and in order:
+	// DISCOVERED (observation, above) → PROPOSED (this run's target set,
+	// recorded before the gateway ran) → RESOLVED (the gateway's authority,
+	// below). Publishing only the end state is what made `targets=[]` look
+	// like a value that had been silently overwritten.
 	d.noteScopeTransition(ScopeResolution{
-		State:   ScopeDiscovered,
-		Targets: append([]string(nil), proven...),
-		Kinds:   append([]string(nil), derivation.Kinds...),
-		Reason:  derivation.Reason,
-	})
-	d.noteScopeTransition(ScopeResolution{
-		State:   ScopeResolved,
-		Targets: append([]string(nil), proven...),
-		Kinds:   append([]string(nil), derivation.Kinds...),
-		Reason:  "the strategy gateway accepted the observed files as this run's mutation scope",
+		State:      ScopeResolved,
+		Targets:    append([]string(nil), proven...),
+		Candidates: append([]string(nil), derivation.Candidates...),
+		Kinds:      append([]string(nil), derivation.Kinds...),
+		Reason:     "the strategy gateway accepted the observed files as this run's mutation scope",
 	})
 }
 

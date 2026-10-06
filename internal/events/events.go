@@ -459,6 +459,16 @@ type ExecutionAuthorizedPayload struct {
 	Targets      []string `json:"targets,omitempty"`
 	Intent       string   `json:"intent,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
+	// Candidates is the DISCOVERED candidate set the verdict was grounded in:
+	// the files bounded discovery observed. It is EVIDENCE, never a target set,
+	// and it is recorded even on a refusal so "we looked and did not bind" is
+	// distinguishable from "we never looked".
+	Candidates []string `json:"candidates,omitempty"`
+	// ProposedTargets is the scope-resolution target set when it is NOT yet
+	// authoritative (the PROPOSED stage). It is empty on an ADMIT because the
+	// authorized targets travel in Targets; a non-empty value here is a
+	// proposal awaiting a decision.
+	ProposedTargets []string `json:"proposed_targets,omitempty"`
 	// Authority names the component that produced the verdict. It is the
 	// answer to "which component decided it?".
 	Authority string `json:"authority,omitempty"`
@@ -470,23 +480,27 @@ type ExecutionAuthorizedPayload struct {
 // frozen, the run's bounds are the ones below, not the ones a later step would
 // prefer.
 type ExecutionSpecFrozenPayload struct {
-	RunID               string   `json:"run_id,omitempty"`
-	SessionID           string   `json:"session_id,omitempty"`
-	Intent              string   `json:"intent,omitempty"`
-	Strategy            string   `json:"strategy,omitempty"`
-	InteractionContract string   `json:"interaction_contract,omitempty"`
-	ContractID          string   `json:"contract_id,omitempty"`
-	AuthorityCeiling    string   `json:"authority_ceiling,omitempty"`
-	Targets             []string `json:"targets,omitempty"`
-	ExplicitTargets     []string `json:"explicit_targets,omitempty"`
-	ContextChannels     []string `json:"context_channels,omitempty"`
-	MutationBoundary    string   `json:"mutation_boundary,omitempty"`
-	WorkspaceEvidence   string   `json:"workspace_evidence,omitempty"`
-	ScopeState          string   `json:"scope_state,omitempty"`
-	ScopeReason         string   `json:"scope_reason,omitempty"`
-	DerivationState     string   `json:"derivation_state,omitempty"`
-	DerivationKinds     []string `json:"derivation_kinds,omitempty"`
-	WorkspaceDigest     string   `json:"workspace_digest,omitempty"`
+	RunID                string   `json:"run_id,omitempty"`
+	SessionID            string   `json:"session_id,omitempty"`
+	Intent               string   `json:"intent,omitempty"`
+	Strategy             string   `json:"strategy,omitempty"`
+	InteractionContract  string   `json:"interaction_contract,omitempty"`
+	ContractID           string   `json:"contract_id,omitempty"`
+	AuthorityCeiling     string   `json:"authority_ceiling,omitempty"`
+	Targets              []string `json:"targets,omitempty"`
+	ExplicitTargets      []string `json:"explicit_targets,omitempty"`
+	ContextChannels      []string `json:"context_channels,omitempty"`
+	MutationBoundary     string   `json:"mutation_boundary,omitempty"`
+	WorkspaceEvidence    string   `json:"workspace_evidence,omitempty"`
+	ScopeState           string   `json:"scope_state,omitempty"`
+	ScopeReason          string   `json:"scope_reason,omitempty"`
+	DerivationState      string   `json:"derivation_state,omitempty"`
+	DerivationKinds      []string `json:"derivation_kinds,omitempty"`
+	DerivationCandidates []string `json:"derivation_candidates,omitempty"`
+	// ScopeTargets is the scope-resolution target set: a PROPOSAL when the scope
+	// is not yet RESOLVED, the authorized set when it is.
+	ScopeTargets    []string `json:"scope_targets,omitempty"`
+	WorkspaceDigest string   `json:"workspace_digest,omitempty"`
 	// Evidence is the admission-time evidence axis (PRODUCED / NONE): did the
 	// spec carry authoritative, non-empty workspace evidence?
 	Evidence              string `json:"evidence,omitempty"`
