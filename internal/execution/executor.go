@@ -3485,7 +3485,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 		user += "\n" + symbolBaseline.Context()
 		var contextFiles []contextcompiler.FileContext
 		if !patchOnly {
-			contextFiles = x.workspaceFiles([]string{target}, true)
+			contextFiles = x.workspaceFiles([]string{target}, true, false)
 		}
 		compiledReq, compiledAgent, compileErr := x.compileRequest(
 			ctx, req, profile, model, system, user, contextFiles, maxOut,
@@ -4409,7 +4409,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 	rs := llmstep.NewResponseState(req.Prompt, "findings / needed adjustments / reason / optional concise example")
 	system := readOnlySystemPrompt(profile.Strategy)
 	baseReq, baseAgent, compileErr := x.compileRequest(
-		ctx, req, profile, model, system, req.Prompt, x.workspaceFiles(targets, false), maxRead,
+		ctx, req, profile, model, system, req.Prompt, x.workspaceFiles(targets, false, false), maxRead,
 	)
 	if compileErr != nil {
 		return "", nil, nil, fmt.Errorf("executor: context compilation: %w", compileErr)

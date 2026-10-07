@@ -392,8 +392,11 @@ func (x *RuntimeExecutor) recompileIntentContext(ctx context.Context, targets []
 	}
 	// The MUTATION context contract always projects the declared targets as
 	// required (critical) file context: a read-only projection of them is not a
-	// mutation context.
+	// mutation context. A DECLARED CREATION contract is the exception: the
+	// targets are expected absent, so they are admitted with an explicit
+	// creation representation instead of being required to carry bytes.
 	critical := required == contextcompiler.IntentContextWorkspace
+	creation := required == contextcompiler.IntentContextCreation
 	compiler := x.contextCompilerInstance()
 	// PHASE 14 — step 1 of the blocking intent revision: drop every payload
 	// compiled under the PREVIOUS intent before compiling under this one. The
@@ -404,7 +407,7 @@ func (x *RuntimeExecutor) recompileIntentContext(ctx context.Context, targets []
 		UserRequest:   intentLabel,
 		WorkflowState: string(strategy.TargetedMutation),
 		Phase:         contextcompiler.PhaseExecute,
-		Files:         x.workspaceFiles(targets, critical),
+		Files:         x.workspaceFiles(targets, critical, creation),
 		ContextPolicy: "target_file_only",
 		Scope:         strings.Join(targets, ","),
 	})
@@ -421,7 +424,7 @@ func (x *RuntimeExecutor) recompileIntentContext(ctx context.Context, targets []
 	return provenance, nil
 }
 
-func (x *RuntimeExecutor) workspaceFiles(targets []string, critical bool) []contextcompiler.FileContext {
+func (x *RuntimeExecutor) workspaceFiles(targets []string, critical, creation bool) []contextcompiler.FileContext {
 	if x == nil {
 		return nil
 	}
@@ -429,6 +432,21 @@ func (x *RuntimeExecutor) workspaceFiles(targets []string, critical bool) []cont
 	for i, target := range targets {
 		data, ok := x.getSnapshotContent(target)
 		if !ok {
+			// A DECLARED CREATION target is expected to be absent. Its absence
+			// is part of the contract, not a dropped read: it is carried into
+			// the payload with an explicit creation representation, which is
+			// what lets scope provenance treat the target as NAMED without
+			// fabricating bytes it does not have.
+			if creation {
+				files = append(files, contextcompiler.FileContext{
+					Path:     target,
+					Size:     0,
+					Content:  "",
+					Critical: false,
+					Priority: len(targets) - i,
+					Creation: true,
+				})
+			}
 			continue
 		}
 		// Optional supporting context may be capped at the executor's legacy

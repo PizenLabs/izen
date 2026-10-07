@@ -87,6 +87,16 @@ const (
 	// required (a direct answer, a chat reply, a plan authored from the
 	// request alone).
 	IntentContextSelfContained = "self_contained"
+	// IntentContextCreation: the contract is a DECLARED CREATION. The payload
+	// must NAME every requested target in scope (the target is what is being
+	// created), but the targets are expected to be ABSENT and therefore carry
+	// no pre-existing workspace material. Requiring bytes here would make it
+	// impossible to create a file — the exact inversion of the contract the
+	// admission gate already states ("an explicitly stated file that does not
+	// exist yet is a legitimate CREATION target"). A creation target appears
+	// in the payload with an explicit "no existing content" representation, so
+	// the absence is truthful rather than a silent drop.
+	IntentContextCreation = "creation"
 )
 
 // ValidateContextProvenance evaluates a compiled payload against the active
@@ -165,6 +175,12 @@ func (c *CompiledContext) ValidateContextProvenance(binding IntentBinding, reque
 	case IntentContextNone:
 		// A zero-workspace turn carries no workspace material BY DESIGN; the
 		// empty payload is the correct one and is not a provenance failure.
+	case IntentContextCreation:
+		// A creation contract requires the target to be NAMED (already checked
+		// by SCOPE above) and expects it to carry no pre-existing material. An
+		// empty projection of an absent creation target is the correct one; a
+		// creation target that HAPPENS to have material (creating over an empty
+		// file) is also acceptable. Demanding bytes here would forbid creation.
 	default:
 		// IntentContextSelfContained and an unset requirement both accept an
 		// empty workspace projection.
@@ -202,13 +218,40 @@ func (c *CompiledContext) admittedPaths() map[string]bool {
 
 // hasWorkspaceMaterial reports whether the payload carries real workspace file
 // content (a section with bytes), not merely a heading.
+//
+// A payload whose admitted workspace files are ALL declared creation
+// destinations carries no PRE-EXISTING material: its artifact "content" is the
+// creation declaration ("new file — declared for creation"), not bytes read from
+// disk. Excluding that case keeps the workspace contract strict — a creation
+// declaration must never be able to satisfy a modification contract — while the
+// creation contract (IntentContextCreation) deliberately does not require
+// material at all.
 func (c *CompiledContext) hasWorkspaceMaterial() bool {
+	hasArtifactContent := false
 	for _, s := range c.Sections {
 		if s.Source == SourceArtifacts && strings.TrimSpace(s.Content) != "" {
+			hasArtifactContent = true
+			break
+		}
+	}
+	if !hasArtifactContent {
+		return false
+	}
+	if len(c.CreationPaths) == 0 {
+		return true
+	}
+	creations := make(map[string]bool, len(c.CreationPaths))
+	for _, p := range c.CreationPaths {
+		creations[normalizeTargetPath(p)] = true
+	}
+	for _, p := range c.AdmittedPaths {
+		if !creations[normalizeTargetPath(p)] {
 			return true
 		}
 	}
-	return false
+	// AdmittedPaths reconstructed from persisted sections (audit/replay) is
+	// empty; fall back to the section-presence fact already established.
+	return len(c.AdmittedPaths) == 0
 }
 
 // truncatedSet indexes the payload's recorded source-side truncations.
