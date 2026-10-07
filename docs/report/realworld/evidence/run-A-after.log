@@ -1,0 +1,189 @@
+=== RUN   TestRealWorld_A_Create
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+2026/10/07 11:49:32 [occ] baseline request_targets=1 scoped=1 digest=549d38af9f2a cache_hits=0 duration=5µs
+2026/10/07 11:49:32 [execution] request=run-1 attempt=1 target=testing.md strategy=targeted_mutation artifact_kind=create_file output_contract=full_file_or_patch context_bytes=255 prompt_bytes=255 max_output=4096 reasoning=provider_default recovery=none
+2026/10/07 11:49:32 [execution] request=run-1 attempt=1 target=testing.md strategy=targeted_mutation artifact_kind=create_file output_contract=full_file_or_patch context_bytes=255 prompt_bytes=255 max_output=4096 reasoning=provider_default recovery=none
+    tasks_test.go:163: [A / CREATE — create new file named testing.md] driver.Run -> <nil: parked at a human boundary>
+2026/10/07 11:49:36 [occ] verify targets=1 conflicts=0 cache_hits=0 duration=9µs
+    tasks_test.go:163: [A / CREATE — create new file named testing.md] driver.ResumeApprove -> completed reason="objective satisfied: changed; objective PROVEN by evidence" class=
+    tasks_test.go:163: 
+        ═══ A-create — A / CREATE — create new file named testing.md ═══
+        prompt:     create new file named testing.md
+        wall:       5631ms
+        state:      completed
+        termination:completed reason="objective satisfied: changed; objective PROVEN by evidence" class=
+        boundary:   action= resumable=false targets=[] options=[] reason=""
+        model:      calls=2 failures=0 output_exhausted=0 continuations=1 tokens=356/40 known=true
+        caps:       []
+        mutations:  [target=testing.md outcome=changed applied=true fs_changed=true adds=0 removes=0]
+        verify:     [applicable=false passed=false reason="no verification configured for language "]
+        objective:  [state=PROVEN granted=true reason=""]
+        patterns:   []
+        delta:      [ADDED   testing.md]
+        content[testing.md]: "# Introduction\n\nWelcome to the Testing File!\n\nThis document is intended to serve as a simple testing ground for your needs. Feel free to modify it as you see fit.\n"
+        events:
+          approval.required                    1
+          continuation.evaluated               3
+          continuation.selected                3
+          engine.activity                      17
+          execution.admission.decision         2
+          execution.artifact.produced          1
+          execution.authorized                 2
+          execution.context.compilation        1
+          execution.context.prepared           1
+          execution.evidence                   1
+          execution.finished                   1
+          execution.model.invoked              1
+          execution.mutation.completed         1
+          execution.mutation.started           1
+          execution.provider.execution         2
+          execution.provider.response          1
+          execution.spec.frozen                1
+          execution.started                    1
+          execution.strategy.selected          1
+          execution.summary                    2
+          execution.target.resolved            1
+          execution.verification.completed     1
+          execution.verification.started       1
+          loop.transition                      9
+          objective.evaluated                  1
+          phase.changed                        1
+          preflight.snapshot                   1
+          provider.first_token                 1
+          provider.stream_delta                39
+          provider.usage_update                2
+          provider.waiting                     1
+          reasoning.state.committed            1
+          reasoning.step.completed             1
+          reasoning.step.started               1
+          stage.completed                      1
+    tasks_test.go:163: 
+        EXECUTION
+        ────────────────────────────────────────────────────────────────────────
+        run_id:  run-1
+        objective:
+          create new file named testing.md
+        
+        AUTHORIZATION
+          verdict:   allow
+          granted:   true  blocked: false
+          authority: preflight_admission_gate
+          intent:    MUTATE   scope: RESOLVED   mode: $prompt
+          targets:   testing.md
+          candidates: (none)
+          proposed:  (none)
+          reason:    admitted: proven target, admissible mutation boundary, authoritative evidence
+        
+        EXECUTION SPEC (frozen before dispatch)
+          intent:        MUTATE
+          strategy:      multi_file_planning
+          contract:      agentic_loop  ceiling: execute
+          targets:       testing.md
+          boundary:      BOUND   evidence: PRODUCED
+          channels:      target:testing.md
+          scope:         RESOLVED (the strategy gateway resolved this request's target set before discovery was consulted)
+          derivation:    (none) kinds=(none)
+          candidates:    (none)
+          scope targets: testing.md
+          req_budget:    1536
+          digest:        36ac2e21fa2b8bbc2820d45339060530730ee3f132a70afea983799689187d52
+        
+        MODEL CALLS
+        
+          CALL #1
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   512 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      229 tokens / 1069 chars  fp=d01179fe86d4
+            completion:  16 tokens / 47 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    0s (first token 0s)
+        
+          CALL #2
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   4096 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      356 tokens / 1565 chars  fp=7e3fcc841654
+            completion:  40 tokens / 176 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    3.917s (first token 1.958s)
+        
+        CONTINUATION DECISIONS
+        
+          step 1  deciding → executing
+            proposed:   continue — objective resolved — execute
+            selected:   continue — objective resolved — execute
+            outcome:    (none) (permanent)  attempt=0 cycle=0
+            objective:  (none)   pending: UNSUBSTANTIATE
+            progress:   READY (prev (none))  []
+        
+          step 2  interpreting → awaiting_human
+            proposed:   ask_human — mutation awaiting approval
+            selected:   ask_human — mutation awaiting approval
+            outcome:    pending_approval (transient)  attempt=1 cycle=0
+            objective:  (none)   pending: WAIT_FOR_AUTHORIZATION
+            progress:   REQUIRES_AUTHORIZATION (prev READY)  []
+        
+          step 3  deciding → completed
+            proposed:   complete — objective satisfied: changed
+            selected:   complete — objective satisfied: changed; objective PROVEN by evidence
+            REWRITTEN by: objective_completion_authority
+            outcome:    changed (transient)  attempt=1 cycle=0
+            objective:  (none)   pending: COMPLETE
+            progress:   PROVEN (prev REQUIRES_AUTHORIZATION)  [new_evidence, new_artifact, mutation_applied, objective_advanced]
+        
+        OBJECTIVE EVALUATIONS
+          PROVEN             granted=true mutations=1 verified=false
+              clause: (none)
+              reason: (none)
+        
+        EVIDENCE
+          mutation: target=testing.md outcome=changed artifact=true diff=false apply=true fs_changed=true (+0/-0)
+          verification: STARTED for 1 request(s) — the gate was entered
+          verification: NOT_APPLICABLE — no verification configured for language 
+        
+        BEHAVIOURAL OBSERVATION
+          (no behavioral observation recorded — this run did not engage the
+           behavioural gate, or engaged it before this record existed)
+        
+        LOOP TRANSITIONS
+          idle         → observing    continue      user objective: create new file named testing.md
+          observing    → deciding     continue      observation consumed
+          deciding     → executing    continue      objective resolved — execute
+          executing    → verifying    continue      execution consumed: pending_approval
+          verifying    → interpreting continue      verification consumed
+          interpreting → awaiting_human ask_human     mutation awaiting approval
+          awaiting_human → observing    continue      patch approved
+          observing    → deciding     continue      observation consumed
+          deciding     → completed    complete      objective satisfied: changed; objective PROVEN by evidence
+        
+        EXECUTION SUMMARY
+        ────────────────────────────────────────────────────────────────────────
+        status: completed
+        note:   revision 2 — the run parked earlier and this is its resumed outcome
+        model_calls:   2 (failures 0, output_exhausted 0)
+        runtime_steps: 1
+        continuations: 1
+        tokens:
+          input:                   356
+          output:                  40
+          total:                   396  (authoritative=true)
+        budgets:
+          call #1 requested=512 effective=unobserved
+          call #2 requested=4096 effective=unobserved
+        execution:
+          mutations:     1
+          verification:  not_applicable
+          evidence:      3
+        termination:
+          state:  completed
+          reason: objective satisfied: changed; objective PROVEN by evidence
+        patterns:
+          none detected
+          (uninterpreted event types: engine.activity x17, execution.context.compilation x1, execution.finished x1, execution.model.invoked x1, execution.provider.response x1, phase.changed x1, preflight.snapshot x1, provider.first_token x1, provider.stream_delta x39, provider.usage_update x2, provider.waiting x1, reasoning.state.committed x1, reasoning.step.completed x1, stage.completed x1)
+    tasks_test.go:163: [A-create] evidence written to /Users/anvndev/Documents/Project/OpenSource/PizenLabs/izen/docs/report/realworld/evidence
+--- PASS: TestRealWorld_A_Create (5.85s)
+PASS
+ok  	github.com/PizenLabs/izen/test/realworld	6.321s

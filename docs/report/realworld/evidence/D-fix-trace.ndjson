@@ -1,0 +1,67 @@
+{
+  "run_id": "run-1",
+  "recorded_at": "2026-10-07T12:12:50.404165+07:00",
+  "status": "awaiting_human",
+  "summary": {
+    "run_id": "run-1",
+    "revision": 1,
+    "objective": "find and fix the bug causing the user endpoint to fail",
+    "status": "awaiting_human",
+    "parked": true,
+    "boundary_action": "inform",
+    "model_calls": 0,
+    "model_failures": 0,
+    "output_exhausted": 0,
+    "runtime_steps": 0,
+    "continuations": 0,
+    "attempts": 0,
+    "recovery_cycles": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "usage_known": false,
+    "mutations": 0,
+    "verifications": 0,
+    "verification_passed": false,
+    "verification_observed": false,
+    "schema_mode": "auto"
+  },
+  "entries": [
+    {
+      "seq": 1,
+      "at": "2026-10-07T12:12:50.127491+07:00",
+      "event": "loop.transition",
+      "summary": "loop: idle → observing (continue)",
+      "detail": {
+        "reason": "user objective: find and fix the bug causing the user endpoint to fail"
+      }
+    },
+    {
+      "seq": 2,
+      "at": "2026-10-07T12:12:50.140532+07:00",
+      "event": "execution.authorized",
+      "summary": "authorization deny (granted=false)",
+      "detail": {
+        "authority": "preflight_admission_gate",
+        "candidates": "go.mod,main.go,store.go",
+        "reason": "canonical intent revision incomplete — the run holds intent  with no valid workspace context for it: autonomy: intent context re-compilation under \"modification\" failed: execution: compiled context does not satisfy the active intent's provenance contract: the contract requires workspace material but the compiled payload carries none",
+        "scope": "DISCOVERED"
+      }
+    },
+    {
+      "seq": 3,
+      "at": "2026-10-07T12:12:50.140511+07:00",
+      "event": "loop.transition",
+      "summary": "loop: observing → awaiting_human (ask_human)",
+      "detail": {
+        "reason": "canonical intent revision incomplete: autonomy: intent context re-compilation under \"modification\" failed: execution: compiled context does not satisfy the active intent's provenance contract: the contract requires workspace material but the compiled payload carries none — the run holds intent \"unknown\" with no valid workspace context for it; re-scope the objective or grant an explicit mutation contract"
+      }
+    },
+    {
+      "seq": 4,
+      "at": "2026-10-07T12:12:50.15156+07:00",
+      "event": "execution.summary",
+      "summary": "(recorded)"
+    }
+  ]
+}

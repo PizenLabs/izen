@@ -1653,7 +1653,7 @@ func (d *Driver) resolveAuthoritativeScope(targets []string) Resolved {
 	if d == nil || d.adapter == nil {
 		return d.resolved
 	}
-	return d.adapter.Resolve(d.scopeRequest(targets))
+	return d.adapter.ResolveScoped(d.scopeRequest(targets))
 }
 
 // scopeRequest renders the text the canonical gateway is asked to resolve.

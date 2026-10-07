@@ -1,0 +1,353 @@
+=== RUN   TestRealWorld_B_ModifyDiag
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+    tasks_test.go:199: [B-diag / MODIFY (target named by the human at clarify)] driver.Run -> <nil: parked at a human boundary>
+    tasks_test.go:199: [B-diag / MODIFY (target named by the human at clarify)] DIAGNOSTIC: answering clarify [README.md go.mod main.go] with "main.go" (main arm leaves this unanswered)
+2026/10/07 11:45:27 [occ] baseline request_targets=1 scoped=1 digest=d1c52972f268 cache_hits=1 duration=12µs
+2026/10/07 11:45:27 [execution] request=run-1 attempt=1 target=main.go strategy=targeted_mutation artifact_kind=replace_block output_contract=full_file_or_patch context_bytes=540 prompt_bytes=540 max_output=1024 reasoning=provider_default recovery=none
+2026/10/07 11:45:27 [execution] request=run-1 attempt=1 target=main.go strategy=targeted_mutation artifact_kind=replace_block output_contract=full_file_or_patch context_bytes=540 prompt_bytes=540 max_output=1024 reasoning=provider_default recovery=none
+    tasks_test.go:199: [B-diag / MODIFY (target named by the human at clarify)] driver.ResumeClarify -> <nil: parked at a human boundary>
+2026/10/07 11:45:30 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=22µs
+    tasks_test.go:199: [B-diag / MODIFY (target named by the human at clarify)] driver.ResumeApprove -> aborted reason="approved mutation failed: verify_failed" class=permanent
+    tasks_test.go:199: 
+        ═══ B-modify-diag — B-diag / MODIFY (target named by the human at clarify) ═══
+        prompt:     find the incorrect greeting in this project and fix it
+        wall:       3665ms
+        state:      aborted
+        termination:aborted reason="approved mutation failed: verify_failed" class=permanent
+        boundary:   action= resumable=false targets=[] options=[] reason=""
+        model:      calls=2 failures=0 output_exhausted=0 continuations=1 tokens=424/19 known=true
+        caps:       []
+        mutations:  [target=main.go outcome=verify_failed applied=true fs_changed=false adds=0 removes=0]
+        verify:     [applicable=true passed=false reason=""]
+        objective:  []
+        patterns:   []
+        delta:      []
+        events:
+          approval.required                    1
+          continuation.evaluated               2
+          continuation.selected                2
+          engine.activity                      21
+          execution.admission.decision         2
+          execution.artifact.produced          1
+          execution.authorized                 2
+          execution.context.compilation        1
+          execution.context.prepared           1
+          execution.evidence                   1
+          execution.failed                     1
+          execution.finished                   1
+          execution.model.invoked              1
+          execution.mutation.completed         1
+          execution.mutation.started           1
+          execution.provider.execution         2
+          execution.provider.response          1
+          execution.spec.frozen                1
+          execution.started                    1
+          execution.strategy.selected          1
+          execution.summary                    3
+          execution.target.resolved            1
+          execution.verification.completed     1
+          execution.verification.started       1
+          loop.transition                      11
+          phase.changed                        1
+          preflight.snapshot                   1
+          provider.first_token                 1
+          provider.stream_delta                18
+          provider.usage_update                2
+          provider.waiting                     1
+          reasoning.state.committed            1
+          reasoning.step.completed             1
+          reasoning.step.started               1
+          stage.completed                      1
+    tasks_test.go:199: 
+        EXECUTION
+        ────────────────────────────────────────────────────────────────────────
+        run_id:  run-1
+        objective:
+          find the incorrect greeting in this project and fix it
+        
+        AUTHORIZATION
+          verdict:   allow
+          granted:   true  blocked: false
+          authority: preflight_admission_gate
+          intent:    MUTATE   scope: RESOLVED   mode: $prompt
+          targets:   main.go
+          candidates: (none)
+          proposed:  (none)
+          reason:    admitted: proven target, admissible mutation boundary, authoritative evidence
+        
+        EXECUTION SPEC (frozen before dispatch)
+          intent:        MUTATE
+          strategy:      multi_file_planning
+          contract:      agentic_loop  ceiling: execute
+          targets:       (none)
+          boundary:      UNBOUND   evidence: (none)
+          channels:      (none)
+          scope:         DISCOVERED (bounded workspace discovery observed candidate file(s); they are evidence and nothing is bound)
+          derivation:    UNRESOLVED kinds=(none)
+          candidates:    README.md,go.mod,main.go
+          scope targets: (none)
+          req_budget:    1536
+          digest:        (none)
+        
+        MODEL CALLS
+        
+          CALL #1
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   512 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      239 tokens / 1126 chars  fp=d55abb0baef3
+            completion:  6 tokens / 14 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    0s (first token 0s)
+        
+          CALL #2
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   1024 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      424 tokens / 1862 chars  fp=89d35aed4208
+            completion:  19 tokens / 91 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    2.632s (first token 1.717s)
+        
+        CONTINUATION DECISIONS
+        
+          step 1  deciding → executing
+            proposed:   continue — objective resolved — execute
+            selected:   continue — objective resolved — execute
+            outcome:    (none) (permanent)  attempt=0 cycle=0
+            objective:  (none)   pending: UNSUBSTANTIATE
+            progress:   READY (prev (none))  []
+        
+          step 2  interpreting → awaiting_human
+            proposed:   ask_human — mutation awaiting approval
+            selected:   ask_human — mutation awaiting approval
+            outcome:    pending_approval (transient)  attempt=1 cycle=0
+            objective:  (none)   pending: WAIT_FOR_AUTHORIZATION
+            progress:   REQUIRES_AUTHORIZATION (prev READY)  [new_evidence, objective_advanced]
+        
+        OBJECTIVE EVALUATIONS
+          (no completion was ever proposed)
+        
+        EVIDENCE
+          mutation: target=main.go outcome=verify_failed artifact=true diff=false apply=true fs_changed=false (+0/-0)
+          verification: STARTED for 1 request(s) — the gate was entered
+          verification: FAILED steps=fmt (go fmt ./...),lint (golangci-lint run ./...),vet (go vet ./...),build (go build ./...),test (go test ./...)
+        
+        BEHAVIOURAL OBSERVATION
+          (no behavioral observation recorded — this run did not engage the
+           behavioural gate, or engaged it before this record existed)
+        
+        LOOP TRANSITIONS
+          idle         → observing    continue      user objective: find the incorrect greeting in this project and fix it
+          observing    → deciding     continue      observation consumed
+          deciding     → awaiting_human ask_human     the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider cal…
+          awaiting_human → observing    continue      target specified: main.go
+          observing    → deciding     continue      observation consumed
+          deciding     → executing    continue      objective resolved — execute
+          executing    → verifying    continue      execution consumed: pending_approval
+          verifying    → interpreting continue      verification consumed
+          interpreting → awaiting_human ask_human     mutation awaiting approval
+          awaiting_human → observing    continue      patch approved
+          observing    → aborted      abort         approved mutation failed: verify_failed
+        
+        EXECUTION SUMMARY
+        ────────────────────────────────────────────────────────────────────────
+        status: aborted
+        note:   revision 3 — the run parked earlier and this is its resumed outcome
+        model_calls:   2 (failures 0, output_exhausted 0)
+        runtime_steps: 1
+        continuations: 1
+        tokens:
+          input:                   424
+          output:                  19
+          total:                   443  (authoritative=true)
+        budgets:
+          call #1 requested=512 effective=unobserved
+          call #2 requested=1024 effective=unobserved
+        execution:
+          mutations:     1
+          verification:  failed
+          evidence:      2
+        termination:
+          state:  aborted
+          reason: approved mutation failed: verify_failed
+        patterns:
+          none detected
+          (uninterpreted event types: engine.activity x21, execution.context.compilation x1, execution.finished x1, execution.model.invoked x1, execution.provider.response x1, phase.changed x1, preflight.snapshot x1, provider.first_token x1, provider.stream_delta x18, provider.usage_update x2, provider.waiting x1, reasoning.state.committed x1, reasoning.step.completed x1, stage.completed x1)
+    tasks_test.go:199: [B-modify-diag] evidence written to /Users/anvndev/Documents/Project/OpenSource/PizenLabs/izen/docs/report/realworld/evidence
+--- PASS: TestRealWorld_B_ModifyDiag (3.88s)
+=== RUN   TestRealWorld_E_PerformanceDiag
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+    tasks_test.go:208: [E-diag / PERFORMANCE (target named by the human at clarify)] driver.Run -> <nil: parked at a human boundary>
+    tasks_test.go:208: [E-diag / PERFORMANCE (target named by the human at clarify)] DIAGNOSTIC: answering clarify [README.md go.mod report.go] with "report.go" (main arm leaves this unanswered)
+2026/10/07 11:45:31 [occ] baseline request_targets=1 scoped=1 digest=3079ca6806fd cache_hits=1 duration=5µs
+2026/10/07 11:45:31 [execution] request=run-1 attempt=1 target=report.go strategy=targeted_mutation artifact_kind=replace_block output_contract=full_file_or_patch context_bytes=1053 prompt_bytes=1053 max_output=1024 reasoning=provider_default recovery=none
+2026/10/07 11:45:31 [execution] request=run-1 attempt=1 target=report.go strategy=targeted_mutation artifact_kind=replace_block output_contract=full_file_or_patch context_bytes=1053 prompt_bytes=1053 max_output=1024 reasoning=provider_default recovery=none
+    tasks_test.go:208: [E-diag / PERFORMANCE (target named by the human at clarify)] driver.ResumeClarify -> <nil: parked at a human boundary>
+    tasks_test.go:208: [E-diag / PERFORMANCE (target named by the human at clarify)] approval boundary presented but task disables answering: "mutation awaiting approval"
+    tasks_test.go:208: 
+        ═══ E-performance-diag — E-diag / PERFORMANCE (target named by the human at clarify) ═══
+        prompt:     find the main performance bottleneck in this project. Do not modify anything.
+        wall:       10444ms
+        state:      awaiting_human
+        termination:<nil: parked at a human boundary>
+        boundary:   action=approve resumable=true targets=[report.go] options=[] reason="mutation awaiting approval"
+        model:      calls=2 failures=0 output_exhausted=0 continuations=1 tokens=566/141 known=true
+        caps:       []
+        mutations:  []
+        verify:     []
+        objective:  []
+        patterns:   []
+        delta:      []
+        events:
+          approval.required                    1
+          continuation.evaluated               2
+          continuation.selected                2
+          engine.activity                      21
+          execution.admission.decision         1
+          execution.artifact.produced          1
+          execution.authorized                 2
+          execution.context.compilation        1
+          execution.context.prepared           1
+          execution.model.invoked              1
+          execution.provider.execution         2
+          execution.provider.response          1
+          execution.spec.frozen                1
+          execution.started                    1
+          execution.strategy.selected          1
+          execution.summary                    2
+          execution.target.resolved            1
+          loop.transition                      9
+          preflight.snapshot                   1
+          provider.first_token                 1
+          provider.stream_delta                140
+          provider.usage_update                2
+          provider.waiting                     1
+          reasoning.state.committed            1
+          reasoning.step.completed             1
+          reasoning.step.started               1
+          stage.completed                      1
+    tasks_test.go:208: 
+        EXECUTION
+        ────────────────────────────────────────────────────────────────────────
+        run_id:  run-1
+        objective:
+          find the main performance bottleneck in this project. Do not modify anything.
+        
+        AUTHORIZATION
+          verdict:   allow
+          granted:   true  blocked: false
+          authority: preflight_admission_gate
+          intent:    MUTATE   scope: RESOLVED   mode: $prompt
+          targets:   report.go
+          candidates: (none)
+          proposed:  (none)
+          reason:    admitted: proven target, admissible mutation boundary, authoritative evidence
+        
+        EXECUTION SPEC (frozen before dispatch)
+          intent:        MUTATE
+          strategy:      multi_file_planning
+          contract:      agentic_loop  ceiling: execute
+          targets:       (none)
+          boundary:      UNBOUND   evidence: (none)
+          channels:      (none)
+          scope:         DISCOVERED (bounded workspace discovery observed candidate file(s); they are evidence and nothing is bound)
+          derivation:    UNRESOLVED kinds=(none)
+          candidates:    README.md,go.mod,report.go
+          scope targets: (none)
+          req_budget:    1536
+          digest:        (none)
+        
+        MODEL CALLS
+        
+          CALL #1
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   512 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      242 tokens / 1149 chars  fp=8e34d9d3efb5
+            completion:  2 tokens / 2 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    0s (first token 0s)
+        
+          CALL #2
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   1024 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      566 tokens / 2381 chars  fp=ca5304d33776
+            completion:  141 tokens / 497 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    9.739s (first token 2.66s)
+        
+        CONTINUATION DECISIONS
+        
+          step 1  deciding → executing
+            proposed:   continue — objective resolved — execute
+            selected:   continue — objective resolved — execute
+            outcome:    (none) (permanent)  attempt=0 cycle=0
+            objective:  (none)   pending: UNSUBSTANTIATE
+            progress:   READY (prev (none))  []
+        
+          step 2  interpreting → awaiting_human
+            proposed:   ask_human — mutation awaiting approval
+            selected:   ask_human — mutation awaiting approval
+            outcome:    pending_approval (transient)  attempt=1 cycle=0
+            objective:  (none)   pending: WAIT_FOR_AUTHORIZATION
+            progress:   REQUIRES_AUTHORIZATION (prev READY)  [new_evidence, objective_advanced]
+        
+        OBJECTIVE EVALUATIONS
+          (no completion was ever proposed)
+        
+        EVIDENCE
+          mutations:     (none)
+          verifications: UNKNOWN — the runtime published no verification record.
+                       This is absence of evidence, NOT proof that verification
+                       did not run; it is deliberately not reported as a failure.
+        
+        BEHAVIOURAL OBSERVATION
+          (no behavioral observation recorded — this run did not engage the
+           behavioural gate, or engaged it before this record existed)
+        
+        LOOP TRANSITIONS
+          idle         → observing    continue      user objective: find the main performance bottleneck in this project. Do not modify anything.
+          observing    → deciding     continue      observation consumed
+          deciding     → awaiting_human ask_human     the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider cal…
+          awaiting_human → observing    continue      target specified: report.go
+          observing    → deciding     continue      observation consumed
+          deciding     → executing    continue      objective resolved — execute
+          executing    → verifying    continue      execution consumed: pending_approval
+          verifying    → interpreting continue      verification consumed
+          interpreting → awaiting_human ask_human     mutation awaiting approval
+        
+        EXECUTION SUMMARY
+        ────────────────────────────────────────────────────────────────────────
+        status: awaiting_human
+        note:   revision 2 — the run parked earlier and this is its resumed outcome
+        model_calls:   2 (failures 0, output_exhausted 0)
+        runtime_steps: 1
+        continuations: 1
+        tokens:
+          input:                   566
+          output:                  141
+          total:                   707  (authoritative=true)
+        budgets:
+          call #1 requested=512 effective=unobserved
+          call #2 requested=1024 effective=unobserved
+        execution:
+          mutations:     0
+          verification:  unknown (the runtime published no verification record)
+          evidence:      0
+        termination:
+          state:  (none)
+          reason: (none)
+          parked: approve
+        patterns:
+          none detected
+          (uninterpreted event types: engine.activity x21, execution.context.compilation x1, execution.model.invoked x1, execution.provider.response x1, preflight.snapshot x1, provider.first_token x1, provider.stream_delta x140, provider.usage_update x2, provider.waiting x1, reasoning.state.committed x1, reasoning.step.completed x1, stage.completed x1)
+    tasks_test.go:208: [E-performance-diag] evidence written to /Users/anvndev/Documents/Project/OpenSource/PizenLabs/izen/docs/report/realworld/evidence
+--- PASS: TestRealWorld_E_PerformanceDiag (10.66s)
+PASS
+ok  	github.com/PizenLabs/izen/test/realworld	15.150s

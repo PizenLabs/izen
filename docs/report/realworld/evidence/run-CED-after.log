@@ -1,0 +1,495 @@
+=== RUN   TestRealWorld_C_Investigate
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+    tasks_test.go:173: [C / INVESTIGATE — user endpoint error, do not modify] driver.Run -> <nil: parked at a human boundary>
+    tasks_test.go:173: [C / INVESTIGATE — user endpoint error, do not modify] PARKED at clarify boundary: reason="the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider call" options=[go.mod main.go store.go] — NOT answered (discovery stays the runtime's job)
+    tasks_test.go:173: 
+        ═══ C-investigate — C / INVESTIGATE — user endpoint error, do not modify ═══
+        prompt:     investigate why this application returns an error from the user endpoint. Do not modify anything.
+        wall:       4789ms
+        state:      awaiting_human
+        termination:<nil: parked at a human boundary>
+        boundary:   action=clarify resumable=true targets=[] options=[go.mod main.go store.go] reason="the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider call"
+        model:      calls=1 failures=0 output_exhausted=0 continuations=0 tokens=0/0 known=false
+        caps:       []
+        mutations:  []
+        verify:     []
+        objective:  []
+        patterns:   []
+        delta:      []
+        events:
+          engine.activity                      13
+          execution.authorized                 1
+          execution.provider.execution         1
+          execution.spec.frozen                1
+          execution.summary                    1
+          loop.transition                      3
+          preflight.snapshot                   1
+          stage.completed                      1
+    tasks_test.go:173: 
+        EXECUTION
+        ────────────────────────────────────────────────────────────────────────
+        run_id:  run-1
+        objective:
+          investigate why this application returns an error from the user endpoint. Do not modify anything.
+        
+        AUTHORIZATION
+          verdict:   disambiguate
+          granted:   false  blocked: true
+          authority: preflight_admission_gate
+          intent:    MUTATE   scope: DISCOVERED   mode: $prompt
+          targets:   (none)
+          candidates: go.mod,main.go,store.go
+          proposed:  (none)
+          reason:    the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider call
+        
+        EXECUTION SPEC (frozen before dispatch)
+          intent:        MUTATE
+          strategy:      repository_investigation
+          contract:      agentic_loop  ceiling: execute
+          targets:       (none)
+          boundary:      UNBOUND   evidence: (none)
+          channels:      (none)
+          scope:         DISCOVERED (bounded workspace discovery observed candidate file(s); they are evidence and nothing is bound)
+          derivation:    UNRESOLVED kinds=(none)
+          candidates:    go.mod,main.go,store.go
+          scope targets: (none)
+          req_budget:    1536
+          digest:        (none)
+        
+        MODEL CALLS
+        
+          CALL #1
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   512 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      246 tokens / 1169 chars  fp=3034380350c1
+            completion:  2 tokens / 2 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    0s (first token 0s)
+        
+        CONTINUATION DECISIONS
+          (none recorded)
+        
+        OBJECTIVE EVALUATIONS
+          (no completion was ever proposed)
+        
+        EVIDENCE
+          mutations:     (none)
+          verifications: UNKNOWN — the runtime published no verification record.
+                       This is absence of evidence, NOT proof that verification
+                       did not run; it is deliberately not reported as a failure.
+        
+        BEHAVIOURAL OBSERVATION
+          (no behavioral observation recorded — this run did not engage the
+           behavioural gate, or engaged it before this record existed)
+        
+        LOOP TRANSITIONS
+          idle         → observing    continue      user objective: investigate why this application returns an error from the user endpoint. Do not modify anything.
+          observing    → deciding     continue      observation consumed
+          deciding     → awaiting_human ask_human     the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider cal…
+        
+        EXECUTION SUMMARY
+        ────────────────────────────────────────────────────────────────────────
+        status: awaiting_human
+        model_calls:   1 (failures 0, output_exhausted 0)
+        runtime_steps: 0
+        continuations: 0
+        tokens:
+          input:                   0
+          output:                  0
+          total:                   0  (authoritative=false)
+        budgets:
+          call #1 requested=512 effective=unobserved
+        execution:
+          mutations:     0
+          verification:  unknown (the runtime published no verification record)
+          evidence:      0
+        termination:
+          state:  (none)
+          reason: (none)
+          parked: clarify
+        patterns:
+          none detected
+          (uninterpreted event types: engine.activity x13, preflight.snapshot x1, stage.completed x1)
+    tasks_test.go:173: [C-investigate] evidence written to /Users/anvndev/Documents/Project/OpenSource/PizenLabs/izen/docs/report/realworld/evidence
+--- PASS: TestRealWorld_C_Investigate (4.99s)
+=== RUN   TestRealWorld_D_Fix
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+    tasks_test.go:178: [D / FIX — find and fix the failing user endpoint] driver.Run -> <nil: parked at a human boundary>
+    tasks_test.go:178: [D / FIX — find and fix the failing user endpoint] PARKED at inform boundary: reason="canonical intent revision incomplete: autonomy: intent context re-compilation under \"modification\" failed: execution: compiled context does not satisfy the active intent's provenance contract: the contract requires workspace material but the compiled payload carries none — the run holds intent \"unknown\" with no valid workspace context for it; re-scope the objective or grant an explicit mutation contract" options=[] — NOT answered (discovery stays the runtime's job)
+    tasks_test.go:178: 
+        ═══ D-fix — D / FIX — find and fix the failing user endpoint ═══
+        prompt:     find and fix the bug causing the user endpoint to fail
+        wall:       275ms
+        state:      awaiting_human
+        termination:<nil: parked at a human boundary>
+        boundary:   action=inform resumable=false targets=[] options=[] reason="canonical intent revision incomplete: autonomy: intent context re-compilation under \"modification\" failed: execution: compiled context does not satisfy the active intent's provenance contract: the contract requires workspace material but the compiled payload carries none — the run holds intent \"unknown\" with no valid workspace context for it; re-scope the objective or grant an explicit mutation contract"
+        model:      calls=0 failures=0 output_exhausted=0 continuations=0 tokens=0/0 known=false
+        caps:       []
+        mutations:  []
+        verify:     []
+        objective:  []
+        patterns:   []
+        delta:      []
+        events:
+          engine.activity                      7
+          execution.authorized                 1
+          execution.summary                    1
+          loop.transition                      2
+          preflight.snapshot                   1
+          stage.completed                      1
+    tasks_test.go:178: 
+        EXECUTION
+        ────────────────────────────────────────────────────────────────────────
+        run_id:  run-1
+        objective:
+          find and fix the bug causing the user endpoint to fail
+        
+        AUTHORIZATION
+          verdict:   deny
+          granted:   false  blocked: true
+          authority: preflight_admission_gate
+          intent:    PLAN   scope: DISCOVERED   mode: $prompt
+          targets:   (none)
+          candidates: go.mod,main.go,store.go
+          proposed:  (none)
+          reason:    canonical intent revision incomplete — the run holds intent  with no valid workspace context for it: autonomy: intent context re-compilation under "modification" failed: execution: compiled context …
+        
+        MODEL CALLS
+          (none — no provider request crossed the boundary)
+        
+        CONTINUATION DECISIONS
+          (none recorded)
+        
+        OBJECTIVE EVALUATIONS
+          (no completion was ever proposed)
+        
+        EVIDENCE
+          mutations:     (none)
+          verifications: UNKNOWN — the runtime published no verification record.
+                       This is absence of evidence, NOT proof that verification
+                       did not run; it is deliberately not reported as a failure.
+        
+        BEHAVIOURAL OBSERVATION
+          (no behavioral observation recorded — this run did not engage the
+           behavioural gate, or engaged it before this record existed)
+        
+        LOOP TRANSITIONS
+          idle         → observing    continue      user objective: find and fix the bug causing the user endpoint to fail
+          observing    → awaiting_human ask_human     canonical intent revision incomplete: autonomy: intent context re-compilation under "modification" failed: execution: co…
+        
+        EXECUTION SUMMARY
+        ────────────────────────────────────────────────────────────────────────
+        status: awaiting_human
+        model_calls:   0 (failures 0, output_exhausted 0)
+        runtime_steps: 0
+        continuations: 0
+        tokens:
+          input:                   0
+          output:                  0
+          total:                   0  (authoritative=false)
+        budgets:
+          (no model call)
+        execution:
+          mutations:     0
+          verification:  unknown (the runtime published no verification record)
+          evidence:      0
+        termination:
+          state:  (none)
+          reason: (none)
+          parked: inform
+        patterns:
+          none detected
+          (uninterpreted event types: engine.activity x7, preflight.snapshot x1, stage.completed x1)
+    tasks_test.go:178: [D-fix] evidence written to /Users/anvndev/Documents/Project/OpenSource/PizenLabs/izen/docs/report/realworld/evidence
+--- PASS: TestRealWorld_D_Fix (0.47s)
+=== RUN   TestRealWorld_E_Performance
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+    tasks_test.go:183: [E / PERFORMANCE — find the main bottleneck, do not modify] driver.Run -> <nil: parked at a human boundary>
+    tasks_test.go:183: [E / PERFORMANCE — find the main bottleneck, do not modify] PARKED at clarify boundary: reason="the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider call" options=[README.md go.mod report.go] — NOT answered (discovery stays the runtime's job)
+    tasks_test.go:183: 
+        ═══ E-performance — E / PERFORMANCE — find the main bottleneck, do not modify ═══
+        prompt:     find the main performance bottleneck in this project. Do not modify anything.
+        wall:       707ms
+        state:      awaiting_human
+        termination:<nil: parked at a human boundary>
+        boundary:   action=clarify resumable=true targets=[] options=[README.md go.mod report.go] reason="the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider call"
+        model:      calls=1 failures=0 output_exhausted=0 continuations=0 tokens=0/0 known=false
+        caps:       []
+        mutations:  []
+        verify:     []
+        objective:  []
+        patterns:   []
+        delta:      []
+        events:
+          engine.activity                      13
+          execution.authorized                 1
+          execution.provider.execution         1
+          execution.spec.frozen                1
+          execution.summary                    1
+          loop.transition                      3
+          preflight.snapshot                   1
+          stage.completed                      1
+    tasks_test.go:183: 
+        EXECUTION
+        ────────────────────────────────────────────────────────────────────────
+        run_id:  run-1
+        objective:
+          find the main performance bottleneck in this project. Do not modify anything.
+        
+        AUTHORIZATION
+          verdict:   disambiguate
+          granted:   false  blocked: true
+          authority: preflight_admission_gate
+          intent:    MUTATE   scope: DISCOVERED   mode: $prompt
+          targets:   (none)
+          candidates: README.md,go.mod,report.go
+          proposed:  (none)
+          reason:    the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider call
+        
+        EXECUTION SPEC (frozen before dispatch)
+          intent:        MUTATE
+          strategy:      repository_investigation
+          contract:      agentic_loop  ceiling: execute
+          targets:       (none)
+          boundary:      UNBOUND   evidence: (none)
+          channels:      (none)
+          scope:         DISCOVERED (bounded workspace discovery observed candidate file(s); they are evidence and nothing is bound)
+          derivation:    UNRESOLVED kinds=(none)
+          candidates:    README.md,go.mod,report.go
+          scope targets: (none)
+          req_budget:    1536
+          digest:        (none)
+        
+        MODEL CALLS
+        
+          CALL #1
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   512 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      242 tokens / 1149 chars  fp=8e34d9d3efb5
+            completion:  2 tokens / 2 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    0s (first token 0s)
+        
+        CONTINUATION DECISIONS
+          (none recorded)
+        
+        OBJECTIVE EVALUATIONS
+          (no completion was ever proposed)
+        
+        EVIDENCE
+          mutations:     (none)
+          verifications: UNKNOWN — the runtime published no verification record.
+                       This is absence of evidence, NOT proof that verification
+                       did not run; it is deliberately not reported as a failure.
+        
+        BEHAVIOURAL OBSERVATION
+          (no behavioral observation recorded — this run did not engage the
+           behavioural gate, or engaged it before this record existed)
+        
+        LOOP TRANSITIONS
+          idle         → observing    continue      user objective: find the main performance bottleneck in this project. Do not modify anything.
+          observing    → deciding     continue      observation consumed
+          deciding     → awaiting_human ask_human     the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider cal…
+        
+        EXECUTION SUMMARY
+        ────────────────────────────────────────────────────────────────────────
+        status: awaiting_human
+        model_calls:   1 (failures 0, output_exhausted 0)
+        runtime_steps: 0
+        continuations: 0
+        tokens:
+          input:                   0
+          output:                  0
+          total:                   0  (authoritative=false)
+        budgets:
+          call #1 requested=512 effective=unobserved
+        execution:
+          mutations:     0
+          verification:  unknown (the runtime published no verification record)
+          evidence:      0
+        termination:
+          state:  (none)
+          reason: (none)
+          parked: clarify
+        patterns:
+          none detected
+          (uninterpreted event types: engine.activity x13, preflight.snapshot x1, stage.completed x1)
+    tasks_test.go:183: [E-performance] evidence written to /Users/anvndev/Documents/Project/OpenSource/PizenLabs/izen/docs/report/realworld/evidence
+--- PASS: TestRealWorld_E_Performance (0.90s)
+=== RUN   TestRealWorld_E_PerformanceDiag
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+    tasks_test.go:208: [E-diag / PERFORMANCE (target named by the human at clarify)] driver.Run -> <nil: parked at a human boundary>
+    tasks_test.go:208: [E-diag / PERFORMANCE (target named by the human at clarify)] DIAGNOSTIC: answering clarify [README.md go.mod report.go] with "report.go" (main arm leaves this unanswered)
+2026/10/07 11:56:22 [occ] baseline request_targets=1 scoped=1 digest=bedee7b1df70 cache_hits=1 duration=10µs
+2026/10/07 11:56:22 [execution] request=run-1 attempt=1 target=report.go strategy=targeted_mutation artifact_kind=replace_block output_contract=full_file_or_patch context_bytes=1053 prompt_bytes=1053 max_output=1024 reasoning=provider_default recovery=none
+2026/10/07 11:56:22 [execution] request=run-1 attempt=1 target=report.go strategy=targeted_mutation artifact_kind=replace_block output_contract=full_file_or_patch context_bytes=1053 prompt_bytes=1053 max_output=1024 reasoning=provider_default recovery=none
+    tasks_test.go:208: [E-diag / PERFORMANCE (target named by the human at clarify)] driver.ResumeClarify -> <nil: parked at a human boundary>
+    tasks_test.go:208: [E-diag / PERFORMANCE (target named by the human at clarify)] approval boundary presented but task disables answering: "mutation awaiting approval"
+    tasks_test.go:208: 
+        ═══ E-performance-diag — E-diag / PERFORMANCE (target named by the human at clarify) ═══
+        prompt:     find the main performance bottleneck in this project. Do not modify anything.
+        wall:       11042ms
+        state:      awaiting_human
+        termination:<nil: parked at a human boundary>
+        boundary:   action=approve resumable=true targets=[report.go] options=[] reason="mutation awaiting approval"
+        model:      calls=2 failures=0 output_exhausted=0 continuations=1 tokens=566/141 known=true
+        caps:       []
+        mutations:  []
+        verify:     []
+        objective:  []
+        patterns:   []
+        delta:      []
+        events:
+          approval.required                    1
+          continuation.evaluated               2
+          continuation.selected                2
+          engine.activity                      21
+          execution.admission.decision         1
+          execution.artifact.produced          1
+          execution.authorized                 2
+          execution.context.compilation        1
+          execution.context.prepared           1
+          execution.model.invoked              1
+          execution.provider.execution         2
+          execution.provider.response          1
+          execution.spec.frozen                1
+          execution.started                    1
+          execution.strategy.selected          1
+          execution.summary                    2
+          execution.target.resolved            1
+          loop.transition                      9
+          preflight.snapshot                   1
+          provider.first_token                 1
+          provider.stream_delta                140
+          provider.usage_update                2
+          provider.waiting                     1
+          reasoning.state.committed            1
+          reasoning.step.completed             1
+          reasoning.step.started               1
+          stage.completed                      1
+    tasks_test.go:208: 
+        EXECUTION
+        ────────────────────────────────────────────────────────────────────────
+        run_id:  run-1
+        objective:
+          find the main performance bottleneck in this project. Do not modify anything.
+        
+        AUTHORIZATION
+          verdict:   allow
+          granted:   true  blocked: false
+          authority: preflight_admission_gate
+          intent:    MUTATE   scope: RESOLVED   mode: $prompt
+          targets:   report.go
+          candidates: (none)
+          proposed:  (none)
+          reason:    admitted: proven target, admissible mutation boundary, authoritative evidence
+        
+        EXECUTION SPEC (frozen before dispatch)
+          intent:        MUTATE
+          strategy:      repository_investigation
+          contract:      agentic_loop  ceiling: execute
+          targets:       (none)
+          boundary:      UNBOUND   evidence: (none)
+          channels:      (none)
+          scope:         DISCOVERED (bounded workspace discovery observed candidate file(s); they are evidence and nothing is bound)
+          derivation:    UNRESOLVED kinds=(none)
+          candidates:    README.md,go.mod,report.go
+          scope targets: (none)
+          req_budget:    1536
+          digest:        (none)
+        
+        MODEL CALLS
+        
+          CALL #1
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   512 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      242 tokens / 1149 chars  fp=8e34d9d3efb5
+            completion:  6 tokens / 14 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    0s (first token 0s)
+        
+          CALL #2
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   1024 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      566 tokens / 2381 chars  fp=ca5304d33776
+            completion:  141 tokens / 496 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    10.272s (first token 3.197s)
+        
+        CONTINUATION DECISIONS
+        
+          step 1  deciding → executing
+            proposed:   continue — objective resolved — execute
+            selected:   continue — objective resolved — execute
+            outcome:    (none) (permanent)  attempt=0 cycle=0
+            objective:  (none)   pending: UNSUBSTANTIATE
+            progress:   READY (prev (none))  []
+        
+          step 2  interpreting → awaiting_human
+            proposed:   ask_human — mutation awaiting approval
+            selected:   ask_human — mutation awaiting approval
+            outcome:    pending_approval (transient)  attempt=1 cycle=0
+            objective:  (none)   pending: WAIT_FOR_AUTHORIZATION
+            progress:   REQUIRES_AUTHORIZATION (prev READY)  [new_evidence, objective_advanced]
+        
+        OBJECTIVE EVALUATIONS
+          (no completion was ever proposed)
+        
+        EVIDENCE
+          mutations:     (none)
+          verifications: UNKNOWN — the runtime published no verification record.
+                       This is absence of evidence, NOT proof that verification
+                       did not run; it is deliberately not reported as a failure.
+        
+        BEHAVIOURAL OBSERVATION
+          (no behavioral observation recorded — this run did not engage the
+           behavioural gate, or engaged it before this record existed)
+        
+        LOOP TRANSITIONS
+          idle         → observing    continue      user objective: find the main performance bottleneck in this project. Do not modify anything.
+          observing    → deciding     continue      observation consumed
+          deciding     → awaiting_human ask_human     the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider cal…
+          awaiting_human → observing    continue      target specified: report.go
+          observing    → deciding     continue      observation consumed
+          deciding     → executing    continue      objective resolved — execute
+          executing    → verifying    continue      execution consumed: pending_approval
+          verifying    → interpreting continue      verification consumed
+          interpreting → awaiting_human ask_human     mutation awaiting approval
+        
+        EXECUTION SUMMARY
+        ────────────────────────────────────────────────────────────────────────
+        status: awaiting_human
+        note:   revision 2 — the run parked earlier and this is its resumed outcome
+        model_calls:   2 (failures 0, output_exhausted 0)
+        runtime_steps: 1
+        continuations: 1
+        tokens:
+          input:                   566
+          output:                  141
+          total:                   707  (authoritative=true)
+        budgets:
+          call #1 requested=512 effective=unobserved
+          call #2 requested=1024 effective=unobserved
+        execution:
+          mutations:     0
+          verification:  unknown (the runtime published no verification record)
+          evidence:      0
+        termination:
+          state:  (none)
+          reason: (none)
+          parked: approve
+        patterns:
+          none detected
+          (uninterpreted event types: engine.activity x21, execution.context.compilation x1, execution.model.invoked x1, execution.provider.response x1, preflight.snapshot x1, provider.first_token x1, provider.stream_delta x140, provider.usage_update x2, provider.waiting x1, reasoning.state.committed x1, reasoning.step.completed x1, stage.completed x1)
+    tasks_test.go:208: [E-performance-diag] evidence written to /Users/anvndev/Documents/Project/OpenSource/PizenLabs/izen/docs/report/realworld/evidence
+--- PASS: TestRealWorld_E_PerformanceDiag (11.24s)
+PASS
+ok  	github.com/PizenLabs/izen/test/realworld	18.379s

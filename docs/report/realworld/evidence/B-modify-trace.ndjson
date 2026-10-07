@@ -1,0 +1,99 @@
+{
+  "run_id": "run-1",
+  "recorded_at": "2026-10-07T12:11:39.66376+07:00",
+  "status": "awaiting_human",
+  "summary": {
+    "run_id": "run-1",
+    "revision": 1,
+    "objective": "find the incorrect greeting in this project and fix it",
+    "status": "awaiting_human",
+    "parked": true,
+    "boundary_action": "clarify",
+    "model_calls": 0,
+    "model_failures": 0,
+    "output_exhausted": 0,
+    "runtime_steps": 0,
+    "continuations": 0,
+    "attempts": 0,
+    "recovery_cycles": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "usage_known": false,
+    "mutations": 0,
+    "verifications": 0,
+    "verification_passed": false,
+    "verification_observed": false,
+    "schema_mode": "auto"
+  },
+  "entries": [
+    {
+      "seq": 1,
+      "at": "2026-10-07T12:11:38.898852+07:00",
+      "event": "loop.transition",
+      "summary": "loop: idle → observing (continue)",
+      "detail": {
+        "reason": "user objective: find the incorrect greeting in this project and fix it"
+      }
+    },
+    {
+      "seq": 2,
+      "at": "2026-10-07T12:11:39.397869+07:00",
+      "event": "execution.provider.execution",
+      "summary": "model call: ollama/qwen2.5-coder:7b finish=stop completion=6",
+      "detail": {
+        "effective": "512",
+        "fingerprint": "d55abb0baef3",
+        "requested": "512",
+        "truncated": "false"
+      }
+    },
+    {
+      "seq": 3,
+      "at": "2026-10-07T12:11:39.398013+07:00",
+      "event": "loop.transition",
+      "summary": "loop: observing → deciding (continue)",
+      "detail": {
+        "reason": "observation consumed"
+      }
+    },
+    {
+      "seq": 4,
+      "at": "2026-10-07T12:11:39.39824+07:00",
+      "event": "execution.spec.frozen",
+      "summary": "spec frozen: intent=MUTATE boundary=UNBOUND",
+      "detail": {
+        "candidates": "README.md,go.mod,main.go",
+        "req_budget": "1536",
+        "scope": "DISCOVERED"
+      }
+    },
+    {
+      "seq": 5,
+      "at": "2026-10-07T12:11:39.398258+07:00",
+      "event": "execution.authorized",
+      "summary": "authorization disambiguate (granted=false)",
+      "detail": {
+        "authority": "preflight_admission_gate",
+        "candidates": "README.md,go.mod,main.go",
+        "reason": "the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider call",
+        "scope": "DISCOVERED"
+      }
+    },
+    {
+      "seq": 6,
+      "at": "2026-10-07T12:11:39.398261+07:00",
+      "event": "loop.transition",
+      "summary": "loop: deciding → awaiting_human (ask_human)",
+      "detail": {
+        "reason": "the target is unresolved and the workspace offers 3 candidate(s); the human must name the target before any provider call"
+      }
+    },
+    {
+      "seq": 7,
+      "at": "2026-10-07T12:11:39.410845+07:00",
+      "event": "execution.summary",
+      "summary": "(recorded)"
+    }
+  ]
+}

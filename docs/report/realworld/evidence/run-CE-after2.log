@@ -1,0 +1,569 @@
+=== RUN   TestRealWorld_C_Investigate
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+    tasks_test.go:173: [C / INVESTIGATE — user endpoint error, do not modify] driver.Run -> unsubstantiated reason="objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome \"completed\"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened" class=
+    tasks_test.go:173: 
+        ═══ C-investigate — C / INVESTIGATE — user endpoint error, do not modify ═══
+        prompt:     investigate why this application returns an error from the user endpoint. Do not modify anything.
+        wall:       65151ms
+        state:      unsubstantiated
+        termination:unsubstantiated reason="objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome \"completed\"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened" class=
+        boundary:   action= resumable=false targets=[] options=[] reason=""
+        model:      calls=3 failures=0 output_exhausted=0 continuations=2 tokens=146/1218 known=true
+        caps:       []
+        mutations:  []
+        verify:     [applicable=false passed=false reason="read-only execution" applicable=false passed=false reason="read-only execution"]
+        objective:  [state=UNSUBSTANTIATED granted=false reason="completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target)" state=UNSUBSTANTIATED granted=false reason="completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target)"]
+        patterns:   []
+        delta:      []
+        events:
+          continuation.evaluated               3
+          continuation.selected                3
+          engine.activity                      20
+          execution.admission.decision         2
+          execution.artifact.produced          2
+          execution.authorized                 1
+          execution.context.compilation        2
+          execution.context.prepared           2
+          execution.evidence                   2
+          execution.finished                   2
+          execution.model.invoked              2
+          execution.provider.execution         3
+          execution.provider.response          2
+          execution.spec.frozen                1
+          execution.started                    2
+          execution.strategy.selected          2
+          execution.summary                    1
+          execution.verification.completed     2
+          loop.transition                      9
+          objective.evaluated                  2
+          preflight.snapshot                   1
+          provider.first_token                 2
+          provider.stream_delta                1216
+          provider.usage_update                4
+          provider.waiting                     2
+          reasoning.state.committed            2
+          reasoning.step.completed             2
+          reasoning.step.started               2
+          stage.completed                      1
+    tasks_test.go:173: 
+        EXECUTION
+        ────────────────────────────────────────────────────────────────────────
+        run_id:  run-1
+        objective:
+          investigate why this application returns an error from the user endpoint. Do not modify anything.
+        
+        AUTHORIZATION
+          verdict:   allow
+          granted:   true  blocked: false
+          authority: preflight_admission_gate
+          intent:    INVESTIGATE   scope: DISCOVERED   mode: $prompt
+          targets:   (none)
+          candidates: go.mod,main.go,store.go
+          proposed:  (none)
+          reason:    admitted: proven target, admissible mutation boundary, authoritative evidence
+        
+        EXECUTION SPEC (frozen before dispatch)
+          intent:        INVESTIGATE
+          strategy:      repository_investigation
+          contract:      agentic_loop  ceiling: execute
+          targets:       (none)
+          boundary:      (none)   evidence: (none)
+          channels:      (none)
+          scope:         DISCOVERED (bounded workspace discovery observed candidate file(s); they are evidence and nothing is bound)
+          derivation:    UNRESOLVED kinds=(none)
+          candidates:    go.mod,main.go,store.go
+          scope targets: (none)
+          req_budget:    1536
+          digest:        (none)
+        
+        MODEL CALLS
+        
+          CALL #1
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   512 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      246 tokens / 1169 chars  fp=3034380350c1
+            completion:  2 tokens / 2 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    0s (first token 0s)
+        
+          CALL #2
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   1536 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      73 tokens / 302 chars  fp=718684f33a36
+            completion:  669 tokens / 3238 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    35.578s (first token 522ms)
+        
+          CALL #3
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   1536 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      73 tokens / 302 chars  fp=718684f33a36
+            completion:  549 tokens / 2610 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    28.66s (first token 84ms)
+        
+        CONTINUATION DECISIONS
+        
+          step 1  deciding → executing
+            proposed:   continue — objective resolved — execute
+            selected:   continue — objective resolved — execute
+            outcome:    (none) (permanent)  attempt=0 cycle=0
+            objective:  (none)   pending: UNSUBSTANTIATE
+            progress:   READY (prev (none))  []
+        
+          step 2  interpreting → executing
+            proposed:   complete — objective satisfied: completed
+            selected:   continue — objective PARTIALLY_SATISFIED — 1 of 2 completion condition(s) hold; continuing against the same objective contract, preserving established evidence
+            REWRITTEN by: 
+            outcome:    completed (transient)  attempt=1 cycle=0
+            objective:  (none)   pending: CONTINUE
+            progress:   PARTIALLY_SATISFIED (prev READY)  [objective_advanced]
+        
+          step 3  interpreting → unsubstantiated
+            proposed:   complete — objective satisfied: completed
+            selected:   unsubstantiate — objective UNPROVEN (UNSUBSTANTIATED): completion condition "cond-observed" is unmet: no workspace observation event for (no declared target) — refused complet…
+            REWRITTEN by: objective_continuation_router
+            outcome:    completed (transient)  attempt=2 cycle=0
+            objective:  UNSUBSTANTIATED   pending: CONTINUE
+            progress:   PARTIALLY_SATISFIED (prev PARTIALLY_SATISFIED)  []
+        
+        OBJECTIVE EVALUATIONS
+          UNSUBSTANTIATED    granted=false mutations=0 verified=false
+              clause: objective_scope_unobserved
+              reason: completion condition "cond-observed" is unmet: no workspace observation event for (no declared target)
+          UNSUBSTANTIATED    granted=false mutations=0 verified=false
+              clause: objective_scope_unobserved
+              reason: completion condition "cond-observed" is unmet: no workspace observation event for (no declared target)
+        
+        EVIDENCE
+          mutations:     (none)
+          verification: SKIPPED (boundary never reached) — read-only execution
+          verification: SKIPPED (boundary never reached) — read-only execution
+        
+        BEHAVIOURAL OBSERVATION
+          (no behavioral observation recorded — this run did not engage the
+           behavioural gate, or engaged it before this record existed)
+        
+        LOOP TRANSITIONS
+          idle         → observing    continue      user objective: investigate why this application returns an error from the user endpoint. Do not modify anything.
+          observing    → deciding     continue      observation consumed
+          deciding     → executing    continue      objective resolved — execute
+          executing    → verifying    continue      execution consumed: completed
+          verifying    → interpreting continue      verification consumed
+          interpreting → executing    continue      objective PARTIALLY_SATISFIED — 1 of 2 completion condition(s) hold; continuing against the same objective contract, p…
+          executing    → verifying    continue      execution consumed: completed
+          verifying    → interpreting continue      verification consumed
+          interpreting → unsubstantiated unsubstantiate objective UNPROVEN (UNSUBSTANTIATED): completion condition "cond-observed" is unmet: no workspace observation event for …
+        
+        EXECUTION SUMMARY
+        ────────────────────────────────────────────────────────────────────────
+        status: unsubstantiated
+        model_calls:   3 (failures 0, output_exhausted 0)
+        runtime_steps: 2
+        continuations: 2
+        tokens:
+          input:                   146
+          output:                  1218
+          total:                   1364  (authoritative=true)
+        budgets:
+          call #1 requested=512 effective=unobserved
+          call #2 requested=1536 effective=unobserved
+          call #3 requested=1536 effective=unobserved
+        execution:
+          mutations:     0
+          verification:  skipped (the verification boundary was never reached)
+          evidence:      4
+        termination:
+          state:  unsubstantiated
+          reason: objective UNPROVEN (UNSUBSTANTIATED): completion condition "cond-observed" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome "completed"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened
+        patterns:
+          none detected
+          (uninterpreted event types: engine.activity x20, execution.context.compilation x2, execution.finished x2, execution.model.invoked x2, execution.provider.response x2, preflight.snapshot x1, provider.first_token x2, provider.stream_delta x1216, provider.usage_update x4, provider.waiting x2, reasoning.state.committed x2, reasoning.step.completed x2, stage.completed x1)
+    tasks_test.go:173: [C-investigate] evidence written to /Users/anvndev/Documents/Project/OpenSource/PizenLabs/izen/docs/report/realworld/evidence
+--- PASS: TestRealWorld_C_Investigate (65.37s)
+=== RUN   TestRealWorld_E_Performance
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+    tasks_test.go:183: [E / PERFORMANCE — find the main bottleneck, do not modify] driver.Run -> unsubstantiated reason="objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome \"completed\"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened" class=
+    tasks_test.go:183: 
+        ═══ E-performance — E / PERFORMANCE — find the main bottleneck, do not modify ═══
+        prompt:     find the main performance bottleneck in this project. Do not modify anything.
+        wall:       62047ms
+        state:      unsubstantiated
+        termination:unsubstantiated reason="objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome \"completed\"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened" class=
+        boundary:   action= resumable=false targets=[] options=[] reason=""
+        model:      calls=3 failures=0 output_exhausted=0 continuations=2 tokens=138/1214 known=true
+        caps:       []
+        mutations:  []
+        verify:     [applicable=false passed=false reason="read-only execution" applicable=false passed=false reason="read-only execution"]
+        objective:  [state=UNSUBSTANTIATED granted=false reason="completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target)" state=UNSUBSTANTIATED granted=false reason="completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target)"]
+        patterns:   []
+        delta:      []
+        events:
+          continuation.evaluated               3
+          continuation.selected                3
+          engine.activity                      20
+          execution.admission.decision         2
+          execution.artifact.produced          2
+          execution.authorized                 1
+          execution.context.compilation        2
+          execution.context.prepared           2
+          execution.evidence                   2
+          execution.finished                   2
+          execution.model.invoked              2
+          execution.provider.execution         3
+          execution.provider.response          2
+          execution.spec.frozen                1
+          execution.started                    2
+          execution.strategy.selected          2
+          execution.summary                    1
+          execution.verification.completed     2
+          loop.transition                      9
+          objective.evaluated                  2
+          preflight.snapshot                   1
+          provider.first_token                 2
+          provider.stream_delta                1212
+          provider.usage_update                4
+          provider.waiting                     2
+          reasoning.state.committed            2
+          reasoning.step.completed             2
+          reasoning.step.started               2
+          stage.completed                      1
+    tasks_test.go:183: 
+        EXECUTION
+        ────────────────────────────────────────────────────────────────────────
+        run_id:  run-1
+        objective:
+          find the main performance bottleneck in this project. Do not modify anything.
+        
+        AUTHORIZATION
+          verdict:   allow
+          granted:   true  blocked: false
+          authority: preflight_admission_gate
+          intent:    INVESTIGATE   scope: DISCOVERED   mode: $prompt
+          targets:   (none)
+          candidates: README.md,go.mod,report.go
+          proposed:  (none)
+          reason:    admitted: proven target, admissible mutation boundary, authoritative evidence
+        
+        EXECUTION SPEC (frozen before dispatch)
+          intent:        INVESTIGATE
+          strategy:      repository_investigation
+          contract:      agentic_loop  ceiling: execute
+          targets:       (none)
+          boundary:      (none)   evidence: (none)
+          channels:      (none)
+          scope:         DISCOVERED (bounded workspace discovery observed candidate file(s); they are evidence and nothing is bound)
+          derivation:    UNRESOLVED kinds=(none)
+          candidates:    README.md,go.mod,report.go
+          scope targets: (none)
+          req_budget:    1536
+          digest:        (none)
+        
+        MODEL CALLS
+        
+          CALL #1
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   512 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      242 tokens / 1149 chars  fp=8e34d9d3efb5
+            completion:  2 tokens / 2 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    0s (first token 0s)
+        
+          CALL #2
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   1536 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      69 tokens / 282 chars  fp=d87e54836d2c
+            completion:  594 tokens / 2987 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    30.943s (first token 369ms)
+        
+          CALL #3
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   1536 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      69 tokens / 282 chars  fp=d87e54836d2c
+            completion:  620 tokens / 3241 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    30.202s (first token 74ms)
+        
+        CONTINUATION DECISIONS
+        
+          step 1  deciding → executing
+            proposed:   continue — objective resolved — execute
+            selected:   continue — objective resolved — execute
+            outcome:    (none) (permanent)  attempt=0 cycle=0
+            objective:  (none)   pending: UNSUBSTANTIATE
+            progress:   READY (prev (none))  []
+        
+          step 2  interpreting → executing
+            proposed:   complete — objective satisfied: completed
+            selected:   continue — objective PARTIALLY_SATISFIED — 1 of 2 completion condition(s) hold; continuing against the same objective contract, preserving established evidence
+            REWRITTEN by: 
+            outcome:    completed (transient)  attempt=1 cycle=0
+            objective:  (none)   pending: CONTINUE
+            progress:   PARTIALLY_SATISFIED (prev READY)  [objective_advanced]
+        
+          step 3  interpreting → unsubstantiated
+            proposed:   complete — objective satisfied: completed
+            selected:   unsubstantiate — objective UNPROVEN (UNSUBSTANTIATED): completion condition "cond-observed" is unmet: no workspace observation event for (no declared target) — refused complet…
+            REWRITTEN by: objective_continuation_router
+            outcome:    completed (transient)  attempt=2 cycle=0
+            objective:  UNSUBSTANTIATED   pending: CONTINUE
+            progress:   PARTIALLY_SATISFIED (prev PARTIALLY_SATISFIED)  []
+        
+        OBJECTIVE EVALUATIONS
+          UNSUBSTANTIATED    granted=false mutations=0 verified=false
+              clause: objective_scope_unobserved
+              reason: completion condition "cond-observed" is unmet: no workspace observation event for (no declared target)
+          UNSUBSTANTIATED    granted=false mutations=0 verified=false
+              clause: objective_scope_unobserved
+              reason: completion condition "cond-observed" is unmet: no workspace observation event for (no declared target)
+        
+        EVIDENCE
+          mutations:     (none)
+          verification: SKIPPED (boundary never reached) — read-only execution
+          verification: SKIPPED (boundary never reached) — read-only execution
+        
+        BEHAVIOURAL OBSERVATION
+          (no behavioral observation recorded — this run did not engage the
+           behavioural gate, or engaged it before this record existed)
+        
+        LOOP TRANSITIONS
+          idle         → observing    continue      user objective: find the main performance bottleneck in this project. Do not modify anything.
+          observing    → deciding     continue      observation consumed
+          deciding     → executing    continue      objective resolved — execute
+          executing    → verifying    continue      execution consumed: completed
+          verifying    → interpreting continue      verification consumed
+          interpreting → executing    continue      objective PARTIALLY_SATISFIED — 1 of 2 completion condition(s) hold; continuing against the same objective contract, p…
+          executing    → verifying    continue      execution consumed: completed
+          verifying    → interpreting continue      verification consumed
+          interpreting → unsubstantiated unsubstantiate objective UNPROVEN (UNSUBSTANTIATED): completion condition "cond-observed" is unmet: no workspace observation event for …
+        
+        EXECUTION SUMMARY
+        ────────────────────────────────────────────────────────────────────────
+        status: unsubstantiated
+        model_calls:   3 (failures 0, output_exhausted 0)
+        runtime_steps: 2
+        continuations: 2
+        tokens:
+          input:                   138
+          output:                  1214
+          total:                   1352  (authoritative=true)
+        budgets:
+          call #1 requested=512 effective=unobserved
+          call #2 requested=1536 effective=unobserved
+          call #3 requested=1536 effective=unobserved
+        execution:
+          mutations:     0
+          verification:  skipped (the verification boundary was never reached)
+          evidence:      4
+        termination:
+          state:  unsubstantiated
+          reason: objective UNPROVEN (UNSUBSTANTIATED): completion condition "cond-observed" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome "completed"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened
+        patterns:
+          none detected
+          (uninterpreted event types: engine.activity x20, execution.context.compilation x2, execution.finished x2, execution.model.invoked x2, execution.provider.response x2, preflight.snapshot x1, provider.first_token x2, provider.stream_delta x1212, provider.usage_update x4, provider.waiting x2, reasoning.state.committed x2, reasoning.step.completed x2, stage.completed x1)
+    tasks_test.go:183: [E-performance] evidence written to /Users/anvndev/Documents/Project/OpenSource/PizenLabs/izen/docs/report/realworld/evidence
+--- PASS: TestRealWorld_E_Performance (62.25s)
+=== RUN   TestRealWorld_E_PerformanceDiag
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+    tasks_test.go:208: [E-diag / PERFORMANCE (target named by the human at clarify)] driver.Run -> unsubstantiated reason="objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome \"completed\"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened" class=
+    tasks_test.go:208: 
+        ═══ E-performance-diag — E-diag / PERFORMANCE (target named by the human at clarify) ═══
+        prompt:     find the main performance bottleneck in this project. Do not modify anything.
+        wall:       63579ms
+        state:      unsubstantiated
+        termination:unsubstantiated reason="objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome \"completed\"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened" class=
+        boundary:   action= resumable=false targets=[] options=[] reason=""
+        model:      calls=3 failures=0 output_exhausted=0 continuations=2 tokens=138/1419 known=true
+        caps:       []
+        mutations:  []
+        verify:     [applicable=false passed=false reason="read-only execution" applicable=false passed=false reason="read-only execution"]
+        objective:  [state=UNSUBSTANTIATED granted=false reason="completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target)" state=UNSUBSTANTIATED granted=false reason="completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target)"]
+        patterns:   []
+        delta:      []
+        events:
+          continuation.evaluated               3
+          continuation.selected                3
+          engine.activity                      21
+          execution.admission.decision         2
+          execution.artifact.produced          2
+          execution.authorized                 1
+          execution.context.compilation        2
+          execution.context.prepared           2
+          execution.evidence                   2
+          execution.finished                   2
+          execution.model.invoked              2
+          execution.provider.execution         3
+          execution.provider.response          2
+          execution.spec.frozen                1
+          execution.started                    2
+          execution.strategy.selected          2
+          execution.summary                    1
+          execution.verification.completed     2
+          loop.transition                      9
+          objective.evaluated                  2
+          preflight.snapshot                   1
+          provider.first_token                 2
+          provider.stream_delta                1417
+          provider.usage_update                4
+          provider.waiting                     2
+          reasoning.state.committed            2
+          reasoning.step.completed             2
+          reasoning.step.started               2
+          stage.completed                      1
+    tasks_test.go:208: 
+        EXECUTION
+        ────────────────────────────────────────────────────────────────────────
+        run_id:  run-1
+        objective:
+          find the main performance bottleneck in this project. Do not modify anything.
+        
+        AUTHORIZATION
+          verdict:   allow
+          granted:   true  blocked: false
+          authority: preflight_admission_gate
+          intent:    INVESTIGATE   scope: DISCOVERED   mode: $prompt
+          targets:   (none)
+          candidates: README.md,go.mod,report.go
+          proposed:  (none)
+          reason:    admitted: proven target, admissible mutation boundary, authoritative evidence
+        
+        EXECUTION SPEC (frozen before dispatch)
+          intent:        INVESTIGATE
+          strategy:      repository_investigation
+          contract:      agentic_loop  ceiling: execute
+          targets:       (none)
+          boundary:      (none)   evidence: (none)
+          channels:      (none)
+          scope:         DISCOVERED (bounded workspace discovery observed candidate file(s); they are evidence and nothing is bound)
+          derivation:    UNRESOLVED kinds=(none)
+          candidates:    README.md,go.mod,report.go
+          scope targets: (none)
+          req_budget:    1536
+          digest:        (none)
+        
+        MODEL CALLS
+        
+          CALL #1
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   512 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      242 tokens / 1149 chars  fp=8e34d9d3efb5
+            completion:  19 tokens / 71 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    0s (first token 0s)
+        
+          CALL #2
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   1536 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      69 tokens / 282 chars  fp=d87e54836d2c
+            completion:  572 tokens / 2787 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    26.617s (first token 328ms)
+        
+          CALL #3
+            provider:    ollama / qwen2.5-coder:7b
+            requested:   1536 output tokens
+            effective:   unobserved (no truncation observed)
+            prompt:      69 tokens / 282 chars  fp=d87e54836d2c
+            completion:  847 tokens / 3905 chars
+            finish:      stop   truncated: false
+            error:       (none)
+            duration:    35.554s (first token 85ms)
+        
+        CONTINUATION DECISIONS
+        
+          step 1  deciding → executing
+            proposed:   continue — objective resolved — execute
+            selected:   continue — objective resolved — execute
+            outcome:    (none) (permanent)  attempt=0 cycle=0
+            objective:  (none)   pending: UNSUBSTANTIATE
+            progress:   READY (prev (none))  []
+        
+          step 2  interpreting → executing
+            proposed:   complete — objective satisfied: completed
+            selected:   continue — objective PARTIALLY_SATISFIED — 1 of 2 completion condition(s) hold; continuing against the same objective contract, preserving established evidence
+            REWRITTEN by: 
+            outcome:    completed (transient)  attempt=1 cycle=0
+            objective:  (none)   pending: CONTINUE
+            progress:   PARTIALLY_SATISFIED (prev READY)  [objective_advanced]
+        
+          step 3  interpreting → unsubstantiated
+            proposed:   complete — objective satisfied: completed
+            selected:   unsubstantiate — objective UNPROVEN (UNSUBSTANTIATED): completion condition "cond-observed" is unmet: no workspace observation event for (no declared target) — refused complet…
+            REWRITTEN by: objective_continuation_router
+            outcome:    completed (transient)  attempt=2 cycle=0
+            objective:  UNSUBSTANTIATED   pending: CONTINUE
+            progress:   PARTIALLY_SATISFIED (prev PARTIALLY_SATISFIED)  []
+        
+        OBJECTIVE EVALUATIONS
+          UNSUBSTANTIATED    granted=false mutations=0 verified=false
+              clause: objective_scope_unobserved
+              reason: completion condition "cond-observed" is unmet: no workspace observation event for (no declared target)
+          UNSUBSTANTIATED    granted=false mutations=0 verified=false
+              clause: objective_scope_unobserved
+              reason: completion condition "cond-observed" is unmet: no workspace observation event for (no declared target)
+        
+        EVIDENCE
+          mutations:     (none)
+          verification: SKIPPED (boundary never reached) — read-only execution
+          verification: SKIPPED (boundary never reached) — read-only execution
+        
+        BEHAVIOURAL OBSERVATION
+          (no behavioral observation recorded — this run did not engage the
+           behavioural gate, or engaged it before this record existed)
+        
+        LOOP TRANSITIONS
+          idle         → observing    continue      user objective: find the main performance bottleneck in this project. Do not modify anything.
+          observing    → deciding     continue      observation consumed
+          deciding     → executing    continue      objective resolved — execute
+          executing    → verifying    continue      execution consumed: completed
+          verifying    → interpreting continue      verification consumed
+          interpreting → executing    continue      objective PARTIALLY_SATISFIED — 1 of 2 completion condition(s) hold; continuing against the same objective contract, p…
+          executing    → verifying    continue      execution consumed: completed
+          verifying    → interpreting continue      verification consumed
+          interpreting → unsubstantiated unsubstantiate objective UNPROVEN (UNSUBSTANTIATED): completion condition "cond-observed" is unmet: no workspace observation event for …
+        
+        EXECUTION SUMMARY
+        ────────────────────────────────────────────────────────────────────────
+        status: unsubstantiated
+        model_calls:   3 (failures 0, output_exhausted 0)
+        runtime_steps: 2
+        continuations: 2
+        tokens:
+          input:                   138
+          output:                  1419
+          total:                   1557  (authoritative=true)
+        budgets:
+          call #1 requested=512 effective=unobserved
+          call #2 requested=1536 effective=unobserved
+          call #3 requested=1536 effective=unobserved
+        execution:
+          mutations:     0
+          verification:  skipped (the verification boundary was never reached)
+          evidence:      4
+        termination:
+          state:  unsubstantiated
+          reason: objective UNPROVEN (UNSUBSTANTIATED): completion condition "cond-observed" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome "completed"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened
+        patterns:
+          none detected
+          (uninterpreted event types: engine.activity x21, execution.context.compilation x2, execution.finished x2, execution.model.invoked x2, execution.provider.response x2, preflight.snapshot x1, provider.first_token x2, provider.stream_delta x1417, provider.usage_update x4, provider.waiting x2, reasoning.state.committed x2, reasoning.step.completed x2, stage.completed x1)
+    tasks_test.go:208: [E-performance-diag] evidence written to /Users/anvndev/Documents/Project/OpenSource/PizenLabs/izen/docs/report/realworld/evidence
+--- PASS: TestRealWorld_E_PerformanceDiag (63.94s)
+PASS
+ok  	github.com/PizenLabs/izen/test/realworld	193.149s

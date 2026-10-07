@@ -123,3 +123,45 @@ None of the above can produce unauthorized mutation, false `PROVEN`, false
 progress, false verification, duplicate mutation, cross-execution contamination,
 unbounded continuation, incorrect cancellation, incorrect durable mutation
 truth, or loss of human authority.
+
+---
+
+## ADDENDUM — Real-world agent validation (not a new phase)
+
+**Read `REAL_WORLD_AGENT_VALIDATION_REPORT.md`.** This is a validation/forensic
+exercise over the *same* production path, run against five representative
+real-world tasks with a real local model (`qwen2.5-coder:7b`). It added no phase,
+no kernel change, and no new subsystem. Harness: `test/realworld/`. Raw evidence:
+`docs/report/realworld/evidence/`.
+
+**Verdict:** `REAL-WORLD EXECUTION NOT YET PROVEN`. The authority/evidence/
+truthfulness invariants held under real execution (no unauthorized mutation, no
+false PROVEN, no activity-as-progress), but IZEN cannot yet *autonomously solve*
+targetless real-world tasks: it parks for human target disambiguation (by design,
+I13), cannot complete a targetless read-only investigation, and one natural
+bug-fix objective dead-ends in a control-plane park.
+
+**Two contract-level defects fixed (minimal, with regressions):**
+
+1. **D1 — behavioral gate mis-fired on a filename.** `BehaviorRequired("create new
+   file named testing.md")` matched `"test"` inside the filename and downgraded a
+   `PROVEN` CREATE to `unsubstantiated`. Fix: `stripPathTokens` in
+   `internal/runtime/autonomy/behavior.go`. Regression:
+   `TestBehaviorRequiredIgnoresFilenameTokens`.
+2. **D2 — explicit read-only constraint ignored on the autonomy path.**
+   "Do not modify anything" was classified as a mutation because the driver used
+   the unconditional `SelectStrategy` and `taskContract` read the text only. Fix:
+   one constraint call site (`IntentGateway.ReadOnlyConstraintStated`),
+   `ReadOnlyConstraintStrategy`, `ExecutorAdapter.ResolveScoped`, driver routing,
+   and `taskContract` honouring the constraint. Regressions:
+   `TestAdapter_ResolveScopedHonorsReadOnlyConstraint`,
+   `TestDriver_ReadOnlyConstraintOverridesMutationVerb`.
+
+**Recorded, not fixed (with first incorrect transition and owner):** D3 (intent
+revision hard-fails on an unresolved scope, Task D), D5 (targetless read-only
+investigation cannot satisfy its observation clause), and the UI truth defects
+E1–E6 (the objective PROVEN verdict is not projected; `"Completed"` can be shown
+without it; several activity strings are local/timer-driven).
+
+**Suite:** `go build ./...` clean; `go vet ./...` clean; `go test -count=1 ./...`
+green (212 packages, 0 failures); both architecture-lock packages green.

@@ -1,0 +1,357 @@
+=== go vet ===
+VET_EXIT=0
+=== go test ===
+?   	github.com/PizenLabs/izen/cmd/diagnostic	[no test files]
+ok  	github.com/PizenLabs/izen/cmd/izen	1.140s
+?   	github.com/PizenLabs/izen/internal/adapters/web	[no test files]
+ok  	github.com/PizenLabs/izen/internal/ai	0.488s
+ok  	github.com/PizenLabs/izen/internal/ai/telemetry	0.465s
+ok  	github.com/PizenLabs/izen/internal/app	1.016s
+ok  	github.com/PizenLabs/izen/internal/app/compiler	0.463s
+ok  	github.com/PizenLabs/izen/internal/app/model	0.419s
+2026/10/07 12:05:35 [occ] baseline request_targets=1 scoped=1 digest=a8d4a27dbc29 cache_hits=0 duration=26µs
+2026/10/07 12:05:35 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:35 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:35 [occ] baseline request_targets=1 scoped=1 digest=4ae39d98a67b cache_hits=0 duration=33µs
+2026/10/07 12:05:35 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:35 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:35 [occ] baseline request_targets=1 scoped=1 digest=4ae39d98a67b cache_hits=0 duration=25µs
+2026/10/07 12:05:35 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:35 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:35 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=4µs
+2026/10/07 12:05:36 [occ] baseline request_targets=1 scoped=1 digest=708368a7fefb cache_hits=0 duration=32µs
+2026/10/07 12:05:36 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:36 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:36 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=7µs
+2026/10/07 12:05:37 [occ] baseline request_targets=1 scoped=1 digest=0759f5764ce2 cache_hits=0 duration=29µs
+2026/10/07 12:05:37 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:37 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:37 [occ] verify targets=1 conflicts=1 cache_hits=0 duration=35µs
+2026/10/07 12:05:37 [occ] baseline request_targets=1 scoped=1 digest=613e22fb909f cache_hits=0 duration=32µs
+2026/10/07 12:05:37 [execution] request=arch-lock-control attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=106 prompt_bytes=106 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:37 [execution] request=arch-lock-control attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=106 prompt_bytes=106 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:37 [occ] baseline request_targets=1 scoped=1 digest=dedcb5bf22cd cache_hits=0 duration=26µs
+2026/10/07 12:05:37 [execution] request=arch-escalate-granted attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:37 [execution] request=arch-escalate-granted attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=c17f1b1e780e cache_hits=0 duration=25µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=5µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=b5365efb08e2 cache_hits=0 duration=24µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=1 cache_hits=0 duration=33µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=ebfcb8287baa cache_hits=0 duration=480µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=1 cache_hits=0 duration=6µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=8bf759b44e06 cache_hits=0 duration=4µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=253 prompt_bytes=253 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=253 prompt_bytes=253 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=0 duration=3µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=957930ddbd03 cache_hits=0 duration=32µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=5µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=5a2e1d0e9945 cache_hits=0 duration=34µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=5µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=ee7fd0659eae cache_hits=0 duration=36µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=5µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=7cff474fef01 cache_hits=0 duration=30µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=5µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=a4ba325aefdb cache_hits=0 duration=37µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=7µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=0bdd750914a5 cache_hits=0 duration=45µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=8µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=8ce13f4422a3 cache_hits=0 duration=39µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=7µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=b94377ec7544 cache_hits=0 duration=29µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=7µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=19b87ceaaf6f cache_hits=0 duration=35µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=5µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=49e76e94fd33 cache_hits=0 duration=27µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=6µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=8aded1daa8cf cache_hits=0 duration=36µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=9µs
+2026/10/07 12:05:38 [occ] baseline request_targets=1 scoped=1 digest=42bb86f7a3aa cache_hits=0 duration=32µs
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [execution] request=arch-lock attempt=1 target=note.txt strategy=targeted_mutation artifact_kind= output_contract=full_file_or_patch context_bytes=164 prompt_bytes=164 max_output=1200 reasoning=provider_default recovery=none
+2026/10/07 12:05:38 [occ] verify targets=1 conflicts=0 cache_hits=1 duration=5µs
+--- FAIL: TestSemanticLock_ReadOnlyConstraintHasExactlyOneNonTestCaller (0.34s)
+    semantic_boundary_lock_test.go:105: internal/runtime/autonomy/objective_completion.go consults StatesReadOnlyConstraint at line(s) 154.
+          StatesReadOnlyConstraint answers "did the HUMAN decline a write", and strategy.Select also runs on
+          runtime-composed provider prompts whose own instructions contain phrases like
+          "do not modify any other region". Reading those as a human constraint silently
+          downgrades authorized mutations to read-only.
+          Only internal/execution/intent.go may consult it.
+FAIL
+FAIL	github.com/PizenLabs/izen/internal/architecture	10.587s
+ok  	github.com/PizenLabs/izen/internal/architecture_experiment/scheduler	0.422s
+ok  	github.com/PizenLabs/izen/internal/audit	0.459s
+ok  	github.com/PizenLabs/izen/internal/autonomy	0.406s
+ok  	github.com/PizenLabs/izen/internal/boundary	0.399s
+ok  	github.com/PizenLabs/izen/internal/boundary/scopeguard	0.348s
+ok  	github.com/PizenLabs/izen/internal/changeset	0.411s
+ok  	github.com/PizenLabs/izen/internal/changesurface	0.366s
+ok  	github.com/PizenLabs/izen/internal/checkpoint	3.804s
+ok  	github.com/PizenLabs/izen/internal/cli	0.586s
+ok  	github.com/PizenLabs/izen/internal/command	0.354s
+ok  	github.com/PizenLabs/izen/internal/compact	0.453s
+?   	github.com/PizenLabs/izen/internal/compiler	[no test files]
+ok  	github.com/PizenLabs/izen/internal/config	0.504s
+ok  	github.com/PizenLabs/izen/internal/context	6.924s
+ok  	github.com/PizenLabs/izen/internal/context/compactor	0.362s
+ok  	github.com/PizenLabs/izen/internal/contextcompiler	0.396s
+ok  	github.com/PizenLabs/izen/internal/contextspec	0.380s
+ok  	github.com/PizenLabs/izen/internal/continuation	0.831s
+ok  	github.com/PizenLabs/izen/internal/control	0.409s
+ok  	github.com/PizenLabs/izen/internal/controlplane/failure	0.366s
+ok  	github.com/PizenLabs/izen/internal/controlplane/guard	0.350s
+ok  	github.com/PizenLabs/izen/internal/controlplane/risk	0.374s
+ok  	github.com/PizenLabs/izen/internal/core/artifact	0.410s
+ok  	github.com/PizenLabs/izen/internal/core/authorization	0.385s
+ok  	github.com/PizenLabs/izen/internal/core/budget	0.440s
+ok  	github.com/PizenLabs/izen/internal/core/classifier	0.355s
+?   	github.com/PizenLabs/izen/internal/core/contract	[no test files]
+ok  	github.com/PizenLabs/izen/internal/core/domain	0.379s
+?   	github.com/PizenLabs/izen/internal/core/domain/artifact	[no test files]
+?   	github.com/PizenLabs/izen/internal/core/domain/authorization	[no test files]
+ok  	github.com/PizenLabs/izen/internal/core/domain/checkpoint	0.362s
+ok  	github.com/PizenLabs/izen/internal/core/domain/context	0.355s
+?   	github.com/PizenLabs/izen/internal/core/domain/evidence	[no test files]
+?   	github.com/PizenLabs/izen/internal/core/domain/execution	[no test files]
+ok  	github.com/PizenLabs/izen/internal/core/domain/occ	0.390s
+ok  	github.com/PizenLabs/izen/internal/core/domain/provider	5.561s
+?   	github.com/PizenLabs/izen/internal/core/domain/workflow	[no test files]
+ok  	github.com/PizenLabs/izen/internal/core/runtime	0.357s
+ok  	github.com/PizenLabs/izen/internal/core/stream	0.955s
+ok  	github.com/PizenLabs/izen/internal/core/workflow	0.365s
+ok  	github.com/PizenLabs/izen/internal/dag	0.358s
+ok  	github.com/PizenLabs/izen/internal/debug	0.360s
+?   	github.com/PizenLabs/izen/internal/discovery	[no test files]
+ok  	github.com/PizenLabs/izen/internal/discovery/recon	0.390s
+?   	github.com/PizenLabs/izen/internal/domain	[no test files]
+ok  	github.com/PizenLabs/izen/internal/domain/capability	0.368s
+?   	github.com/PizenLabs/izen/internal/domain/capability/policy	[no test files]
+?   	github.com/PizenLabs/izen/internal/domain/capability/validator	[no test files]
+ok  	github.com/PizenLabs/izen/internal/domain/command	0.387s
+ok  	github.com/PizenLabs/izen/internal/domain/intent	0.368s
+?   	github.com/PizenLabs/izen/internal/domain/orchestration	[no test files]
+ok  	github.com/PizenLabs/izen/internal/domain/policy	0.369s
+ok  	github.com/PizenLabs/izen/internal/domain/ports	0.358s
+ok  	github.com/PizenLabs/izen/internal/domain/role	0.356s
+ok  	github.com/PizenLabs/izen/internal/domain/signal	0.361s
+ok  	github.com/PizenLabs/izen/internal/domain/task	0.355s
+ok  	github.com/PizenLabs/izen/internal/domain/workflow	0.366s
+ok  	github.com/PizenLabs/izen/internal/engine	0.631s
+ok  	github.com/PizenLabs/izen/internal/engine/adapter	0.354s
+ok  	github.com/PizenLabs/izen/internal/engine/context	0.393s
+ok  	github.com/PizenLabs/izen/internal/engine/control	0.372s
+ok  	github.com/PizenLabs/izen/internal/engine/decision	0.349s
+ok  	github.com/PizenLabs/izen/internal/engine/executor	0.350s
+ok  	github.com/PizenLabs/izen/internal/engine/inference	0.378s
+ok  	github.com/PizenLabs/izen/internal/engine/intent	0.361s
+ok  	github.com/PizenLabs/izen/internal/engine/ir	0.437s
+ok  	github.com/PizenLabs/izen/internal/engine/ir/logical	0.363s
+ok  	github.com/PizenLabs/izen/internal/engine/layer0	0.411s
+ok  	github.com/PizenLabs/izen/internal/engine/layer1	0.390s
+ok  	github.com/PizenLabs/izen/internal/engine/layer2	0.814s
+ok  	github.com/PizenLabs/izen/internal/engine/layer3	0.562s
+ok  	github.com/PizenLabs/izen/internal/engine/layer4	0.543s
+ok  	github.com/PizenLabs/izen/internal/engine/lowerer	0.349s
+ok  	github.com/PizenLabs/izen/internal/engine/pipeline	0.514s
+ok  	github.com/PizenLabs/izen/internal/engine/plan	0.391s
+ok  	github.com/PizenLabs/izen/internal/engine/planner	0.379s
+ok  	github.com/PizenLabs/izen/internal/engine/strategy	0.355s
+ok  	github.com/PizenLabs/izen/internal/engine/telemetry	0.414s
+ok  	github.com/PizenLabs/izen/internal/events	0.676s
+ok  	github.com/PizenLabs/izen/internal/events/audit	0.452s
+ok  	github.com/PizenLabs/izen/internal/execution	2.635s
+ok  	github.com/PizenLabs/izen/internal/execution/cache	0.372s
+ok  	github.com/PizenLabs/izen/internal/execution/capability	0.451s
+ok  	github.com/PizenLabs/izen/internal/execution/graph	0.373s
+ok  	github.com/PizenLabs/izen/internal/execution/ingestion	0.349s
+ok  	github.com/PizenLabs/izen/internal/execution/planner	0.432s
+ok  	github.com/PizenLabs/izen/internal/execution/preflight	0.394s
+ok  	github.com/PizenLabs/izen/internal/execution/rmah	0.375s
+ok  	github.com/PizenLabs/izen/internal/execution/strategy	0.410s
+ok  	github.com/PizenLabs/izen/internal/execution/verifier	0.369s
+ok  	github.com/PizenLabs/izen/internal/executor	0.424s
+?   	github.com/PizenLabs/izen/internal/forensics	[no test files]
+ok  	github.com/PizenLabs/izen/internal/fs	0.551s
+ok  	github.com/PizenLabs/izen/internal/gateway	0.356s
+ok  	github.com/PizenLabs/izen/internal/git	2.108s
+ok  	github.com/PizenLabs/izen/internal/graph	0.666s
+ok  	github.com/PizenLabs/izen/internal/hotfix	0.839s
+ok  	github.com/PizenLabs/izen/internal/httpx	1.722s
+?   	github.com/PizenLabs/izen/internal/infrastructure	[no test files]
+ok  	github.com/PizenLabs/izen/internal/infrastructure/capabilities	0.711s
+ok  	github.com/PizenLabs/izen/internal/infrastructure/events	0.483s
+ok  	github.com/PizenLabs/izen/internal/ir	0.359s
+ok  	github.com/PizenLabs/izen/internal/kernelbridge	0.391s
+ok  	github.com/PizenLabs/izen/internal/knowledge	0.552s
+ok  	github.com/PizenLabs/izen/internal/language	0.355s
+ok  	github.com/PizenLabs/izen/internal/lea	0.629s
+ok  	github.com/PizenLabs/izen/internal/lea/graph	0.364s
+ok  	github.com/PizenLabs/izen/internal/llm	0.792s
+ok  	github.com/PizenLabs/izen/internal/llmstep	0.367s
+?   	github.com/PizenLabs/izen/internal/loop	[no test files]
+ok  	github.com/PizenLabs/izen/internal/mcp	0.365s
+ok  	github.com/PizenLabs/izen/internal/modes	0.366s
+ok  	github.com/PizenLabs/izen/internal/modes/build	0.358s
+ok  	github.com/PizenLabs/izen/internal/modes/commit	0.458s
+ok  	github.com/PizenLabs/izen/internal/modes/investigate	5.470s
+ok  	github.com/PizenLabs/izen/internal/modes/plan	1.240s
+ok  	github.com/PizenLabs/izen/internal/modes/review	1.182s
+ok  	github.com/PizenLabs/izen/internal/modes/undo	1.488s
+ok  	github.com/PizenLabs/izen/internal/mutationstrategy	0.363s
+?   	github.com/PizenLabs/izen/internal/observability	[no test files]
+ok  	github.com/PizenLabs/izen/internal/op	0.352s
+ok  	github.com/PizenLabs/izen/internal/parser	0.357s
+ok  	github.com/PizenLabs/izen/internal/patch	0.373s
+ok  	github.com/PizenLabs/izen/internal/pipeline	0.399s
+ok  	github.com/PizenLabs/izen/internal/pkg/atomicio	0.413s
+ok  	github.com/PizenLabs/izen/internal/pkg/lock	2.960s
+ok  	github.com/PizenLabs/izen/internal/planner	0.422s
+ok  	github.com/PizenLabs/izen/internal/planner/brownfield	0.606s
+ok  	github.com/PizenLabs/izen/internal/planner/greenfield	0.403s
+ok  	github.com/PizenLabs/izen/internal/planner/scope	0.392s
+ok  	github.com/PizenLabs/izen/internal/policy	0.352s
+ok  	github.com/PizenLabs/izen/internal/presentation	0.570s
+ok  	github.com/PizenLabs/izen/internal/presentation/diff	0.376s
+?   	github.com/PizenLabs/izen/internal/problem	[no test files]
+?   	github.com/PizenLabs/izen/internal/problemsurface	[no test files]
+ok  	github.com/PizenLabs/izen/internal/progress	0.388s
+ok  	github.com/PizenLabs/izen/internal/project	0.372s
+ok  	github.com/PizenLabs/izen/internal/prompt	0.369s
+ok  	github.com/PizenLabs/izen/internal/protocol	0.406s
+ok  	github.com/PizenLabs/izen/internal/provider	0.379s
+ok  	github.com/PizenLabs/izen/internal/provider/adapter	0.354s
+ok  	github.com/PizenLabs/izen/internal/provider/detector	0.404s
+ok  	github.com/PizenLabs/izen/internal/provider/discovery	0.388s
+ok  	github.com/PizenLabs/izen/internal/provider/registry	0.506s
+ok  	github.com/PizenLabs/izen/internal/providers	1.708s
+ok  	github.com/PizenLabs/izen/internal/providers/capability	0.423s
+ok  	github.com/PizenLabs/izen/internal/providers/openrouter	0.377s
+?   	github.com/PizenLabs/izen/internal/resolver	[no test files]
+ok  	github.com/PizenLabs/izen/internal/resource	0.371s
+ok  	github.com/PizenLabs/izen/internal/resource/file	0.405s
+ok  	github.com/PizenLabs/izen/internal/resource/git	0.737s
+ok  	github.com/PizenLabs/izen/internal/resource/terminal	0.378s
+ok  	github.com/PizenLabs/izen/internal/retrieval	13.123s
+ok  	github.com/PizenLabs/izen/internal/retrieval/extractor	1.793s
+ok  	github.com/PizenLabs/izen/internal/retrieval/fulltext	1.755s
+ok  	github.com/PizenLabs/izen/internal/retrieval/grounding	1.600s
+?   	github.com/PizenLabs/izen/internal/retrieval/symbol	[no test files]
+ok  	github.com/PizenLabs/izen/internal/retrieval/symbol/extractors	1.712s
+ok  	github.com/PizenLabs/izen/internal/review	1.493s
+ok  	github.com/PizenLabs/izen/internal/runtime	4.315s
+ok  	github.com/PizenLabs/izen/internal/runtime/adaptive	0.715s
+ok  	github.com/PizenLabs/izen/internal/runtime/authority	0.357s
+ok  	github.com/PizenLabs/izen/internal/runtime/authorization	0.361s
+ok  	github.com/PizenLabs/izen/internal/runtime/autonomy	24.982s
+ok  	github.com/PizenLabs/izen/internal/runtime/compose	4.645s
+ok  	github.com/PizenLabs/izen/internal/runtime/context	0.380s
+?   	github.com/PizenLabs/izen/internal/runtime/contextpipeline	[no test files]
+ok  	github.com/PizenLabs/izen/internal/runtime/durable	4.269s
+ok  	github.com/PizenLabs/izen/internal/runtime/engine	0.468s
+ok  	github.com/PizenLabs/izen/internal/runtime/ephemeral	1.621s
+ok  	github.com/PizenLabs/izen/internal/runtime/executor	1.863s
+ok  	github.com/PizenLabs/izen/internal/runtime/gate	0.379s
+ok  	github.com/PizenLabs/izen/internal/runtime/handlers	1.034s
+ok  	github.com/PizenLabs/izen/internal/runtime/harness	0.363s
+ok  	github.com/PizenLabs/izen/internal/runtime/orchestrator	0.485s
+ok  	github.com/PizenLabs/izen/internal/runtime/output	1.664s
+ok  	github.com/PizenLabs/izen/internal/runtime/preflight	0.401s
+ok  	github.com/PizenLabs/izen/internal/runtime/scope	0.465s
+ok  	github.com/PizenLabs/izen/internal/runtime/scopeguard	1.129s
+ok  	github.com/PizenLabs/izen/internal/runtime/substrate	0.930s
+?   	github.com/PizenLabs/izen/internal/runtime/substrate/store	[no test files]
+ok  	github.com/PizenLabs/izen/internal/runtime/target	1.306s
+?   	github.com/PizenLabs/izen/internal/runtime/ui/decision	[no test files]
+ok  	github.com/PizenLabs/izen/internal/security/credentials	0.392s
+ok  	github.com/PizenLabs/izen/internal/session	9.536s
+ok  	github.com/PizenLabs/izen/internal/session/compaction	0.390s
+?   	github.com/PizenLabs/izen/internal/state	[no test files]
+ok  	github.com/PizenLabs/izen/internal/stepadmission	0.367s
+ok  	github.com/PizenLabs/izen/internal/substrate	1.654s
+ok  	github.com/PizenLabs/izen/internal/telemetry	0.379s
+?   	github.com/PizenLabs/izen/internal/templates	[no test files]
+ok  	github.com/PizenLabs/izen/internal/tui/components/ask	0.387s
+ok  	github.com/PizenLabs/izen/internal/tui/components/shimmer	0.488s
+ok  	github.com/PizenLabs/izen/internal/tui/tips	0.389s
+ok  	github.com/PizenLabs/izen/internal/ui	12.614s
+ok  	github.com/PizenLabs/izen/internal/ui/animation	0.393s
+?   	github.com/PizenLabs/izen/internal/ui/commands	[no test files]
+ok  	github.com/PizenLabs/izen/internal/ui/components	2.457s
+ok  	github.com/PizenLabs/izen/internal/ui/diff	0.398s
+?   	github.com/PizenLabs/izen/internal/ui/format	[no test files]
+ok  	github.com/PizenLabs/izen/internal/ui/git	0.390s
+ok  	github.com/PizenLabs/izen/internal/ui/markdown	0.395s
+ok  	github.com/PizenLabs/izen/internal/ui/modelpicker	0.388s
+ok  	github.com/PizenLabs/izen/internal/ui/plan	0.354s
+ok  	github.com/PizenLabs/izen/internal/ui/states	0.355s
+ok  	github.com/PizenLabs/izen/internal/ui/status	0.350s
+ok  	github.com/PizenLabs/izen/internal/ui/tool	0.402s
+ok  	github.com/PizenLabs/izen/internal/ui/tui	0.447s
+ok  	github.com/PizenLabs/izen/internal/ui/widgets	0.388s
+ok  	github.com/PizenLabs/izen/internal/ui/widgets/model_picker	0.399s
+ok  	github.com/PizenLabs/izen/internal/ui/widgets/settings	0.390s
+ok  	github.com/PizenLabs/izen/internal/understanding	0.470s
+ok  	github.com/PizenLabs/izen/internal/verification	0.508s
+ok  	github.com/PizenLabs/izen/internal/verification/stabilize	0.369s
+ok  	github.com/PizenLabs/izen/internal/workspace	0.763s
+ok  	github.com/PizenLabs/izen/internal/workspace/capability	0.377s
+ok  	github.com/PizenLabs/izen/internal/workspace/checkpoint	0.659s
+ok  	github.com/PizenLabs/izen/internal/workspace/failure	0.381s
+ok  	github.com/PizenLabs/izen/internal/workspace/snapshot	0.427s
+ok  	github.com/PizenLabs/izen/runtime/capabilities/filesystem	0.397s
+ok  	github.com/PizenLabs/izen/runtime/headless	0.402s
+ok  	github.com/PizenLabs/izen/runtime/kernel	0.393s
+--- FAIL: TestKernelLock_NoUnregisteredWorkspaceExistenceDecision (0.14s)
+    kernel_lock_test.go:265: 2 unregistered workspace existence decision(s).
+        A branch that decides whether a workspace target exists from a raw syscall has no event,
+        no state, no evidence and no verification behind it. Route it through internal/kernelbridge:
+        
+        internal/runtime/autonomy/adapter.go:789 — os.Stat used in a branch at line 789
+        
+        internal/runtime/autonomy/adapter.go:812 — os.Stat used in a branch at line 812
+        
+        If this is genuinely not a target-existence decision, add it to knownExistenceBypasses
+        with a reason of workspace-probe or type-gate — not target-existence.
+    kernel_lock_test.go:274: 2 stale allowlist entr(ies). The strangler's work list must shrink, never rot:
+        internal/runtime/autonomy/adapter.go:777 — allowlisted as "target-existence: TargetExists/TargetAbsent evidence" but no longer exists there
+        internal/runtime/autonomy/adapter.go:800 — allowlisted as "target-existence: TargetExistence pre-dispatch evidence" but no longer exists there
+FAIL
+FAIL	github.com/PizenLabs/izen/test/architecture	0.577s
+ok  	github.com/PizenLabs/izen/test/benchmark	0.417s
+ok  	github.com/PizenLabs/izen/test/forensics	1.844s
+ok  	github.com/PizenLabs/izen/test/integration	0.592s
+ok  	github.com/PizenLabs/izen/test/live_r1	0.427s
+ok  	github.com/PizenLabs/izen/test/live_r2	0.433s
+ok  	github.com/PizenLabs/izen/test/live_r4	0.435s
+ok  	github.com/PizenLabs/izen/test/live_r5	0.432s
+ok  	github.com/PizenLabs/izen/test/live_r6	0.430s
+ok  	github.com/PizenLabs/izen/test/realworld	0.450s
+FAIL
+TEST_EXIT=1

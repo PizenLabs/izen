@@ -6,7 +6,30 @@ import (
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/autonomy"
+	"github.com/PizenLabs/izen/internal/execution/strategy"
 )
+
+// TestAdapter_ResolveScopedHonorsReadOnlyConstraint is the regression for the
+// real-world investigation defect: on the autonomy path "Do not modify
+// anything" was ignored, so an investigation resolved to a mutation and parked
+// for a target instead of running read-only.
+func TestAdapter_ResolveScopedHonorsReadOnlyConstraint(t *testing.T) {
+	_, _, a, _ := testHarness(t, nil)
+
+	ro := a.ResolveScoped("investigate why the endpoint fails. Do not modify anything.")
+	switch ro.Profile.Strategy {
+	case strategy.TargetedMutation, strategy.MultiFilePlanning, strategy.DirectDeterministic:
+		t.Fatalf("read-only objective resolved to mutation strategy %s", ro.Profile.Strategy)
+	}
+
+	// A mutation objective under the same scope must still resolve to mutation.
+	mut := a.ResolveScoped("change bar to qux @note.txt")
+	switch mut.Profile.Strategy {
+	case strategy.TargetedMutation, strategy.DirectDeterministic:
+	default:
+		t.Fatalf("mutation objective resolved to %s, want a mutation strategy", mut.Profile.Strategy)
+	}
+}
 
 // TestAdapter_ResolveReadOnly asserts a read-only objective resolves to a real
 // target set (never ambiguous, never guessed).

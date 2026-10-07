@@ -44,6 +44,41 @@ func TestDriver_ReadOnlyCompletes(t *testing.T) {
 	}
 }
 
+// TestDriver_ReadOnlyConstraintOverridesMutationVerb is the regression for the
+// real-world investigation defect at the completion layer: an objective that
+// contains a mutation verb ("modify") but also an explicit read-only constraint
+// must derive a READ contract and must not attempt a mutation.
+//
+// It does NOT assert completion: a targetless read-only investigation cannot
+// satisfy the contract's workspace-observation clause today (recorded as a
+// separate capability gap in the validation report). It asserts the transition
+// that was wrong — mutation classification — is now correct.
+func TestDriver_ReadOnlyConstraintOverridesMutationVerb(t *testing.T) {
+	root, mock, a, _ := testHarness(t, []*ai.Response{
+		{Content: "userHandler passes an empty id to findUser."},
+		{Content: "userHandler passes an empty id to findUser."},
+	})
+	d := NewDriver(a, nil)
+
+	_, err := d.Run(context.Background(),
+		"investigate why this application returns an error from the user endpoint. Do not modify anything.")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if d.lastContract.Kind != execution.TaskRead {
+		t.Fatalf("contract kind = %s, want read: a stated read-only constraint must override the mutation verb", d.lastContract.Kind)
+	}
+	if b := d.Boundary(); b != nil && b.Action == autonomy.HumanBoundaryClarify {
+		t.Fatalf("read-only objective parked for a mutation target: %+v", b)
+	}
+	if got := readTarget(t, root, "note.txt"); got != sampleOriginal {
+		t.Fatalf("read-only objective mutated the workspace: %q", got)
+	}
+	if mock.calls() == 0 {
+		t.Fatal("read-only investigation must invoke the model")
+	}
+}
+
 // TestDriver_MutationApprovalCycle proves the real mutation loop: execute →
 // park at the approval gate (no mutation yet) → human approves → the SAME
 // execution is interpreted as completed. The provider is invoked exactly once —
