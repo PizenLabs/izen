@@ -135,7 +135,8 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 	// A creation verb over an EXISTING target is untouched: "add a comment to
 	// @file.go" names a target that exists, so it stays a modification. The
 	// existence evidence, not the verb alone, is what separates the two.
-	if op != OperationCreate && isDeclaredCreation(raw, parsed, targets) {
+	declaredCreation := isDeclaredCreation(raw, parsed, targets)
+	if op != OperationCreate && declaredCreation {
 		op = OperationCreate
 	}
 
@@ -260,10 +261,26 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 	}
 
 	// ── 4. Explicit target(s) → targeted execution ────────────────────
-	if len(explicit) > 0 || (op == OperationCreate && len(explicitSyntax) > 0) {
+	// "Explicit" means the target was NAMED by the request and is therefore
+	// authoritative, whether it was written with @scope syntax or as a bare
+	// filename in prose ("create a file named testfile.md"). For a declared
+	// creation those named destinations do not exist yet, so they never appear
+	// in `explicit` (which is existence-gated); `explicitSyntax` covers the
+	// @scope spelling and `declaredCreation` covers the prose spelling. Binding
+	// them here is what stops a primitive creation from falling through to
+	// repository-level planning — a path that inflates the output budget shape
+	// (plan) and then forces the creation into a bounded SEARCH/REPLACE
+	// contract that has no anchor because the file does not exist.
+	if len(explicit) > 0 ||
+		(op == OperationCreate && (len(explicitSyntax) > 0 || declaredCreation)) {
 		named := explicit
 		if len(named) == 0 {
 			named = explicitSyntax
+		}
+		if len(named) == 0 {
+			// A declared creation names only absent destinations; those are the
+			// authoritative targets.
+			named = missing
 		}
 		switch {
 		case op == OperationExplain:

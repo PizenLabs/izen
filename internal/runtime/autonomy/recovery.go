@@ -323,6 +323,20 @@ func DecideRecovery(o autonomy.Observation, b autonomy.LoopBounds) autonomy.Loop
 		return autonomy.LoopDecision{Action: autonomy.LoopRepair,
 			Reason: "typed transition FULL_REWRITE -> BOUNDED_PATCH after output exhaustion"}
 	case SubtypeSchemaViolation:
+		if !patchAnchored(o.ArtifactShape) {
+			// A creation had no baseline when it was dispatched, so relabelling
+			// it as a bounded SEARCH/REPLACE patch asks the model for an anchor
+			// against a file that does not exist — an impossible artifact that
+			// burns a full recovery cycle proving it. Re-prompt under the SAME
+			// create contract, bounded by the recovery-cycle budget.
+			cyclesLeft := b.MaxRecoveryCycles <= 0 || o.RecoveryCycle < b.MaxRecoveryCycles
+			if !cyclesLeft {
+				return autonomy.LoopDecision{Action: autonomy.LoopAskHuman,
+					Reason: "creation contract schema violations exhausted the recovery cycles — ask human"}
+			}
+			return autonomy.LoopDecision{Action: autonomy.LoopRepair,
+				Reason: "creation contract schema violation — structured re-prompt under the SAME create contract (no relabelling)"}
+		}
 		if !transitionAvailable(o) {
 			cyclesLeft := b.MaxRecoveryCycles <= 0 || o.RecoveryCycle < b.MaxRecoveryCycles
 			if !cyclesLeft {
@@ -515,6 +529,26 @@ func typedRepair(o autonomy.Observation, req autonomy.LoopRequest) (autonomy.Loo
 		return next, nil
 
 	case SubtypeSchemaViolation:
+		if !patchAnchored(o.ArtifactShape) {
+			// A creation keeps its full-artifact contract: a bounded patch has
+			// no baseline to anchor. Only the attempt counter and the evidence
+			// (the schema defect) change; the artifact shape travels UNCHANGED
+			// so the model is asked to re-emit the complete FILE_CREATE
+			// artifact rather than an impossible SEARCH/REPLACE block.
+			next.RecoveryAttempt = attempt
+			next.RecoveryReason = fmt.Sprintf(
+				"schema_violation: creation artifact rejected for %s (attempt %d) — same create contract re-prompt",
+				target, o.AttemptNum)
+			audit := execution.StructuralAuditDirective(o.Diagnostic)
+			next.Evidence = joinEvidence(req.Evidence, fmt.Sprintf(
+				"[DIAGNOSTIC subtype=SCHEMA_VIOLATION boundary=B4-artifact-gate target=%s] %s "+
+					"Re-emit the COMPLETE new file content in the required creation envelope.",
+				target, audit))
+			if o.ContractID != "" {
+				next.ParentContractID = o.ContractID
+			}
+			return next, nil
+		}
 		if transitionAvailable(o) {
 			next.RecoveryStrategy = autonomy.StrategyBoundedPatch
 			next.ParentContractID = o.ContractID

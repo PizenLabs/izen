@@ -3403,16 +3403,26 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	maxOut, llmConstrained = llmstep.ResolveMaxTokens(model, requested)
 	// Constrained Output Budget Invariant: models capped at max_output <= 1024
 	// (or ":free" free-tier IDs) force max_tokens = min(requested, 980) and
-	// DISABLE FULL_REWRITE entirely, forcing SEARCH_REPLACE output.
-	// Both the capability-derived classification (llmstep) and the
+	// DISABLE FULL_REWRITE for PATCH-SHAPED artifacts, forcing SEARCH_REPLACE
+	// output. Both the capability-derived classification (llmstep) and the
 	// strategy-derived classification (ModelProfile against the profile budget)
 	// gate the artifact shape.
+	//
+	// ── A CREATION IS NOT A PATCH ──────────────────────────────────────
+	// The bounded-patch contract is only sound when there is existing content
+	// to anchor a SEARCH block against. A `create_file` target does not exist
+	// yet, so forcing it into search_replace asks the model for an anchored
+	// patch against nothing — an impossible artifact that guarantees failure
+	// and burns the constrained budget proving it. The creation keeps its
+	// full-artifact contract; the constrained ceiling still bounds it, and
+	// hidden reasoning is disabled below so CoT cannot consume the shared
+	// budget before the content is emitted.
 	profileConstrained := ModelProfile{OutputTokenCap: profile.MaxOutputTokens, ModelID: model}.IsConstrained()
 	if llmConstrained || profileConstrained {
 		if maxOut <= 0 || maxOut > ConstrainedMaxTokens {
 			maxOut = ConstrainedMaxTokens
 		}
-		if !patchOnly {
+		if !patchOnly && profile.Artifact.Kind != "create_file" {
 			patchOnly = true
 		}
 	}
@@ -3578,6 +3588,13 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// gateway IGNORES reasoning.max_tokens, so only an explicit
 			// disable converges). The bounded patch is a deterministic small
 			// artifact; the hidden reasoning pass is disabled for it.
+			disableReasoning = true
+		}
+		// A constrained model shares its small output ceiling between hidden
+		// reasoning and the artifact. Disable the hidden channel for it as
+		// well, including a constrained CREATION: the model reasons by default
+		// and would otherwise spend the ceiling before writing the file.
+		if llmConstrained || profileConstrained {
 			disableReasoning = true
 		}
 		reasoningMode := "provider_default"
