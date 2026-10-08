@@ -361,6 +361,51 @@ func TestSelectNewFileCreationExplicitTarget(t *testing.T) {
 	}
 }
 
+// TestSelectDeclaredCreationBindsAnAbsentTarget pins the evidence-based CREATE
+// rule. "add file named X" carries the canonical creation verb "add" but not the
+// operation-family table's literal "add a", so it used to be read as an
+// incomplete resolution and parked at clarification forever. With the target
+// absent and a creation verb present it is a DECLARED CREATION: the destination
+// is bound.
+func TestSelectDeclaredCreationBindsAnAbsentTarget(t *testing.T) {
+	d := deps(t, map[string]string{"readme.md": "x"})
+	for _, prompt := range []string{
+		"add file named addtest.md",
+		"add a file named addtest.md",
+		"create addtest.md",
+		"write a new file addtest.md",
+	} {
+		p := Select(prompt, d)
+		if p.Strategy == HumanClarification {
+			t.Fatalf("%q: declared creation was sent to clarification (reason: %s)", prompt, p.StrategyReason)
+		}
+		found := false
+		for _, target := range p.Targets {
+			if target.Resolved == "addtest.md" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%q: absent creation target was not bound: %+v", prompt, p.Targets)
+		}
+	}
+}
+
+// TestSelectCreationVerbOverExistingTargetStaysModify is the negative half of
+// the evidence-based rule: the verb ALONE is not a creation. "insert a comment
+// into @file.go" is a change to a target that exists, so it stays a modification
+// and must not be forced through the creation contract.
+func TestSelectCreationVerbOverExistingTargetStaysModify(t *testing.T) {
+	d := deps(t, map[string]string{"file.go": "package main\n"})
+	p := Select("insert a comment into @file.go", d)
+	if p.Strategy != TargetedMutation {
+		t.Fatalf("Strategy = %s, want targeted_mutation (reason: %s)", p.Strategy, p.StrategyReason)
+	}
+	if p.Artifact.Kind != "replace_block" {
+		t.Fatalf("Artifact.Kind = %s, want replace_block: an existing target is a modification", p.Artifact.Kind)
+	}
+}
+
 func TestSelectComplexityExecutionFactors(t *testing.T) {
 	// Simple single-file content change → low.
 	low := Assess(ComplexityInputs{Operation: OperationContent, TargetCount: 1, FileCount: 1,

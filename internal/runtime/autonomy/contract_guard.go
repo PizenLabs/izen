@@ -86,10 +86,15 @@ func ValidateDispatchContract(req core.LoopRequest) error {
 	if canonical := core.ParseIntent(intent); canonical.RequiresMutation() {
 		classified.Intent = canonical
 	}
-	if looksLikeMutationObjective(intent) {
+	if !req.ReadOnly && looksLikeMutationObjective(intent) {
 		classified.Intent = core.IntentModification
 	}
-	if classified.Intent.RequiresMutation() {
+	// The human's explicit read-only constraint outranks the runtime's reading
+	// of a verb: a request that says "do not modify anything" is read-only even
+	// when the classifier also reads a change word in it. Forcing a mutation
+	// obligation here is what turned a legitimate investigation into a contract
+	// ceiling abort.
+	if !req.ReadOnly && classified.Intent.RequiresMutation() {
 		if err := requireOperation(contract, descriptor, protocol.OperationFileMutate, "intent"); err != nil {
 			return err
 		}
@@ -178,7 +183,7 @@ func normalizedRequestContract(req core.LoopRequest) (protocol.InteractionContra
 			caps = append(caps, string(capability))
 		}
 		contract = protocol.SelectInteractionContract(intent, "autonomy", caps...)
-		if looksLikeMutationObjective(intent) {
+		if !req.ReadOnly && looksLikeMutationObjective(intent) {
 			contract = protocol.AgenticLoop
 		}
 	}

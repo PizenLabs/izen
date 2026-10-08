@@ -1,0 +1,7 @@
+=== RUN   TestRealWorld_D_Fix
+[search] External Lynx engine detected (/Users/anvndev/.cargo/bin/lx). Hybrid search enabled.
+    tasks_test.go:178: [D / FIX — find and fix the failing user endpoint] driver.Run: protocol: operation exceeds interaction contract authority ceiling: contract=direct_completion operation=FILE_MUTATE: intent is outside the declared authority/capability boundary
+--- FAIL: TestRealWorld_D_Fix (0.81s)
+FAIL
+FAIL	github.com/PizenLabs/izen/test/realworld	1.393s
+FAIL

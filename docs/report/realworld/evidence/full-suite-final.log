@@ -1,0 +1,245 @@
+=== go vet ===
+VET_EXIT=0
+=== go test ===
+?   	github.com/PizenLabs/izen/cmd/diagnostic	[no test files]
+ok  	github.com/PizenLabs/izen/cmd/izen	1.119s
+?   	github.com/PizenLabs/izen/internal/adapters/web	[no test files]
+ok  	github.com/PizenLabs/izen/internal/ai	0.122s
+ok  	github.com/PizenLabs/izen/internal/ai/telemetry	0.104s
+ok  	github.com/PizenLabs/izen/internal/app	0.388s
+ok  	github.com/PizenLabs/izen/internal/app/compiler	0.133s
+ok  	github.com/PizenLabs/izen/internal/app/model	0.140s
+ok  	github.com/PizenLabs/izen/internal/architecture	11.389s
+ok  	github.com/PizenLabs/izen/internal/architecture_experiment/scheduler	0.125s
+ok  	github.com/PizenLabs/izen/internal/audit	0.124s
+ok  	github.com/PizenLabs/izen/internal/autonomy	0.394s
+ok  	github.com/PizenLabs/izen/internal/boundary	0.396s
+ok  	github.com/PizenLabs/izen/internal/boundary/scopeguard	0.106s
+ok  	github.com/PizenLabs/izen/internal/changeset	0.114s
+ok  	github.com/PizenLabs/izen/internal/changesurface	0.106s
+ok  	github.com/PizenLabs/izen/internal/checkpoint	3.756s
+ok  	github.com/PizenLabs/izen/internal/cli	0.571s
+ok  	github.com/PizenLabs/izen/internal/command	0.103s
+ok  	github.com/PizenLabs/izen/internal/compact	0.128s
+?   	github.com/PizenLabs/izen/internal/compiler	[no test files]
+ok  	github.com/PizenLabs/izen/internal/config	0.551s
+ok  	github.com/PizenLabs/izen/internal/context	7.926s
+ok  	github.com/PizenLabs/izen/internal/context/compactor	0.111s
+ok  	github.com/PizenLabs/izen/internal/contextcompiler	0.131s
+ok  	github.com/PizenLabs/izen/internal/contextspec	0.129s
+ok  	github.com/PizenLabs/izen/internal/continuation	0.562s
+ok  	github.com/PizenLabs/izen/internal/control	0.379s
+ok  	github.com/PizenLabs/izen/internal/controlplane/failure	0.117s
+ok  	github.com/PizenLabs/izen/internal/controlplane/guard	0.116s
+ok  	github.com/PizenLabs/izen/internal/controlplane/risk	0.119s
+ok  	github.com/PizenLabs/izen/internal/core/artifact	0.132s
+ok  	github.com/PizenLabs/izen/internal/core/authorization	0.119s
+ok  	github.com/PizenLabs/izen/internal/core/budget	0.172s
+ok  	github.com/PizenLabs/izen/internal/core/classifier	0.109s
+?   	github.com/PizenLabs/izen/internal/core/contract	[no test files]
+ok  	github.com/PizenLabs/izen/internal/core/domain	0.110s
+?   	github.com/PizenLabs/izen/internal/core/domain/artifact	[no test files]
+?   	github.com/PizenLabs/izen/internal/core/domain/authorization	[no test files]
+ok  	github.com/PizenLabs/izen/internal/core/domain/checkpoint	0.110s
+ok  	github.com/PizenLabs/izen/internal/core/domain/context	0.111s
+?   	github.com/PizenLabs/izen/internal/core/domain/evidence	[no test files]
+?   	github.com/PizenLabs/izen/internal/core/domain/execution	[no test files]
+ok  	github.com/PizenLabs/izen/internal/core/domain/occ	0.103s
+ok  	github.com/PizenLabs/izen/internal/core/domain/provider	5.323s
+?   	github.com/PizenLabs/izen/internal/core/domain/workflow	[no test files]
+ok  	github.com/PizenLabs/izen/internal/core/runtime	0.108s
+ok  	github.com/PizenLabs/izen/internal/core/stream	0.699s
+ok  	github.com/PizenLabs/izen/internal/core/workflow	0.112s
+ok  	github.com/PizenLabs/izen/internal/dag	0.111s
+ok  	github.com/PizenLabs/izen/internal/debug	0.112s
+?   	github.com/PizenLabs/izen/internal/discovery	[no test files]
+ok  	github.com/PizenLabs/izen/internal/discovery/recon	0.120s
+?   	github.com/PizenLabs/izen/internal/domain	[no test files]
+ok  	github.com/PizenLabs/izen/internal/domain/capability	0.110s
+?   	github.com/PizenLabs/izen/internal/domain/capability/policy	[no test files]
+?   	github.com/PizenLabs/izen/internal/domain/capability/validator	[no test files]
+ok  	github.com/PizenLabs/izen/internal/domain/command	0.122s
+ok  	github.com/PizenLabs/izen/internal/domain/intent	0.110s
+?   	github.com/PizenLabs/izen/internal/domain/orchestration	[no test files]
+ok  	github.com/PizenLabs/izen/internal/domain/policy	0.106s
+ok  	github.com/PizenLabs/izen/internal/domain/ports	0.107s
+ok  	github.com/PizenLabs/izen/internal/domain/role	0.107s
+ok  	github.com/PizenLabs/izen/internal/domain/signal	0.112s
+ok  	github.com/PizenLabs/izen/internal/domain/task	0.116s
+ok  	github.com/PizenLabs/izen/internal/domain/workflow	0.113s
+ok  	github.com/PizenLabs/izen/internal/engine	0.382s
+ok  	github.com/PizenLabs/izen/internal/engine/adapter	0.110s
+ok  	github.com/PizenLabs/izen/internal/engine/context	0.131s
+ok  	github.com/PizenLabs/izen/internal/engine/control	0.126s
+ok  	github.com/PizenLabs/izen/internal/engine/decision	0.114s
+ok  	github.com/PizenLabs/izen/internal/engine/executor	0.110s
+ok  	github.com/PizenLabs/izen/internal/engine/inference	0.112s
+ok  	github.com/PizenLabs/izen/internal/engine/intent	0.105s
+ok  	github.com/PizenLabs/izen/internal/engine/ir	0.179s
+ok  	github.com/PizenLabs/izen/internal/engine/ir/logical	0.126s
+ok  	github.com/PizenLabs/izen/internal/engine/layer0	0.142s
+ok  	github.com/PizenLabs/izen/internal/engine/layer1	0.145s
+ok  	github.com/PizenLabs/izen/internal/engine/layer2	0.945s
+ok  	github.com/PizenLabs/izen/internal/engine/layer3	0.383s
+ok  	github.com/PizenLabs/izen/internal/engine/layer4	0.372s
+ok  	github.com/PizenLabs/izen/internal/engine/lowerer	0.112s
+ok  	github.com/PizenLabs/izen/internal/engine/pipeline	0.239s
+ok  	github.com/PizenLabs/izen/internal/engine/plan	0.140s
+ok  	github.com/PizenLabs/izen/internal/engine/planner	0.132s
+ok  	github.com/PizenLabs/izen/internal/engine/strategy	0.105s
+ok  	github.com/PizenLabs/izen/internal/engine/telemetry	0.168s
+ok  	github.com/PizenLabs/izen/internal/events	0.420s
+ok  	github.com/PizenLabs/izen/internal/events/audit	0.207s
+ok  	github.com/PizenLabs/izen/internal/execution	3.273s
+ok  	github.com/PizenLabs/izen/internal/execution/cache	0.369s
+ok  	github.com/PizenLabs/izen/internal/execution/capability	0.184s
+ok  	github.com/PizenLabs/izen/internal/execution/graph	0.128s
+ok  	github.com/PizenLabs/izen/internal/execution/ingestion	0.107s
+ok  	github.com/PizenLabs/izen/internal/execution/planner	0.387s
+ok  	github.com/PizenLabs/izen/internal/execution/preflight	0.360s
+ok  	github.com/PizenLabs/izen/internal/execution/rmah	0.107s
+ok  	github.com/PizenLabs/izen/internal/execution/strategy	0.154s
+ok  	github.com/PizenLabs/izen/internal/execution/verifier	0.365s
+ok  	github.com/PizenLabs/izen/internal/executor	0.396s
+?   	github.com/PizenLabs/izen/internal/forensics	[no test files]
+ok  	github.com/PizenLabs/izen/internal/fs	0.293s
+ok  	github.com/PizenLabs/izen/internal/gateway	0.110s
+ok  	github.com/PizenLabs/izen/internal/git	1.694s
+ok  	github.com/PizenLabs/izen/internal/graph	0.448s
+ok  	github.com/PizenLabs/izen/internal/hotfix	0.111s
+ok  	github.com/PizenLabs/izen/internal/httpx	1.461s
+?   	github.com/PizenLabs/izen/internal/infrastructure	[no test files]
+ok  	github.com/PizenLabs/izen/internal/infrastructure/capabilities	0.502s
+ok  	github.com/PizenLabs/izen/internal/infrastructure/events	0.203s
+ok  	github.com/PizenLabs/izen/internal/ir	0.129s
+ok  	github.com/PizenLabs/izen/internal/kernelbridge	0.159s
+ok  	github.com/PizenLabs/izen/internal/knowledge	0.326s
+ok  	github.com/PizenLabs/izen/internal/language	0.117s
+ok  	github.com/PizenLabs/izen/internal/lea	0.554s
+ok  	github.com/PizenLabs/izen/internal/lea/graph	0.131s
+ok  	github.com/PizenLabs/izen/internal/llm	0.543s
+ok  	github.com/PizenLabs/izen/internal/llmstep	0.120s
+?   	github.com/PizenLabs/izen/internal/loop	[no test files]
+ok  	github.com/PizenLabs/izen/internal/mcp	0.130s
+ok  	github.com/PizenLabs/izen/internal/modes	0.108s
+ok  	github.com/PizenLabs/izen/internal/modes/build	0.105s
+ok  	github.com/PizenLabs/izen/internal/modes/commit	0.231s
+ok  	github.com/PizenLabs/izen/internal/modes/investigate	5.244s
+ok  	github.com/PizenLabs/izen/internal/modes/plan	0.997s
+ok  	github.com/PizenLabs/izen/internal/modes/review	0.929s
+ok  	github.com/PizenLabs/izen/internal/modes/undo	1.394s
+ok  	github.com/PizenLabs/izen/internal/mutationstrategy	0.111s
+?   	github.com/PizenLabs/izen/internal/observability	[no test files]
+ok  	github.com/PizenLabs/izen/internal/op	0.110s
+ok  	github.com/PizenLabs/izen/internal/parser	0.110s
+ok  	github.com/PizenLabs/izen/internal/patch	0.112s
+ok  	github.com/PizenLabs/izen/internal/pipeline	0.117s
+ok  	github.com/PizenLabs/izen/internal/pkg/atomicio	0.147s
+ok  	github.com/PizenLabs/izen/internal/pkg/lock	2.730s
+ok  	github.com/PizenLabs/izen/internal/planner	0.158s
+ok  	github.com/PizenLabs/izen/internal/planner/brownfield	0.376s
+ok  	github.com/PizenLabs/izen/internal/planner/greenfield	0.166s
+ok  	github.com/PizenLabs/izen/internal/planner/scope	0.376s
+ok  	github.com/PizenLabs/izen/internal/policy	0.120s
+ok  	github.com/PizenLabs/izen/internal/presentation	0.549s
+ok  	github.com/PizenLabs/izen/internal/presentation/diff	0.117s
+?   	github.com/PizenLabs/izen/internal/problem	[no test files]
+?   	github.com/PizenLabs/izen/internal/problemsurface	[no test files]
+ok  	github.com/PizenLabs/izen/internal/progress	0.125s
+ok  	github.com/PizenLabs/izen/internal/project	0.105s
+ok  	github.com/PizenLabs/izen/internal/prompt	0.110s
+ok  	github.com/PizenLabs/izen/internal/protocol	0.367s
+ok  	github.com/PizenLabs/izen/internal/provider	0.106s
+ok  	github.com/PizenLabs/izen/internal/provider/adapter	0.108s
+ok  	github.com/PizenLabs/izen/internal/provider/detector	0.150s
+ok  	github.com/PizenLabs/izen/internal/provider/discovery	0.145s
+ok  	github.com/PizenLabs/izen/internal/provider/registry	0.314s
+ok  	github.com/PizenLabs/izen/internal/providers	1.389s
+ok  	github.com/PizenLabs/izen/internal/providers/capability	0.149s
+ok  	github.com/PizenLabs/izen/internal/providers/openrouter	0.106s
+?   	github.com/PizenLabs/izen/internal/resolver	[no test files]
+ok  	github.com/PizenLabs/izen/internal/resource	0.104s
+ok  	github.com/PizenLabs/izen/internal/resource/file	0.156s
+ok  	github.com/PizenLabs/izen/internal/resource/git	0.830s
+ok  	github.com/PizenLabs/izen/internal/resource/terminal	0.133s
+ok  	github.com/PizenLabs/izen/internal/retrieval	10.872s
+ok  	github.com/PizenLabs/izen/internal/retrieval/extractor	0.111s
+ok  	github.com/PizenLabs/izen/internal/retrieval/fulltext	0.196s
+ok  	github.com/PizenLabs/izen/internal/retrieval/grounding	0.135s
+?   	github.com/PizenLabs/izen/internal/retrieval/symbol	[no test files]
+ok  	github.com/PizenLabs/izen/internal/retrieval/symbol/extractors	0.141s
+ok  	github.com/PizenLabs/izen/internal/review	0.120s
+ok  	github.com/PizenLabs/izen/internal/runtime	3.780s
+ok  	github.com/PizenLabs/izen/internal/runtime/adaptive	0.427s
+ok  	github.com/PizenLabs/izen/internal/runtime/authority	0.107s
+ok  	github.com/PizenLabs/izen/internal/runtime/authorization	0.116s
+ok  	github.com/PizenLabs/izen/internal/runtime/autonomy	24.108s
+ok  	github.com/PizenLabs/izen/internal/runtime/compose	4.525s
+ok  	github.com/PizenLabs/izen/internal/runtime/context	0.105s
+?   	github.com/PizenLabs/izen/internal/runtime/contextpipeline	[no test files]
+ok  	github.com/PizenLabs/izen/internal/runtime/durable	3.992s
+ok  	github.com/PizenLabs/izen/internal/runtime/engine	0.420s
+ok  	github.com/PizenLabs/izen/internal/runtime/ephemeral	1.162s
+ok  	github.com/PizenLabs/izen/internal/runtime/executor	1.310s
+ok  	github.com/PizenLabs/izen/internal/runtime/gate	0.132s
+ok  	github.com/PizenLabs/izen/internal/runtime/handlers	1.037s
+ok  	github.com/PizenLabs/izen/internal/runtime/harness	0.128s
+ok  	github.com/PizenLabs/izen/internal/runtime/orchestrator	0.511s
+ok  	github.com/PizenLabs/izen/internal/runtime/output	1.397s
+ok  	github.com/PizenLabs/izen/internal/runtime/preflight	0.134s
+ok  	github.com/PizenLabs/izen/internal/runtime/scope	0.203s
+ok  	github.com/PizenLabs/izen/internal/runtime/scopeguard	0.830s
+ok  	github.com/PizenLabs/izen/internal/runtime/substrate	0.660s
+?   	github.com/PizenLabs/izen/internal/runtime/substrate/store	[no test files]
+ok  	github.com/PizenLabs/izen/internal/runtime/target	1.597s
+?   	github.com/PizenLabs/izen/internal/runtime/ui/decision	[no test files]
+ok  	github.com/PizenLabs/izen/internal/security/credentials	0.150s
+ok  	github.com/PizenLabs/izen/internal/session	9.044s
+ok  	github.com/PizenLabs/izen/internal/session/compaction	0.157s
+?   	github.com/PizenLabs/izen/internal/state	[no test files]
+ok  	github.com/PizenLabs/izen/internal/stepadmission	0.116s
+ok  	github.com/PizenLabs/izen/internal/substrate	1.177s
+ok  	github.com/PizenLabs/izen/internal/telemetry	0.115s
+?   	github.com/PizenLabs/izen/internal/templates	[no test files]
+ok  	github.com/PizenLabs/izen/internal/tui/components/ask	0.139s
+ok  	github.com/PizenLabs/izen/internal/tui/components/shimmer	0.164s
+ok  	github.com/PizenLabs/izen/internal/tui/tips	0.108s
+ok  	github.com/PizenLabs/izen/internal/ui	12.270s
+ok  	github.com/PizenLabs/izen/internal/ui/animation	0.131s
+?   	github.com/PizenLabs/izen/internal/ui/commands	[no test files]
+ok  	github.com/PizenLabs/izen/internal/ui/components	2.194s
+ok  	github.com/PizenLabs/izen/internal/ui/diff	0.139s
+?   	github.com/PizenLabs/izen/internal/ui/format	[no test files]
+ok  	github.com/PizenLabs/izen/internal/ui/git	0.137s
+ok  	github.com/PizenLabs/izen/internal/ui/markdown	0.138s
+ok  	github.com/PizenLabs/izen/internal/ui/modelpicker	0.130s
+ok  	github.com/PizenLabs/izen/internal/ui/plan	0.115s
+ok  	github.com/PizenLabs/izen/internal/ui/states	0.111s
+ok  	github.com/PizenLabs/izen/internal/ui/status	0.117s
+ok  	github.com/PizenLabs/izen/internal/ui/tool	0.115s
+ok  	github.com/PizenLabs/izen/internal/ui/tui	0.387s
+ok  	github.com/PizenLabs/izen/internal/ui/widgets	0.113s
+ok  	github.com/PizenLabs/izen/internal/ui/widgets/model_picker	0.142s
+ok  	github.com/PizenLabs/izen/internal/ui/widgets/settings	0.111s
+ok  	github.com/PizenLabs/izen/internal/understanding	0.127s
+ok  	github.com/PizenLabs/izen/internal/verification	0.400s
+ok  	github.com/PizenLabs/izen/internal/verification/stabilize	0.103s
+ok  	github.com/PizenLabs/izen/internal/workspace	0.332s
+ok  	github.com/PizenLabs/izen/internal/workspace/capability	0.103s
+ok  	github.com/PizenLabs/izen/internal/workspace/checkpoint	0.408s
+ok  	github.com/PizenLabs/izen/internal/workspace/failure	0.107s
+ok  	github.com/PizenLabs/izen/internal/workspace/snapshot	0.445s
+ok  	github.com/PizenLabs/izen/runtime/capabilities/filesystem	0.438s
+ok  	github.com/PizenLabs/izen/runtime/headless	0.200s
+ok  	github.com/PizenLabs/izen/runtime/kernel	0.131s
+ok  	github.com/PizenLabs/izen/test/architecture	0.314s
+ok  	github.com/PizenLabs/izen/test/benchmark	0.458s
+ok  	github.com/PizenLabs/izen/test/forensics	1.804s
+ok  	github.com/PizenLabs/izen/test/integration	0.341s
+ok  	github.com/PizenLabs/izen/test/live_r1	0.427s
+ok  	github.com/PizenLabs/izen/test/live_r2	0.422s
+ok  	github.com/PizenLabs/izen/test/live_r4	0.427s
+ok  	github.com/PizenLabs/izen/test/live_r5	0.422s
+ok  	github.com/PizenLabs/izen/test/live_r6	0.429s
+ok  	github.com/PizenLabs/izen/test/realworld	0.417s
+TEST_EXIT=0

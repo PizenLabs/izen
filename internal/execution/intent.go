@@ -80,6 +80,29 @@ func (g *IntentGateway) SelectStrategy(prompt string) strategy.ExecutionStrategy
 	return strategy.Select(prompt, deps)
 }
 
+// ReadOnlyConstraintStrategy is SelectStrategy plus ONLY the explicit human
+// read-only constraint ("do not modify anything"). It deliberately does not
+// consult the scope's mutation authority: the autonomy driver owns that
+// decision through its own admission gate, and folding it in here would change
+// the behaviour of every non-mutating-scope run. It exists so the driver can
+// honour a stated constraint without re-deciding authorization.
+func (g *IntentGateway) ReadOnlyConstraintStrategy(prompt string) strategy.ExecutionStrategyProfile {
+	profile := g.SelectStrategy(prompt)
+	if !g.ReadOnlyConstraintStated(prompt) {
+		return profile
+	}
+	return downgradeToReadOnly(profile, true)
+}
+
+// ReadOnlyConstraintStated reports whether a HUMAN request explicitly declines
+// a write. It is the ONLY call site of the constraint predicate: both strategy
+// entry points and the autonomy driver route through it, so the semantic
+// boundary lock's single-caller rule holds and no second copy of the "who may
+// read the constraint" decision can drift.
+func (g *IntentGateway) ReadOnlyConstraintStated(prompt string) bool {
+	return strategy.StatesReadOnlyConstraint(prompt)
+}
+
 // Gate resolves one user action into an ExecutionRequest. It never decides the
 // execution path beyond what Strategy.Select decided deterministically. The
 // intent's execution context payload is FROZEN here — at the point of intent
@@ -204,10 +227,17 @@ func (g *IntentGateway) selectScopedStrategy(prompt string, scope intentdomain.S
 		profile.EscalationReason = "human clarification required before execution"
 		return profile
 	}
-	readOnlyRequested := strategy.StatesReadOnlyConstraint(prompt)
+	readOnlyRequested := g.ReadOnlyConstraintStated(prompt)
 	if scope.AllowsMutation() && !readOnlyRequested {
 		return profile
 	}
+	return downgradeToReadOnly(profile, readOnlyRequested)
+}
+
+// downgradeToReadOnly rewrites a mutation-shaped profile into a read-only
+// investigation/reasoning profile. The two causes are reported separately: one
+// is the system withholding authority, the other is the user declining it.
+func downgradeToReadOnly(profile strategy.ExecutionStrategyProfile, readOnlyRequested bool) strategy.ExecutionStrategyProfile {
 	switch profile.Strategy {
 	case strategy.DirectDeterministic, strategy.TargetedMutation, strategy.MultiFilePlanning:
 		profile.Strategy = strategy.RepositoryInvestigation
@@ -218,9 +248,6 @@ func (g *IntentGateway) selectScopedStrategy(prompt string, scope intentdomain.S
 			profile.ContextPolicy = strategy.ContextPolicyTargetFileOnly
 			profile.ContextKinds = []strategy.ContextKind{strategy.ContextUserIntent, strategy.ContextExplicitTargets, strategy.ContextTargetContent}
 		}
-		// The two causes are reported separately. They close the same path but
-		// they mean opposite things to a human reading the transcript: one is
-		// the system withholding authority, the other is the user declining it.
 		if readOnlyRequested {
 			profile.StrategyReason = "read-only intent: the request itself states an explicit read-only constraint"
 		} else {

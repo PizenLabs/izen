@@ -3,6 +3,7 @@ package autonomy
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -102,6 +103,12 @@ func BehaviorRequired(objective string) bool {
 	if lower == "" {
 		return false
 	}
+	// A filename or path in the objective is a TARGET, not a verb. Scanning it
+	// as prose made "create new file named testing.md" read as behavioral (the
+	// "test" inside the filename) and turned a CREATE the completion authority
+	// had PROVEN into an unsubstantiated terminal. Strip path-shaped tokens
+	// before the verb scan; the objective's actual verbs still decide.
+	lower = stripPathTokens(lower)
 	// An objective that explicitly scopes itself to reading has nothing to run.
 	for _, readOnly := range []string{
 		"explain", "describe", "what is", "how does", "list the", "summar",
@@ -123,6 +130,19 @@ func BehaviorRequired(objective string) bool {
 		}
 	}
 	return false
+}
+
+// pathTokenRe matches a filename or path token: one or more path characters
+// followed by a short extension. It exists so a TARGET named in the objective
+// ("testing.md", "@src/auth/login.go") is never scanned as a verb.
+var pathTokenRe = regexp.MustCompile(`[a-z0-9_./\\-]*[a-z0-9_/-]\.[a-z0-9]{1,8}\b`)
+
+// stripPathTokens removes filename/path tokens from an objective before the
+// behavioral verb scan. A target is not a verb: without this, "create new file
+// named testing.md" matched the "test" keyword and a PROVEN CREATE was
+// downgraded to an unsubstantiated terminal by the behavioral gate.
+func stripPathTokens(s string) string {
+	return pathTokenRe.ReplaceAllString(s, " ")
 }
 
 // BehaviorResult is the terminal outcome of the behavioral stage, projected onto

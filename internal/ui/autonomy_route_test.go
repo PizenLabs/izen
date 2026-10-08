@@ -419,6 +419,44 @@ func TestAutonomyConfirmationGateNoLoop(t *testing.T) {
 	}
 }
 
+// TestAutonomyCreateObjectiveStagesMutationProposal pins the TUI intent-
+// compilation layer for a declared CREATE. "$prompt add file named X" must be
+// compiled by the autonomy runtime into a BUILD mutation objective that names
+// the new file — never dropped, never re-classified as conversation, never
+// silently resolved to an unrelated existing file. The runtime (not the UI)
+// owns whether the absent target is a creation; the UI only forwards it.
+func TestAutonomyCreateObjectiveStagesMutationProposal(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile("readme.md", []byte("# Project\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := autonomyTestModel()
+	m.resolver.Set(modes.ModeAsk)
+
+	cmd := m.routePromptDirective("add file named addtest.md")
+	if cmd != nil {
+		t.Fatal("a pre-grant mutation must await the authority proposal, not execute")
+	}
+	prop := m.pendingAutonomyProposal
+	if prop == nil {
+		t.Fatal("a declared CREATE must stage a mutation proposal")
+	}
+	if prop.Intent != autonomy.IntentModification {
+		t.Errorf("intent = %s, want modification", prop.Intent)
+	}
+	if prop.Workspace != autonomy.WorkspaceBuild {
+		t.Errorf("workspace = %s, want build", prop.Workspace)
+	}
+	if !prop.Missing.Has(autonomy.CapMutate) {
+		t.Errorf("proposal must request mutate, got %v", prop.Missing)
+	}
+	// The UI must not have fabricated anything on disk while asking.
+	if _, err := os.Stat("addtest.md"); err == nil {
+		t.Fatal("the UI created the target before any authorization")
+	}
+}
+
 // TestAutonomyContextEvidenceLedger pins requirement §6/§8: before the build
 // engine asks the model, the runtime compiles structural evidence for the
 // resolved target and hands the model a Context Evidence Ledger.

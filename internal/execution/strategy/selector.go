@@ -119,6 +119,26 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 	op := classifyOperation(raw, parsed)
 	profile.Targets = targets
 
+	// ── EVIDENCE-BASED CREATE ──────────────────────────────────────────
+	// The operation-family table above is a PHRASE table: it recognises
+	// "add a file" but not "add file named X", because its creation entry is
+	// the literal "add a". The objective contract layer and the executor
+	// already decide CREATE from two independent facts — a canonical creation
+	// VERB and the ABSENCE of the named target — and the admission gate
+	// already accepts an explicitly named creation target
+	// (TargetStateNotFound + explicit). This reconciles the strategy gateway
+	// to that same evidence: a request that carries a canonical creation verb
+	// and names only targets that do not yet exist is a creation, not a
+	// target-resolution failure, so its named destination is BOUND rather
+	// than sent to clarification.
+	//
+	// A creation verb over an EXISTING target is untouched: "add a comment to
+	// @file.go" names a target that exists, so it stays a modification. The
+	// existence evidence, not the verb alone, is what separates the two.
+	if op != OperationCreate && isDeclaredCreation(raw, parsed, targets) {
+		op = OperationCreate
+	}
+
 	// The canonical semantic verdict, read once. It answers "what act does this
 	// request perform?" and is what stops a review that named a file from
 	// dispatching a mutation (step 4) and a vague improvement request from
@@ -461,6 +481,28 @@ func classifyOperation(raw string, parsed *parser.IntentAST) OperationKind {
 		return OperationUndetermined
 	}
 	return OperationContent
+}
+
+// isDeclaredCreation reports whether a request declares a NEW artifact: it
+// carries a canonical creation verb AND every named file target does not yet
+// exist. It reads the parsed Goal (the task text without @scope markers) so a
+// filename like "create.md" cannot by itself supply the verb, and it uses the
+// token-boundary phrase matcher so "add" never matches inside "address".
+//
+// It is deliberately evidence-gated on target absence: "add a comment to
+// @file.go" carries the verb but the target exists, so it is a modification.
+// This is the same two-fact rule the objective contract layer uses to compile
+// an objective as CREATE.
+func isDeclaredCreation(raw string, parsed *parser.IntentAST, targets []Target) bool {
+	if len(targets) == 0 {
+		return false
+	}
+	for _, t := range targets {
+		if t.Exists {
+			return false
+		}
+	}
+	return ContainsPhrase(goalText(raw, parsed), CreationVerbs())
 }
 
 // collectTargets extracts and resolves the explicit (@scope) and inferred

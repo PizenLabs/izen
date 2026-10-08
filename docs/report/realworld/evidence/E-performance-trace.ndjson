@@ -1,0 +1,399 @@
+{
+  "run_id": "run-1",
+  "recorded_at": "2026-10-07T12:14:06.939016+07:00",
+  "status": "unsubstantiated",
+  "summary": {
+    "run_id": "run-1",
+    "revision": 1,
+    "objective": "find the main performance bottleneck in this project. Do not modify anything.",
+    "status": "unsubstantiated",
+    "termination_reason": "objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome \"completed\"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened",
+    "termination_state": "unsubstantiated",
+    "parked": false,
+    "model_calls": 0,
+    "model_failures": 0,
+    "output_exhausted": 0,
+    "runtime_steps": 2,
+    "continuations": 0,
+    "attempts": 2,
+    "recovery_cycles": 0,
+    "input_tokens": 138,
+    "output_tokens": 1475,
+    "total_tokens": 1613,
+    "usage_known": true,
+    "mutations": 0,
+    "verifications": 0,
+    "verification_passed": false,
+    "verification_observed": false,
+    "schema_mode": "auto"
+  },
+  "entries": [
+    {
+      "seq": 1,
+      "at": "2026-10-07T12:12:50.576576+07:00",
+      "event": "loop.transition",
+      "summary": "loop: idle → observing (continue)",
+      "detail": {
+        "reason": "user objective: find the main performance bottleneck in this project. Do not modify anything."
+      }
+    },
+    {
+      "seq": 2,
+      "at": "2026-10-07T12:12:51.227564+07:00",
+      "event": "execution.provider.execution",
+      "summary": "model call: ollama/qwen2.5-coder:7b finish=stop completion=6",
+      "detail": {
+        "effective": "512",
+        "fingerprint": "8e34d9d3efb5",
+        "requested": "512",
+        "truncated": "false"
+      }
+    },
+    {
+      "seq": 3,
+      "at": "2026-10-07T12:12:51.22785+07:00",
+      "event": "execution.spec.frozen",
+      "summary": "spec frozen: intent=INVESTIGATE boundary=(none)",
+      "detail": {
+        "candidates": "README.md,go.mod,report.go",
+        "req_budget": "1536",
+        "scope": "DISCOVERED"
+      }
+    },
+    {
+      "seq": 4,
+      "at": "2026-10-07T12:12:51.227886+07:00",
+      "event": "execution.authorized",
+      "summary": "authorization allow (granted=true)",
+      "detail": {
+        "authority": "preflight_admission_gate",
+        "candidates": "README.md,go.mod,report.go",
+        "reason": "admitted: proven target, admissible mutation boundary, authoritative evidence",
+        "scope": "DISCOVERED"
+      }
+    },
+    {
+      "seq": 5,
+      "at": "2026-10-07T12:12:51.227809+07:00",
+      "event": "loop.transition",
+      "summary": "loop: observing → deciding (continue)",
+      "detail": {
+        "reason": "observation consumed"
+      }
+    },
+    {
+      "seq": 6,
+      "at": "2026-10-07T12:12:51.250871+07:00",
+      "event": "continuation.evaluated",
+      "summary": "continuation evaluated: proposed continue",
+      "detail": {
+        "from": "deciding",
+        "mutation_applied": "false",
+        "new_artifact": "false",
+        "new_evidence": "false",
+        "objective_advanced": "false",
+        "progress": "READY",
+        "progress_delta": "true",
+        "proposed_reason": "objective resolved — execute",
+        "verification_advanced": "false"
+      }
+    },
+    {
+      "seq": 7,
+      "at": "2026-10-07T12:12:51.250876+07:00",
+      "event": "loop.transition",
+      "summary": "loop: deciding → executing (continue)",
+      "detail": {
+        "reason": "objective resolved — execute"
+      }
+    },
+    {
+      "seq": 8,
+      "at": "2026-10-07T12:12:51.281079+07:00",
+      "event": "execution.started",
+      "summary": "execution started: 77 chars",
+      "detail": {
+        "mode": "autonomy",
+        "request": "run-1"
+      }
+    },
+    {
+      "seq": 9,
+      "at": "2026-10-07T12:12:51.281092+07:00",
+      "event": "execution.strategy.selected",
+      "summary": "strategy: multi_file_planning",
+      "detail": {
+        "reason": "no explicit target set; repository-level reasoning is justified"
+      }
+    },
+    {
+      "seq": 10,
+      "at": "2026-10-07T12:12:51.281146+07:00",
+      "event": "execution.admission.decision",
+      "summary": "admission: allowed=true",
+      "detail": {
+        "capability": "mutate",
+        "reason": "task type READ is read-only",
+        "reason_code": "admitted"
+      }
+    },
+    {
+      "seq": 11,
+      "at": "2026-10-07T12:12:51.28133+07:00",
+      "event": "execution.context.prepared",
+      "summary": "context prepared: 77 tokens, 0 channels",
+      "detail": {
+        "truncated": "false"
+      }
+    },
+    {
+      "seq": 12,
+      "at": "2026-10-07T12:12:51.28134+07:00",
+      "event": "reasoning.step.started",
+      "summary": "step 1 started (budget=1536)",
+      "detail": {
+        "model": "qwen2.5-coder:7b"
+      }
+    },
+    {
+      "seq": 13,
+      "at": "2026-10-07T12:13:30.623945+07:00",
+      "event": "execution.provider.execution",
+      "summary": "model call: ollama/qwen2.5-coder:7b finish=stop completion=766",
+      "detail": {
+        "effective": "1536",
+        "fingerprint": "d87e54836d2c",
+        "requested": "1536",
+        "truncated": "false"
+      }
+    },
+    {
+      "seq": 14,
+      "at": "2026-10-07T12:13:30.623977+07:00",
+      "event": "execution.artifact.produced",
+      "summary": "artifact produced: plan"
+    },
+    {
+      "seq": 15,
+      "at": "2026-10-07T12:13:30.623981+07:00",
+      "event": "execution.verification.completed",
+      "summary": "verification: SKIPPED (boundary never reached)",
+      "detail": {
+        "reason": "read-only execution"
+      }
+    },
+    {
+      "seq": 16,
+      "at": "2026-10-07T12:13:30.623988+07:00",
+      "event": "execution.evidence",
+      "summary": "evidence sealed: COMMITTED tainted=false",
+      "detail": {
+        "contract": "ct-20902f34c1459a5c",
+        "files_mutated": "0"
+      }
+    },
+    {
+      "seq": 17,
+      "at": "2026-10-07T12:13:30.640213+07:00",
+      "event": "loop.transition",
+      "summary": "loop: executing → verifying (continue)",
+      "detail": {
+        "reason": "execution consumed: completed"
+      }
+    },
+    {
+      "seq": 18,
+      "at": "2026-10-07T12:13:30.640217+07:00",
+      "event": "loop.transition",
+      "summary": "loop: verifying → interpreting (continue)",
+      "detail": {
+        "reason": "verification consumed"
+      }
+    },
+    {
+      "seq": 19,
+      "at": "2026-10-07T12:13:30.66509+07:00",
+      "event": "continuation.evaluated",
+      "summary": "continuation evaluated: proposed complete",
+      "detail": {
+        "from": "interpreting",
+        "mutation_applied": "false",
+        "new_artifact": "false",
+        "new_evidence": "false",
+        "objective_advanced": "true",
+        "outcome": "completed",
+        "prev_progress": "READY",
+        "progress": "PARTIALLY_SATISFIED",
+        "progress_delta": "true",
+        "proposed_reason": "objective satisfied: completed",
+        "verification_advanced": "false"
+      }
+    },
+    {
+      "seq": 20,
+      "at": "2026-10-07T12:13:30.665179+07:00",
+      "event": "objective.evaluated",
+      "summary": "objective evaluated: UNSUBSTANTIATED (granted=false)",
+      "detail": {
+        "clause": "objective_scope_unobserved",
+        "reason": "completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target)"
+      }
+    },
+    {
+      "seq": 21,
+      "at": "2026-10-07T12:13:30.665199+07:00",
+      "event": "loop.transition",
+      "summary": "loop: interpreting → executing (continue)",
+      "detail": {
+        "reason": "objective PARTIALLY_SATISFIED — 1 of 2 completion condition(s) hold; continuing against the same objective contract, preserving established evidence"
+      }
+    },
+    {
+      "seq": 22,
+      "at": "2026-10-07T12:13:30.714264+07:00",
+      "event": "execution.started",
+      "summary": "execution started: 77 chars",
+      "detail": {
+        "mode": "autonomy",
+        "request": "run-1"
+      }
+    },
+    {
+      "seq": 23,
+      "at": "2026-10-07T12:13:30.714281+07:00",
+      "event": "execution.strategy.selected",
+      "summary": "strategy: multi_file_planning",
+      "detail": {
+        "reason": "no explicit target set; repository-level reasoning is justified"
+      }
+    },
+    {
+      "seq": 24,
+      "at": "2026-10-07T12:13:30.714291+07:00",
+      "event": "execution.admission.decision",
+      "summary": "admission: allowed=true",
+      "detail": {
+        "capability": "mutate",
+        "reason": "task type READ is read-only",
+        "reason_code": "admitted"
+      }
+    },
+    {
+      "seq": 25,
+      "at": "2026-10-07T12:13:30.714344+07:00",
+      "event": "execution.context.prepared",
+      "summary": "context prepared: 77 tokens, 0 channels",
+      "detail": {
+        "truncated": "false"
+      }
+    },
+    {
+      "seq": 26,
+      "at": "2026-10-07T12:13:30.714348+07:00",
+      "event": "reasoning.step.started",
+      "summary": "step 1 started (budget=1536)",
+      "detail": {
+        "model": "qwen2.5-coder:7b"
+      }
+    },
+    {
+      "seq": 27,
+      "at": "2026-10-07T12:14:06.608594+07:00",
+      "event": "execution.provider.execution",
+      "summary": "model call: ollama/qwen2.5-coder:7b finish=stop completion=709",
+      "detail": {
+        "effective": "1536",
+        "fingerprint": "d87e54836d2c",
+        "requested": "1536",
+        "truncated": "false"
+      }
+    },
+    {
+      "seq": 28,
+      "at": "2026-10-07T12:14:06.60861+07:00",
+      "event": "execution.artifact.produced",
+      "summary": "artifact produced: plan"
+    },
+    {
+      "seq": 29,
+      "at": "2026-10-07T12:14:06.608612+07:00",
+      "event": "execution.verification.completed",
+      "summary": "verification: SKIPPED (boundary never reached)",
+      "detail": {
+        "reason": "read-only execution"
+      }
+    },
+    {
+      "seq": 30,
+      "at": "2026-10-07T12:14:06.608616+07:00",
+      "event": "execution.evidence",
+      "summary": "evidence sealed: COMMITTED tainted=false",
+      "detail": {
+        "contract": "ct-63ae4039cc7c9bb4",
+        "files_mutated": "0"
+      }
+    },
+    {
+      "seq": 31,
+      "at": "2026-10-07T12:14:06.622306+07:00",
+      "event": "loop.transition",
+      "summary": "loop: executing → verifying (continue)",
+      "detail": {
+        "reason": "execution consumed: completed"
+      }
+    },
+    {
+      "seq": 32,
+      "at": "2026-10-07T12:14:06.622311+07:00",
+      "event": "loop.transition",
+      "summary": "loop: verifying → interpreting (continue)",
+      "detail": {
+        "reason": "verification consumed"
+      }
+    },
+    {
+      "seq": 33,
+      "at": "2026-10-07T12:14:06.645184+07:00",
+      "event": "continuation.evaluated",
+      "summary": "continuation evaluated: proposed complete",
+      "detail": {
+        "from": "interpreting",
+        "mutation_applied": "false",
+        "new_artifact": "false",
+        "new_evidence": "false",
+        "objective_advanced": "false",
+        "outcome": "completed",
+        "prev_progress": "PARTIALLY_SATISFIED",
+        "progress": "PARTIALLY_SATISFIED",
+        "progress_delta": "false",
+        "proposed_reason": "objective satisfied: completed",
+        "verification_advanced": "false"
+      }
+    },
+    {
+      "seq": 34,
+      "at": "2026-10-07T12:14:06.6454+07:00",
+      "event": "objective.evaluated",
+      "summary": "objective evaluated: UNSUBSTANTIATED (granted=false)",
+      "detail": {
+        "clause": "objective_scope_unobserved",
+        "reason": "completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target)"
+      }
+    },
+    {
+      "seq": 35,
+      "at": "2026-10-07T12:14:06.645461+07:00",
+      "event": "loop.transition",
+      "summary": "loop: interpreting → unsubstantiated (unsubstantiate)",
+      "detail": {
+        "reason": "objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-observed\" is unmet: no workspace observation event for (no declared target) — refused completion claim over outcome \"completed\"; objective PARTIALLY_SATISFIED without an authoritative progress delta — continuation not re-opened"
+      }
+    },
+    {
+      "seq": 36,
+      "at": "2026-10-07T12:14:06.672133+07:00",
+      "event": "execution.summary",
+      "summary": "(recorded)"
+    }
+  ]
+}

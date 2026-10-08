@@ -884,3 +884,26 @@ func observationContractID(res *execution.ExecutionResult) string {
 	}
 	return ""
 }
+
+// ResolveScoped is Resolve that also honours an explicit human read-only
+// constraint ("do not modify anything"). The unconditional SelectStrategy
+// cannot apply that constraint, so without this an investigation resolved to a
+// mutation and parked for a target instead of running read-only. The
+// executor's own post-admission re-selection still uses SelectStrategy.
+func (a *ExecutorAdapter) ResolveScoped(prompt string) Resolved {
+	if a == nil || a.gateway == nil {
+		return a.Resolve(prompt)
+	}
+	return a.resolveWith(prompt, a.gateway.ReadOnlyConstraintStrategy(prompt))
+}
+
+// ReadOnlyConstraintStated reports whether the human request explicitly
+// declines a write. It delegates to the gateway so the constraint predicate has
+// exactly one call site (internal/execution/intent.go), as the semantic
+// boundary lock requires.
+func (a *ExecutorAdapter) ReadOnlyConstraintStated(prompt string) bool {
+	if a == nil || a.gateway == nil {
+		return false
+	}
+	return a.gateway.ReadOnlyConstraintStated(prompt)
+}

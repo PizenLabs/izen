@@ -158,6 +158,81 @@ func TestProvenance_SelfContainedAndNoneContractsDoNotDemandWorkspaceMaterial(t 
 	}
 }
 
+// TestProvenance_DeclaredCreationAcceptsAnAbsentTarget pins the CREATE contract
+// at the compiler layer: a target declared for creation is NAMED in the payload
+// (scope matches) without carrying pre-existing bytes, and a creation contract
+// accepts it. The absence is represented explicitly, not treated as a drop.
+func TestProvenance_DeclaredCreationAcceptsAnAbsentTarget(t *testing.T) {
+	compiler := New(WithMaxTokens(4000))
+	compiled, err := compiler.Compile(context.Background(), Input{
+		UserRequest:   "modification",
+		Phase:         PhaseExecute,
+		ContextPolicy: "target_file_only",
+		Scope:         "addtest.md",
+		Files: []FileContext{{
+			Path: "addtest.md", Size: 0, Content: "", Creation: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if len(compiled.AdmittedPaths) != 1 || compiled.AdmittedPaths[0] != "addtest.md" {
+		t.Fatalf("admitted paths = %v, want [addtest.md]", compiled.AdmittedPaths)
+	}
+	if len(compiled.CreationPaths) != 1 || compiled.CreationPaths[0] != "addtest.md" {
+		t.Fatalf("creation paths = %v, want [addtest.md] (absent-by-contract representation)", compiled.CreationPaths)
+	}
+
+	p := compiled.ValidateContextProvenance(IntentBinding{
+		Active: "modification", Required: IntentContextCreation,
+	}, []string{"addtest.md"})
+	if !p.Valid || !p.ScopeMatched {
+		t.Fatalf("creation provenance = %+v, want valid and scope-matched", p)
+	}
+	if len(p.MissingTargets) != 0 {
+		t.Fatalf("a declared creation target was reported missing: %v", p.MissingTargets)
+	}
+
+	// A creation contract still requires the target to be NAMED: a request for a
+	// target the payload does not carry is refused, exactly like any other scope.
+	other := compiled.ValidateContextProvenance(IntentBinding{
+		Active: "modification", Required: IntentContextCreation,
+	}, []string{"other.md"})
+	if other.Valid || other.ScopeMatched {
+		t.Fatalf("a creation contract accepted an un-named target: %+v", other)
+	}
+}
+
+// TestProvenance_CreationDeclarationDoesNotSatisfyTheWorkspaceContract pins the
+// boundary between the two contracts. A creation declaration is not workspace
+// material, so it can never satisfy a MODIFY (workspace) contract, even though
+// its rendered section is non-empty. CREATE is a distinct contract, not a
+// loophole in the modification one.
+func TestProvenance_CreationDeclarationDoesNotSatisfyTheWorkspaceContract(t *testing.T) {
+	compiler := New(WithMaxTokens(4000))
+	compiled, err := compiler.Compile(context.Background(), Input{
+		UserRequest:   "modification",
+		Phase:         PhaseExecute,
+		ContextPolicy: "target_file_only",
+		Scope:         "addtest.md",
+		Files: []FileContext{{
+			Path: "addtest.md", Size: 0, Content: "", Creation: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	p := compiled.ValidateContextProvenance(IntentBinding{
+		Active: "modification", Required: IntentContextWorkspace,
+	}, []string{"addtest.md"})
+	if p.Valid {
+		t.Fatalf("a creation declaration satisfied the workspace contract: %+v", p)
+	}
+	if p.WorkspaceMaterialPresent {
+		t.Fatalf("a creation declaration was reported as workspace material: %+v", p)
+	}
+}
+
 // TestProvenance_IntentRevisionDropsTheCachedProjection is INVARIANT 5 step 1
 // at the compiler layer: a blocking intent revision must invalidate every
 // payload compiled under the PREVIOUS intent, so a read-only projection can

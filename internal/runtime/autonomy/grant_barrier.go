@@ -57,6 +57,7 @@ import (
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/contextcompiler"
 	"github.com/PizenLabs/izen/internal/events"
+	"github.com/PizenLabs/izen/internal/execution"
 )
 
 // WorkspaceGrantCapabilities is the capability vector that unlocks a granted
@@ -275,8 +276,18 @@ func (d *Driver) syncGrantedWorkspaceContext(ctx context.Context) error {
 		d.grantContextSynced = true
 		return nil
 	}
+	// A DECLARED CREATION has no pre-existing workspace material to compile: the
+	// target is expected absent. Requiring bytes would make it impossible to
+	// create a file through the granted path, so the contract is the CREATION
+	// contract, which still requires the target to be NAMED (scope) while
+	// accepting the absence. Every other mutation keeps the workspace contract
+	// unchanged.
+	required := contextcompiler.IntentContextWorkspace
+	if d.objectiveSemantics().Operation == execution.OperationCreate {
+		required = contextcompiler.IntentContextCreation
+	}
 	provenance, err := d.adapter.RecompileGrantedIntentContext(ctx, targets,
-		string(autonomy.IntentModification), contextcompiler.IntentContextWorkspace)
+		string(autonomy.IntentModification), required)
 	if err != nil {
 		return fmt.Errorf("autonomy: granted workspace context re-compilation for %s: %w",
 			strings.Join(targets, ", "), err)

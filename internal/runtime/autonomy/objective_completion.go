@@ -145,6 +145,15 @@ func (d *Driver) taskContract() execution.TaskContract {
 		intent = string(autonomy.Classify(d.prompt, nil).Intent)
 	}
 	requiresMutation := autonomy.Classify(d.prompt, nil).RequiresMutation()
+	// An explicit human read-only constraint ("do not modify anything") removes
+	// mutation authority even when the objective contains a mutation verb. The
+	// classifier reads prompt TEXT and deliberately ignores the constraint (it
+	// also runs over runtime-composed prompts); the driver holds the human
+	// request and must honour it, or a read-only investigation is gated as a
+	// mutation and parks for a target it will never mutate.
+	if requiresMutation && d.adapter != nil && d.adapter.ReadOnlyConstraintStated(d.prompt) {
+		requiresMutation = false
+	}
 	// A lifecycle that carries an explicit mutation-strategy contract is
 	// mutation authority evidence regardless of how the wording classified: the
 	// executor was dispatched under a mutation contract, so the objective's

@@ -28,6 +28,13 @@ type ArtifactRef struct {
 	// Truncated marks a source-side read cap applied before compilation. It
 	// is surfaced in section telemetry and is fatal for required files.
 	Truncated bool
+	// Creation marks a target the runtime has DECLARED as a creation
+	// destination: it is expected to be ABSENT, and that absence is a truthful
+	// fact about the contract rather than a dropped read. A creation artifact
+	// is admitted to scope (the target is named) but carries no pre-existing
+	// workspace material, and provenance must not treat its emptiness as a
+	// violation. See IntentContextCreation.
+	Creation bool
 }
 
 // FileContext is the descriptive spelling used by new callers. ArtifactRef is
@@ -142,6 +149,13 @@ type CompiledContext struct {
 	// provenance gate reads: a requested target absent from this set was
 	// dropped, and no token arithmetic can substitute for it.
 	AdmittedPaths []string
+	// CreationPaths records the targets this compilation admitted as DECLARED
+	// CREATION destinations: named by the contract, expected absent, and
+	// therefore carried with an explicit "no existing content" representation
+	// rather than treated as a dropped read. They are a subset of AdmittedPaths
+	// (a creation target IS in scope); the separate set exists so a projection
+	// can tell an absent-by-contract target apart from an empty existing file.
+	CreationPaths []string
 	// Policy is the caller-selected context policy that produced this result.
 	Policy string
 
@@ -494,6 +508,9 @@ func (c *Compiler) Compile(ctx context.Context, in Input) (*CompiledContext, err
 			// about. Token counts stay telemetry; this set is the semantic
 			// truth the provenance gate reads.
 			out.AdmittedPaths = appendUniqueStrings(out.AdmittedPaths, file.Path)
+			if file.Creation {
+				out.CreationPaths = appendUniqueStrings(out.CreationPaths, file.Path)
+			}
 		}
 		if file.Truncated && strings.TrimSpace(file.Path) != "" {
 			out.TruncatedFiles = append(out.TruncatedFiles, file.Path)
@@ -841,6 +858,7 @@ func mergeFiles(groups ...[]ArtifactRef) []ArtifactRef {
 				}
 				out[idx].Critical = out[idx].Critical || file.Critical
 				out[idx].Truncated = out[idx].Truncated || file.Truncated
+				out[idx].Creation = out[idx].Creation || file.Creation
 				if file.Priority > out[idx].Priority {
 					out[idx].Priority = file.Priority
 				}
@@ -1242,6 +1260,9 @@ func renderCompact(cc *session.CompactContext) string {
 }
 
 func renderArtifactBlock(file ArtifactRef) string {
+	if file.Creation {
+		return fmt.Sprintf("### FILE: %s\n(new file — declared for creation; no existing content)", file.Path)
+	}
 	if file.Content == "" {
 		return fmt.Sprintf("%s (%d bytes)", file.Path, file.Size)
 	}
@@ -1392,7 +1413,7 @@ func (c *Compiler) fingerprint(in Input) string {
 	}
 	for _, file := range mergeFiles(in.Files, in.WorkspaceFiles, in.Artifacts) {
 		write(file.Path)
-		fmt.Fprintf(&b, "%d:%t:%t:%d\x00", file.Size, file.Critical, file.Truncated, file.Priority)
+		fmt.Fprintf(&b, "%d:%t:%t:%d:%t\x00", file.Size, file.Critical, file.Truncated, file.Priority, file.Creation)
 		write(file.Content)
 	}
 	for _, asset := range in.Knowledge {
@@ -1413,6 +1434,8 @@ func cloneCompiled(in *CompiledContext) *CompiledContext {
 	out := *in
 	out.Sections = append([]Section(nil), in.Sections...)
 	out.TruncatedFiles = append([]string(nil), in.TruncatedFiles...)
+	out.AdmittedPaths = append([]string(nil), in.AdmittedPaths...)
+	out.CreationPaths = append([]string(nil), in.CreationPaths...)
 	out.Exclusions = append([]string(nil), in.Exclusions...)
 	out.Budget.BySource = cloneSourceMap(in.Budget.BySource)
 	return &out

@@ -152,6 +152,36 @@ func TestBehaviorRequiredTargetsVerifiableObjectives(t *testing.T) {
 	}
 }
 
+// TestBehaviorRequiredIgnoresFilenameTokens is the regression for the
+// real-world CREATE defect: the objective "create new file named testing.md"
+// was read as behavioral because the filename contains "test", so the
+// behavioral gate tried to serve the workspace, found no entry document, and
+// downgraded a PROVEN CREATE to an unsubstantiated terminal.
+//
+// A target filename is not a verb. The objective's actual verbs still decide.
+func TestBehaviorRequiredIgnoresFilenameTokens(t *testing.T) {
+	// The reproduced defect: no behavioral verb exists outside the filename.
+	for _, objective := range []string{
+		"create new file named testing.md",
+		"create index.html",
+		"write the report to report_test.go",
+	} {
+		if BehaviorRequired(objective) {
+			t.Errorf("BehaviorRequired(%q) = true, want false: only the filename carries a keyword", objective)
+		}
+	}
+	// A real behavioral verb outside the filename must still engage the gate.
+	for _, objective := range []string{
+		"create testing.md and verify it renders",
+		"fix the greeting in @main.go",
+		"run the tests in test_utils.py",
+	} {
+		if !BehaviorRequired(objective) {
+			t.Errorf("BehaviorRequired(%q) = false, want true: a real behavioral verb is present", objective)
+		}
+	}
+}
+
 // ── the gate's authority properties ─────────────────────────────────────────
 
 // TestBehaviorGateCanOnlyRemoveACompletion is the single most important property

@@ -138,7 +138,7 @@ func conditionFactsFrom(ev ObjectiveEvidence) conditionFacts {
 		DeltaTargets:       toSet(ev.ObservedDeltaTargets),
 		Exists:             toSetMap(ev.TargetExists),
 		Absent:             toSetMap(ev.TargetAbsent),
-		Observations:       ev.WorkspaceObservations,
+		Observations:       ev.WorkspaceObservations + ev.RepositoryObservations,
 		PostMutation:       toSet(ev.PostMutationObserved),
 		VerifierSatisfied:  ev.verifierSatisfied(true),
 		VerificationPassed: ev.VerificationPassed,

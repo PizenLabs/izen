@@ -346,6 +346,16 @@ type ObjectiveEvidence struct {
 	// WorkspaceObservations counts the workspace observation / AST parse events
 	// this execution produced. It is the READ/REVIEW evidence of observation.
 	WorkspaceObservations int
+	// RepositoryObservations counts the workspace files the runtime admitted as
+	// READ-ONLY investigation context for an objective whose target was
+	// legitimately unknown (a targetless investigation / diagnosis).
+	//
+	// It is the observation evidence for a targetless read/review objective: the
+	// runtime observed the repository and the model reasoned from that observed
+	// material. It is EVIDENCE, never authority — it can satisfy the observation
+	// obligation, and it can never bind a mutation target, authorize a write, or
+	// stand in for the objective's own completion conditions.
+	RepositoryObservations int
 	// PreconditionSatisfied is a DETERMINISTIC PRE-EXECUTION determination that
 	// the objective's target state already held before this execution. It
 	// strengthens the recorded provenance; on its own it is NOT sufficient to
@@ -886,10 +896,20 @@ func responseSatisfied(ev ObjectiveEvidence) bool {
 	return ev.ResponseProduced || ev.StructuralNoOpConfirmed
 }
 
+// observedWorkspace reports whether the runtime holds authoritative evidence
+// that it actually observed the workspace for this objective: either a declared
+// target's bytes were read/projected, or a targetless investigation admitted
+// bounded repository material. It is the single predicate the READ/REVIEW
+// observation obligation consults, so the two evidence kinds can never be
+// satisfied by different, disagreeing rules.
+func observedWorkspace(ev ObjectiveEvidence) bool {
+	return ev.WorkspaceObservations >= 1 || ev.RepositoryObservations >= 1
+}
+
 // evaluateRead — READ: a required workspace observation event was produced AND
 // the response contract is satisfied. No mutation is required or permitted.
 func (a *ObjectiveCompletionAuthority) evaluateRead(contract TaskContract, ev ObjectiveEvidence) ObjectiveOutcome {
-	if contract.RequiresObservation && ev.WorkspaceObservations < 1 {
+	if contract.RequiresObservation && !observedWorkspace(ev) {
 		return ObjectiveUnsubstantiated
 	}
 	if contract.RequiresResponse && !responseSatisfied(ev) {
@@ -902,7 +922,7 @@ func (a *ObjectiveCompletionAuthority) evaluateRead(contract TaskContract, ev Ob
 // read. A review that produced no observation event (no workspace read, no AST
 // parse) is a review of nothing; the response contract alone is insufficient.
 func (a *ObjectiveCompletionAuthority) evaluateReview(contract TaskContract, ev ObjectiveEvidence) ObjectiveOutcome {
-	if contract.RequiresObservation && ev.WorkspaceObservations < 1 {
+	if contract.RequiresObservation && !observedWorkspace(ev) {
 		return ObjectiveUnsubstantiated
 	}
 	if contract.RequiresResponse && !responseSatisfied(ev) {
@@ -1064,8 +1084,8 @@ func unsatisfiedClause(contract TaskContract, ev ObjectiveEvidence) (string, str
 			return "target_present", "the declared target still exists after the delete mutation"
 		}
 	case TaskRead, TaskReview:
-		if contract.RequiresObservation && ev.WorkspaceObservations < 1 {
-			return "observation_missing", "no workspace observation event was produced for a read/review objective"
+		if contract.RequiresObservation && !observedWorkspace(ev) {
+			return "observation_missing", "no workspace observation event and no repository investigation evidence was produced for a read/review objective"
 		}
 		if contract.RequiresResponse && !responseSatisfied(ev) {
 			return "response_empty", "the execution produced no response and no structural verdict"
@@ -1324,6 +1344,7 @@ func ObjectiveEvidenceFromResult(res *ExecutionResult, pre TargetPreState) Objec
 	ev.VerificationSkipped = report.Skipped
 	if res.Proof != nil {
 		ev.WorkspaceObservations = res.Proof.WorkspaceObservations
+		ev.RepositoryObservations = res.Proof.RepositoryObservations
 		ev.StructuralNoOpConfirmed = res.Proof.Outcome == OutcomeNoOpObjectiveSatisfied
 	}
 	ev.ResponseProduced = res.Content != ""
