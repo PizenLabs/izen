@@ -199,12 +199,43 @@ func TestTruthMatrix_MalformedArtifactRejected(t *testing.T) {
 
 // ── 5. truncated artifact ───────────────────────────────────────────────────
 
+// TestTruthMatrix_TruncatedArtifactRejected pins that a genuinely truncated
+// generation is rejected: finish_reason=length is the AUTHORITATIVE truncation
+// signal at the transport boundary, so no artifact is staged and no file is
+// written.
+//
+// Body emptiness alone is NOT truncation — an explicit, terminated creation
+// envelope with an empty body is a legitimate empty-file creation (see
+// TestCreateEmptyEnvelopeCreatesEmptyFile).
 func TestTruthMatrix_TruncatedArtifactRejected(t *testing.T) {
 	root := t.TempDir()
 
-	// A new file whose "artifact" is a single line — the truncation guard
-	// rejects it at the apply boundary (never written to disk).
-	mock := &mockProvider{responses: []*ai.Response{{Content: "only one line\n"}}}
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "<<<<<<< FILE_CREATE new.txt\nalpha\n",
+		Usage:   ai.ProviderUsage{Known: true, PromptTokens: 10, CompletionTokens: 5, FinishReason: "length"},
+	}}}
+	x := phase4Executor(t, root, mock, nil)
+
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		Mode: "build", Prompt: "create new.txt", Target: "new.txt",
+	})
+	if err == nil || res == nil || res.Err == nil {
+		t.Fatalf("a truncated generation must fail: err=%v res.Err=%v", err, resErr(res))
+	}
+	if res.PendingPatchID != "" {
+		t.Fatal("a truncated generation must never reach the approval gate")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "new.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("a truncated generation must never be written: statErr=%v", statErr)
+	}
+}
+
+// TestTruthMatrix_ShortCreationAccepted is the corrected half: a complete but
+// short new-file artifact is a legitimate creation and is applied. Rejecting it
+// would force a model to emit filler purely to satisfy a heuristic.
+func TestTruthMatrix_ShortCreationAccepted(t *testing.T) {
+	root := t.TempDir()
+	mock := &mockProvider{responses: []*ai.Response{{Content: "hello\n"}}}
 	x := phase4Executor(t, root, mock, nil)
 
 	res, err := x.Execute(context.Background(), ExecuteRequest{
@@ -213,11 +244,11 @@ func TestTruthMatrix_TruncatedArtifactRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if _, err := x.Approve(context.Background(), res.PendingPatchID); err == nil {
-		t.Fatal("truncated artifact must fail the apply")
+	if _, err := x.Approve(context.Background(), res.PendingPatchID); err != nil {
+		t.Fatalf("approve short creation: %v", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(root, "new.txt")); !os.IsNotExist(statErr) {
-		t.Fatalf("truncated artifact must never be written: statErr=%v", statErr)
+	if got := mustRead(t, root, "new.txt"); got != "hello\n" {
+		t.Fatalf("short creation content = %q, want %q", got, "hello\n")
 	}
 }
 

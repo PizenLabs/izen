@@ -3807,28 +3807,33 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					target, parseErr)
 			}
 			modified = ResolveModifiedContent(original, raw)
+			// ── CREATE FROM A SEARCH/REPLACE PAYLOAD ────────────────────
+			// A model that answered a creation with a SEARCH/REPLACE envelope
+			// has no existing file to anchor against. Its REPLACE side is the
+			// new file's body; the envelope is the model's transport choice, not
+			// the artifact contract. Extract the body here so the staged
+			// candidate is clean and no anchor is invented for an absent target.
+			if original == "" && strings.Contains(verbatim, "<<<<<<< SEARCH") {
+				if body := creationBodyFromSearchReplace(ParseSearchReplaceBlocks(verbatim)); body != "" {
+					modified = body
+				}
+			}
 			// ANCHOR HONESTY UNDER A FULL-ARTIFACT CONTRACT. A provider that
 			// answered a "replace the file" contract with a SEARCH/REPLACE
 			// envelope did NOT produce a whole document; it produced a patch
 			// that names a destination region. If that region does not exist in
 			// the target, the model hallucinated the anchor.
 			//
-			// ResolveModifiedContent deliberately returns the ORIGINAL bytes when
-			// an unresolvable envelope is present (so raw markers can never be
-			// written into a user's file). That safety choice is correct, but on
-			// its own it converts "I could not anchor this" into "there is
-			// nothing to change" — a fabricated no-op that then opens an approval
-			// surface and asks a human to authorize a mutation of nothing.
-			//
-			// A no-op is a CLAIM and may only come from the NO_CHANGES_REQUIRED
-			// sentinel, which is structurally classified. An unanchorable patch is
-			// a FAILURE and is classified here, at the artifact boundary, before
-			// any candidate exists.
-			if _, anchorErr := classifyAnchors(original, verbatim); anchorErr != nil {
-				log.Printf("[execution] request=%s target=%s artifact_anchor=REJECTED reason=%q — no patch staged, no approval surface opened",
-					requestID, target, anchorErr)
-				return nil, invs, diffs, candidates, trace,
-					fmt.Errorf("%w: %w: %s: %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, anchorErr)
+			// It applies ONLY when there are existing bytes to anchor to: a
+			// creation has no region to hallucinate, and its REPLACE payload was
+			// already resolved above.
+			if original != "" {
+				if _, anchorErr := classifyAnchors(original, verbatim); anchorErr != nil {
+					log.Printf("[execution] request=%s target=%s artifact_anchor=REJECTED reason=%q — no patch staged, no approval surface opened",
+						requestID, target, anchorErr)
+					return nil, invs, diffs, candidates, trace,
+						fmt.Errorf("%w: %w: %s: %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, anchorErr)
+				}
 			}
 			if modified == "" {
 				// The payload carried a recognizable artifact but the content
