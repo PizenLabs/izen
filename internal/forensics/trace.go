@@ -641,6 +641,13 @@ func (t *Trace) detectPatterns() []string {
 	// calls AND zero mutations is the clearest instance: there is no observation
 	// from which completion could have been derived.
 	//
+	// The model-call test reads the RECONSTRUCTED trace's own invocation list as
+	// well as the summary scalar. The summary scalar is advisory (older runtimes
+	// leave it at zero), and a completed READ-ONLY investigation that billed
+	// invocations and observed the repository is not premature — reading only the
+	// summary would fire this pattern on exactly the truthful runs it is meant to
+	// protect.
+	//
 	// The verification clause is deliberately absent. "Zero verifications" is not
 	// itself evidence of a premature termination — a read-only run legitimately
 	// verifies nothing, and a run whose verification was legitimately skipped or
@@ -648,7 +655,7 @@ func (t *Trace) detectPatterns() []string {
 	// Folding that absence into the predicate would fire this pattern on correct
 	// runs, which is the same cry-wolf failure UNVERIFIED_MUTATION just had.
 	if t.Summary.Status == "completed" &&
-		t.Summary.ModelCalls == 0 && len(t.Mutations) == 0 {
+		len(t.ModelCalls) == 0 && t.Summary.ModelCalls == 0 && len(t.Mutations) == 0 {
 		out = append(out, PatternPrematureTermination)
 	}
 

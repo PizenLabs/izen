@@ -3598,6 +3598,14 @@ func (m *model) handleDomainEvent(ev events.DomainEvent) {
 			return
 		}
 		m.logActivity("[autonomy] %s: %s", strings.TrimPrefix(ev.Type(), "autonomous."), truncateForActivity(p.Reason))
+	case events.ObjectiveEvaluatedPayload:
+		// The completion authority's verdict is the AUTHORITATIVE objective
+		// state. The execution projection consumes it (above) so the completed
+		// state is gated on a real PROVEN verdict; the raw line is
+		// infrastructure telemetry, so it goes to the Trace overlay rather than
+		// the main narrative.
+		m.logRuntimeDetail("[objective] %s granted=%t clause=%s: %s",
+			p.State, p.Granted, p.UnmetClause, truncateForActivity(p.Reason))
 	}
 }
 

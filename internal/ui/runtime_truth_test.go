@@ -50,6 +50,7 @@ func TestProjectedEventTypesCoverEveryEventTheReducerRequires(t *testing.T) {
 		events.EventMutationCompleted:     "the stage dock's apply verdict",
 		events.EventVerificationCompleted: "the stage dock's validate verdict",
 		events.EventExecutionFinished:     "the terminal state reduction",
+		events.EventObjectiveEvaluated:    "the authoritative objective verdict that gates the completed state (Completed ⇔ PROVEN)",
 	}
 	for typ, why := range required {
 		if !subscribed[typ] {

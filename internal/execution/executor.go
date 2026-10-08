@@ -289,6 +289,13 @@ type ExecutionProof struct {
 	// a response-content heuristic can never establish that. Token counts are
 	// budget arithmetic and are deliberately NOT a substitute for this field.
 	WorkspaceObservations int `json:"workspace_observations"`
+	// RepositoryObservations counts the bounded repository files this execution
+	// admitted as READ-ONLY investigation context for an objective whose target
+	// is legitimately unknown. It is the observation provenance for a targetless
+	// investigation: the runtime read the repository and the model reasoned from
+	// that material. It is EVIDENCE, never authority — no repository file is
+	// bound as a mutation target, approved, or written.
+	RepositoryObservations int `json:"repository_observations,omitempty"`
 	// DiffSummary is the compact per-file diff accounting of the mutation
 	// (e.g. "index.html +12/-4").
 	DiffSummary []string `json:"diff_summary,omitempty"`
@@ -1245,6 +1252,54 @@ func (x *RuntimeExecutor) countWorkspaceObservations(targets []string) int {
 	return n
 }
 
+// maxInvestigationContextFiles bounds how many observed repository files one
+// targetless read-only investigation may admit as context. The bound is a
+// context-budget property, not an authority property: a truncated observation
+// set is still an observation, and it is recorded as a count rather than as a
+// claim to have seen the whole repository.
+const maxInvestigationContextFiles = 24
+
+// investigationContextTargets returns a bounded, deterministic set of OBSERVED
+// workspace files the runtime may admit as READ-ONLY investigation context for
+// an objective whose target is legitimately unknown.
+//
+// It is the counterpart of the declared-target read: a targetless investigation
+// still has to LOOK at the repository, or it answers from priors. Every path it
+// returns comes from bounded discovery, is read through the same snapshot cache
+// a declared target uses, and is NEVER bound as a mutation scope, approved or
+// written. Returning an empty slice keeps the previous behaviour exactly.
+//
+// A declared target set short-circuits this: a named target is already the
+// observation, and admitting repository material beside it would widen what the
+// model was shown beyond the scope the objective named.
+func (x *RuntimeExecutor) investigationContextTargets(profile strategy.ExecutionStrategyProfile, declared []string) []string {
+	if x == nil || len(declared) > 0 {
+		return nil
+	}
+	// Repository policy is the strategy's own declaration that it reasons over
+	// repository evidence without a declared target (repository_investigation,
+	// multi_file_planning). A target-file policy, a none policy and an APPLIED
+	// mutation never qualify.
+	if profile.Policy() != strategy.ContextPolicyRepository {
+		return nil
+	}
+	resolver := x.TargetResolver()
+	if resolver == nil {
+		return nil
+	}
+	paths := resolver.DiscoverProfile().CandidatePaths()
+	out := make([]string, 0, maxInvestigationContextFiles)
+	for _, p := range paths {
+		if len(out) >= maxInvestigationContextFiles {
+			break
+		}
+		if _, ok := x.getSnapshotContent(p); ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // ErrProviderModelMismatch is the deterministic error returned when the model
 // resolved for an invocation does not belong to the provider the executor is
 // bound to. It fires BEFORE any network call, so an OpenRouter model can never
@@ -1997,7 +2052,18 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 		// review objective actually looked at the workspace instead of
 		// answering from priors.
 		res.Proof.WorkspaceObservations = x.countWorkspaceObservations(targets)
-		content, invs, ingTrace, err := x.invokeReadOnly(ctx, req, requestID, profile, targets, g)
+		// A targetless read-only investigation has no declared target to read, so
+		// without repository material the model would answer from priors. Admit a
+		// bounded, deterministic set of OBSERVED repository files as READ-ONLY
+		// context and record the observation as evidence. The paths are never
+		// bound as a mutation target, never approved and never written.
+		investigation := x.investigationContextTargets(profile, targets)
+		contextTargets := targets
+		if len(investigation) > 0 {
+			contextTargets = append(append([]string(nil), targets...), investigation...)
+			res.Proof.RepositoryObservations = len(investigation)
+		}
+		content, invs, ingTrace, err := x.invokeReadOnly(ctx, req, requestID, profile, contextTargets, g)
 		if ingTrace != nil {
 			res.IngestionTrace = ingTrace
 		}

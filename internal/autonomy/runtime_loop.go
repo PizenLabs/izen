@@ -716,6 +716,14 @@ type LoopRequest struct {
 	IntentConfidence float64
 	TargetConfidence float64
 	Scope            string
+	// ReadOnly records that the HUMAN request explicitly declined workspace
+	// change ("do not modify anything"). It is derived ONCE by the driver from
+	// the single read-only-constraint authority (IntentGateway) and travels with
+	// the request so the dispatch contract guard cannot independently re-read a
+	// negated mutation verb ("Do not modify…") as a mutation request and force
+	// an authority ceiling violation. It never grants authority; it only removes
+	// a mutation obligation the human explicitly declined.
+	ReadOnly bool
 	// InteractionContract and Contract are Phase 12 G2 per-step protocol
 	// metadata. They describe the semantic turn; they do not grant provider
 	// tools or execution authority.

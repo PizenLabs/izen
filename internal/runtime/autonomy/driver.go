@@ -731,6 +731,12 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		// read-only authority and make the gate's verdict unprovable by
 		// construction.
 		Scope: d.scope,
+		// The human's explicit read-only constraint is a lifecycle fact, not a
+		// property of any one prompt string. Threading it onto the request keeps
+		// the dispatch contract guard consistent with the strategy gateway: a
+		// read-only investigation can never be refused (or forced into) a
+		// mutation merely because its text contains a negated change verb.
+		ReadOnly: d.adapter.ReadOnlyConstraintStated(objective),
 	}
 	// The durable execution record opens HERE: once the objective and its
 	// resolved targets are known, and before anything can be dispatched, so

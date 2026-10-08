@@ -173,14 +173,14 @@ var workspacePrimitives = map[string]string{
 //     workspace target exists, feeding execution. Strangle next.
 var knownExistenceBypasses = map[string]string{
 	"internal/ui/agents.go:624":                      "workspace-probe: does .izen exist",
-	"internal/ui/program.go:664":                     "workspace-probe: is the root a git repository",
+	"internal/ui/program.go:668":                     "workspace-probe: is the root a git repository",
 	"internal/ui/update_init.go:125":                 "workspace-probe: config file at boot",
 	"internal/ui/update_init.go:149":                 "workspace-probe: session slot at boot",
 	"internal/ui/update_init.go:169":                 "workspace-probe: git dir at boot",
 	"internal/ui/update_init.go:504":                 "workspace-probe: session slot during init",
 	"internal/ui/utils.go:63":                        "target-existence: @file composer expansion",
 	"internal/ui/utils.go:74":                        "target-existence: @file composer expansion",
-	"internal/execution/executor.go:1069":            "target-existence: workspace evidence for context compilation",
+	"internal/execution/executor.go:1076":            "target-existence: workspace evidence for context compilation",
 	"internal/execution/capability/serve.go:253":     "type-gate: refusing to serve a non-directory",
 	"internal/runtime/autonomy/adapter.go:777":       "target-existence: TargetExists/TargetAbsent evidence",
 	"internal/runtime/autonomy/adapter.go:800":       "target-existence: TargetExistence pre-dispatch evidence",

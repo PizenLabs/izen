@@ -456,6 +456,10 @@ func projectedEventTypes() []string {
 		events.EventMutationCompleted,
 		events.EventVerificationCompleted,
 		events.EventExecutionFinished,
+		// The runtime's AUTHORITATIVE objective verdict. It is the source of
+		// truth for "was the objective proven", and the UI consumes it so a
+		// completed state is shown only when the objective was actually PROVEN.
+		events.EventObjectiveEvaluated,
 		events.EventApprovalRequired,
 		events.EventApprovalRejected,
 		// Autonomy decision runtime events: every gate (auto_continue /

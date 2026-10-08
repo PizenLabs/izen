@@ -15,6 +15,8 @@
 package presentation
 
 import (
+	"strings"
+
 	"github.com/PizenLabs/izen/internal/events"
 )
 
@@ -133,6 +135,24 @@ type ExecutionProjection struct {
 	// narrative is the deterministic human/machine narrative layer. The UI
 	// reads it; it never authors narration text.
 	narrative *ExecutionNarrative
+	// objective is the authoritative completion verdict the runtime published
+	// for this execution (objective.evaluated). When observed it — not the raw
+	// execution.finished success flag — decides whether the projection may show
+	// a completed state. It is a projection of runtime truth, never a second
+	// authority.
+	objective objectiveVerdict
+	// lastFinished retains the terminal execution.finished payload so a late
+	// objective verdict can re-derive the terminal state without having to keep
+	// the whole event stream.
+	lastFinished *events.ExecutionFinishedPayload
+}
+
+// objectiveVerdict is the authoritative objective.evaluated projection.
+type objectiveVerdict struct {
+	observed bool
+	outcome  string
+	granted  bool
+	reason   string
 }
 
 // NewExecutionProjection returns an idle single-execution projection.
@@ -494,6 +514,8 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		if !p.matches(pl.RequestID) {
 			return
 		}
+		finished := pl
+		p.lastFinished = &finished
 		p.details.FinishedAt = ev.Timestamp()
 		p.state = p.terminalState(pl)
 		// The terminal sentence is the one narrative line whose truth depends on
@@ -501,6 +523,27 @@ func (p *ExecutionProjection) Project(ev events.DomainEvent) {
 		// projection — which holds the gate — supplies it. The narrative keeps
 		// the machine record either way, so the event stream is never falsified.
 		p.narrative.RewriteHuman(terminalSentence(p.state))
+	case events.ObjectiveEvaluatedPayload:
+		// The runtime's AUTHORITATIVE objective verdict. It is published after
+		// execution.finished (the executor seals and completes, then the driver's
+		// completion authority rules), so it typically ARRIVES LATE. Recording it
+		// and re-deriving a provisional terminal state is what makes
+		// `UI.Completed ⇔ ObjectiveState == PROVEN` structural rather than
+		// accidental: a read-only run that terminated "successfully" but was
+		// never proven can no longer be rendered as Completed.
+		if pl.RunID != "" && !p.matches(pl.RunID) {
+			return
+		}
+		p.objective = objectiveVerdict{
+			observed: true,
+			outcome:  pl.State,
+			granted:  pl.Granted,
+			reason:   pl.Reason,
+		}
+		if p.state.Phase.Terminal() && p.lastFinished != nil {
+			p.state = p.terminalState(*p.lastFinished)
+			p.narrative.RewriteHuman(terminalSentence(p.state))
+		}
 	case events.ExecutionFailedPayload:
 		// execution.failed may arrive before execution.finished; both are
 		// terminal transitions. The finished event carries the authoritative
@@ -545,6 +588,31 @@ func (p *ExecutionProjection) terminalState(pl events.ExecutionFinishedPayload) 
 		base.Phase = PhaseUnsubstantiated
 		base.Outcome = verdict.Reason
 		return base
+	}
+	// The authoritative objective verdict, when the runtime published one, is the
+	// ONLY licence for a completed state. The execution gate above is necessary
+	// for the workspace claim, but it does not answer "was the objective
+	// achieved": that is the completion authority's ruling. Requiring it is what
+	// makes UI.Completed ⇔ ObjectiveState == PROVEN structural.
+	if p.objective.observed {
+		switch {
+		case p.objective.granted && strings.EqualFold(p.objective.outcome, "PROVEN"):
+			base.Phase = PhaseCompleted
+			base.Outcome = "completed"
+			return base
+		case strings.EqualFold(p.objective.outcome, "FAILED"):
+			base.Phase = PhaseFailed
+			base.Outcome = "failed"
+			return base
+		default:
+			base.Phase = PhaseUnsubstantiated
+			reason := p.objective.reason
+			if strings.TrimSpace(reason) == "" {
+				reason = "the objective was not proven by evidence"
+			}
+			base.Outcome = reason
+			return base
+		}
 	}
 	base.Phase = PhaseCompleted
 	base.Outcome = pl.Outcome
