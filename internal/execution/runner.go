@@ -327,7 +327,13 @@ func (r *Runner) run(ctx context.Context, command, dir string) (*RunResult, erro
 		_ = r.budget.Consume(budget.BudgetDelta{ShellCmds: 1})
 	}
 
-	markAuthConsumed(r.auth)
+	// A grant whose scope is a whole MUTATION OPERATION is not consumed by an
+	// individual shell command: verification is part of that operation and a
+	// multi-step verifier must be able to run every step under the one grant.
+	// Only a capability-invocation grant is consumed here.
+	if r.auth.ConsumesPerInvocation() {
+		markAuthConsumed(r.auth)
+	}
 	return result, nil
 }
 

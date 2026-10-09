@@ -135,7 +135,8 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 	// A creation verb over an EXISTING target is untouched: "add a comment to
 	// @file.go" names a target that exists, so it stays a modification. The
 	// existence evidence, not the verb alone, is what separates the two.
-	if op != OperationCreate && isDeclaredCreation(raw, parsed, targets) {
+	declaredCreation := isDeclaredCreation(raw, parsed, targets)
+	if op != OperationCreate && declaredCreation {
 		op = OperationCreate
 	}
 
@@ -260,10 +261,26 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 	}
 
 	// ── 4. Explicit target(s) → targeted execution ────────────────────
-	if len(explicit) > 0 || (op == OperationCreate && len(explicitSyntax) > 0) {
+	// "Explicit" means the target was NAMED by the request and is therefore
+	// authoritative, whether it was written with @scope syntax or as a bare
+	// filename in prose ("create a file named testfile.md"). For a declared
+	// creation those named destinations do not exist yet, so they never appear
+	// in `explicit` (which is existence-gated); `explicitSyntax` covers the
+	// @scope spelling and `declaredCreation` covers the prose spelling. Binding
+	// them here is what stops a primitive creation from falling through to
+	// repository-level planning — a path that inflates the output budget shape
+	// (plan) and then forces the creation into a bounded SEARCH/REPLACE
+	// contract that has no anchor because the file does not exist.
+	if len(explicit) > 0 ||
+		(op == OperationCreate && (len(explicitSyntax) > 0 || declaredCreation)) {
 		named := explicit
 		if len(named) == 0 {
 			named = explicitSyntax
+		}
+		if len(named) == 0 {
+			// A declared creation names only absent destinations; those are the
+			// authoritative targets.
+			named = missing
 		}
 		switch {
 		case op == OperationExplain:
@@ -550,7 +567,16 @@ func collectTargets(parsed *parser.IntentAST, raw string, deps Deps) ([]Target, 
 }
 
 // extractBareTargets finds prose-mentioned filenames (no @ prefix).
+//
+// QUOTED / CODE-QUOTED NAMES. A human names a target inside backticks or quotes
+// as often as bare ("Create a file named `zuru.md`"). The delimiters are not
+// part of the path, but they were left on the token, so `.md` never matched the
+// extension table and an explicitly named creation target was invisible. The
+// delimiters are normalized to spaces before the field split, exactly as the
+// autonomy classifier does, so both target-resolution authorities agree on a
+// name the user actually wrote.
 func extractBareTargets(raw string) []string {
+	raw = normalizeBareTargetDelimiters(raw)
 	lower := strings.ToLower(raw)
 	var names []string
 	seen := map[string]bool{}
@@ -579,6 +605,21 @@ func extractBareTargets(raw string) []string {
 		}
 	}
 	return names
+}
+
+// normalizeBareTargetDelimiters replaces quote and code-span delimiters with
+// spaces so a quoted / code-quoted filename presents the same word boundary as
+// a bare one. Only delimiters are touched.
+func normalizeBareTargetDelimiters(raw string) string {
+	return strings.NewReplacer(
+		"`", " ",
+		`"`, " ",
+		"'", " ",
+		"\u2018", " ",
+		"\u2019", " ",
+		"\u201c", " ",
+		"\u201d", " ",
+	).Replace(raw)
 }
 
 // isBareKnown reports whether the lowercased word is a conventional filename.

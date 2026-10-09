@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/config"
 	"github.com/PizenLabs/izen/internal/core/workflow"
@@ -71,6 +72,19 @@ type Task struct {
 	// "discovery is blocked" from "the downstream chain is broken"; the main
 	// arms leave it empty so discovery stays the runtime's job.
 	ClarifyAnswer string
+
+	// Surface is the command surface the run is admitted under: "$prompt"
+	// (default), "$build" (an ordinary prompt inside /build), or "$hot". It is
+	// the same value the TUI hands the driver via SetScope, so a live arm can
+	// exercise a specific entry point's authority without driving the TUI.
+	Surface string
+
+	// Provider, when non-nil, overrides the default local Ollama provider for
+	// this task. It lets the benchmark drive the EXACT configured production
+	// provider (e.g. OpenRouter) without changing the composition.
+	Provider ai.Provider
+	// Config, when non-nil, replaces config.Default() in the wiring.
+	Config *config.Config
 }
 
 // requireLiveModel skips unless the operator opted in AND a local model server
@@ -136,16 +150,26 @@ func provision(t *testing.T, task Task) string {
 	return root
 }
 
-func wireApp(t *testing.T, root, objective string) *compose.Application {
+// wireAppForTask is wireApp with an optional provider/config override so the
+// benchmark can drive the exact configured production provider.
+func wireAppForTask(t *testing.T, root string, task Task) *compose.Application {
 	t.Helper()
-	cfg := config.Default()
-	cfg.Bindings.Active.Provider = "ollama"
-	cfg.Bindings.Active.Model = liveModel
-	app, err := compose.Wire(
+	cfg := task.Config
+	if cfg == nil {
+		cfg = config.Default()
+		cfg.Bindings.Active.Provider = "ollama"
+		cfg.Bindings.Active.Model = liveModel
+	}
+	opts := []compose.Option{
 		compose.WithRoot(root),
 		compose.WithConfig(cfg),
-		compose.WithProvider(providers.NewOllamaProvider(liveBaseURL, "ollama", liveModel)),
-	)
+	}
+	if task.Provider != nil {
+		opts = append(opts, compose.WithProvider(task.Provider))
+	} else {
+		opts = append(opts, compose.WithProvider(providers.NewOllamaProvider(liveBaseURL, "ollama", liveModel)))
+	}
+	app, err := compose.Wire(opts...)
 	if err != nil {
 		t.Fatalf("wire: %v", err)
 	}
@@ -156,7 +180,7 @@ func wireApp(t *testing.T, root, objective string) *compose.Application {
 	}
 	app.Runtime.Start()
 	if err := app.Runtime.Execute(context.Background(),
-		appruntime.SubmitPromptCmd{Prompt: objective, Mode: "build"}); err != nil {
+		appruntime.SubmitPromptCmd{Prompt: task.Prompt, Mode: "build"}); err != nil {
 		t.Fatalf("SubmitPromptCmd (production preflight dispatch): %v", err)
 	}
 	return app
@@ -306,13 +330,19 @@ func run(t *testing.T, task Task) *RunRecord {
 	root := provision(t, task)
 	before := snapshot(t, root)
 
-	app := wireApp(t, root, task.Prompt)
+	app := wireAppForTask(t, root, task)
 
 	rec := forensics.NewRecorder()
 	sub := app.Bus.SubscribeAll(rec.Handle)
 
 	d := app.Autonomous
-	d.SetScope("$prompt") // the EXACT production call runAutonomousDriver makes
+	// The EXACT production call runAutonomousDriver makes: the recorded command
+	// surface of the admitting entry point ($prompt / $build / $hot).
+	surface := task.Surface
+	if surface == "" {
+		surface = "$prompt"
+	}
+	d.SetScope(surface)
 
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)

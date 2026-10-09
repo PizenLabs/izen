@@ -149,7 +149,13 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 	// presentation layer. The driver derives the behavioral completion gate's
 	// capability vector from it, so a run that received an empty scope would
 	// silently execute under read-only authority and could never prove a result.
-	m.autonomousDriver.SetScope(m.scopeProvenanceDirective())
+	// The recorded command SURFACE wins ("$prompt" / "$build" / "$hot") so the
+	// run's command axis is truthful and `/build` is not relabelled as `$prompt`.
+	surface := m.executionSurface
+	if surface == "" {
+		surface = m.scopeProvenanceDirective()
+	}
+	m.autonomousDriver.SetScope(surface)
 	m.beginOperation(OpAutonomous)
 	m.agentLabel = ""
 	m.startShimmer("", "autonomy")

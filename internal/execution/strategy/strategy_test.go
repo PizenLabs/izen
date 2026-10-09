@@ -374,14 +374,22 @@ func TestSelectDeclaredCreationBindsAnAbsentTarget(t *testing.T) {
 		"add a file named addtest.md",
 		"create addtest.md",
 		"write a new file addtest.md",
+		"Create a file named testfile.md with the content 'Hello World'.",
+		"create a new file named tata.txt containing \"hello\"",
 	} {
 		p := Select(prompt, d)
 		if p.Strategy == HumanClarification {
 			t.Fatalf("%q: declared creation was sent to clarification (reason: %s)", prompt, p.StrategyReason)
 		}
+		if p.Strategy != TargetedMutation {
+			t.Fatalf("%q: strategy = %s, want targeted_mutation (reason: %s)", prompt, p.Strategy, p.StrategyReason)
+		}
+		if p.Artifact.Kind != "create_file" {
+			t.Fatalf("%q: artifact = %s, want create_file", prompt, p.Artifact.Kind)
+		}
 		found := false
 		for _, target := range p.Targets {
-			if target.Resolved == "addtest.md" {
+			if target.Resolved == "addtest.md" || target.Resolved == "testfile.md" || target.Resolved == "tata.txt" {
 				found = true
 			}
 		}

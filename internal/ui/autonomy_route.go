@@ -76,6 +76,7 @@ func (m *model) routeHotfixThroughAutonomy(objective string) tea.Cmd {
 		return nil
 	}
 	m.bindScopeProvenance(intentdomain.ScopeDeclared)
+	m.executionSurface = "$hot"
 	if m.autonomy == nil {
 		// Legacy compatibility: no decision runtime wired — fall back to the
 		// unified IntentGateway, which decides the execution path deterministically.

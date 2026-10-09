@@ -84,6 +84,43 @@ const (
 	ArtifactContractUnknown ArtifactContractKind = "UNKNOWN"
 )
 
+// Artifact-contract placeholders. They describe the slot the model must fill;
+// they are DELIBERATELY NOT angle-bracketed. An earlier form wrapped each slot
+// in "<…>", which made it look exactly like an HTML element: a model that
+// copied the placeholder verbatim produced a payload the ingestion classifier
+// treated as an unbalanced HTML tag and "repaired" by appending synthetic
+// closing tags — corrupting a Markdown/plain artifact. Square brackets are not
+// valid markup, so a copied placeholder can never trip markup repair, and the
+// placeholder text is detectable as an explicit contract-echo failure.
+const (
+	artifactPlaceholderCreate  = "the COMPLETE new file content, every line of it"
+	artifactPlaceholderSearch  = "consecutive lines copied BYTE-FOR-BYTE from"
+	artifactPlaceholderReplace = "the replacement lines"
+	artifactPlaceholderFile    = "the COMPLETE replacement content of"
+)
+
+// artifactPlaceholderMarkers are the distinctive slot descriptions a compliant
+// model must REPLACE. Their presence in a final artifact means the model echoed
+// the instruction instead of satisfying it — an explicit failure, never content.
+var artifactPlaceholderMarkers = []string{
+	artifactPlaceholderCreate,
+	artifactPlaceholderSearch,
+	artifactPlaceholderFile,
+}
+
+// isArtifactPlaceholderEcho reports whether a payload still carries the
+// artifact-contract placeholder verbatim, i.e. the model republished the
+// instruction instead of the artifact. Such a payload is NOT valid content: it
+// must be rejected explicitly, never silently "repaired" into a file.
+func isArtifactPlaceholderEcho(payload string) bool {
+	for _, m := range artifactPlaceholderMarkers {
+		if strings.Contains(payload, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // StrictArtifactContractInstruction builds the EXPLICIT, NON-AMBIGUOUS system
 // instruction that forces the provider to emit a recognized structural artifact
 // block for a CREATE / PATCH / FILE contract.
@@ -109,17 +146,17 @@ func StrictArtifactContractInstruction(kind ArtifactContractKind, target string)
 	switch kind {
 	case ArtifactContractCreate:
 		envelope = "<<<<<<< FILE_CREATE " + name + "\n" +
-			"<the COMPLETE new file content, every line of it>\n" +
+			artifactPlaceholderCreate + "\n" +
 			">>>>>>> END_FILE"
 	case ArtifactContractPatch:
 		envelope = "<<<<<<< SEARCH\n" +
-			"<consecutive lines copied BYTE-FOR-BYTE from " + name + ">\n" +
+			"[" + artifactPlaceholderSearch + " " + name + "]\n" +
 			"=======\n" +
-			"<the replacement lines>\n" +
+			"[" + artifactPlaceholderReplace + "]\n" +
 			">>>>>>> REPLACE"
 	case ArtifactContractFile:
 		envelope = "```" + name + "\n" +
-			"<the COMPLETE replacement content of " + name + ">\n" +
+			"[" + artifactPlaceholderFile + " " + name + "]\n" +
 			"```"
 	default:
 		// An unknown contract injects nothing rather than guessing: a wrong
