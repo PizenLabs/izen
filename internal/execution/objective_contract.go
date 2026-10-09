@@ -404,6 +404,12 @@ type ObjectiveDerivation struct {
 	Request string
 	// Kind is the canonical task contract kind.
 	Kind TaskKind
+	// Intent is the canonical user-intent label the lifecycle classified the
+	// request under (e.g. "conversation"). It selects the runtime-authored
+	// obligation set for a read-only objective: a pure conversation has no
+	// workspace to observe, so its contract drops the observation obligation.
+	// Empty preserves the observation obligation (fail-closed).
+	Intent string
 	// Operation is the semantic operation the objective intends. When empty it
 	// is derived from Kind. It is an explicit input so a caller that already
 	// classified the operation does not have to round-trip it through the
@@ -483,7 +489,7 @@ func DeriveObjectiveContract(in ObjectiveDerivation) ObjectiveContract {
 	contract.Requirements = admitRequirements(in.Proposals, in.Request, scope, clauses)
 
 	// ── 3 — the runtime's own obligations ────────────────────────────
-	contract.Conditions = authorRuntimeConditions(in.Kind, scope)
+	contract.Conditions = authorRuntimeConditions(in.Kind, scope, in.Intent)
 
 	// …then the obligations the admitted model requirements add.
 	for _, r := range contract.Requirements {
@@ -505,9 +511,12 @@ func DeriveObjectiveContract(in ObjectiveDerivation) ObjectiveContract {
 }
 
 // authorRuntimeConditions builds the obligations the runtime owns. They are a
-// function of the task contract KIND and the resolved SCOPE only — never of the
-// size, shape or domain of the change.
-func authorRuntimeConditions(kind TaskKind, scope []string) []CompletionCondition {
+// function of the task contract KIND, the resolved SCOPE and the classified
+// INTENT only — never of the size, shape or domain of the change. Intent is
+// consulted for exactly one case: a pure conversational objective has no
+// workspace to observe, so its read-only contract omits the observation
+// obligation and is judged by the delivered response alone.
+func authorRuntimeConditions(kind TaskKind, scope []string, intent string) []CompletionCondition {
 	cond := func(id, desc string, ob Obligation, targets []string) CompletionCondition {
 		return CompletionCondition{
 			ID:                id,
@@ -561,13 +570,20 @@ func authorRuntimeConditions(kind TaskKind, scope []string) []CompletionConditio
 				ObligationIntegrityHeld, scopeCopy),
 		}
 	case TaskRead, TaskReview:
-		return []CompletionCondition{
-			cond("cond-observed",
-				"the declared scope was observed, not answered from priors", ObligationObserved, scopeCopy),
-			cond("cond-response-delivered",
-				"a response (or a deterministic structural verdict) was delivered",
-				ObligationResponseDelivered, nil),
+		observed := cond("cond-observed",
+			"the declared scope was observed, not answered from priors", ObligationObserved, scopeCopy)
+		response := cond("cond-response-delivered",
+			"a response (or a deterministic structural verdict) was delivered",
+			ObligationResponseDelivered, nil)
+		// A pure conversation has no workspace to observe. Requiring an
+		// observation would make every greeting unprovable by construction, so
+		// the conversation contract is judged by the delivered response alone.
+		// Every other read-only objective (explanation, investigation, review)
+		// keeps the observation obligation and still fails closed without one.
+		if strings.EqualFold(strings.TrimSpace(intent), "conversation") {
+			return []CompletionCondition{response}
 		}
+		return []CompletionCondition{observed, response}
 	case TaskIdempotent:
 		return []CompletionCondition{
 			cond("cond-post-mutation-reinspected",

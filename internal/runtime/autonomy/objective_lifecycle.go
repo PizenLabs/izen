@@ -154,6 +154,7 @@ func (d *Driver) objectiveContract() execution.ObjectiveContract {
 		ObjectiveID: d.runRequestID,
 		Request:     d.prompt,
 		Kind:        d.taskContract().Kind,
+		Intent:      d.lifecycleIntent(),
 		Scope:       d.objectiveTargets(),
 		Proposals:   d.objective.proposals,
 	})

@@ -562,8 +562,10 @@ var reviewIntents = map[string]bool{
 //     (pre-execution determination or the executor's NO-OP structural verdict)
 //     → IDEMPOTENT
 //  4. any other mutation objective        → PATCH
-//  5. a review-classified read-only intent → REVIEW
-//  6. any other read-only intent           → READ
+//  5. a conversational objective           → READ (response only; no workspace
+//     observation, because a conversation has no workspace)
+//  6. a review-classified read-only intent → REVIEW
+//  7. any other read-only intent           → READ
 //
 // A mutation objective that names NO target (target DEFERRED) takes rule 4, not
 // rule 2: an unresolved target is not evidence of a new artifact. Discovery
@@ -653,7 +655,27 @@ func DeriveTaskContract(in TaskClassification) TaskContract {
 		return contract
 	}
 
-	// 5/6 — read-only contracts: the deliverable is the delivered response, and
+	// 5 — CONVERSATION: a pure conversational exchange has NO workspace to
+	// observe. Its objective is delivered the moment the runtime produced a
+	// response, so it is judged by the RESPONSE obligation alone. Requiring a
+	// workspace observation would make every greeting unprovable by
+	// construction — the runtime would refuse completion for a request that
+	// never had a workspace.
+	//
+	// This is NOT "assume success". The contract stays evidence-bound: the
+	// observation obligation is dropped, but the response obligation is kept,
+	// and ResponseProduced is a runtime-observed fact (non-empty delivered
+	// bytes), never the model's self-report. Conversation is the ONLY intent
+	// with no workspace (autonomy.Intent.RequiresWorkspace), so this clause can
+	// never leak to a read/investigation/review objective that must look.
+	if strings.EqualFold(strings.TrimSpace(in.Intent), "conversation") {
+		contract.Kind = TaskRead
+		contract.RequiresResponse = true
+		contract.RequiresObservation = false
+		return contract
+	}
+
+	// 6/7 — read-only contracts: the deliverable is the delivered response, and
 	// the evidence that the model actually looked at the workspace.
 	contract.RequiresResponse = true
 	contract.RequiresObservation = true

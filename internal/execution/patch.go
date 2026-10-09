@@ -99,6 +99,24 @@ type Patch struct {
 	// the exact bytes committed. It is never set on an unresolved payload: a
 	// non-canonical patch still goes through the full envelope/diff resolution.
 	Canonical bool `json:"canonical,omitempty"`
+	// Resolved reports that Modified ALREADY holds the runtime's final,
+	// apply-ready content for an EXISTING target: the executor resolved the
+	// payload (SEARCH/REPLACE, unified diff, bounded patch, full artifact) to
+	// the exact bytes the mutation will write, and the human reviewed and the
+	// authorization digested those same bytes. Apply must therefore write them
+	// verbatim, never re-run the protocol cascade. Re-resolving a resolved
+	// patch is not a harmless idempotence step: SanitizeLLMResponse can strip a
+	// legitimate reviewed line (one beginning "FILE:", a stray "```", ...), so
+	// the bytes committed would differ from the bytes approved and digested —
+	// the exact approved-content/applied-content divergence the canonical bit
+	// removes for envelope creations, here removed for every resolved mutation.
+	//
+	// It is distinct from Canonical: a Canonical patch is an addressed
+	// creation/contract envelope whose own header names the file, while a
+	// Resolved patch has already been resolved to content by the executor
+	// against a known target. A raw protocol payload staged by a legacy
+	// PatchManager caller leaves both unset and resolves through the cascade.
+	Resolved bool `json:"resolved,omitempty"`
 }
 
 type PatchManager struct {
@@ -840,62 +858,88 @@ func (pm *PatchManager) apply(ctx context.Context, patch *Patch) error {
 		return pm.store(patch)
 	}
 
-	// SanitizeLLMResponse: strip hallucinated metadata (FILE: lines, [target]
-	// markers, stray code fences) that local models inject inside code blocks
-	// before the content enters the diff parser or file write path. This runs
-	// only on the non-envelope path: a creation envelope was already extracted
-	// from the raw payload above.
-	patch.Modified = SanitizeLLMResponse(patch.Modified)
+	// ── APPLY-READY CONTENT ─────────────────────────────────────────────
+	// A patch the runtime executor already RESOLVED at staging carries its final
+	// apply-ready bytes in Modified — the same bytes the human reviewed and the
+	// authorization's digest bound. Writing them verbatim is what makes
+	// "approved" and "applied" one object; re-running the protocol cascade here
+	// would let SanitizeLLMResponse strip a legitimate reviewed line and commit
+	// bytes nobody saw.
+	//
+	// A patch with no Resolved marker is a raw protocol payload staged by a
+	// legacy PatchManager caller: it resolves through the full cascade below.
+	var final string
+	var patchErr error
+	if patch.Resolved {
+		// Run the apply boundary's SAFETY predicates (ambiguous snippet, raw
+		// protocol residue, truncation) by resolving a COPY, then DISCARD the
+		// resolved output. The approved bytes are written verbatim: the
+		// resolver is used here purely as a validator, never as a rewriter, so
+		// applying a reviewed patch can never substitute different content.
+		probe := *patch
+		if _, probeErr := pm.resolvePatchContent(patch.Original, patch.Modified, &probe); probeErr != nil {
+			patchErr = probeErr
+		} else {
+			final = patch.Modified
+		}
+	} else {
+		// SanitizeLLMResponse: strip hallucinated metadata (FILE: lines, [target]
+		// markers, stray code fences) that local models inject inside code blocks
+		// before the content enters the diff parser or file write path. This runs
+		// only on the non-envelope path: a creation envelope was already extracted
+		// from the raw payload above.
+		patch.Modified = SanitizeLLMResponse(patch.Modified)
 
-	// SplitAndFilterPatches: strip hunks targeting other files from the raw
-	// LLM diff output before passing it to the patching engine. This handles
-	// multi-file context bleeding where the model hallucinates hunks for
-	// unrelated files within a single code block.
-	diffInput := SplitAndFilterPatches(patch.Modified, patch.File)
+		// SplitAndFilterPatches: strip hunks targeting other files from the raw
+		// LLM diff output before passing it to the patching engine. This handles
+		// multi-file context bleeding where the model hallucinates hunks for
+		// unrelated files within a single code block.
+		diffInput := SplitAndFilterPatches(patch.Modified, patch.File)
 
-	// Resolve the final file content through the strategy cascade (unified
-	// diff → SEARCH/REPLACE blocks → legacy content block → full content).
-	// `patch.Original` holds the exact bytes freshly read from disk, so every
-	// SEARCH/hunk context is matched against the true current file content.
-	final, patchErr := pm.resolvePatchContent(patch.Original, diffInput, patch)
+		// Resolve the final file content through the strategy cascade (unified
+		// diff → SEARCH/REPLACE blocks → legacy content block → full content).
+		// `patch.Original` holds the exact bytes freshly read from disk, so every
+		// SEARCH/hunk context is matched against the true current file content.
+		final, patchErr = pm.resolvePatchContent(patch.Original, diffInput, patch)
 
-	// ── FRESH CONTEXT RETRY (ONCE) ──────────────────────────────────────
-	// When a patch fails to match its SEARCH/hunk context, the file may have
-	// changed between when the caller captured `patch.Original` and now (e.g.
-	// a sibling mutation in the same batch, or an external editor save).
-	// Re-read the exact bytes from disk and re-attempt the resolution ONCE
-	// before reporting a failure.
-	if patchErr != nil {
-		if data, err := os.ReadFile(fullPath); err == nil && string(data) != patch.Original {
-			patch.Original = string(data)
-			if retried, rerr := pm.resolvePatchContent(patch.Original, diffInput, patch); rerr == nil {
-				final = retried
-				patchErr = nil
-				if globalActivityLog != nil {
-					globalActivityLog("[patch] Context refresh on %s: re-read file and re-resolved patch successfully", patch.File)
+		// ── FRESH CONTEXT RETRY (ONCE) ──────────────────────────────────────
+		// When a patch fails to match its SEARCH/hunk context, the file may have
+		// changed between when the caller captured `patch.Original` and now (e.g.
+		// a sibling mutation in the same batch, or an external editor save).
+		// Re-read the exact bytes from disk and re-attempt the resolution ONCE
+		// before reporting a failure.
+		if patchErr != nil {
+			if data, err := os.ReadFile(fullPath); err == nil && string(data) != patch.Original {
+				patch.Original = string(data)
+				if retried, rerr := pm.resolvePatchContent(patch.Original, diffInput, patch); rerr == nil {
+					final = retried
+					patchErr = nil
+					if globalActivityLog != nil {
+						globalActivityLog("[patch] Context refresh on %s: re-read file and re-resolved patch successfully", patch.File)
+					}
 				}
 			}
 		}
-	}
 
-	// ── FORCED FULL-CONTENT FALLBACK (≤50KB) ──────────────────────────
-	// If both attempts still failed to match and the target file is small
-	// (≤ MaxFullContentRewriteBytes, e.g. index.html), a ≤50KB file edit
-	// NEVER aborts with a hunk-mismatch error when the patch payload carries
-	// a valid full replacement text. Write that replacement payload as the
-	// full file content unconditionally. Only an ambiguous-snippet rejection
-	// (ErrInvalidPatchFormat) still short-circuits here so the build agent
-	// can retry with properly formatted SEARCH/REPLACE markers.
-	if patchErr != nil &&
-		!errors.Is(patchErr, ErrInvalidPatchFormat) &&
-		patch.Original != "" &&
-		len(patch.Original) <= MaxFullContentRewriteBytes {
-		if resolved, ok := forcedFullContentFallback(patch.Original, diffInput); ok {
-			if globalActivityLog != nil {
-				globalActivityLog("[patch] SEARCH mismatch — forced full-content fallback applied on %s (%d bytes)", patch.File, len(resolved))
+		// ── FORCED FULL-CONTENT FALLBACK (≤50KB) ──────────────────────────
+		// If both attempts still failed to match and the target file is small
+		// (≤ MaxFullContentRewriteBytes, e.g. index.html), a ≤50KB file edit
+		// NEVER aborts with a hunk-mismatch error when the patch payload carries
+		// a valid full replacement text. Write that replacement payload as the
+		// full file content unconditionally. Only an ambiguous-snippet rejection
+		// (ErrInvalidPatchFormat) still short-circuits here so the build agent
+		// can retry with properly formatted SEARCH/REPLACE markers.
+		if patchErr != nil &&
+			!errors.Is(patchErr, ErrInvalidPatchFormat) &&
+			patch.Original != "" &&
+			len(patch.Original) <= MaxFullContentRewriteBytes {
+			if resolved, ok := forcedFullContentFallback(patch.Original, diffInput); ok {
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] SEARCH mismatch — forced full-content fallback applied on %s (%d bytes)", patch.File, len(resolved))
+				}
+				final = resolved
+				patchErr = nil
 			}
-			final = resolved
-			patchErr = nil
 		}
 	}
 

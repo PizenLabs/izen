@@ -129,6 +129,21 @@ func (d *Driver) allTargetsExistedBefore(targets []string) bool {
 	return true
 }
 
+// lifecycleIntent is the canonical intent label of the current lifecycle: the
+// executor-observed intent when one was recorded, else the deterministic
+// classification of the prompt. It is the SAME value taskContract() consumes,
+// so the execution-shape contract and the objective completion contract can
+// never classify the request differently.
+func (d *Driver) lifecycleIntent() string {
+	if d == nil {
+		return ""
+	}
+	if s := string(d.obs.Intent); s != "" {
+		return s
+	}
+	return string(autonomy.Classify(d.prompt, nil).Intent)
+}
+
 // taskContract derives the ONE canonical TaskContract of the current lifecycle.
 //
 // The intent that decides the contract is the CANONICAL resolved intent, not the
@@ -140,10 +155,7 @@ func (d *Driver) taskContract() execution.TaskContract {
 	}
 	targets := d.objectiveTargets()
 	ev := d.obs.Objective
-	intent := string(d.obs.Intent)
-	if intent == "" {
-		intent = string(autonomy.Classify(d.prompt, nil).Intent)
-	}
+	intent := d.lifecycleIntent()
 	requiresMutation := autonomy.Classify(d.prompt, nil).RequiresMutation()
 	// An explicit human read-only constraint ("do not modify anything") removes
 	// mutation authority even when the objective contains a mutation verb. The
@@ -328,6 +340,14 @@ func (d *Driver) scopeProvenance() domain.ScopeProvenance {
 	// `izen orchestrate`). It is a runtime-resolved dynamic mutation scope,
 	// exactly like `$prompt` and `$build`; only the command surface differs.
 	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$orchestrate") {
+		return domain.ScopeDynamic
+	}
+	// `$run` is the headless `izen run` build surface. It carries the SAME
+	// runtime-resolved dynamic mutation authority as `$prompt`, `$build` and
+	// `$orchestrate`; only the command surface differs. Migrating `izen run`
+	// onto the authoritative runtime must not silently downgrade every run to
+	// read-only authority, which is exactly what an unmapped scope would do.
+	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$run") {
 		return domain.ScopeDynamic
 	}
 	return domain.ScopeNone

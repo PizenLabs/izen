@@ -3813,11 +3813,15 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			}
 		}
 		var modified string
-		// canonicalCreate records that the full-artifact path resolved the
+		// canonicalEnvelope records that the full-artifact path resolved the
 		// artifact's canonical, apply-ready bytes at STAGING (a terminated
-		// FILE_CREATE envelope body), so the staged candidate, its digest, the
-		// approval preview and the applied bytes are one object.
-		canonicalCreate := false
+		// FILE_CREATE / contract-fence body), so the staged candidate, its
+		// digest, the approval preview and the applied bytes are one object.
+		// It covers an envelope aimed at a NEW target and at an EXISTING one:
+		// the apply boundary has always extracted the body in both cases, so
+		// staging the envelope instead made the review describe bytes the
+		// mutation would not write.
+		canonicalEnvelope := false
 		if patchOnly {
 			// Bounded-patch artifact boundary: extract ONLY structured patch
 			// representations. A full-file (or otherwise unstructured)
@@ -3930,9 +3934,13 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// the envelope while the applied file held only the parsed body — a
 			// human approving one artifact and the runtime writing another.
 			//
-			// A recognized envelope that is NOT terminated is malformed: fail
-			// closed, stage no candidate, open no approval surface.
-			if artifact.Structural && original == "" {
+			// A recognized envelope is resolved to its canonical body whether it
+			// is aimed at a NEW target or an EXISTING one: the apply boundary
+			// has always extracted the body in both cases, so staging the
+			// envelope left the approval review describing bytes the mutation
+			// would not write. An envelope that is NOT terminated is malformed:
+			// fail closed, stage no candidate, open no approval surface.
+			if artifact.Structural {
 				switch artifact.Form {
 				case ArtifactFormFileCreate:
 					body, ok := canonicalFileCreateBody(verbatim)
@@ -3942,7 +3950,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 							ErrInvalidPatchFormat, ErrArtifactRejected, target)
 					}
 					modified = body
-					canonicalCreate = true
+					canonicalEnvelope = true
 				case ArtifactFormContractFence:
 					body, ok := canonicalContractFenceBody(verbatim)
 					if !ok {
@@ -3951,7 +3959,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 							ErrInvalidPatchFormat, ErrArtifactRejected, target)
 					}
 					modified = body
-					canonicalCreate = true
+					canonicalEnvelope = true
 				}
 			}
 			// ANCHOR HONESTY UNDER A FULL-ARTIFACT CONTRACT. A provider that
@@ -4031,15 +4039,15 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			return nil, invs, diffs, candidates, trace, fmt.Errorf(
 				"%w: %w: %s", ErrArtifactPlaceholderEcho, ErrArtifactRejected, target)
 		}
-		if strings.TrimSpace(modified) == "" && !canonicalCreate {
+		if strings.TrimSpace(modified) == "" && !canonicalEnvelope {
 			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
 			// never a proposal staged for approval. The model produced no
 			// usable mutation artifact — abort before any approval surface.
 			// The billed invocation is still returned so usage is preserved.
 			//
-			// A canonical CREATE is exempt: an explicitly TERMINATED
+			// A canonical envelope is exempt: an explicitly TERMINATED
 			// FILE_CREATE envelope with an empty body is a legitimate
-			// empty-file creation (truncation is signalled by
+			// empty-file / empty-overwrite (truncation is signalled by
 			// finish_reason=length, not by body emptiness).
 			return nil, invs, diffs, candidates, trace, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
 		}
@@ -4096,18 +4104,48 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			File:      target,
 			Original:  original,
 			Modified:  modified,
-			Canonical: canonicalCreate,
+			Canonical: canonicalEnvelope,
+			// The executor has resolved Modified to the exact bytes the
+			// mutation will write — for every staged patch, not only an
+			// addressed envelope. The mutation boundary must therefore write
+			// those bytes verbatim: re-running its protocol cascade would let
+			// SanitizeLLMResponse strip a reviewed line and commit bytes
+			// nobody approved / the authorization did not digest.
+			Resolved: true,
 		})
-		if canonicalCreate {
-			// A CREATE has no baseline: derive the diff from the SAME canonical
-			// bytes the apply will write (never from the raw envelope), so the
-			// review the human approves and the mutation that lands are one
-			// object. The mutation boundary records its diff from this same
-			// compiled diff (SetCompiledDiffs).
+		if original == "" {
+			// A creation has no baseline: derive the entire diff from the SAME
+			// canonical bytes the apply will write (never from the raw
+			// envelope), so the review the human approves and the mutation that
+			// lands are one object. The mutation boundary records its diff from
+			// this same compiled diff (SetCompiledDiffs). This covers both a
+			// recognized FILE_CREATE/contract-fence envelope and a plain-body
+			// creation.
 			d, _ := wholeFileAdditionDiff(modified)
 			diffs = append(diffs, d)
 		} else {
-			diffs = append(diffs, x.compileDiff(raw, target, original))
+			// ── PREVIEW/EVIDENCE DIFF FROM THE APPLIED BYTES ────────────────
+			//
+			// `modified` is the canonical content the apply will write
+			// (Patch.Modified). The review and the mutation-boundary evidence
+			// MUST describe those bytes — never a re-parse of the transport
+			// envelope that produced them. The bounded-patch extractor and the
+			// changeset pipeline are two parsers of the same model output, and
+			// on a malformed envelope (stray blank lines around the markers,
+			// say) they can disagree: the extractor resolves the applied body
+			// while the changeset pipeline reads the whole envelope as a
+			// full-file replacement. The human was then shown an
+			// envelope-shaped diff while the mutation wrote the resolved body
+			// — an approved-content/applied-content divergence.
+			//
+			// Compiling from the canonical bytes makes the review and the
+			// mutation the same object by construction. The raw-envelope
+			// re-parse remains only as a fallback for a no-diff edge case.
+			if d, derr := changeset.UnifiedDiffBetween(target, original, modified); derr == nil {
+				diffs = append(diffs, d)
+			} else {
+				diffs = append(diffs, x.compileDiff(raw, target, original))
+			}
 		}
 	}
 	return patches, invs, diffs, candidates, trace, nil

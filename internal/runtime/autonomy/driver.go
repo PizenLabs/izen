@@ -336,6 +336,14 @@ type Driver struct {
 	// behavioral completion gate derives a read-only capability vector and can
 	// never observe the workspace it is being asked to prove. See WithScope.
 	scope string
+
+	// statedTargets is the explicit target set a caller bound for the NEXT Run
+	// through SetTargets. It is a STATEMENT (the same authority as a target the
+	// human names at a clarification boundary), not a resolution: the run still
+	// binds it through the canonical gateway. It is consumed once — cleared when
+	// the run binds its scope — so a later Run without an explicit binding
+	// resolves its own scope rather than silently reusing this one.
+	statedTargets []string
 }
 
 // MaxContractRecoveryAttempts bounds how many times one execution lifecycle
@@ -495,6 +503,21 @@ func (d *Driver) SetScope(s string) {
 	}
 	d.scope = s
 	d.req.Scope = s
+}
+
+// SetTargets records the explicit target set for the NEXT Run. It is the push
+// form of an explicit scope statement, bound before the run begins and applied
+// through the SAME authoritative seam a human-named target uses (see
+// bindAuthoritativeTargets): the run still resolves, derives and admission-gates
+// the statement through the canonical gateway. An explicit target that does not
+// resolve stays unresolved and fails closed exactly like one stated in the
+// prompt; SetTargets never fabricates a binding. The set is consumed once, so a
+// subsequent Run without a new binding resolves its own scope.
+func (d *Driver) SetTargets(targets []string) {
+	if d == nil {
+		return
+	}
+	d.statedTargets = uniqueNonEmpty(targets)
 }
 
 // WithInteractionContract binds the semantic interaction contract used by the
@@ -695,8 +718,16 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	//
 	// bindAuthoritativeTargets is that resolution and that derivation, in the one
 	// place either can happen for this lifecycle. Nothing stated yet, so the
-	// objective resolves alone.
-	d.bindAuthoritativeTargets(nil, "a new run resolves and derives its own scope")
+	// objective resolves alone — unless a caller bound an explicit target set
+	// before the run, which is a statement the run must honour through the SAME
+	// seam rather than re-guess.
+	stated := d.statedTargets
+	d.statedTargets = nil
+	bindReason := "a new run resolves and derives its own scope"
+	if len(stated) > 0 {
+		bindReason = "the caller stated an explicit target set before the run"
+	}
+	d.bindAuthoritativeTargets(stated, bindReason)
 	interaction, interactionDescriptor, contractErr := d.selectInteractionContract(objective)
 	if contractErr != nil {
 		d.emitAuthorization("deny", "interaction contract binding failed: "+contractErr.Error(),

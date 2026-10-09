@@ -244,3 +244,23 @@ func compileUnifiedDiff(path, original, modified string) ([]byte, error) {
 	// spurious trailing empty context line.
 	return []byte(strings.TrimSuffix(text, "\n")), nil
 }
+
+// UnifiedDiffBetween computes the authoritative unified diff between two known
+// contents using the SAME engine CompileToPatch uses for a whole-file
+// replacement. It is exposed so an execution boundary can derive its human
+// review and its recorded evidence from the EXACT bytes it will apply, rather
+// than by re-parsing the transport envelope that produced those bytes.
+//
+// That distinction is not cosmetic. A model's SEARCH/REPLACE envelope may be
+// resolvable by the bounded-patch extractor and simultaneously unparseable by
+// the changeset extractor (stray blank lines around the markers are enough).
+// Deriving the diff from the canonical applied bytes makes the review and the
+// mutation the same object by construction; re-parsing the envelope is what let
+// a human authorize one artifact while the runtime wrote another.
+func UnifiedDiffBetween(path, original, modified string) (string, error) {
+	out, err := compileUnifiedDiff(path, original, modified)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}

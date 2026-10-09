@@ -11,6 +11,7 @@ package architecture
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -87,11 +88,12 @@ func TestExecutionOwnership_DirectExecutorDispatchIsFencedToHarnessFallback(t *t
 
 // TestExecutionOwnership_CLIOrchestrateDrivesAuthoritativeDriver pins that the
 // `izen prompt` / `izen orchestrate` command drives the SAME authoritative
-// runtime lifecycle as the TUI. Its historical private control-plane proposal
-// lifecycle (orchestrator.RunCycle + ProposalProviderCLI + ProposalValidator +
-// ApprovalGate + FileExecutor) must no longer be on the command path. The lock
-// is an AST call-edge assertion: it survives whitespace churn and fails if a
-// competing lifecycle is silently reintroduced.
+// runtime lifecycle as the TUI, through the shared CLI seam. Its historical
+// private control-plane proposal lifecycle (orchestrator.RunCycle +
+// ProposalProviderCLI + ProposalValidator + ApprovalGate + FileExecutor) must
+// no longer be on the command path. The lock is an AST call-edge assertion: it
+// survives whitespace churn and fails if a competing lifecycle is silently
+// reintroduced.
 func TestExecutionOwnership_CLIOrchestrateDrivesAuthoritativeDriver(t *testing.T) {
 	root := repoRoot(t)
 	f, _ := parseFile(t, filepath.Join(root, "cmd", "izen", "orchestrate.go"))
@@ -100,16 +102,85 @@ func TestExecutionOwnership_CLIOrchestrateDrivesAuthoritativeDriver(t *testing.T
 		t.Fatal("architecture: runOrchestrateCommand must exist")
 	}
 	callees := calleeNamesInNode(fn)
-	if callees["RunAuthoritative"] == 0 {
-		t.Error("architecture: izen orchestrate must drive the authoritative runtime lifecycle (cli.RunAuthoritative)")
+	if callees["runAuthoritativeCommand"] == 0 {
+		t.Error("architecture: izen orchestrate must drive the shared authoritative runtime lifecycle (runAuthoritativeCommand)")
 	}
-	if callees["Wire"] == 0 {
-		t.Error("architecture: izen orchestrate must wire the production composition root")
-	}
-	// The command must NOT construct or run its own proposal lifecycle.
-	for _, forbidden := range []string{"RunCycle", "NewOrchestrator", "NewProposalProvider", "NewTerminalBridge"} {
+	// The command must NOT construct or run its own proposal lifecycle or its
+	// own app.Pipeline.
+	for _, forbidden := range []string{"RunCycle", "NewOrchestrator", "NewProposalProvider", "NewTerminalBridge", "NewPipeline"} {
 		if callees[forbidden] != 0 {
 			t.Errorf("architecture: izen orchestrate still calls %s — a competing proposal lifecycle", forbidden)
+		}
+	}
+}
+
+// TestExecutionOwnership_CLIRunDrivesAuthoritativeDriver pins the Phase 3
+// migration: `izen run` no longer owns the internal/app.Pipeline execution
+// lifecycle. It parses its arguments and hands the objective to the SAME
+// shared authoritative runtime lifecycle as every migrated surface. The AST
+// lock fails if the retired pipeline loop silently returns to the command path.
+func TestExecutionOwnership_CLIRunDrivesAuthoritativeDriver(t *testing.T) {
+	root := repoRoot(t)
+	f, _ := parseFile(t, filepath.Join(root, "cmd", "izen", "runtime.go"))
+	fn := findFuncDecl(f, "runRuntimeCommand")
+	if fn == nil {
+		t.Fatal("architecture: runRuntimeCommand must exist")
+	}
+	callees := calleeNamesInNode(fn)
+	if callees["runAuthoritativeCommand"] == 0 {
+		t.Error("architecture: izen run must cross the shared authoritative runtime lifecycle (runAuthoritativeCommand)")
+	}
+	// The retired owners: the app.Pipeline loop and the control-plane proposal
+	// lifecycle must not be reachable from the command.
+	for _, forbidden := range []string{"NewPipeline", "RunCycle", "NewOrchestrator", "NewProposalProvider", "NewTerminalBridge"} {
+		if callees[forbidden] != 0 {
+			t.Errorf("architecture: izen run still calls %s — a competing execution lifecycle", forbidden)
+		}
+	}
+}
+
+// TestExecutionOwnership_AuthoritativeCommandWiresRuntimeAndDriver pins the
+// shared CLI seam itself: it must cross the production composition root
+// (compose.Wire) and drive the authoritative driver through the structural port
+// (cli.RunAuthoritative), and it must not construct the retired alternative
+// lifecycles. This is what makes the convergence single-sourced rather than
+// duplicated per command.
+func TestExecutionOwnership_AuthoritativeCommandWiresRuntimeAndDriver(t *testing.T) {
+	root := repoRoot(t)
+	f, _ := parseFile(t, filepath.Join(root, "cmd", "izen", "authoritative.go"))
+	fn := findFuncDecl(f, "runAuthoritativeCommand")
+	if fn == nil {
+		t.Fatal("architecture: runAuthoritativeCommand must exist in cmd/izen/authoritative.go")
+	}
+	callees := calleeNamesInNode(fn)
+	if callees["Wire"] == 0 {
+		t.Error("architecture: runAuthoritativeCommand must wire the production composition root (compose.Wire)")
+	}
+	if callees["RunAuthoritative"] == 0 {
+		t.Error("architecture: runAuthoritativeCommand must drive the authoritative runtime (cli.RunAuthoritative)")
+	}
+	for _, forbidden := range []string{"NewPipeline", "RunCycle", "NewOrchestrator", "NewProposalProvider", "NewTerminalBridge", "NewDriver"} {
+		if callees[forbidden] != 0 {
+			t.Errorf("architecture: runAuthoritativeCommand constructs %s — a competing runtime/loop (the authoritative Driver is built by compose.Wire)", forbidden)
+		}
+	}
+}
+
+// TestExecutionOwnership_CLIProductionFilesDoNotImportApp pins that no
+// production cmd/izen file imports internal/app. That package owns the retired
+// app.Pipeline; a production import is the strongest signal that the competing
+// lifecycle is being wired back into the CLI. (Test files may still import it to
+// exercise the retained pipeline library directly.)
+func TestExecutionOwnership_CLIProductionFilesDoNotImportApp(t *testing.T) {
+	root := repoRoot(t)
+	const appImport = "github.com/PizenLabs/izen/internal/app"
+	for _, rel := range goFilesUnder(root) {
+		if !strings.HasPrefix(rel, "cmd/izen/") {
+			continue
+		}
+		f, _ := parseFile(t, filepath.Join(root, rel))
+		if imports(f)[appImport] {
+			t.Errorf("architecture: production file %s imports internal/app — the retired app.Pipeline lifecycle must not return to the CLI command path (Phase 3)", rel)
 		}
 	}
 }

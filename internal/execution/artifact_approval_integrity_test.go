@@ -446,3 +446,176 @@ func TestArtifactIntegrity_PlaceholderEchoRejectedBeforeApproval(t *testing.T) {
 		t.Fatalf("a placeholder echo reached disk (stat err = %v)", statErr)
 	}
 }
+
+// TestArtifactIntegrity_MalformedPatchEnvelopePreviewIsTheAppliedArtifact is the
+// regression for the PATCH-side divergence found live during Phase 3. A model
+// SEARCH/REPLACE envelope with stray blank lines around the markers was resolved
+// by the bounded-patch extractor (which the apply uses) to the applied body,
+// while the changeset pipeline read the WHOLE envelope as a full-file
+// replacement. The human was therefore shown an envelope-shaped diff while the
+// mutation wrote the resolved body — the same approved/applied divergence the
+// CREATE fix removed, on the PATCH path.
+//
+// The invariant is restored at the owner: the preview and the recorded evidence
+// are compiled from the canonical bytes the apply will write (Patch.Modified),
+// never by re-parsing the transport envelope.
+func TestArtifactIntegrity_MalformedPatchEnvelopePreviewIsTheAppliedArtifact(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "note.txt", sampleOriginal)
+
+	// The exact live shape: a valid SEARCH/REPLACE envelope with a stray blank
+	// line after each side's content.
+	const malformed = "<<<<<<< SEARCH\nbar\n\n=======\nqux\n\n>>>>>>> REPLACE"
+	mock := &mockProvider{responses: []*ai.Response{{Content: malformed}}}
+	x := phase4Executor(t, root, mock, nil)
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		Mode: "build", Prompt: "change bar to qux", Target: "note.txt",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	preview, ok := x.CandidatePreview(res.PendingPatchID)
+	if !ok {
+		t.Fatal("the held patch candidate is not previewable")
+	}
+	// The review must not carry the transport envelope: it described a
+	// different artifact than the one the mutation writes.
+	for _, marker := range []string{"<<<<<<< SEARCH", ">>>>>>> REPLACE"} {
+		if strings.Contains(preview.Diff, marker) {
+			t.Fatalf("preview diff still carries the transport envelope marker %q:\n%s", marker, preview.Diff)
+		}
+	}
+	if !strings.Contains(preview.Diff, "+qux") || !strings.Contains(preview.Diff, "-bar") {
+		t.Fatalf("preview diff does not describe the applied change:\n%s", preview.Diff)
+	}
+	bindAuthorization(x, res.PendingPatchID, preview.Digest())
+	if _, err := x.Approve(context.Background(), res.PendingPatchID); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	applied := mustRead(t, root, "note.txt")
+	if applied != "foo\nqux\nbaz\n" {
+		t.Fatalf("applied bytes = %q, want %q", applied, "foo\nqux\nbaz\n")
+	}
+	if sha256Hex(applied) != preview.ArtifactDigest {
+		t.Fatalf("applied bytes digest %q != reviewed artifact digest %q",
+			sha256Hex(applied), preview.ArtifactDigest)
+	}
+}
+
+// TestArtifactIntegrity_FileCreateAgainstExistingTargetIsCanonical pins the
+// second limitation recorded in the Phase 2.1 report: a FILE_CREATE envelope
+// aimed at an EXISTING target. The apply boundary has always extracted its body
+// and written it; before this correction the staging boundary left the envelope
+// as the candidate, so the human reviewed the envelope while the mutation wrote
+// the body. The canonicalization now covers the existing-target case too: the
+// reviewed diff/digest and the applied bytes are the body, and the overwrite
+// remains gated by the ordinary authorization boundary.
+func TestArtifactIntegrity_FileCreateAgainstExistingTargetIsCanonical(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "note.txt", sampleOriginal)
+
+	const raw = "<<<<<<< FILE_CREATE note.txt\nHello everyone\n>>>>>>> END_FILE"
+	mock := &mockProvider{responses: []*ai.Response{{Content: raw}}}
+	x := phase4Executor(t, root, mock, nil)
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		Mode: "build", Prompt: "replace note.txt with a greeting", Target: "note.txt",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	preview, ok := x.CandidatePreview(res.PendingPatchID)
+	if !ok {
+		t.Fatal("the held candidate is not previewable")
+	}
+	for _, marker := range []string{"FILE_CREATE", "END_FILE"} {
+		if strings.Contains(preview.Diff, marker) {
+			t.Fatalf("preview diff still carries the transport marker %q:\n%s", marker, preview.Diff)
+		}
+	}
+	if !strings.Contains(preview.Diff, "+Hello everyone") {
+		t.Fatalf("preview diff does not show the canonical body:\n%s", preview.Diff)
+	}
+	bindAuthorization(x, res.PendingPatchID, preview.Digest())
+	if _, err := x.Approve(context.Background(), res.PendingPatchID); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	applied := mustRead(t, root, "note.txt")
+	if applied != "Hello everyone\n" {
+		t.Fatalf("applied bytes = %q, want %q", applied, "Hello everyone\n")
+	}
+	if sha256Hex(applied) != preview.ArtifactDigest {
+		t.Fatalf("applied bytes digest %q != reviewed artifact digest %q",
+			sha256Hex(applied), preview.ArtifactDigest)
+	}
+}
+
+// TestArtifactIntegrity_PatchAppliedBytesAreTheReviewedArtifact is the
+// regression for the third reachable divergence, on the ordinary (non-
+// envelope) PATCH path the Phase 3 envelope fixes did not cover.
+//
+// The executor resolves a SEARCH/REPLACE / full-artifact payload to the final
+// apply-ready content at STAGING; that content is what the preview diff and the
+// authorization digest bind. But the staged Patch carried neither the Canonical
+// nor the Resolved marker, so PatchManager.Apply re-ran its own protocol
+// cascade and SanitizeLLMResponse stripped any reviewed line matching a
+// hallucinated prefix (a line beginning "FILE:", a lone "```", ...). The human
+// approved and the authorization digested bytes that were never written — the
+// approved/applied divergence the envelope fixes removed for creations, still
+// live for every ordinary patch.
+//
+// The invariant is now enforced at the owner: a runtime-resolved patch is
+// written verbatim, so the reviewed bytes, the digested bytes and the applied
+// bytes are one object for EVERY mutation shape.
+func TestArtifactIntegrity_PatchAppliedBytesAreTheReviewedArtifact(t *testing.T) {
+	root := t.TempDir()
+	// A target large enough that the resolved body is not classified as an
+	// ambiguous snippet against it — the case where the divergence silently
+	// wrote different bytes rather than failing closed.
+	var orig strings.Builder
+	for i := 0; i < 40; i++ {
+		orig.WriteString("line content number ")
+		orig.WriteByte(byte('a' + i%26))
+		orig.WriteString("\n")
+	}
+	writeTarget(t, root, "note.txt", orig.String())
+
+	// The REPLACE line is a legitimate artifact the human will see and approve;
+	// "FILE:" is also a prefix SanitizeLLMResponse removes. Before the fix the
+	// reviewed diff carried it and the applied file did not.
+	const raw = "<<<<<<< SEARCH\nline content number k\n=======\nFILE: keep me\n>>>>>>> REPLACE"
+	mock := &mockProvider{responses: []*ai.Response{{Content: raw}}}
+	x := phase4Executor(t, root, mock, nil)
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		Mode: "build", Prompt: "replace a line", Target: "note.txt",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	preview, ok := x.CandidatePreview(res.PendingPatchID)
+	if !ok {
+		t.Fatal("the held candidate is not previewable")
+	}
+	if !strings.Contains(preview.Diff, "+FILE: keep me") {
+		t.Fatalf("preview diff does not show the reviewed line:\n%s", preview.Diff)
+	}
+	if !strings.Contains(res.Content, "FILE: keep me") {
+		t.Fatalf("the reviewed candidate content lost the line before approval: %q", res.Content)
+	}
+
+	bindAuthorization(x, res.PendingPatchID, preview.Digest())
+	if _, err := x.Approve(context.Background(), res.PendingPatchID); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+
+	applied := mustRead(t, root, "note.txt")
+	if applied != res.Content {
+		t.Fatalf("applied bytes differ from the reviewed artifact:\n reviewed=%q\n  applied=%q", res.Content, applied)
+	}
+	if !strings.Contains(applied, "FILE: keep me") {
+		t.Fatalf("the reviewed line was stripped at apply: %q", applied)
+	}
+	if sha256Hex(applied) != preview.ArtifactDigest {
+		t.Fatalf("applied bytes digest %q != reviewed artifact digest %q",
+			sha256Hex(applied), preview.ArtifactDigest)
+	}
+}
