@@ -19,6 +19,7 @@ import (
 	"github.com/PizenLabs/izen/internal/loop"
 	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/runtime/durable"
+	"github.com/PizenLabs/izen/internal/runtime/proposal"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
@@ -344,6 +345,38 @@ type Driver struct {
 	// the run binds its scope — so a later Run without an explicit binding
 	// resolves its own scope rather than silently reusing this one.
 	statedTargets []string
+
+	// ── Adaptive proposal orchestration ─────────────────────────────────
+	// proposalAdvisor derives the proposal (strategies, questions, evidence)
+	// from facts the driver already owns. It is nil by default: an unwired
+	// driver behaves exactly as before, so simple tasks and every existing test
+	// keep their path. The production composition root wires it.
+	proposalAdvisor ProposalAdvisor
+	// proposalState is the revision-safe mutable holder of the current
+	// proposal. It owns the revision and the decisions; the Driver never edits a
+	// contract by hand.
+	proposalState *proposal.State
+	// compiledProposal is the authoritative execution contract the accepted
+	// decisions compiled into. It is the bridge to the existing execution path,
+	// never a second executor.
+	compiledProposal *proposal.ExecutionContract
+	// renderedCriteria / renderedRequired carry the accepted rendered-check
+	// requirement into the completion path.
+	renderedCriteria []proposal.AcceptanceCriterion
+	renderedRequired bool
+	// renderedEvidence is the attributable rendered-verification observation,
+	// populated only by a real browser run.
+	renderedEvidence RenderedVerification
+	// renderedVerifier is the local-browser verifier (nil disables it);
+	// renderedEntry/renderedChecks are the entry document and deterministic
+	// checks an accepted rendered strategy requires.
+	renderedVerifier RenderedVerifier
+	renderedEntry    string
+	renderedChecks   []RenderedCheck
+	renderedChecked  bool
+	// renderedPolicy decides whether an objective requires a rendered
+	// verification. Nil disables it by default.
+	renderedPolicy func(objective string) bool
 }
 
 // MaxContractRecoveryAttempts bounds how many times one execution lifecycle
@@ -652,6 +685,12 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.contractRecoveries = 0
 	d.contractRecoveryExhausted = false
 	d.derivationNote = ""
+	d.proposalState = nil
+	d.compiledProposal = nil
+	d.renderedCriteria = nil
+	d.renderedRequired = false
+	d.renderedChecked = false
+	d.renderedEvidence = RenderedVerification{}
 	// R5: a new run is a new progress lifecycle. Carrying the previous run's
 	// satisfied-condition snapshot forward would render one objective's
 	// first decision as an advance over another objective.
@@ -819,6 +858,20 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		d.enrichBoundary()
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 		return d.term(), nil
+	}
+	// ── ADAPTIVE PROPOSAL ORCHESTRATION ────────────────────────────────
+	// With an advisor wired, the runtime selects its interaction from the
+	// objective, the observed evidence and the applicable policy. A clear,
+	// bounded objective returns here and keeps its direct path; a broad or
+	// consequential objective forms an evidence-bound proposal and either parks
+	// for the decisions that matter or proceeds with the recommended strategy.
+	// The proposal never authorizes anything: acceptance compiles into THIS
+	// request and the existing authorization/approval/verification path runs
+	// unchanged.
+	if d.proposalAdvisor != nil {
+		if term, parked := d.maybeAdaptiveProposal(ctx, runID); parked {
+			return term, nil
+		}
 	}
 	if err := ValidateObjectiveContract(objective, interaction, interactionDescriptor); err != nil {
 		d.emitAuthorization("deny", "interaction contract authority ceiling: "+err.Error(),
@@ -2376,6 +2429,11 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// that returned, a step that came back nil and a verifier that
 			// merely ran are structurally incapable of producing it.
 			pre := decision
+			// Rendered verification, when an accepted proposal demanded it, runs
+			// BEFORE the authority judges the evidence so a real, passing
+			// rendering can satisfy a broad objective's integrity condition. It
+			// is idempotent (at most once per run) and mutates nothing.
+			d.ensureRenderedVerification(ctx)
 			d.authorizeObjectiveCompletion(&decision)
 			d.forensics.noteAuthority(AuthorityCompletionGate, pre, decision)
 			// ── OBJECTIVE EVIDENCE-CARRY-OVER ──────────────────────

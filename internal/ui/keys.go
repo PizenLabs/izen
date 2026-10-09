@@ -881,6 +881,23 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousProposal("cancel")
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal &&
+				msg.Type == tea.KeyRunes && len(msg.Runes) == 1 &&
+				msg.Runes[0] >= '1' && msg.Runes[0] <= '9' && bare:
+				m.selectAdaptiveOption(int(msg.Runes[0]-'0') - 1)
+				m.refreshViewportContent()
+				m.followTail()
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal && msg.Type == tea.KeyEnter && bare:
+				m.push(roleSystem, infoStyle.Render("  Decisions submitted — the runtime will validate and record them."))
+				m.refreshViewportContent()
+				m.followTail()
+				return m, m.resumeAutonomousAdaptiveProposal()
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal && msg.Type == tea.KeyEscape && bare:
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — autonomous run aborted."))
+				m.refreshViewportContent()
+				m.followTail()
+				return m, m.abortAutonomousRun("adaptive proposal dismissed by operator")
 			case b.Action == autonomy.HumanBoundaryApproval &&
 				(msg.String() == "alt+a" || (msg.Type == tea.KeyEnter && bare)):
 				// STATE-ACCURATE TRANSITION LANGUAGE.

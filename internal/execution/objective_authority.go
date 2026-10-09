@@ -303,6 +303,33 @@ func (c TaskContract) targetsAbsent(absent map[string]bool) bool {
 // keeps `ExecutionEvidence`. The authority consumes BOTH: the sealed record
 // when the runtime has one (see SealedRecord) and the boundary facts otherwise.
 
+// RenderedVerificationEvidence is the completion authority's view of one
+// rendered-layout verification. It is EVIDENCE, never authority: a passing
+// value can satisfy the broad objective's integrity condition only because a
+// real browser rendered a concrete artifact revision and every deterministic
+// acceptance check held.
+type RenderedVerificationEvidence struct {
+	// Ran reports that a real browser rendered the workspace.
+	Ran bool
+	// Passed reports that every deterministic acceptance check held.
+	Passed bool
+	// Revision is the digest of the served artifact set at inspection time.
+	Revision string
+	// Browser identifies the browser that performed the rendering.
+	Browser string
+	// Observations are the deterministic facts observed in the rendered output.
+	Observations []string
+	// Defects are the checks that failed.
+	Defects []string
+	// BlockedReason explains why rendering could not run.
+	BlockedReason string
+}
+
+// RenderedProven reports whether a real, passing rendering was recorded.
+func (r RenderedVerificationEvidence) RenderedProven() bool {
+	return r.Ran && r.Passed
+}
+
 type ObjectiveEvidence struct {
 	// ── Boundary 1: PROVIDER (transport) ──────────────────────────────
 	Provider ProviderState
@@ -343,6 +370,12 @@ type ObjectiveEvidence struct {
 	// target (semantically NOT APPLICABLE — distinct from a gate that ran and
 	// failed). It never claims a pass.
 	VerificationSkipped bool
+	// RenderedVerification is the attributable result of a REAL browser
+	// rendering of the composed output, when one was required and performed.
+	// Its zero value means rendered verification did not run; a broad objective
+	// whose source-level gate is not applicable stays UNVERIFIED unless this
+	// evidence shows a real, passing rendering.
+	RenderedVerification RenderedVerificationEvidence
 	// BroadObjective reports that the objective is a broad project-level
 	// transformation (the strategy gateway classified it architect/refactor)
 	// whose acceptance criteria are semantic rather than determined by the
@@ -424,6 +457,10 @@ func (e ObjectiveEvidence) VerifierVerdict() string {
 	switch {
 	case e.VerificationRan && e.VerificationPassed:
 		return "PASS"
+	case e.RenderedVerification.Ran && e.RenderedVerification.Passed:
+		return "RENDERED_PASS"
+	case e.RenderedVerification.Ran && !e.RenderedVerification.Passed:
+		return "RENDERED_FAIL"
 	case e.VerificationSkipped && e.BroadObjective:
 		// A skipped verifier is NOT APPLICABLE only when the objective's
 		// acceptance is determined by the artifact. A broad transformation's
@@ -452,7 +489,9 @@ func (e ObjectiveEvidence) verifierSatisfied(required bool) bool {
 		return true
 	}
 	if e.VerificationSkipped && !e.VerificationPassed && e.BroadObjective {
-		return false
+		// A broad objective's skipped source-level gate is satisfied ONLY by a
+		// real, passing rendered verification. Nothing else may stand in.
+		return e.RenderedVerification.RenderedProven()
 	}
 	return e.VerificationPassed || e.VerificationSkipped
 }

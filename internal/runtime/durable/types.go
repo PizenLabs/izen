@@ -215,6 +215,13 @@ const (
 	// lineage only: task identity, cursor, checkpoint, evidence and
 	// negative knowledge are preserved verbatim (STEP 2 parity).
 	EventPhaseTransition EventType = "PHASE_TRANSITION"
+	// EventProposalSnapshot records the durable image of an adaptive proposal
+	// (identity, revision, questions, decisions, fingerprint). It is audit
+	// lineage only; the authoritative execution state remains the task itself.
+	// It exists so a resumed process can restore the proposal revision and its
+	// decisions rather than reconstructing authorization from conversational
+	// text.
+	EventProposalSnapshot EventType = "PROPOSAL_SNAPSHOT"
 )
 
 // IsTruthBoundary reports whether the event type requires an explicit

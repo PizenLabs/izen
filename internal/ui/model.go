@@ -1424,6 +1424,11 @@ type model struct {
 	// autonomousSelect is the highlighted candidate index of a parked
 	// clarify boundary.
 	autonomousSelect int
+	// adaptiveAnswers holds the human's selected option id(s) per adaptive
+	// proposal question while the driver parks at HumanBoundaryAdaptiveProposal.
+	// It is presentation state only: the runtime validates and records every
+	// decision on submit.
+	adaptiveAnswers map[string][]string
 	// autonomousObjective is the objective of the active/parked driver run.
 	autonomousObjective string
 	// proposalTUI is the interactive Zero-Token DecisionSurface selection model

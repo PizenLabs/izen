@@ -428,6 +428,10 @@ func (d *Driver) objectiveEvidence() execution.ObjectiveEvidence {
 	// classification is the gateway's (isProjectLevelObjective), never
 	// re-derived here.
 	ev.BroadObjective = d.isProjectLevelObjective()
+	// The rendered verification is the runtime's own browser observation when
+	// one was required and performed. Its zero value means it did not run, so a
+	// broad objective stays UNVERIFIED rather than claiming a pass it lacks.
+	ev.RenderedVerification = d.renderedEvidence.Evidence()
 	return ev
 }
 

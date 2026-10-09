@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -76,6 +77,11 @@ type autonomousDriver interface {
 	// / inspect / cancel) back to the runtime. The intent is a plain string so
 	// this projection never imports the runtime autonomy package.
 	ResumeWithProposal(ctx context.Context, intent string) (*autonomy.LoopTermination, error)
+	// ResumeAdaptiveProposal routes the human's accepted decisions for an
+	// adaptive proposal back to the runtime. The decisions are the transport
+	// type owned by the loop contract package, so this projection never imports
+	// the runtime autonomy package.
+	ResumeAdaptiveProposal(ctx context.Context, fingerprint string, decisions []autonomy.ProposalDecision) (*autonomy.LoopTermination, error)
 	Abort(reason string) (*autonomy.LoopTermination, error)
 	State() autonomy.RuntimeState
 	Boundary() *autonomy.HumanBoundary
@@ -357,6 +363,187 @@ func (m *model) resumeAutonomousProposal(intent string) tea.Cmd {
 	})
 }
 
+// renderAutonomousAdaptiveProposalBoundary announces the parked adaptive
+// proposal and initializes the answer state. The interactive card is rendered
+// by renderAutonomousBoundaryBlock; this records the status lines.
+func (m *model) renderAutonomousAdaptiveProposalBoundary(b *autonomy.HumanBoundary) {
+	if b == nil {
+		return
+	}
+	if m.adaptiveAnswers == nil {
+		m.adaptiveAnswers = map[string][]string{}
+	}
+	m.push(roleStatus, fmt.Sprintf(
+		"%s ADAPTIVE PROPOSAL — revision %d",
+		boldSapphireStyle.Render(Icon.Blueprint), b.ProposalRevision))
+	if strings.TrimSpace(b.ProposalSummary) != "" {
+		m.push(roleSystem, infoStyle.Render("  Recommended: "+b.ProposalSummary))
+	}
+	m.push(roleSystem, mutedStyle.Render("  "+b.Reason))
+	m.push(roleSystem, infoStyle.Render("  Select options with 1–9 · Enter submit · Esc cancel"))
+}
+
+// resumeAutonomousAdaptiveProposal submits the human's accepted decisions to
+// the runtime. The UI owns no proposal state: it collects the selected option
+// ids and routes them through Driver.ResumeAdaptiveProposal, which validates
+// them against the parked revision, records them durably, and compiles them
+// into the existing execution contract.
+func (m *model) resumeAutonomousAdaptiveProposal() tea.Cmd {
+	b := m.autonomousBoundary
+	if b == nil || b.Action != autonomy.HumanBoundaryAdaptiveProposal {
+		return nil
+	}
+	var decisions []autonomy.ProposalDecision
+	for _, q := range b.ProposalQuestions {
+		sel := m.adaptiveAnswers[q.ID]
+		if len(sel) == 0 {
+			continue
+		}
+		if q.Kind == autonomy.HumanProposalQuestionMulti {
+			decisions = append(decisions, autonomy.ProposalDecision{
+				QuestionID: q.ID,
+				OptionIDs:  append([]string(nil), sel...),
+			})
+			continue
+		}
+		decisions = append(decisions, autonomy.ProposalDecision{
+			QuestionID: q.ID,
+			OptionID:   sel[0],
+		})
+	}
+	m.autonomousBoundary = nil
+	m.adaptiveAnswers = nil
+	m.beginAutonomousResume("autonomy proposal")
+	ctx := m.operationContext()
+	return m.autonomousResumeCmds(func() tea.Msg {
+		return m.driveAutonomy(func() (*autonomy.LoopTermination, error) {
+			return m.autonomousDriver.ResumeAdaptiveProposal(ctx, b.ProposalFingerprint, decisions)
+		})
+	})
+}
+
+// adaptiveOptionRef maps one flattened option index to its question and option.
+type adaptiveOptionRef struct {
+	QuestionID string
+	OptionID   string
+	Multi      bool
+}
+
+// adaptiveOptions flattens the proposal's selectable options into a stable
+// index order shared by the renderer and the key handler.
+func adaptiveOptions(b *autonomy.HumanBoundary) []adaptiveOptionRef {
+	if b == nil {
+		return nil
+	}
+	var out []adaptiveOptionRef
+	for _, q := range b.ProposalQuestions {
+		for _, o := range q.Options {
+			out = append(out, adaptiveOptionRef{
+				QuestionID: q.ID,
+				OptionID:   o.ID,
+				Multi:      q.Kind == autonomy.HumanProposalQuestionMulti,
+			})
+		}
+	}
+	return out
+}
+
+// selectAdaptiveOption applies a flattened option index to the answer state.
+// Single-choice replaces; multi-select toggles.
+func (m *model) selectAdaptiveOption(index int) {
+	refs := adaptiveOptions(m.autonomousBoundary)
+	if index < 0 || index >= len(refs) {
+		return
+	}
+	if m.adaptiveAnswers == nil {
+		m.adaptiveAnswers = map[string][]string{}
+	}
+	ref := refs[index]
+	cur := m.adaptiveAnswers[ref.QuestionID]
+	if !ref.Multi {
+		m.adaptiveAnswers[ref.QuestionID] = []string{ref.OptionID}
+		return
+	}
+	// Toggle.
+	for i, id := range cur {
+		if id == ref.OptionID {
+			m.adaptiveAnswers[ref.QuestionID] = append(cur[:i], cur[i+1:]...)
+			return
+		}
+	}
+	m.adaptiveAnswers[ref.QuestionID] = append(cur, ref.OptionID)
+}
+
+// renderAdaptiveProposalBlock renders the adaptive proposal card: objective,
+// recommended strategy, material trade-offs/risks, and the questions with their
+// selectable options. It is pure presentation.
+func renderAdaptiveProposalBlock(b *autonomy.HumanBoundary, answers map[string][]string, width int) string {
+	var sb strings.Builder
+	sb.WriteString(permissionTitleStyle.Render(Icon.Blueprint + " ADAPTIVE PROPOSAL"))
+	sb.WriteString("\n\n")
+	if strings.TrimSpace(b.ProposalObjective) != "" {
+		sb.WriteString(permissionDescStyle.Render("Objective:"))
+		sb.WriteString(" " + infoStyle.Render(b.ProposalObjective) + "\n")
+	}
+	sb.WriteString(permissionDescStyle.Render("Revision:"))
+	fmt.Fprintf(&sb, " %d\n", b.ProposalRevision)
+
+	for _, s := range b.ProposalStrategies {
+		if !s.Recommended {
+			continue
+		}
+		sb.WriteString("\n")
+		sb.WriteString(permissionDescStyle.Render("Recommended:"))
+		sb.WriteString(" " + boldTextStyle.Render(s.Title) + "\n")
+		if strings.TrimSpace(s.Summary) != "" {
+			sb.WriteString("  " + mutedStyle.Render(s.Summary) + "\n")
+		}
+		for _, tr := range s.Tradeoffs {
+			sb.WriteString("  " + mutedStyle.Render("trade-off: "+tr.Description+" (+"+tr.Benefit+" / -"+tr.Cost+")") + "\n")
+		}
+		for _, r := range s.Risks {
+			sb.WriteString("  " + mutedStyle.Render("risk ["+r.Severity+"]: "+r.Description) + "\n")
+		}
+	}
+
+	index := 0
+	for _, q := range b.ProposalQuestions {
+		sb.WriteString("\n")
+		marker := ""
+		if q.Required {
+			marker = " *"
+		}
+		sb.WriteString(permissionDescStyle.Render(q.Prompt) + marker + "\n")
+		for _, o := range q.Options {
+			index++
+			selected := false
+			for _, id := range answers[q.ID] {
+				if id == o.ID {
+					selected = true
+				}
+			}
+			var prefix string
+			label := mutedStyle.Render(o.Label)
+			if selected {
+				prefix = "  " + permissionKeyStyle.Render("[x]") + " "
+				label = boldTextStyle.Render(o.Label)
+			} else {
+				prefix = fmt.Sprintf("  %s ", mutedStyle.Render("["+strconv.Itoa(index)+"]"))
+			}
+			rec := ""
+			if o.ID == q.Recommended {
+				rec = " " + mutedStyle.Render("(recommended)")
+			}
+			sb.WriteString(prefix + label + rec + "\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(" " + boundRule(width, permissionBoxStyle, 2) + "\n")
+	sb.WriteString(" " + mutedStyle.Render("1–9 select/toggle · Enter submit · Esc cancel") + "\n")
+	return boundBox(permissionBoxStyle, width).Render(sb.String())
+}
+
 // resumeAutonomousProposalApprove resolves a parked DECOMPOSITION_PROPOSAL
 // boundary by authorizing the WHOLE plan: the driver runs every approved
 // sub-task as one atomic transaction. The authorization issued here covers
@@ -581,6 +768,12 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 				// never relies on log strings for a human decision.
 				m.finalizeOperation(OpOutcomeAmbiguous, nil)
 				m.renderAutonomousProposalBoundary(b)
+			case autonomy.HumanBoundaryAdaptiveProposal:
+				// An adaptive proposal park is a LIVE human decision: render the
+				// interpreted objective, the recommended strategy, its material
+				// trade-offs, and the questions that affect execution.
+				m.finalizeOperation(OpOutcomeAmbiguous, nil)
+				m.renderAutonomousAdaptiveProposalBoundary(b)
 			default:
 				m.finalizeOperation(OpOutcomeFailure, nil)
 				m.renderAutonomousInformBoundary(b)
@@ -1153,6 +1346,12 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 		sb.WriteString(" " + boundRule(width, permissionBoxStyle, 2) + "\n")
 		sb.WriteString(" " + mutedStyle.Render("↑/↓ navigate · Enter select · Esc cancel") + "\n")
 		return boundBox(permissionBoxStyle, width).Render(sb.String())
+	case autonomy.HumanBoundaryAdaptiveProposal:
+		// The adaptive proposal: the interpreted objective, the recommended
+		// strategy, its material trade-offs, and only the questions that
+		// materially affect execution. Decisions route to the runtime; the UI
+		// owns no proposal state.
+		return renderAdaptiveProposalBlock(b, m.adaptiveAnswers, width)
 	default:
 		return ""
 	}

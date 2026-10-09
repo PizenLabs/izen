@@ -433,6 +433,14 @@ const (
 	// the human may choose a repair-first / cancel strategy. No sub-task is
 	// ever staged. Resumable via the driver's ResumeWithProposal.
 	HumanBoundaryProposal HumanBoundaryAction = "proposal"
+	// HumanBoundaryAdaptiveProposal is the ADAPTIVE PROPOSAL gate: the runtime
+	// formed an evidence-bound proposal whose accepted decisions materially
+	// affect execution. The loop parks and the UI renders the proposal
+	// (objective, findings, recommended strategy, trade-offs, and only the
+	// questions that matter) from these typed transport fields. The rich
+	// proposal contract lives on the Driver; this boundary carries the
+	// projection. Resumable via the driver's ResumeAdaptiveProposal.
+	HumanBoundaryAdaptiveProposal HumanBoundaryAction = "adaptive_proposal"
 )
 
 // String returns the canonical boundary-action label.
@@ -448,6 +456,91 @@ type HumanProposalOption struct {
 	Label       string
 	Description string
 	Intent      string
+}
+
+// HumanProposalQuestionKind is the interaction shape of one adaptive proposal
+// question, projected for presentation. It mirrors proposal.QuestionKind
+// without importing the proposal package, keeping this contract package
+// dependency-light (the projection is the runtime's job).
+type HumanProposalQuestionKind string
+
+const (
+	// HumanProposalQuestionSingle is a single-choice question.
+	HumanProposalQuestionSingle HumanProposalQuestionKind = "single"
+	// HumanProposalQuestionMulti is a multi-select question.
+	HumanProposalQuestionMulti HumanProposalQuestionKind = "multi"
+	// HumanProposalQuestionFreeForm accepts free-form input.
+	HumanProposalQuestionFreeForm HumanProposalQuestionKind = "free_form"
+)
+
+// HumanProposalStrategy is one strategy projected for presentation. The rich
+// strategy (trade-offs, risks, phases, acceptance criteria) stays on the
+// Driver; the boundary carries the summary the UI renders and the identity the
+// resume surface validates.
+type HumanProposalStrategy struct {
+	ID          string
+	Title       string
+	Summary     string
+	Rationale   string
+	Recommended bool
+	Tradeoffs   []HumanProposalTradeoff
+	Risks       []HumanProposalRisk
+	Phases      []HumanProposalPhase
+}
+
+// HumanProposalTradeoff is one material trade-off of a strategy.
+type HumanProposalTradeoff struct {
+	Description string
+	Benefit     string
+	Cost        string
+}
+
+// HumanProposalRisk is one material risk of a strategy.
+type HumanProposalRisk struct {
+	Description string
+	Mitigation  string
+	Severity    string
+}
+
+// HumanProposalPhase is one optional phase boundary of a strategy.
+type HumanProposalPhase struct {
+	ID         string
+	Title      string
+	Order      int
+	Boundary   string
+	Checkpoint string
+}
+
+// HumanProposalQuestion is one decision carried on an adaptive proposal
+// boundary. It is pure scalar presentation data: the UI renders it and returns
+// the selected option id(s) / free-form text through the authoritative
+// ResumeAdaptiveProposal surface. It never carries a callback and never mutates
+// state.
+type HumanProposalQuestion struct {
+	ID             string
+	Prompt         string
+	Kind           HumanProposalQuestionKind
+	Options        []HumanProposalOption
+	AllowFreeForm  bool
+	Required       bool
+	Recommended    string
+	RecommendedSet []string
+	DependsOn      []string
+	Affects        []string
+}
+
+// ProposalDecision is one human decision submitted for an adaptive proposal
+// question. It is the transport shape the UI produces and the driver records;
+// the driver stamps it with ProvenanceHuman and validates it against the parked
+// proposal's current revision.
+type ProposalDecision struct {
+	QuestionID string
+	// OptionID answers a single-choice question.
+	OptionID string
+	// OptionIDs answer a multi-select question.
+	OptionIDs []string
+	// FreeForm answers a free-form question (or accompanies options).
+	FreeForm string
 }
 
 type HumanBoundary struct {
@@ -478,6 +571,20 @@ type HumanBoundary struct {
 	// HumanBoundaryProposal MUST carry a non-empty set — an awaiting_human
 	// park with no renderable decision surface is a deadlock by construction.
 	ProposalOptions []HumanProposalOption
+	// ── ADAPTIVE PROPOSAL TRANSPORT ────────────────────────────────────
+	//
+	// When Action is HumanBoundaryAdaptiveProposal these fields carry the
+	// typed projection of the Driver's proposal contract. The rich contract
+	// (strategies, trade-offs, dependencies, acceptance criteria) lives on the
+	// Driver; the boundary carries what the UI renders and what the resume
+	// surface validates. They are pure data, never authority.
+	ProposalID          string                  `json:"proposal_id,omitempty"`
+	ProposalRevision    int                     `json:"proposal_revision,omitempty"`
+	ProposalFingerprint string                  `json:"proposal_fingerprint,omitempty"`
+	ProposalObjective   string                  `json:"proposal_objective,omitempty"`
+	ProposalSummary     string                  `json:"proposal_summary,omitempty"`
+	ProposalStrategies  []HumanProposalStrategy `json:"proposal_strategies,omitempty"`
+	ProposalQuestions   []HumanProposalQuestion `json:"proposal_questions,omitempty"`
 	// SurfaceASTStatus / SurfaceFailureCategory / SurfaceEstimatedTokens /
 	// SurfaceCurrentBudget are the authoritative DecisionSurface facts a
 	// HumanBoundaryProposal park carries so the UI can render the TRUE cause
@@ -577,6 +684,9 @@ func DeriveBoundaryAction(b *HumanBoundary) {
 		b.Resumable = true
 	case b.DecisionSurface:
 		b.Action = HumanBoundaryProposal
+		b.Resumable = true
+	case len(b.ProposalQuestions) > 0:
+		b.Action = HumanBoundaryAdaptiveProposal
 		b.Resumable = true
 	case len(b.Options) > 0:
 		b.Action = HumanBoundaryClarify
