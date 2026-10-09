@@ -3952,7 +3952,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					modified = body
 					canonicalEnvelope = true
 				case ArtifactFormContractFence:
-					body, ok := canonicalContractFenceBody(verbatim)
+					body, ok := canonicalContractFenceBody(ctx, verbatim)
 					if !ok {
 						return nil, invs, diffs, candidates, trace, fmt.Errorf(
 							"%w: %w: %s: artifact contract fence is not closed",

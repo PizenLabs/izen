@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
@@ -12,84 +11,42 @@ import (
 )
 
 // runRuntimeUsage describes the `izen run` subcommand.
-const runRuntimeUsage = `Usage: izen run [flags] "<prompt>"
+const runRuntimeUsage = `Usage: izen run [flags] "<objective>"
 
-Execute one prompt through the AUTHORITATIVE Izen runtime — the same bounded
-autonomy Driver that ` + "`izen prompt`" + ` / ` + "`izen orchestrate`" + ` drive over the
-RuntimeExecutor execution plane. The runtime owns admission, the provider seam,
-the proposal/approval boundary, mutation, verification, recovery, cancellation
-and terminal truth; this command only plays the human at the approval boundary.
-
-The proposal diff is rendered to stdout and an interactive [y/N] approval prompt
-blocks until you decide. "y" applies the proposal atomically, "i" inspects
-without applying, and anything else (including Enter) rejects it.
-
-Every prompt enters the runtime through the same admission front-end as the TUI:
-the resolved capability set, target scope and mutation authorization are the
-runtime's, never the command's. Explicit ` + "`-target`" + ` files are bound through the
-runtime's authoritative target seam and never bypass resolution.
+Execute one objective through the AUTHORITATIVE Izen runtime — the same bounded
+autonomy Driver that the TUI drives over the RuntimeExecutor execution plane.
+The runtime owns admission, the provider seam, the proposal/approval boundary,
+mutation, verification, recovery, cancellation and terminal truth; this command
+only plays the human at the approval boundary (or auto-approves/denies when a
+non-interactive -approve policy is given).
 
 Flags:
-  -dir <path>      Workspace root (default ".")
-  -target <path>   Target file to analyze/modify (repeatable)
+  -dir <path>          Workspace root (default ".")
+  -target <path>       Target file to analyze/modify (repeatable)
+  -provider <name>     Provider override (ollama|openrouter|openai|anthropic|gemini|groq|opencode|9router)
+  -model <id>          Model override (must belong to the selected provider)
+  -base-url <url>      Provider endpoint override (self-hosted / automation)
+  -mode <name>         Execution mode: ask|investigate|plan|build|review (default build)
+  -approve <policy>    Approval policy: ask|always|never (default ask)
+  -timeout <dur>       Wall-clock bound, e.g. 90s or 5m (default 10m)
+  -json                Emit one machine-readable JSON report on stdout
+  -quiet               Suppress operator diagnostics on stderr
+
+Exit codes:
+  0 success   1 failed   2 usage/config   3 provider
+  4 human-required   5 unsubstantiated   6 timeout   7 denied
 
 Examples:
   izen run "redesign the portfolio website"
   izen run -target main.go "add a health check endpoint"
-  izen run "explain the routing layer"
+  izen run -json -approve never "delete the migration files"
+  izen run -provider opencode -model z-ai/glm-4 "explain the routing layer"
 `
 
-// runRuntimeCommand implements `izen run`: it parses its arguments and drives
-// the prompt through the shared authoritative CLI lifecycle
-// (runAuthoritativeCommand → compose.Wire → autonomy Driver → RuntimeExecutor).
-// It builds no private pipeline, planner or execution loop.
-func runRuntimeCommand(args []string) error {
-	dir, targets, prompt, help, err := parseRunArgs(args)
-	if err != nil {
-		return err
-	}
-	if help {
-		fmt.Print(runRuntimeUsage)
-		return nil
-	}
-	return runAuthoritativeCommand(dir, prompt, "$run", "run", targets)
-}
-
-// parseRunArgs parses the `izen run` argument grammar: `-dir <path>`, repeatable
-// `-target <path>`, exactly one prompt, and `-h/--help`. It performs no I/O and
-// no execution, so it is directly testable.
-func parseRunArgs(args []string) (dir string, targets []string, prompt string, help bool, err error) {
-	dir = "."
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "-h", "--help":
-			return "", nil, "", true, nil
-		case "-dir":
-			if i+1 >= len(args) {
-				return "", nil, "", false, errors.New("izen run: -dir requires a path")
-			}
-			i++
-			dir = args[i]
-		case "-target":
-			if i+1 >= len(args) {
-				return "", nil, "", false, errors.New("izen run: -target requires a path")
-			}
-			i++
-			targets = append(targets, args[i])
-		default:
-			if strings.HasPrefix(args[i], "-") {
-				return "", nil, "", false, fmt.Errorf("izen run: unknown flag %q", args[i])
-			}
-			if prompt != "" {
-				return "", nil, "", false, errors.New("izen run: exactly one prompt argument is required")
-			}
-			prompt = args[i]
-		}
-	}
-	if prompt == "" {
-		return "", nil, "", false, errors.New("izen run: a prompt argument is required")
-	}
-	return dir, targets, prompt, false, nil
+// runRuntimeCommand implements `izen run`: it parses the shared execution
+// grammar and drives the objective through the one authoritative CLI lifecycle.
+func runRuntimeCommand(args []string) int {
+	return runExecRequest("run", args, runRuntimeUsage)
 }
 
 // validateProviderModelBinding verifies provider/model tuple compatibility
@@ -123,42 +80,57 @@ func validateProviderModelBinding(provider, model string) error {
 	return nil
 }
 
-// buildActiveProvider constructs the ai.Provider for the configured active
-// provider and returns it together with the effective model name. The API key
-// resolves with strict precedence: ~/.izen/config.yml wins over the shell
-// environment variable; an empty resolution surfaces the missing-key prompt.
-func buildActiveProvider(cfg *config.Config) (ai.Provider, string, error) {
-	name := cfg.ActiveProviderName()
+// buildProvider constructs the ai.Provider for an explicit (provider, model,
+// baseURL) selection. The API key resolves with strict precedence: the
+// configured key in ~/.izen/config.yml wins over the provider's environment
+// variable. An explicit baseURL override wins over the configured endpoint so
+// automation can target a self-hosted or benchmark endpoint, and it is never
+// silently dropped.
+func buildProvider(cfg *config.Config, providerName, model, baseURL string) (ai.Provider, string, error) {
+	name := strings.TrimSpace(providerName)
+	if name == "" {
+		name = cfg.ActiveProviderName()
+	}
 	provCfg, ok := cfg.AI.Providers[name]
 	if !ok {
 		provCfg = config.AIProviderConfig{BaseURL: config.WellKnownBaseURL(name)}
 	}
+	effectiveBase := strings.TrimSpace(baseURL)
+	if effectiveBase == "" {
+		effectiveBase = strings.TrimSpace(provCfg.BaseURL)
+	}
+	if effectiveBase == "" {
+		effectiveBase = config.WellKnownBaseURL(name)
+	}
 	apiKey := cfg.ResolveAPIKey(name)
-	if apiKey == "" && strings.TrimSpace(provCfg.BaseURL) == "" {
+	if apiKey == "" && effectiveBase == "" {
 		return nil, "", fmt.Errorf(
-			"izen run: no AI provider configured (provider %q). Set one via 'izen auth login' or environment variables",
+			"no AI provider configured (provider %q). Set one via 'izen auth login' or environment variables",
 			name,
 		)
 	}
-	if apiKey == "" {
+	if apiKey == "" && name != "ollama" {
 		return nil, "", fmt.Errorf(
-			"izen run: no API key for provider %q. Save one via 'izen auth login' or set %s",
+			"no API key for provider %q. Save one via 'izen auth login' or set %s",
 			name, config.EnvVarForProvider(name),
 		)
 	}
-	model := cfg.ActiveModelName()
-	// Fail-fast provider boundary: a mismatched provider/model tuple (e.g.
-	// provider "ollama" with model "cohere/north-mini-code:free") aborts here
-	// with ErrInvalidProviderConfiguration before any execution loop or
-	// preflight timeout can engage. Zero provider calls are made on mismatch.
+	if model == "" {
+		model = cfg.ActiveModelName()
+	}
+	if model == "" {
+		return nil, "", fmt.Errorf("no model selected for provider %q", name)
+	}
+	// Fail-fast provider boundary: a mismatched provider/model tuple aborts
+	// here before any execution loop or preflight timeout can engage.
 	if err := validateProviderModelBinding(name, model); err != nil {
 		return nil, "", err
 	}
 	switch name {
 	case "ollama":
-		return providers.NewOllamaProvider(provCfg.BaseURL, apiKey, model), model, nil
+		return providers.NewOllamaProvider(effectiveBase, apiKey, model), model, nil
 	case "openrouter":
-		return providers.NewOpenRouterProvider(apiKey, model, provCfg.BaseURL), model, nil
+		return providers.NewOpenRouterProvider(apiKey, model, effectiveBase), model, nil
 	case "openai":
 		return providers.NewOpenAIProvider(apiKey, model), model, nil
 	case "anthropic":
@@ -166,12 +138,12 @@ func buildActiveProvider(cfg *config.Config) (ai.Provider, string, error) {
 	case "gemini":
 		return providers.NewGeminiProvider(apiKey, model), model, nil
 	case "groq":
-		return providers.NewGroqProvider(apiKey, model, provCfg.BaseURL), model, nil
+		return providers.NewGroqProvider(apiKey, model, effectiveBase), model, nil
 	case "opencode":
-		return providers.NewOpenCodeProvider(apiKey, model, provCfg.BaseURL), model, nil
+		return providers.NewOpenCodeProvider(apiKey, model, effectiveBase), model, nil
 	case "9router":
-		return providers.NewNineRouterProvider(apiKey, model, provCfg.BaseURL), model, nil
+		return providers.NewNineRouterProvider(apiKey, model, effectiveBase), model, nil
 	default:
-		return nil, "", fmt.Errorf("izen run: unsupported provider %q", name)
+		return nil, "", fmt.Errorf("unsupported provider %q", name)
 	}
 }

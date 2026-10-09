@@ -102,9 +102,13 @@ func TestExecutionOwnership_CLIOrchestrateDrivesAuthoritativeDriver(t *testing.T
 		t.Fatal("architecture: runOrchestrateCommand must exist")
 	}
 	callees := calleeNamesInNode(fn)
-	if callees["runAuthoritativeCommand"] == 0 {
-		t.Error("architecture: izen orchestrate must drive the shared authoritative runtime lifecycle (runAuthoritativeCommand)")
+	// The command crosses the shared execution seam (runExecRequestAs), which
+	// itself drives runAuthoritativeCommand. Both edges are asserted so the lock
+	// cannot be satisfied by a seam that stopped reaching the runtime.
+	if callees["runExecRequestAs"] == 0 && callees["runExecRequest"] == 0 {
+		t.Error("architecture: izen orchestrate must cross the shared authoritative execution seam (runExecRequestAs)")
 	}
+	assertAuthoritativeExecSeam(t, root)
 	// The command must NOT construct or run its own proposal lifecycle or its
 	// own app.Pipeline.
 	for _, forbidden := range []string{"RunCycle", "NewOrchestrator", "NewProposalProvider", "NewTerminalBridge", "NewPipeline"} {
@@ -127,14 +131,36 @@ func TestExecutionOwnership_CLIRunDrivesAuthoritativeDriver(t *testing.T) {
 		t.Fatal("architecture: runRuntimeCommand must exist")
 	}
 	callees := calleeNamesInNode(fn)
-	if callees["runAuthoritativeCommand"] == 0 {
-		t.Error("architecture: izen run must cross the shared authoritative runtime lifecycle (runAuthoritativeCommand)")
+	if callees["runExecRequest"] == 0 && callees["runExecRequestAs"] == 0 {
+		t.Error("architecture: izen run must cross the shared authoritative execution seam (runExecRequest)")
 	}
+	assertAuthoritativeExecSeam(t, root)
 	// The retired owners: the app.Pipeline loop and the control-plane proposal
 	// lifecycle must not be reachable from the command.
 	for _, forbidden := range []string{"NewPipeline", "RunCycle", "NewOrchestrator", "NewProposalProvider", "NewTerminalBridge"} {
 		if callees[forbidden] != 0 {
 			t.Errorf("architecture: izen run still calls %s — a competing execution lifecycle", forbidden)
+		}
+	}
+}
+
+// assertAuthoritativeExecSeam pins the shared execution wrapper to the one
+// authoritative lifecycle: runExecRequestAs must drive runAuthoritativeCommand
+// and own no competing loop.
+func assertAuthoritativeExecSeam(t *testing.T, root string) {
+	t.Helper()
+	f, _ := parseFile(t, filepath.Join(root, "cmd", "izen", "authoritative.go"))
+	fn := findFuncDecl(f, "runExecRequestAs")
+	if fn == nil {
+		t.Fatal("architecture: runExecRequestAs must exist in cmd/izen/authoritative.go")
+	}
+	callees := calleeNamesInNode(fn)
+	if callees["runAuthoritativeCommand"] == 0 {
+		t.Error("architecture: the shared execution seam must drive runAuthoritativeCommand")
+	}
+	for _, forbidden := range []string{"NewPipeline", "RunCycle", "NewOrchestrator", "NewProposalProvider", "NewTerminalBridge", "NewDriver"} {
+		if callees[forbidden] != 0 {
+			t.Errorf("architecture: the shared execution seam constructs %s — a competing runtime/loop", forbidden)
 		}
 	}
 }

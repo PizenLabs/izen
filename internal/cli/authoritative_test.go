@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -420,5 +421,96 @@ func TestDriverTerminalBridgeClarifyReadsTarget(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "1) a.md") || !strings.Contains(out.String(), "2) b.md") {
 		t.Errorf("clarify options not rendered:\n%s", out.String())
+	}
+}
+
+// TestDriverTerminalBridgeApprovalPolicies pins the non-interactive policies:
+// "always" approves without reading input, "never" rejects.
+func TestDriverTerminalBridgeApprovalPolicies(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	approve := NewDriverTerminalBridge(strings.NewReader(""), &out).WithPolicy(ApprovalAlways)
+	dec, err := approve.Decide(context.Background(), approvalBoundary())
+	if err != nil {
+		t.Fatalf("always Decide: %v", err)
+	}
+	if dec.Action != HumanApprove {
+		t.Fatalf("always policy action = %q, want approve", dec.Action)
+	}
+
+	reject := NewDriverTerminalBridge(strings.NewReader(""), &out).WithPolicy(ApprovalNever)
+	dec, err = reject.Decide(context.Background(), approvalBoundary())
+	if err != nil {
+		t.Fatalf("never Decide: %v", err)
+	}
+	if dec.Action != HumanReject {
+		t.Fatalf("never policy action = %q, want reject", dec.Action)
+	}
+}
+
+// TestDriverTerminalBridgeClarifyNonInteractive pins that a non-interactive
+// policy cannot answer a clarify boundary: it returns an empty decision so the
+// lifecycle aborts with a clear human-required outcome instead of guessing.
+func TestDriverTerminalBridgeClarifyNonInteractive(t *testing.T) {
+	t.Parallel()
+
+	for _, policy := range []ApprovalPolicy{ApprovalAlways, ApprovalNever} {
+		var out bytes.Buffer
+		b := NewDriverTerminalBridge(strings.NewReader(""), &out).WithPolicy(policy)
+		bnd := &autonomy.HumanBoundary{Action: autonomy.HumanBoundaryClarify, Reason: "ambiguous", Options: []string{"a.md", "b.md"}}
+		dec, err := b.Decide(context.Background(), bnd)
+		if err != nil {
+			t.Fatalf("policy %s Decide: %v", policy, err)
+		}
+		if dec.Clarify != "" {
+			t.Fatalf("policy %s guessed clarify target %q", policy, dec.Clarify)
+		}
+	}
+}
+
+// TestRunAuthoritativeAlwaysPolicyApproves proves the always policy drives the
+// SAME approve path (authorization then ResumeApprove) as a human "y".
+func TestRunAuthoritativeAlwaysPolicyApproves(t *testing.T) {
+	t.Parallel()
+
+	d := &fakeDriver{boundary: approvalBoundary(), approveTerm: completed()}
+	bridge := NewDriverTerminalBridge(strings.NewReader(""), io.Discard).WithPolicy(ApprovalAlways)
+
+	authorized := false
+	res, err := RunAuthoritative(context.Background(), d, bridge,
+		func([]string, string, string) error { authorized = true; return nil },
+		"$run", "Create zuru.md")
+	if err != nil {
+		t.Fatalf("RunAuthoritative: %v", err)
+	}
+	if !authorized {
+		t.Fatal("always policy did not issue the candidate-bound authorization")
+	}
+	if d.approveCalls != 1 || !res.Approved {
+		t.Fatalf("approveCalls=%d approved=%t, want 1/true", d.approveCalls, res.Approved)
+	}
+}
+
+// TestRunAuthoritativeClarifyUnansweredIsHumanRequired proves an unanswered
+// clarify boundary sets ClarifyRequired and aborts (never a silent guess).
+func TestRunAuthoritativeClarifyUnansweredIsHumanRequired(t *testing.T) {
+	t.Parallel()
+
+	d := &fakeDriver{
+		boundary:  &autonomy.HumanBoundary{Action: autonomy.HumanBoundaryClarify, Reason: "ambiguous", Options: []string{"a.md"}},
+		abortTerm: &autonomy.LoopTermination{State: autonomy.RuntimeAborted, Reason: "clarify boundary left unanswered"},
+	}
+	bridge := NewDriverTerminalBridge(strings.NewReader(""), io.Discard).WithPolicy(ApprovalAlways)
+
+	res, err := RunAuthoritative(context.Background(), d, bridge, nil, "$run", "Update the file")
+	if err != nil {
+		t.Fatalf("RunAuthoritative: %v", err)
+	}
+	if !res.ClarifyRequired {
+		t.Fatal("ClarifyRequired = false, want true")
+	}
+	if d.clarifyCalls != 0 || d.abortCalls != 1 {
+		t.Fatalf("clarify=%d abort=%d, want 0/1", d.clarifyCalls, d.abortCalls)
 	}
 }

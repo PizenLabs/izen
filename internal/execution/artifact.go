@@ -175,8 +175,8 @@ func (p *V3ArtifactPipeline) ParseContracts(raw string) ([]ir.Artifact, error) {
 // from one parse rather than from a later, differently-owned extraction.
 //
 // ok=false is fail-closed: no complete, closed contract fence was found.
-func canonicalContractFenceBody(raw string) (string, bool) {
-	blocks, err := extractor.NewArtifactContractParser().Parse(context.Background(), raw)
+func canonicalContractFenceBody(ctx context.Context, raw string) (string, bool) {
+	blocks, err := extractor.NewArtifactContractParser().Parse(ctx, raw)
 	if err != nil || len(blocks) == 0 {
 		return "", false
 	}

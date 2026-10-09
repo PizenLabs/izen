@@ -32,6 +32,40 @@ import (
 // CLI process. It authorizes nothing.
 const maxBoundaryResolutions = 16
 
+// ApprovalPolicy is the command surface's declared stance at a parked
+// approval boundary. It selects behaviour ONLY at the human surface; it never
+// changes admission, authorization, mutation or verification, all of which
+// remain the runtime's. The default (ApprovalAsk) is the historical
+// interactive contract.
+type ApprovalPolicy string
+
+const (
+	// ApprovalAsk prompts the operator for every approval decision. It is the
+	// default and the only policy that can answer a clarify boundary.
+	ApprovalAsk ApprovalPolicy = "ask"
+	// ApprovalAlways auto-approves every held candidate. The authorization is
+	// still issued for the reviewed candidate identity and digest before the
+	// driver is resumed, so approval binds to the exact canonical mutation.
+	// It is the non-interactive automation policy.
+	ApprovalAlways ApprovalPolicy = "always"
+	// ApprovalNever auto-rejects every held candidate; nothing is applied.
+	ApprovalNever ApprovalPolicy = "never"
+)
+
+// ParseApprovalPolicy parses the -approve flag vocabulary.
+func ParseApprovalPolicy(s string) (ApprovalPolicy, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "ask", "interactive":
+		return ApprovalAsk, nil
+	case "always", "auto", "yes", "approve":
+		return ApprovalAlways, nil
+	case "never", "deny", "no", "reject":
+		return ApprovalNever, nil
+	default:
+		return "", fmt.Errorf("cli: unknown approval policy %q (want ask|always|never)", s)
+	}
+}
+
 // HumanAction is the operator's answer to a parked boundary.
 type HumanAction string
 
@@ -103,6 +137,14 @@ type AuthoritativeResult struct {
 	Approved bool
 	// Inspected reports whether the operator inspected a candidate.
 	Inspected bool
+	// Rejected reports whether the run declined at least one candidate or was
+	// denied by an explicit never-approve policy. It is distinct from an
+	// aborted run that never reached a boundary.
+	Rejected bool
+	// ClarifyRequired reports that a clarify boundary was reached and left
+	// unanswered (the non-interactive contract cannot pick a target). It is a
+	// human-required outcome, never a silent success.
+	ClarifyRequired bool
 	// RunID is the runtime's stable identity for the run.
 	RunID string
 }
@@ -172,12 +214,14 @@ func RunAuthoritative(
 				term, err = driver.ResumeApprove(ctx)
 			case HumanInspect:
 				res.Inspected = true
+				res.Rejected = true
 				term, err = driver.ResumeReject(ctx, "inspect: no mutation applied")
 			default:
 				reason := decision.Reason
 				if reason == "" {
 					reason = "rejected by operator"
 				}
+				res.Rejected = true
 				term, err = driver.ResumeReject(ctx, reason)
 			}
 		case autonomy.HumanBoundaryClarify:
@@ -187,6 +231,7 @@ func RunAuthoritative(
 				return res, derr
 			}
 			if strings.TrimSpace(decision.Clarify) == "" {
+				res.ClarifyRequired = true
 				term, err = driver.Abort("clarify boundary left unanswered")
 			} else {
 				term, err = driver.ResumeClarify(ctx, decision.Clarify)
@@ -229,14 +274,38 @@ func RunAuthoritative(
 // "i"/"inspect" inspects without applying, anything else (including Enter)
 // rejects.
 type DriverTerminalBridge struct {
-	in  io.Reader
-	out io.Writer
+	in     io.Reader
+	out    io.Writer
+	policy ApprovalPolicy
 }
 
 // NewDriverTerminalBridge returns a terminal bridge reading decisions from in
-// and rendering to out.
+// and rendering to out. The default approval policy is ApprovalAsk.
 func NewDriverTerminalBridge(in io.Reader, out io.Writer) *DriverTerminalBridge {
-	return &DriverTerminalBridge{in: in, out: out}
+	return &DriverTerminalBridge{in: in, out: out, policy: ApprovalAsk}
+}
+
+// WithPolicy sets the bridge's non-interactive approval policy and returns the
+// bridge. An unknown/empty policy is normalized to ApprovalAsk.
+func (b *DriverTerminalBridge) WithPolicy(p ApprovalPolicy) *DriverTerminalBridge {
+	if b == nil {
+		return b
+	}
+	switch p {
+	case ApprovalAlways, ApprovalNever:
+		b.policy = p
+	default:
+		b.policy = ApprovalAsk
+	}
+	return b
+}
+
+// Policy returns the bridge's effective approval policy.
+func (b *DriverTerminalBridge) Policy() ApprovalPolicy {
+	if b == nil {
+		return ApprovalAsk
+	}
+	return b.policy
 }
 
 // Decide renders the boundary and blocks for one answer.
@@ -249,7 +318,27 @@ func (b *DriverTerminalBridge) Decide(ctx context.Context, bnd *autonomy.HumanBo
 	}
 	switch bnd.Action {
 	case autonomy.HumanBoundaryApproval:
-		b.renderApproval(bnd)
+		if err := b.renderApproval(bnd); err != nil {
+			return HumanDecision{}, fmt.Errorf("cli: render approval: %w", err)
+		}
+		switch b.policy {
+		case ApprovalAlways:
+			// Non-interactive auto-approve: the review is still rendered (the
+			// evidence is not skipped), but no input is read. The caller still
+			// issues the candidate-bound authorization before resuming.
+			if _, err := fmt.Fprintln(b.out, "auto-approve policy: applying reviewed candidate"); err != nil {
+				return HumanDecision{}, fmt.Errorf("cli: render auto-approve notice: %w", err)
+			}
+			return HumanDecision{Action: HumanApprove}, nil
+		case ApprovalNever:
+			if _, err := fmt.Fprintln(b.out, "never-approve policy: rejecting reviewed candidate"); err != nil {
+				return HumanDecision{}, fmt.Errorf("cli: render never-approve notice: %w", err)
+			}
+			return HumanDecision{Action: HumanReject, Reason: "non-interactive never-approve policy"}, nil
+		}
+		if _, err := fmt.Fprint(b.out, "Apply this proposal? [y/N] "); err != nil {
+			return HumanDecision{}, fmt.Errorf("cli: render approval prompt: %w", err)
+		}
 		line, err := readDecisionLine(ctx, b.in)
 		if err != nil {
 			return HumanDecision{}, err
@@ -263,9 +352,22 @@ func (b *DriverTerminalBridge) Decide(ctx context.Context, bnd *autonomy.HumanBo
 			return HumanDecision{Action: HumanReject, Reason: "operator declined"}, nil
 		}
 	case autonomy.HumanBoundaryClarify:
-		fmt.Fprintf(b.out, "izen: clarification required — %s\n", bnd.Reason)
+		if _, err := fmt.Fprintf(b.out, "izen: clarification required — %s\n", bnd.Reason); err != nil {
+			return HumanDecision{}, fmt.Errorf("cli: render clarify reason: %w", err)
+		}
 		for i, opt := range bnd.Options {
-			fmt.Fprintf(b.out, "  %d) %s\n", i+1, opt)
+			if _, err := fmt.Fprintf(b.out, "  %d) %s\n", i+1, opt); err != nil {
+				return HumanDecision{}, fmt.Errorf("cli: render clarify option: %w", err)
+			}
+		}
+		if b.policy != ApprovalAsk {
+			// Non-interactive surfaces cannot pick a target. Returning an empty
+			// decision makes RunAuthoritative abort with a clear human-required
+			// outcome; it never guesses a target.
+			if _, err := fmt.Fprintln(b.out, "non-interactive policy: clarification cannot be answered"); err != nil {
+				return HumanDecision{}, fmt.Errorf("cli: render clarify notice: %w", err)
+			}
+			return HumanDecision{}, nil
 		}
 		if _, err := fmt.Fprint(b.out, "Select a target: "); err != nil {
 			return HumanDecision{}, fmt.Errorf("cli: render clarify prompt: %w", err)
@@ -283,24 +385,32 @@ func (b *DriverTerminalBridge) Decide(ctx context.Context, bnd *autonomy.HumanBo
 // renderApproval renders the runtime's own review facts: the exact candidate
 // diff, its metrics, the authoritative target set, the operation and the
 // runtime's evidence checklist. It never synthesizes a payload.
-func (b *DriverTerminalBridge) renderApproval(bnd *autonomy.HumanBoundary) {
-	fmt.Fprintf(b.out, "izen: proposal run=%s targets=%v operation=%s (+%d -%d)\n",
+func (b *DriverTerminalBridge) renderApproval(bnd *autonomy.HumanBoundary) error {
+	if _, err := fmt.Fprintf(b.out, "izen: proposal run=%s targets=%v operation=%s (+%d -%d)\n",
 		bnd.RequestID, bnd.CandidateTargets, bnd.CandidateOperation,
-		bnd.CandidateAddedLines, bnd.CandidateRemovedLines)
+		bnd.CandidateAddedLines, bnd.CandidateRemovedLines); err != nil {
+		return fmt.Errorf("cli: render proposal header: %w", err)
+	}
 	if bnd.CandidateOperationEvidence != "" {
-		fmt.Fprintf(b.out, "  why: %s\n", bnd.CandidateOperationEvidence)
+		if _, err := fmt.Fprintf(b.out, "  why: %s\n", bnd.CandidateOperationEvidence); err != nil {
+			return fmt.Errorf("cli: render proposal evidence: %w", err)
+		}
 	}
 	for _, row := range bnd.CandidateEvidence {
 		mark := " "
 		if row.Satisfied {
 			mark = "x"
 		}
-		fmt.Fprintf(b.out, "  [%s] %s %s\n", mark, row.Label, row.Detail)
+		if _, err := fmt.Fprintf(b.out, "  [%s] %s %s\n", mark, row.Label, row.Detail); err != nil {
+			return fmt.Errorf("cli: render proposal checklist: %w", err)
+		}
 	}
 	if strings.TrimSpace(bnd.CandidateDiff) != "" {
-		fmt.Fprintln(b.out, bnd.CandidateDiff)
+		if _, err := fmt.Fprintln(b.out, bnd.CandidateDiff); err != nil {
+			return fmt.Errorf("cli: render proposal diff: %w", err)
+		}
 	}
-	fmt.Fprint(b.out, "Apply this proposal? [y/N] ")
+	return nil
 }
 
 // RenderParked renders a non-resumable boundary.
@@ -312,12 +422,18 @@ func (b *DriverTerminalBridge) RenderParked(bnd *autonomy.HumanBoundary) error {
 		return nil
 	}
 	if bnd.Reason != "" {
-		fmt.Fprintf(b.out, "izen: run parked at %s boundary: %s\n", bnd.Action, bnd.Reason)
+		if _, err := fmt.Fprintf(b.out, "izen: run parked at %s boundary: %s\n", bnd.Action, bnd.Reason); err != nil {
+			return fmt.Errorf("cli: render parked boundary: %w", err)
+		}
 	} else {
-		fmt.Fprintf(b.out, "izen: run parked at %s boundary\n", bnd.Action)
+		if _, err := fmt.Fprintf(b.out, "izen: run parked at %s boundary\n", bnd.Action); err != nil {
+			return fmt.Errorf("cli: render parked boundary: %w", err)
+		}
 	}
 	if len(bnd.Options) > 0 {
-		fmt.Fprintf(b.out, "  options: %v\n", bnd.Options)
+		if _, err := fmt.Fprintf(b.out, "  options: %v\n", bnd.Options); err != nil {
+			return fmt.Errorf("cli: render parked options: %w", err)
+		}
 	}
 	return nil
 }
@@ -332,7 +448,7 @@ func readDecisionLine(ctx context.Context, r io.Reader) (string, error) {
 	ch := make(chan result, 1)
 	go func() {
 		read := readLine(r)
-		ch <- result{line: read.line, err: read.err}
+		ch <- result(read)
 	}()
 	select {
 	case <-ctx.Done():
