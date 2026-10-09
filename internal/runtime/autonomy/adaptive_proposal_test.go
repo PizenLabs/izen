@@ -434,3 +434,47 @@ type fakeRenderedVerifier struct{ result RenderedVerification }
 func (f fakeRenderedVerifier) Verify(context.Context, RenderedVerificationRequest) RenderedVerification {
 	return f.result
 }
+
+// TestAdaptive_BlankFreeFormDecisionIsRefusedByTheAuthoritativePath is the §6
+// input-validation regression at the runtime seam: a submission that answers
+// nothing is refused by the Driver, not merely by the UI.
+func TestAdaptive_BlankFreeFormDecisionIsRefusedByTheAuthoritativePath(t *testing.T) {
+	root := orchestrationWebWorkspace(t)
+	p := &targetProvider{artifacts: webArtifacts, served: map[string]int{}}
+	freeForm := []proposal.Question{{
+		ID: "approach", Prompt: "How should this be phased?", Kind: proposal.QuestionFreeForm,
+		Required: true, AllowFreeForm: true,
+	}}
+	d := adaptiveDriver(t, root, p, true, redesignAdvisor(freeForm), "$prompt")
+	if _, err := d.Run(context.Background(), "redesign this project help me"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	b := d.Boundary()
+	if b == nil || b.Action != autonomy.HumanBoundaryAdaptiveProposal {
+		t.Fatalf("no adaptive boundary: %+v", b)
+	}
+	// A free-form question is projected for the UI to render.
+	if !b.ProposalQuestions[0].AllowFreeForm ||
+		b.ProposalQuestions[0].Kind != autonomy.HumanProposalQuestionFreeForm {
+		t.Fatalf("question = %+v, want a free-form question", b.ProposalQuestions[0])
+	}
+	for _, blank := range []ProposalDecisionInput{
+		{QuestionID: "approach"},
+		{QuestionID: "approach", FreeForm: "   "},
+	} {
+		if _, err := d.ResumeAdaptiveProposal(context.Background(), b.ProposalFingerprint, []ProposalDecisionInput{blank}); err == nil {
+			t.Fatalf("a blank free-form answer was accepted: %+v", blank)
+		}
+	}
+	// The refusal leaves the proposal parked at its original revision and
+	// executes nothing.
+	if got := d.proposalState.Revision(); got != 1 {
+		t.Fatalf("revision after a refused submission = %d, want 1", got)
+	}
+	if p.calls != 0 {
+		t.Fatalf("a refused submission dispatched the provider (%d calls)", p.calls)
+	}
+	if d.compiledProposal != nil {
+		t.Fatalf("a refused submission compiled a proposal: %+v", d.compiledProposal)
+	}
+}

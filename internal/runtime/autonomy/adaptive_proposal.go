@@ -150,6 +150,13 @@ func (d *Driver) maybeAdaptiveProposal(ctx context.Context, runID uint64) (*auto
 	if d == nil || d.proposalAdvisor == nil {
 		return nil, false
 	}
+	if d.proposalState != nil {
+		// A durable proposal was restored for this run (see
+		// proposal_recovery.go). Continue THAT proposal: forming a new one would
+		// mint a revision-1 snapshot, overwrite the durable lineage of the
+		// decisions the human already made, and ask those questions again.
+		return d.continueRestoredProposal(ctx, runID)
+	}
 	facts := d.proposalFacts()
 	plan := d.proposalAdvisor(facts)
 
@@ -457,16 +464,7 @@ func (d *Driver) ResumeAdaptiveProposal(ctx context.Context, fingerprint string,
 // change invalidated. It is deliberately targeted: the authoritative objective
 // is untouched, and only the derived scope/candidates/context are invalidated.
 func (d *Driver) invalidateProposalDerivedState(scopeChanged bool) {
-	if d.adapter != nil {
-		dropped := d.adapter.InvalidatePendingCandidates("adaptive proposal revision changed")
-		if dropped > 0 {
-			diagnosticf("[proposal] invalidated %d held candidate(s) on revision change", dropped)
-		}
-	}
-	if d.intents != nil {
-		d.intents.InvalidateContext()
-	}
-	d.grantContextSynced = false
+	d.dropStaleDerivedProposalState("adaptive proposal revision changed")
 	if scopeChanged {
 		d.invalidateDerivedScope("adaptive proposal decision changed the target set")
 	}
@@ -585,8 +583,16 @@ func (d *Driver) ledgerProposalSnapshot(snap proposal.Snapshot) {
 func proposalIdentity(runRequestID, objective string) string {
 	// Deterministic identity from the run identity and the objective text, so a
 	// resumed run of the same objective attaches to the same proposal record.
+	return runRequestID + ":" + proposalObjectiveHash(objective)
+}
+
+// proposalObjectiveHash is the objective-derived half of a proposal identity.
+// Unlike the run-request prefix it does not depend on how many runs this
+// particular process happened to start, so it is the part a restarted process
+// can still recognise a proposal by.
+func proposalObjectiveHash(objective string) string {
 	sum := sha256.Sum256([]byte(objective))
-	return runRequestID + ":" + hex.EncodeToString(sum[:6])
+	return hex.EncodeToString(sum[:6])
 }
 
 func questionIDs(qs []proposal.Question) []string {

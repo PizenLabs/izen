@@ -812,6 +812,34 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// resolved targets are known, and before anything can be dispatched, so
 	// an interruption from here on is reconstructable.
 	d.ledgerBeginRun(objective)
+	// ── DURABLE CROSS-PROCESS PROPOSAL RECOVERY ─────────────────────────
+	// A new process re-running an objective whose durable task is still open
+	// continues that task rather than minting a second one (see
+	// ledgerBeginRun). The proposal parked inside it is recovered the same way:
+	// from the ledger, not from memory or from the prompt. When a proposal is
+	// restored, maybeAdaptiveProposal below continues THAT revision instead of
+	// forming a competing one — otherwise the fresh record would overwrite the
+	// revision the human actually left decisions on.
+	//
+	// Nothing here is an authorization. The restored value is state only; the
+	// existing approval gate and the canonical gateway still decide what may
+	// execute, exactly as they did in the process that recorded it.
+	if d.proposalAdvisor != nil && d.ledger != nil {
+		if restored, err := d.RestoreProposalFromLedger(objective); err != nil {
+			// A recorded-but-untrustworthy proposal is a refusal, not a
+			// fallback: proceeding as though nothing had been recorded would
+			// discard the human's decisions without ever saying so.
+			d.emitAuthorization("deny", "durable proposal could not be restored: "+err.Error(),
+				"PROPOSAL_RESTORE_REFUSED", false, true)
+			_, _ = d.loop.Abort("durable proposal could not be restored: "+err.Error(), autonomy.FailurePermanent)
+			d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
+			d.releaseRunResources()
+			return nil, err
+		} else if restored {
+			diagnosticf("[proposal] run %s continues a durable proposal (revision %d)",
+				d.runRequestID, d.proposalState.Revision())
+		}
+	}
 	// ── PHASE 12: DERIVE THE RUN-LEVEL TOKEN BOUND ──────────────────────
 	// The run-level budget is derived from the per-invocation budget this run
 	// is actually bound to, so a legitimate multi-invocation task is not

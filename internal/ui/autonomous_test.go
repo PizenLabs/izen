@@ -56,12 +56,13 @@ type fakeAutonomousDriver struct {
 	rejectCandidate func(ctx context.Context, patchID, reason string)
 	rejectPatchID   string
 
-	resumeApproveProposal int
-	resumeRejectProposal  int
-	resumeProposal        int
-	lastProposalIntent    string
-	resumeAdaptive        int
-	lastAdaptiveDecisions []autonomy.ProposalDecision
+	resumeApproveProposal   int
+	resumeRejectProposal    int
+	resumeProposal          int
+	lastProposalIntent      string
+	resumeAdaptive          int
+	lastAdaptiveFingerprint string
+	lastAdaptiveDecisions   []autonomy.ProposalDecision
 
 	// aggInput/aggOutput/aggKnown are the run's spent-token account as the real
 	// driver reports it. The zero value means "unknown", which is the honest
@@ -119,8 +120,9 @@ func (f *fakeAutonomousDriver) ResumeWithProposal(_ context.Context, intent stri
 	return f.term, f.resumeErr
 }
 
-func (f *fakeAutonomousDriver) ResumeAdaptiveProposal(_ context.Context, _ string, decisions []autonomy.ProposalDecision) (*autonomy.LoopTermination, error) {
+func (f *fakeAutonomousDriver) ResumeAdaptiveProposal(_ context.Context, fingerprint string, decisions []autonomy.ProposalDecision) (*autonomy.LoopTermination, error) {
 	f.resumeAdaptive++
+	f.lastAdaptiveFingerprint = fingerprint
 	f.lastAdaptiveDecisions = append([]autonomy.ProposalDecision(nil), decisions...)
 	return f.term, f.resumeErr
 }

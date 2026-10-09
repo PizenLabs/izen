@@ -191,23 +191,57 @@ func TestR5_CaseA_EndToEndMutationReachesProven(t *testing.T) {
 
 	// The forensic record retains the progress classification and the attempt
 	// transitions. This is what answers "what changed between attempt N and
-	// N+1" without replaying the contract.
+	// attempt N+1" without replaying the contract.
+	//
+	// The record is read only after the observer has caught up. continuation
+	// .evaluated is a CONTROL event, so it is always delivered — but it is
+	// delivered by the bus's own dispatch goroutine, which can still be
+	// draining a backlog after ResumeApprove returns. Reading the snapshot
+	// there observes that backlog rather than the run's history, and is the
+	// intermittent failure this test used to produce under CPU contention.
+	// Waiting for the PROVEN classification asserts the same requirement.
+	if !waitForProven(rec) {
+		t.Fatal("no continuation record reported PROVEN progress")
+	}
 	evals, _ := rec.snapshot()
 	if len(evals) == 0 {
 		t.Fatal("no continuation.evaluated records were published")
 	}
-	var sawProven bool
 	for _, e := range evals {
 		if e.Progress == "" {
 			t.Fatalf("continuation record %d carries no progress classification", e.Step)
 		}
-		if e.Progress == string(execution.ProgressProven) {
-			sawProven = true
-		}
 	}
-	if !sawProven {
+	if !containsProven(evals) {
 		t.Fatalf("no continuation record reported PROVEN progress: %+v", evals)
 	}
+}
+
+// containsProven reports whether the continuation history records the objective
+// reaching PROVEN. It is kept beside waitForProven so the assertion the test
+// makes is the same one the wait looks for.
+func containsProven(evals []events.ContinuationDecisionPayload) bool {
+	for _, e := range evals {
+		if e.Progress == string(execution.ProgressProven) {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForProven polls until the run's continuation history records PROVEN, up to
+// a bounded deadline. It is the same bounded-wait shape waitForDecisions uses;
+// a timeout is a failure for the caller, never a pass.
+func waitForProven(r *r5ProgressRecorder) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if evals, _ := r.snapshot(); containsProven(evals) {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	evals, _ := r.snapshot()
+	return containsProven(evals)
 }
 
 // ── CASE B — same output, same state, must stop ─────────────────────────────

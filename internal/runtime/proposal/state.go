@@ -516,10 +516,27 @@ func (s *State) Snapshot() Snapshot {
 // snapshot's content is intact. A snapshot whose fingerprint does not match its
 // contents is REFUSED: silently reconstructing authorization from a corrupted
 // conversational record is exactly what must not happen after a resume.
+// The refusals are deliberately structural rather than accepting. A snapshot
+// that is malformed, torn, empty of strategies, non-human, or stamped with a
+// revision that cannot have existed is not "mostly right": it is an image whose
+// provenance cannot be established, and the honest answer is to refuse it and
+// let the caller re-derive from evidence rather than inherit a story.
 func Restore(snap Snapshot) (*State, error) {
 	c := snap.Contract
 	if err := c.Validate(); err != nil {
 		return nil, err
+	}
+	// A revision of zero or less cannot have been minted by State.Apply: it is
+	// the signature of a truncated or hand-written payload. Repairing it here
+	// would hide a defect the caller must be told about.
+	if c.Revision < 1 {
+		return nil, ValidationError{Field: "snapshot", Reason: "a durable proposal must carry a revision >= 1"}
+	}
+	// A proposal that compiles to nothing must not be accepted at all. Its
+	// absent strategy would silently compile into an empty execution contract,
+	// which is how an objective gets "resumed" into doing nothing.
+	if len(c.Strategies) == 0 {
+		return nil, ValidationError{Field: "snapshot", Reason: "a durable proposal must carry at least one strategy"}
 	}
 	if snap.Fingerprint != "" && snap.Fingerprint != c.Fingerprint() {
 		return nil, ValidationError{Field: "snapshot", Reason: "fingerprint does not match the recorded proposal contents"}
@@ -536,9 +553,6 @@ func Restore(snap Snapshot) (*State, error) {
 		if err := validateAnswer(*q, d); err != nil {
 			return nil, err
 		}
-	}
-	if c.Revision <= 0 {
-		c.Revision = 1
 	}
 	return &State{contract: c, invalid: map[string]bool{}}, nil
 }

@@ -57,6 +57,13 @@ type TaskStore struct {
 	// recovered without trusting sequence numbers.
 	touch    map[string]uint64
 	touchSeq uint64
+	// custom is the retained audit-lineage read-back window (see
+	// custom_events.go): the bounded per-task tail of the events appended
+	// through RecordCustomEvent, reconstructed by replay exactly like every
+	// other materialized view. It is authoritative for nothing — the journal
+	// is — which is what makes it safe to bound.
+	custom          map[string][]CustomEvent
+	customTruncated map[string]bool
 	// closed marks a torn-down store: after Close every append is refused,
 	// so a shut-down runtime can never keep writing execution truth.
 	closed bool
@@ -81,16 +88,18 @@ func NewTaskStore(workDir string) *TaskStore {
 	clean := filepath.Clean(workDir)
 	rt := filepath.Join(clean, ".izen", "runtime")
 	return &TaskStore{
-		workDir:      clean,
-		runtimeDir:   rt,
-		ledgerPath:   filepath.Join(rt, "ledger.ndjson"),
-		snapPath:     filepath.Join(rt, "snapshot.json"),
-		lock:         NewFileLock(clean),
-		tasks:        make(map[string]*TaskState),
-		contextTiers: make(map[string]int),
-		pressures:    make(map[string][]LedgerEvent),
-		negatives:    make(map[string][]NegativeKnowledgeRecord),
-		touch:        make(map[string]uint64),
+		workDir:         clean,
+		runtimeDir:      rt,
+		ledgerPath:      filepath.Join(rt, "ledger.ndjson"),
+		snapPath:        filepath.Join(rt, "snapshot.json"),
+		lock:            NewFileLock(clean),
+		tasks:           make(map[string]*TaskState),
+		contextTiers:    make(map[string]int),
+		pressures:       make(map[string][]LedgerEvent),
+		negatives:       make(map[string][]NegativeKnowledgeRecord),
+		touch:           make(map[string]uint64),
+		custom:          make(map[string][]CustomEvent),
+		customTruncated: make(map[string]bool),
 	}
 }
 
@@ -978,6 +987,8 @@ func (s *TaskStore) replayLocked() error {
 	s.seq = 0
 	s.gaps = nil
 	s.faults = nil
+	s.custom = make(map[string][]CustomEvent)
+	s.customTruncated = make(map[string]bool)
 	f, err := os.Open(s.ledgerPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1228,6 +1239,10 @@ func (s *TaskStore) apply(ev LedgerEvent) {
 		s.currentID = ev.TaskID
 		ensureTask(s.tasks, ev.TaskID)
 	}
+	// Audit-lineage read-back retention (custom_events.go). Every retained
+	// type is folded here — from the live append and from replay alike — so a
+	// fresh process sees exactly what a live one saw.
+	s.retainCustom(ev)
 }
 
 // writeSnapshotLocked persists the materialized view atomically.

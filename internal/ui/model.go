@@ -1429,6 +1429,23 @@ type model struct {
 	// It is presentation state only: the runtime validates and records every
 	// decision on submit.
 	adaptiveAnswers map[string][]string
+	// adaptiveFreeform holds the human's free-form text per adaptive proposal
+	// question. It is the answer for a question that declares AllowFreeForm (or
+	// is a free_form question), and it travels to the runtime through the SAME
+	// ResumeAdaptiveProposal submission as an option selection — never by
+	// mutating proposal state in the UI.
+	adaptiveFreeform map[string]string
+	// adaptiveFocus is the index of the adaptive proposal question the keyboard
+	// cursor is on. It is presentation only: it decides which question the
+	// free-form editor writes to, never what the runtime will accept.
+	adaptiveFocus int
+	// adaptiveEditing names the question whose free-form answer is being typed,
+	// or "" when the keyboard is in selection mode. It is deliberately distinct
+	// from adaptiveFreeform: a draft is not an answer until the human commits
+	// it, and a cancelled draft must never reach the runtime.
+	adaptiveEditing string
+	// adaptiveDraft is the uncommitted free-form text.
+	adaptiveDraft string
 	// autonomousObjective is the objective of the active/parked driver run.
 	autonomousObjective string
 	// proposalTUI is the interactive Zero-Token DecisionSurface selection model
