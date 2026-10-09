@@ -91,6 +91,14 @@ type Patch struct {
 	Applied       bool      `json:"applied"`
 	TaskID        int       `json:"task_id,omitempty"`
 	IsFullRewrite bool      `json:"is_full_rewrite,omitempty"`
+	// Canonical reports that Modified ALREADY holds the mutation artifact's
+	// canonical, apply-ready bytes, resolved by the artifact boundary BEFORE
+	// approval (a FILE_CREATE envelope's terminated body). Apply writes them
+	// verbatim through the kernel instead of re-deriving them from protocol text,
+	// so the bytes a human approved and the digest bound to the authorization are
+	// the exact bytes committed. It is never set on an unresolved payload: a
+	// non-canonical patch still goes through the full envelope/diff resolution.
+	Canonical bool `json:"canonical,omitempty"`
 }
 
 type PatchManager struct {
@@ -643,7 +651,7 @@ func (pm *PatchManager) apply(ctx context.Context, patch *Patch) error {
 	if patch.File == "" {
 		return fmt.Errorf("patch has empty file path")
 	}
-	if patch.Modified == "" {
+	if patch.Modified == "" && !patch.Canonical {
 		return fmt.Errorf("patch for %s has empty content", patch.File)
 	}
 	cleaned := filepath.Clean(patch.File)
@@ -712,29 +720,43 @@ func (pm *PatchManager) apply(ctx context.Context, patch *Patch) error {
 	// payload keeps the creation typed (CREATED evidence) and tolerant of the
 	// marker-length variants a small model emits. New files are written directly
 	// without hunk matching against nonexistent originals.
-	if fileCreateBlocks := parseFileCreateBlocks(patch.Modified); len(fileCreateBlocks) > 0 {
-		block := fileCreateBlocks[0]
-		// A header that names no path keeps the dispatched target; a header that
-		// names one updates it so the write targets the artifact the model
-		// addressed.
-		if block.FilePath != "" {
-			patch.File = block.FilePath
-		}
-		patch.Modified = sanitizeCreationBody(block.Content)
-		// Recompute fullPath with the updated file path so the shadow backup,
-		// write, and verification all target the correct location.
-		cleaned = filepath.Clean(patch.File)
-		if cleaned == "." || cleaned == "/" || strings.Contains(cleaned, "..") {
-			return fmt.Errorf("invalid FILE_CREATE path: %s", patch.File)
-		}
-		fullPath = filepath.Join(pm.root, cleaned)
-		// As above: the kernel creates the parent directories under the grant.
-		patch.Original = ""
-		if err := pm.recordTransaction(fullPath); err != nil {
-			return fmt.Errorf("transaction record %s: %w", patch.File, err)
-		}
-		if err := pm.createShadowBackup(fullPath); err != nil {
-			return fmt.Errorf("shadow backup %s: %w", patch.File, err)
+	//
+	// A patch whose Canonical bit is set (the runtime executor resolved the
+	// envelope body at the artifact boundary, before approval) is written
+	// VERBATIM: its Modified bytes are already the reviewed, digested artifact.
+	// Re-extracting or re-sanitizing them here would let apply substitute
+	// different content after the human approved.
+	fileCreateBlocks := []fileCreateBlock(nil)
+	envelopeCreate := false
+	if !patch.Canonical {
+		fileCreateBlocks = parseFileCreateBlocks(patch.Modified)
+		envelopeCreate = len(fileCreateBlocks) > 0
+	}
+	if patch.Canonical || envelopeCreate {
+		if envelopeCreate {
+			block := fileCreateBlocks[0]
+			// A header that names no path keeps the dispatched target; a header that
+			// names one updates it so the write targets the artifact the model
+			// addressed.
+			if block.FilePath != "" {
+				patch.File = block.FilePath
+			}
+			patch.Modified = sanitizeCreationBody(block.Content)
+			// Recompute fullPath with the updated file path so the shadow backup,
+			// write, and verification all target the correct location.
+			cleaned = filepath.Clean(patch.File)
+			if cleaned == "." || cleaned == "/" || strings.Contains(cleaned, "..") {
+				return fmt.Errorf("invalid FILE_CREATE path: %s", patch.File)
+			}
+			fullPath = filepath.Join(pm.root, cleaned)
+			// As above: the kernel creates the parent directories under the grant.
+			patch.Original = ""
+			if err := pm.recordTransaction(fullPath); err != nil {
+				return fmt.Errorf("transaction record %s: %w", patch.File, err)
+			}
+			if err := pm.createShadowBackup(fullPath); err != nil {
+				return fmt.Errorf("shadow backup %s: %w", patch.File, err)
+			}
 		}
 		// The envelope is terminated by an explicit END_FILE, so the artifact is
 		// complete by construction: the fragmentary-content heuristic (which
@@ -2097,6 +2119,30 @@ func containsCreationEnvelopeResidue(content string) bool {
 		}
 	}
 	return false
+}
+
+// canonicalFileCreateBody resolves a recognized FILE_CREATE envelope into the
+// EXACT bytes the mutation boundary will apply: the terminated body between the
+// header and the END_FILE marker, cleaned with the SAME sanitizer the apply
+// boundary uses.
+//
+// It is the single normalization step that lets the parser's artifact
+// recognition and the candidate's identity agree. Resolving the body at
+// STAGING — before the candidate is held, digested and previewed — is what
+// guarantees the human approves the bytes that will be written; deferring the
+// extraction to apply time let a rendered diff show the envelope while the
+// applied file held only the parsed body.
+//
+// ok=false is a FAIL-CLOSED result: the payload was recognized as an addressed
+// FILE_CREATE envelope but carried no END_FILE terminator, so no body can be
+// determined. A truncated or malformed envelope must never be applied and must
+// never be presented for approval.
+func canonicalFileCreateBody(payload string) (string, bool) {
+	blocks := parseFileCreateBlocks(payload)
+	if len(blocks) == 0 {
+		return "", false
+	}
+	return sanitizeCreationBody(blocks[0].Content), true
 }
 
 // parseFileCreateBlocks scans content for a FILE_CREATE envelope

@@ -2465,9 +2465,12 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 			}
 		}
 	}
-	if strings.TrimSpace(res.Diff) == "" {
+	if strings.TrimSpace(res.Diff) == "" && !patches[0].Canonical {
 		// Truly no renderable payload: fail EXPLICITLY here rather than open an
-		// approval surface that can never be fulfilled.
+		// approval surface that can never be fulfilled. A CANONICAL create is
+		// exempt: a terminated, empty FILE_CREATE envelope is a legitimate
+		// empty-file creation whose artifact is the empty body itself, not a
+		// missing payload.
 		g.FailExecution(events.FailurePermanent, ErrEmptyProposalPayload, "executor.proposal")
 		res.Err = ErrEmptyProposalPayload
 		res.Proof.Outcome = OutcomeFailed
@@ -3810,6 +3813,11 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			}
 		}
 		var modified string
+		// canonicalCreate records that the full-artifact path resolved the
+		// artifact's canonical, apply-ready bytes at STAGING (a terminated
+		// FILE_CREATE envelope body), so the staged candidate, its digest, the
+		// approval preview and the applied bytes are one object.
+		canonicalCreate := false
 		if patchOnly {
 			// Bounded-patch artifact boundary: extract ONLY structured patch
 			// representations. A full-file (or otherwise unstructured)
@@ -3912,6 +3920,40 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					modified = body
 				}
 			}
+			// ── TRANSPORT ENVELOPE → CANONICAL BODY (Phase 2.1) ─────────
+			//
+			// A FILE_CREATE envelope or a formal ":::artifact <path>" contract
+			// fence is TRANSPORT, not the artifact: the bytes to apply are the
+			// terminated body inside it. Resolve that body HERE, before binding,
+			// before the candidate is held, digested and previewed. Deferring the
+			// extraction to apply time is what let a rendered CandidateDiff show
+			// the envelope while the applied file held only the parsed body — a
+			// human approving one artifact and the runtime writing another.
+			//
+			// A recognized envelope that is NOT terminated is malformed: fail
+			// closed, stage no candidate, open no approval surface.
+			if artifact.Structural && original == "" {
+				switch artifact.Form {
+				case ArtifactFormFileCreate:
+					body, ok := canonicalFileCreateBody(verbatim)
+					if !ok {
+						return nil, invs, diffs, candidates, trace, fmt.Errorf(
+							"%w: %w: %s: FILE_CREATE envelope is not terminated by END_FILE",
+							ErrInvalidPatchFormat, ErrArtifactRejected, target)
+					}
+					modified = body
+					canonicalCreate = true
+				case ArtifactFormContractFence:
+					body, ok := canonicalContractFenceBody(verbatim)
+					if !ok {
+						return nil, invs, diffs, candidates, trace, fmt.Errorf(
+							"%w: %w: %s: artifact contract fence is not closed",
+							ErrInvalidPatchFormat, ErrArtifactRejected, target)
+					}
+					modified = body
+					canonicalCreate = true
+				}
+			}
 			// ANCHOR HONESTY UNDER A FULL-ARTIFACT CONTRACT. A provider that
 			// answered a "replace the file" contract with a SEARCH/REPLACE
 			// envelope did NOT produce a whole document; it produced a patch
@@ -3989,11 +4031,16 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			return nil, invs, diffs, candidates, trace, fmt.Errorf(
 				"%w: %w: %s", ErrArtifactPlaceholderEcho, ErrArtifactRejected, target)
 		}
-		if strings.TrimSpace(modified) == "" {
+		if strings.TrimSpace(modified) == "" && !canonicalCreate {
 			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
 			// never a proposal staged for approval. The model produced no
 			// usable mutation artifact — abort before any approval surface.
 			// The billed invocation is still returned so usage is preserved.
+			//
+			// A canonical CREATE is exempt: an explicitly TERMINATED
+			// FILE_CREATE envelope with an empty body is a legitimate
+			// empty-file creation (truncation is signalled by
+			// finish_reason=length, not by body emptiness).
 			return nil, invs, diffs, candidates, trace, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
 		}
 		// ── ARTIFACT BOUNDARY (Phase 2) ─────────────────────────────
@@ -4045,12 +4092,23 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w", ErrArtifactRetryableRejected, redundant)
 		}
 		patches = append(patches, &Patch{
-			ID:       fmt.Sprintf("%s-patch-%d", requestID, len(patches)+1),
-			File:     target,
-			Original: original,
-			Modified: modified,
+			ID:        fmt.Sprintf("%s-patch-%d", requestID, len(patches)+1),
+			File:      target,
+			Original:  original,
+			Modified:  modified,
+			Canonical: canonicalCreate,
 		})
-		diffs = append(diffs, x.compileDiff(raw, target, original))
+		if canonicalCreate {
+			// A CREATE has no baseline: derive the diff from the SAME canonical
+			// bytes the apply will write (never from the raw envelope), so the
+			// review the human approves and the mutation that lands are one
+			// object. The mutation boundary records its diff from this same
+			// compiled diff (SetCompiledDiffs).
+			d, _ := wholeFileAdditionDiff(modified)
+			diffs = append(diffs, d)
+		} else {
+			diffs = append(diffs, x.compileDiff(raw, target, original))
+		}
 	}
 	return patches, invs, diffs, candidates, trace, nil
 }

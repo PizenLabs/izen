@@ -166,3 +166,19 @@ func (p *V3ArtifactPipeline) ParseContracts(raw string) ([]ir.Artifact, error) {
 	}
 	return res.Artifacts, nil
 }
+
+// canonicalContractFenceBody resolves a formal artifact contract fence
+// (":::artifact <path>" … ":::" or "```lang:path" … "```") into the exact body
+// the mutation boundary will apply, using the SAME V3 contract parser the
+// artifact pipeline uses. Reusing that parser keeps one grammar for the
+// transport form, so the candidate's identity and the applied bytes are derived
+// from one parse rather than from a later, differently-owned extraction.
+//
+// ok=false is fail-closed: no complete, closed contract fence was found.
+func canonicalContractFenceBody(raw string) (string, bool) {
+	blocks, err := extractor.NewArtifactContractParser().Parse(context.Background(), raw)
+	if err != nil || len(blocks) == 0 {
+		return "", false
+	}
+	return strings.Join(blocks[0].Lines, "\n"), true
+}
