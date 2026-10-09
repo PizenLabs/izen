@@ -310,7 +310,15 @@ func (d *Driver) scopeProvenance() domain.ScopeProvenance {
 	if d == nil || d.req.Scope == "" {
 		return domain.ScopeNone
 	}
+	// `$prompt` and `/build` share the SAME execution authority — both are
+	// runtime-resolved dynamic mutation scopes. They remain DISTINCT command
+	// surfaces (recorded verbatim on d.req.Scope and rendered on the command
+	// axis); only their authority vector coincides. `$hot` stays a bounded,
+	// human-declared scope.
 	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$prompt") {
+		return domain.ScopeDynamic
+	}
+	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$build") {
 		return domain.ScopeDynamic
 	}
 	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$hot") {

@@ -340,6 +340,7 @@ func (e *AuthorizationEngine) AuthorizeBuildCandidateContent(
 		CheckpointRef:   ref,
 		ExpiresAt:       time.Now().Add(5 * time.Minute),
 		SingleUse:       singleUse,
+		Scope:           ScopeMutationOperation,
 		IssuedAt:        time.Now(),
 	}
 

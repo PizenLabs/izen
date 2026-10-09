@@ -1314,7 +1314,21 @@ var ErrProviderModelMismatch = errors.New("executor: provider/model mismatch")
 // existed but was rejected, distinct from a missing artifact.
 var ErrArtifactRejected = errors.New("executor: mutation artifact rejected")
 
+// ErrArtifactPlaceholderEcho is returned when a mutation artifact still carries
+// the artifact-contract placeholder verbatim: the model republished the
+// instruction rather than the requested content. It is an EXPLICIT rejection —
+// never a silent repair — so a Markdown/plain artifact can never be corrupted
+// by markup tag balancing applied to instruction text.
+var ErrArtifactPlaceholderEcho = errors.New("executor: artifact echoed the contract placeholder instead of content")
+
 var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejected with retry directive")
+
+// ErrEmptyProposalPayload is returned when a valid artifact cannot be rendered
+// as any approval payload. Entering OutcomePendingApproval with no diff would
+// open an approval surface whose consumer waits for a producer that never runs
+// (the orphaned "Waiting for proposal payload..." state). A proposal must reach
+// an explicit terminal outcome, never an unfulfillable wait.
+var ErrEmptyProposalPayload = errors.New("executor: proposal produced no renderable payload")
 
 // ErrNonRetryableArtifactError is the circuit-breaker sentinel for
 // ambiguous-anchor failures that cannot be resolved without explicit
@@ -2436,6 +2450,31 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	res.Original = patches[0].Original
 	res.Content = patches[0].Modified
 	res.Diff = diffs[0]
+	// ── PROPOSAL PRODUCER/CONSUMER AGREEMENT ───────────────────────────
+	// A CREATE has no unified-diff baseline, so the changeset pipeline can
+	// legitimately compile nothing even though the artifact is a concrete body
+	// of bytes. Derive the whole-file-addition diff from the SAME artifact bytes
+	// the apply will write — the same projection the candidate preview already
+	// uses — so the approval payload can never disagree with the held patch.
+	// The consumer then never waits for a payload no producer will fill.
+	if strings.TrimSpace(res.Diff) == "" {
+		if fallback, _ := wholeFileAdditionDiff(patches[0].Modified); fallback != "" {
+			res.Diff = fallback
+			if len(diffs) > 0 {
+				diffs[0] = fallback
+			}
+		}
+	}
+	if strings.TrimSpace(res.Diff) == "" {
+		// Truly no renderable payload: fail EXPLICITLY here rather than open an
+		// approval surface that can never be fulfilled.
+		g.FailExecution(events.FailurePermanent, ErrEmptyProposalPayload, "executor.proposal")
+		res.Err = ErrEmptyProposalPayload
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), ErrEmptyProposalPayload
+	}
 	for _, p := range patches {
 		g.CompleteArtifact("patch", p.File)
 	}
@@ -2501,6 +2540,16 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		if x.auth.CandidateDigest != "" && held && preview.CandidateID != patchID {
 			return nil, fmt.Errorf("executor: %w: authorization %s names candidate %q, refusing %q",
 				authorization.ErrAuthorizationCandidateMismatch, x.auth.ID, x.auth.CandidateID, patchID)
+		}
+		// ── AUTHORIZATION CONSUMPTION BOUNDARY ─────────────────────────
+		// A mutation-operation grant authorizes the WHOLE apply+verify
+		// operation. It is consumed exactly once — when this operation reaches
+		// its terminal state — never by each verification shell command. This
+		// keeps a multi-step verifier from starving itself on the first command
+		// while preserving single-use semantics for the mutation operation.
+		if x.auth.Scope == authorization.ScopeMutationOperation {
+			grant := x.auth
+			defer markAuthConsumed(grant)
 		}
 	}
 
@@ -3167,6 +3216,34 @@ func wholeFileAdditionDiff(body string) (string, int) {
 	return sb.String(), len(lines)
 }
 
+// markupTargetExts are the extensions whose artifact CONTRACT is markup, i.e.
+// for which an HTML tag-balance repair is semantically applicable. Markup
+// knowledge is derived from the resolved target, not from the payload's
+// incidental characters — a Markdown or plain-text target is never markup.
+var markupTargetExts = map[string]bool{
+	".html": true, ".htm": true, ".xhtml": true, ".xml": true,
+	".svg": true, ".vue": true,
+}
+
+// isMarkupTarget reports whether the resolved target's artifact contract is
+// markup, so document-level tag balancing may legitimately apply.
+func isMarkupTarget(target string) bool {
+	if strings.TrimSpace(target) == "" {
+		return false
+	}
+	return markupTargetExts[strings.ToLower(filepath.Ext(target))]
+}
+
+// anyMarkupTarget reports whether any resolved target is a markup artifact.
+func anyMarkupTarget(targets []string) bool {
+	for _, t := range targets {
+		if isMarkupTarget(t) {
+			return true
+		}
+	}
+	return false
+}
+
 // countDiffLines measures the compiled diff for the preview when the patch record
 // carries no own metrics (a bounded SEARCH/REPLACE artifact has no hunk header).
 func countDiffLines(diffs []string) (added, removed int) {
@@ -3639,7 +3716,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					}
 					return stepReq, nil
 				},
-				req.StreamCallback, maxOut, llmConstrained, disableReasoning, &invs, &trace,
+				req.StreamCallback, isMarkupTarget(target), maxOut, llmConstrained, disableReasoning, &invs, &trace,
 			)
 			candidates = append(candidates, outcome.Candidate)
 			if stepErr != nil {
@@ -3654,7 +3731,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			var callErr error
 			var itrace *ingestion.IngestionTrace
 			var usage ai.ProviderUsage
-			raw, usage, itrace, callErr = x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, &providerMetadata)
+			raw, usage, itrace, callErr = x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, isMarkupTarget(target), &providerMetadata)
 			trace = itrace
 			// The invocation evidence is built from the stream outcome REGARDLESS
 			// of the artifact result: the provider billed these tokens whether the
@@ -3903,6 +3980,14 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					"%w: %w: %s", ErrUnboundArtifact, ErrArtifactRejected, bindErr.Error())
 			}
 			modified = bound.Content
+		}
+		if isArtifactPlaceholderEcho(modified) {
+			// The model republished the instruction placeholder as if it were
+			// file content. That is NOT an artifact: reject it explicitly before
+			// validation or any approval surface, so no repair heuristic can
+			// "balance" the placeholder's brackets into a corrupted file.
+			return nil, invs, diffs, candidates, trace, fmt.Errorf(
+				"%w: %w: %s", ErrArtifactPlaceholderEcho, ErrArtifactRejected, target)
 		}
 		if strings.TrimSpace(modified) == "" {
 			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
@@ -4547,7 +4632,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		g.BeginModel(model)
 
 		var providerMetadata ai.ResponseMetadata
-		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, &providerMetadata)
+		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, anyMarkupTarget(targets), &providerMetadata)
 		if itrace != nil {
 			trace = itrace
 		}
@@ -4649,7 +4734,7 @@ func isOutputExhausted(err error) bool {
 // reasoning.telemetry event on completion. The accumulated visible content and
 // the authoritative provider usage are returned; the authoritative artifact
 // always travels on the ExecutionResult afterwards.
-func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback, metadataOut ...*ai.ResponseMetadata) (raw string, usage ai.ProviderUsage, trace *ingestion.IngestionTrace, err error) {
+func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback, allowMarkupRepair bool, metadataOut ...*ai.ResponseMetadata) (raw string, usage ai.ProviderUsage, trace *ingestion.IngestionTrace, err error) {
 	// Provider adapters are untrusted callers. Keep their descriptor mutation
 	// confined to a private request copy so the executor's active ceiling and
 	// the pending approval proof cannot be changed after admission.
@@ -4795,12 +4880,13 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		// Transport normalization: preserve the raw response and record every
 		// transformation in an IngestionTrace before the payload reaches the
 		// L1 Execution Gate / artifact parser.
-		trace, procErr := ingestion.Process(resp.Content)
+		trace, procErr := ingestion.ProcessWithPolicy(resp.Content, allowMarkupRepair)
 		visible := ai.VisibleCompletion(trace.NormalizedPayload)
 		if procErr != nil {
 			if errors.Is(procErr, ingestion.ErrSyntaxInvalid) && trace != nil && trace.RepairCandidate != nil {
 				candidate := trace.RepairCandidate
-				if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) {
+				if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) &&
+					!isArtifactPlaceholderEcho(trace.NormalizedPayload) && !isArtifactPlaceholderEcho(candidate.ProposedPayload) {
 					ingestion.RecordRepairAccepted()
 					log.Printf("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
 					if globalActivityLog != nil {
@@ -5180,14 +5266,14 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	// every transformation in an IngestionTrace before the payload reaches the
 	// L1 Execution Gate / artifact parser.
 	rawVisible := content.String()
-	ingTrace, procErr := ingestion.Process(rawVisible)
+	ingTrace, procErr := ingestion.ProcessWithPolicy(rawVisible, allowMarkupRepair)
 	trace = ingTrace
 	visible := ai.VisibleCompletion(trace.NormalizedPayload)
 	if strings.TrimSpace(visible) == "" && reasoningBuf.Len() > 0 {
 		// The entire visible completion was reasoning: ingest the reasoning
 		// text as the raw artifact so forensic traceability survives.
 		reasoningRaw := reasoningBuf.String()
-		ingTrace2, procErr2 := ingestion.Process(reasoningRaw)
+		ingTrace2, procErr2 := ingestion.ProcessWithPolicy(reasoningRaw, allowMarkupRepair)
 		trace, procErr = ingTrace2, procErr2
 		visible = ai.VisibleCompletion(trace.NormalizedPayload)
 	}
@@ -5197,7 +5283,8 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	if procErr != nil {
 		if errors.Is(procErr, ingestion.ErrSyntaxInvalid) && trace != nil && trace.RepairCandidate != nil {
 			candidate := trace.RepairCandidate
-			if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) {
+			if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) &&
+				!isArtifactPlaceholderEcho(trace.NormalizedPayload) && !isArtifactPlaceholderEcho(candidate.ProposedPayload) {
 				ingestion.RecordRepairAccepted()
 				log.Printf("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
 				if globalActivityLog != nil {

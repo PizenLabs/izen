@@ -2198,6 +2198,13 @@ type model struct {
 	// authorization proposal is outstanding, so Execute can resume the hotfix
 	// pipeline on the SAME objective without re-parsing a command.
 	pendingHotfixObjective string
+	// executionSurface records the COMMAND SURFACE that authorized the run
+	// ("$prompt", "/build" → "$build", "$hot"). It is carried to the
+	// authoritative runtime as the run's scope so the command axis is truthful
+	// and `$hot` stays a bounded, human-declared authority. `/build` and
+	// `$prompt` share the SAME dynamic execution authority but remain distinct
+	// surfaces. Empty falls back to the session scope provenance.
+	executionSurface string
 
 	// Patch engine: 4-tier pipeline (Tier 1 structured diff -> Tier 2
 	// SEARCH/REPLACE -> Tier 3 whole-file -> Tier 4 human approval) replacing

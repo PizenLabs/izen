@@ -108,6 +108,57 @@ func TestBenchmark_CreateExactPrompt(t *testing.T) {
 	}
 }
 
+// ── SCENARIO B: `/build` ordinary prompt (live runtime arm) ─────────────────
+//
+// Scenario B is "enter /build, then submit the create prompt". The TUI routing
+// of that surface is proven deterministically by
+// internal/ui::TestBuildOrdinaryPromptEntersAuthoritativeRuntime. This arm
+// exercises the SAME authoritative runtime owner the TUI now hands the run to,
+// under the "$build" surface, with the REAL provider — so the live lifecycle,
+// budget, proposal and terminal truth are the same for Scenario B as for
+// Scenario A.
+func TestBenchmark_CreateCodeQuotedBuildSurface(t *testing.T) {
+	if os.Getenv(liveOptIn) != "1" {
+		t.Skipf("set %s=1 to run the real-world benchmark (needs a real provider)", liveOptIn)
+	}
+	provider, cfg := benchmarkProvider(t)
+	rec := run(t, Task{
+		ID:      "bench-create-code-quoted-build-surface",
+		Name:    "BENCHMARK (Scenario B, /build surface) — " + benchmarkCodeQuotedPrompt,
+		Prompt:  benchmarkCodeQuotedPrompt,
+		Surface: "$build",
+		Files: map[string]string{
+			"go.mod":      "module benchmarkfixture\n\ngo 1.21\n",
+			"README.md":   "# Sample Project\n\nA small fixture repository.\n",
+			"testfile.md": "an unrelated existing file\n",
+		},
+		AnswerApprovals: true,
+		Provider:        provider,
+		Config:          cfg,
+	})
+
+	body, ok := rec.ChangedContents["zuru.md"]
+	if !ok {
+		t.Fatalf("zuru.md was NOT created; delta=%v mutations=%v boundary=%s/%q",
+			rec.Delta, rec.Mutations, rec.BoundaryAction, rec.BoundaryReason)
+	}
+	if strings.TrimSpace(body) != "Hello everyone" {
+		t.Fatalf("zuru.md content = %q, want %q", body, "Hello everyone")
+	}
+	if got, ok := rec.ChangedContents["testfile.md"]; ok {
+		t.Fatalf("an unrelated file was mutated: testfile.md = %q", got)
+	}
+	var mutated bool
+	for _, m := range rec.Mutations {
+		if strings.Contains(m, "target=zuru.md") && strings.Contains(m, "fs_changed=true") {
+			mutated = true
+		}
+	}
+	if !mutated {
+		t.Fatalf("the /build-surface mutation did not reach the requested target; mutations=%v", rec.Mutations)
+	}
+}
+
 // ── CODE-QUOTED CREATE (the reported regression) ─────────────────────────────
 //
 // The observed trace named the target inside backticks:

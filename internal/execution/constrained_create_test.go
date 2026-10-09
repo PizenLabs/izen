@@ -96,6 +96,51 @@ func TestConstrainedModelCreateKeepsFullArtifactContract(t *testing.T) {
 	}
 }
 
+// TestCreateProposalCarriesWholeFileDiff pins the proposal producer/consumer
+// contract: a creation that compiles no unified diff (no baseline to anchor
+// against) still carries a renderable payload derived from the SAME bytes the
+// apply will write. Before the correction res.Diff was empty and the approval
+// surface waited for a payload no producer would ever fill.
+func TestCreateProposalCarriesWholeFileDiff(t *testing.T) {
+	root := t.TempDir()
+	writeTarget(t, root, "README.md", "# Sample Project\n\nA small fixture.\n")
+
+	bus := events.NewBus(events.DefaultBufferSize)
+	mock := &mockProvider{responses: []*ai.Response{{
+		Content: "Hello everyone\n",
+		Usage:   ai.ProviderUsage{Known: true, PromptTokens: 40, CompletionTokens: 4, FinishReason: "stop"},
+	}}}
+	cfg := config.Default()
+	x := NewRuntimeExecutor(root, cfg, mock, bus, "")
+	x.SetVerifier(trivialVerifier(root))
+	x.SetAuthorization(testAuthorization())
+
+	profile := NewIntentGateway(root).SelectStrategy(constrainedCreatePrompt)
+	res, err := x.Execute(context.Background(), ExecuteRequest{
+		RequestID: "create-proposal-diff",
+		Mode:      "build",
+		Prompt:    constrainedCreatePrompt,
+		Target:    "testfile.md",
+		Targets:   []string{"testfile.md"},
+		Strategy:  &profile,
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.PendingPatchID == "" {
+		t.Fatalf("no candidate staged for approval: %+v", res)
+	}
+	if strings.TrimSpace(res.Diff) == "" {
+		t.Fatal("empty proposal payload: the approval consumer would wait for a producer that never runs")
+	}
+	if !strings.Contains(res.Diff, "@@ -0,0 +1,") {
+		t.Errorf("creation proposal diff is not a whole-file addition:\n%s", res.Diff)
+	}
+	if !strings.Contains(res.Diff, "+Hello everyone") {
+		t.Errorf("creation proposal diff does not carry the created bytes:\n%s", res.Diff)
+	}
+}
+
 // TestConstrainedModelModifyStillForcesBoundedPatch is the negative half: the
 // fix must NOT weaken the existing-content case. A constrained model editing an
 // EXISTING file still runs the bounded SEARCH/REPLACE contract.

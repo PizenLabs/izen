@@ -73,6 +73,12 @@ type Task struct {
 	// arms leave it empty so discovery stays the runtime's job.
 	ClarifyAnswer string
 
+	// Surface is the command surface the run is admitted under: "$prompt"
+	// (default), "$build" (an ordinary prompt inside /build), or "$hot". It is
+	// the same value the TUI hands the driver via SetScope, so a live arm can
+	// exercise a specific entry point's authority without driving the TUI.
+	Surface string
+
 	// Provider, when non-nil, overrides the default local Ollama provider for
 	// this task. It lets the benchmark drive the EXACT configured production
 	// provider (e.g. OpenRouter) without changing the composition.
@@ -330,7 +336,13 @@ func run(t *testing.T, task Task) *RunRecord {
 	sub := app.Bus.SubscribeAll(rec.Handle)
 
 	d := app.Autonomous
-	d.SetScope("$prompt") // the EXACT production call runAutonomousDriver makes
+	// The EXACT production call runAutonomousDriver makes: the recorded command
+	// surface of the admitting entry point ($prompt / $build / $hot).
+	surface := task.Surface
+	if surface == "" {
+		surface = "$prompt"
+	}
+	d.SetScope(surface)
 
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)

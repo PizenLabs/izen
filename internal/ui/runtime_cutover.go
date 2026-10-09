@@ -363,6 +363,26 @@ func (m *model) runRuntimePrompt(content string) tea.Cmd {
 		m.Viewport.GotoBottom()
 		return nil
 	}
+	// ── ONE REQUEST → ONE AUTHORITATIVE RUNTIME ────────────────────────
+	// A /build ordinary prompt is an execution request like `$prompt`. When the
+	// decision runtime is wired, it enters the SAME authoritative runtime
+	// lifecycle (the bounded autonomy Driver) instead of the UI dispatching the
+	// executor directly and thereby owning a second lifecycle. The Driver owns
+	// provider scheduling, budget, continuation and terminal truth; the executor
+	// is its mutation/verification capability. The command surface "$build" is
+	// carried so /build stays distinct from $prompt while sharing their dynamic
+	// execution authority.
+	if m.autonomy != nil && m.autonomousDriver != nil {
+		if !m.admitNewExecutionRun() {
+			return nil
+		}
+		m.executionSurface = "$build"
+		return m.runAutonomyRoutedCmdExplicit(content)
+	}
+	// ── EXPLICIT HARNESS FALLBACK (no decision runtime wired) ──────────
+	// A headless/test harness without the Driver still routes through the single
+	// executor authority; it does NOT start a second loop. This path is fenced
+	// by TestBuildModeWithoutDriverUsesExplicitExecutorBoundary.
 	profile := m.gateway.SelectStrategy(content)
 	m.lastExecutionStrategy = profile
 	if profile.Strategy == strategy.HumanClarification {
