@@ -567,7 +567,16 @@ func collectTargets(parsed *parser.IntentAST, raw string, deps Deps) ([]Target, 
 }
 
 // extractBareTargets finds prose-mentioned filenames (no @ prefix).
+//
+// QUOTED / CODE-QUOTED NAMES. A human names a target inside backticks or quotes
+// as often as bare ("Create a file named `zuru.md`"). The delimiters are not
+// part of the path, but they were left on the token, so `.md` never matched the
+// extension table and an explicitly named creation target was invisible. The
+// delimiters are normalized to spaces before the field split, exactly as the
+// autonomy classifier does, so both target-resolution authorities agree on a
+// name the user actually wrote.
 func extractBareTargets(raw string) []string {
+	raw = normalizeBareTargetDelimiters(raw)
 	lower := strings.ToLower(raw)
 	var names []string
 	seen := map[string]bool{}
@@ -596,6 +605,21 @@ func extractBareTargets(raw string) []string {
 		}
 	}
 	return names
+}
+
+// normalizeBareTargetDelimiters replaces quote and code-span delimiters with
+// spaces so a quoted / code-quoted filename presents the same word boundary as
+// a bare one. Only delimiters are touched.
+func normalizeBareTargetDelimiters(raw string) string {
+	return strings.NewReplacer(
+		"`", " ",
+		`"`, " ",
+		"'", " ",
+		"\u2018", " ",
+		"\u2019", " ",
+		"\u201c", " ",
+		"\u201d", " ",
+	).Replace(raw)
 }
 
 // isBareKnown reports whether the lowercased word is a conventional filename.

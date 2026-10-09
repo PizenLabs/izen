@@ -107,3 +107,61 @@ func TestBenchmark_CreateExactPrompt(t *testing.T) {
 		t.Fatalf("the mutation did not reach the requested target; mutations=%v delta=%v", rec.Mutations, rec.Delta)
 	}
 }
+
+// ── CODE-QUOTED CREATE (the reported regression) ─────────────────────────────
+//
+// The observed trace named the target inside backticks:
+//
+//	$prompt Create a new file named `zuru.md` with the content "Hello everyone".
+//
+// The backticks hid the target from both extraction authorities, so the run
+// compiled as a DEFERRED MODIFY, discovered the unrelated markdown files in the
+// fixture and parked at a candidate-selection prompt. It must instead be a
+// CREATE on zuru.md, and the unrelated files must not be touched.
+const benchmarkCodeQuotedPrompt = "Create a new file named `zuru.md` with the content \"Hello everyone\"."
+
+func TestBenchmark_CreateCodeQuotedPrompt(t *testing.T) {
+	if os.Getenv(liveOptIn) != "1" {
+		t.Skipf("set %s=1 to run the real-world benchmark (needs a real provider)", liveOptIn)
+	}
+	provider, cfg := benchmarkProvider(t)
+	rec := run(t, Task{
+		ID:     "bench-create-code-quoted",
+		Name:   "BENCHMARK — " + benchmarkCodeQuotedPrompt,
+		Prompt: benchmarkCodeQuotedPrompt,
+		Files: map[string]string{
+			"go.mod":      "module benchmarkfixture\n\ngo 1.21\n",
+			"README.md":   "# Sample Project\n\nA small fixture repository.\n",
+			"testfile.md": "an unrelated existing file\n",
+		},
+		AnswerApprovals: true,
+		Provider:        provider,
+		Config:          cfg,
+	})
+
+	// The named target — not a discovered candidate — must be the mutation.
+	body, ok := rec.ChangedContents["zuru.md"]
+	if !ok {
+		t.Fatalf("zuru.md was NOT created; delta=%v mutations=%v boundary=%s/%q",
+			rec.Delta, rec.Mutations, rec.BoundaryAction, rec.BoundaryReason)
+	}
+	if strings.TrimSpace(body) != "Hello everyone" {
+		t.Fatalf("zuru.md content = %q, want %q", body, "Hello everyone")
+	}
+	if rec.BoundaryAction == "clarify" {
+		t.Fatalf("an explicitly named target parked at candidate selection: %q options=%v",
+			rec.BoundaryReason, rec.BoundaryOptions)
+	}
+	if got, ok := rec.ChangedContents["testfile.md"]; ok {
+		t.Fatalf("an unrelated file was mutated: testfile.md = %q", got)
+	}
+	var mutated bool
+	for _, m := range rec.Mutations {
+		if strings.Contains(m, "target=zuru.md") && strings.Contains(m, "fs_changed=true") {
+			mutated = true
+		}
+	}
+	if !mutated {
+		t.Fatalf("the mutation did not reach the requested target; mutations=%v delta=%v", rec.Mutations, rec.Delta)
+	}
+}

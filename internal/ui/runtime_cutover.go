@@ -334,7 +334,24 @@ func (m *model) runRuntimeTaskRequest(task *plan.Task) tea.Cmd {
 // the RuntimeExecutor. It is the cutover equivalent of the legacy build-mode
 // handleMessageContent path (legacy reclassification inside an
 // autonomy-decided workspace).
+//
+// ── /build IS AN EXECUTION CONTRACT ────────────────────────────────────────
+// A normal prompt typed INSIDE /build is already an execution request: the
+// workspace interaction contract itself is the authorization, so it must not
+// require the `$prompt` token. When this input carried no explicit directive
+// (that path is dispatched through dispatchDirectives before reaching here), the
+// /build contract binds the runtime-resolved mutation scope (ScopeDynamic).
+//
+// This does NOT collapse /build into $prompt. An explicit `$hot` already bound a
+// bounded, human-declared scope (ScopeDeclared) and is left untouched; an
+// explicit `$prompt` inside /build already bound ScopeDynamic through its own
+// directive path. The three surfaces stay distinct at the command layer and
+// converge on the same mutation authority at admission.
 func (m *model) runRuntimePrompt(content string) tea.Cmd {
+	if m.resolver != nil && m.resolver.Current() == modes.ModeBuild &&
+		(m.sess == nil || !m.sess.ScopeProvenance.AllowsMutation()) {
+		m.bindScopeProvenance(intentdomain.ScopeDynamic)
+	}
 	if m.sess == nil || !m.sess.ScopeProvenance.AllowsMutation() {
 		return m.runGatedLine(content)
 	}

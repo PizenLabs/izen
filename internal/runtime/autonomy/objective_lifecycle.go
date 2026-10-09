@@ -1021,12 +1021,10 @@ func (d *Driver) observedDeltaTargets() []string {
 //
 //	Intent ≠ Authorization ≠ Grant ≠ Execution ≠ Evidence ≠ Verification
 //
-// Where the driver cannot see an axis (the command mode is chosen by the UI
-// composition root and is not carried into the loop), it reports
-// (not-carried) rather than substituting a neighbouring axis. A missing value is
-// visible; a plausible wrong one is not.
-// NotCarried is the explicit representation for an axis the runtime genuinely
-// does not have.
+// Where the driver cannot see an axis it reports (not-carried) rather than
+// substituting a neighbouring axis. The command mode is carried by the per-run
+// `SetScope` binding, so it is visible for every run that received a directive;
+// the marker remains for a run the composition never bound one for.
 //
 // It exists because "unknown" is ambiguous: it reads as "the runtime looked and
 // could not determine this", when the truth in several cases is "this concept is
@@ -1070,11 +1068,18 @@ func (d *Driver) intentAxes() (userIntent, commandMode, interaction, executionIn
 		userIntent = NotCarried
 	}
 
-	// The command SURFACE is chosen by the UI composition root and is not
-	// carried into the loop. It is reported as not-carried rather than guessed
-	// from a neighbouring axis.
-	commandMode = d.subcommand
-	if strings.TrimSpace(commandMode) == "" {
+	// The command SURFACE is the human directive that authorized this run. It is
+	// carried into the loop by SetScope (the per-input push form), so reading the
+	// authoritative per-run value is what makes the axis truthful. The
+	// composition-time `subcommand` policy field is only a fallback for callers
+	// that bound a policy without a per-run directive; it is never preferred,
+	// because a composition default would mislabel every run with the one value
+	// chosen at wiring time.
+	commandMode = strings.TrimSpace(d.req.Scope)
+	if commandMode == "" {
+		commandMode = strings.TrimSpace(d.subcommand)
+	}
+	if commandMode == "" {
 		commandMode = NotCarried
 	}
 
