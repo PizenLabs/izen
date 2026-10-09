@@ -934,6 +934,16 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 	if err != nil {
 		return d.term(), err
 	}
+	// DURABLE HUMAN DECISION: record what the human authorized, bound to the
+	// reviewed candidate identity and digest, BEFORE the apply. A resumed run
+	// must be able to read the decision itself, not merely infer it from bytes.
+	{
+		cid, digest := "", ""
+		if b := d.loop.Boundary(); b != nil {
+			cid, digest = b.CandidateID, b.CandidateDigest
+		}
+		d.ledgerHumanDecision("approve", "", cid, digest)
+	}
 	obs, err := d.adapter.Approve(ctx, pid)
 	if obs.RequestID == "" {
 		// Hard approve error: no terminal result exists (the held patch is
@@ -1003,6 +1013,13 @@ func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.Loo
 	if err != nil {
 		return d.term(), err
 	}
+	{
+		cid, digest := "", ""
+		if b := d.loop.Boundary(); b != nil {
+			cid, digest = b.CandidateID, b.CandidateDigest
+		}
+		d.ledgerHumanDecision("reject", reason, cid, digest)
+	}
 	obs, err := d.adapter.Reject(ctx, pid, reason)
 	if obs.RequestID == "" {
 		// Hard reject error: no terminal result exists. Release the human and
@@ -1063,6 +1080,7 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	// invalidation an authorization bypass: a target the gateway refuses (a file
 	// the workspace does not contain) must fail closed through the same gate as
 	// any other unbound destination.
+	d.ledgerHumanDecision("clarify", "human named the clarification target", "", "")
 	targets := d.bindAuthoritativeTargets([]string{target},
 		"a human named the target at the clarification boundary: "+target)
 	// Preserve the active contract and request identity across clarification;
@@ -1149,6 +1167,8 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 	if string(intent) == "rescope_textual_patch" {
 		intent = ProposalRescopeBoundedPatch
 	}
+	// DURABLE HUMAN DECISION: the proposal strategy the human selected.
+	d.ledgerHumanDecision("proposal:"+string(intent), d.surfaceReason(), "", "")
 	// Resolve the DecisionSurface lifecycle on every human choice.
 	d.resolveSurfaceLifecycle(ctx, "human choice: "+string(intent))
 	// ProposalCancel: ABORTED with $0 spent.
@@ -1797,6 +1817,35 @@ func (d *Driver) invalidateDerivedScope(reason string) {
 	}
 }
 
+// isProjectLevelObjective reports whether the strategy gateway classified the
+// objective as a broad project-level transformation (architect or refactor).
+//
+// A project-level objective names a PROJECT, not a file: "redesign this
+// project" is about the workspace's implementation surface, so an unresolved
+// target is a DEFERRED target the runtime may resolve from observed evidence —
+// not an ambiguity the human must resolve by nominating a filename. The
+// classification is read from the gateway's own profile (Profile.Operation),
+// never re-derived from the prompt here, so there is one authority for it.
+func (d *Driver) isProjectLevelObjective() bool {
+	if d == nil {
+		return false
+	}
+	// $hot is a STRICT LOCAL TARGET BOUNDARY: it may never widen a run to the
+	// project's implementation surface, so a project-level objective under
+	// $hot keeps the pre-existing conservative behavior (a human names the
+	// local target). Every other surface may resolve a deferred project target
+	// from evidence.
+	if IsHot(d.scope) {
+		return false
+	}
+	switch d.resolved.Profile.Operation {
+	case strategy.OperationArchitect, strategy.OperationRefactor:
+		return true
+	default:
+		return false
+	}
+}
+
 // deriveEvidenceScope observes the workspace and binds an evidence-backed target
 // set for an objective that names no file but DOES declare artifact kinds.
 //
@@ -1865,7 +1914,7 @@ func (d *Driver) deriveEvidenceScope() {
 	// proven target outranks anything discovery could derive, and the precedence
 	// must be legible HERE, at the one place a run acquires a target it was not
 	// given. (The early return above guarantees it is empty on this path.)
-	derivation := d.adapter.DeriveScope(d.prompt, d.resolved.Targets)
+	derivation := d.adapter.DeriveScopeWith(d.prompt, d.resolved.Targets, d.isProjectLevelObjective())
 	d.scopeDerivation = derivation
 
 	// ── DISCOVERED ─────────────────────────────────────────────────────

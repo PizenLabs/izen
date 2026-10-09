@@ -423,6 +423,11 @@ func (d *Driver) objectiveEvidence() execution.ObjectiveEvidence {
 			ev.TargetAbsent[t] = false
 		}
 	}
+	// A broad project-level objective's acceptance criteria are semantic, so a
+	// skipped verifier is UNVERIFIED rather than provably-not-applicable. The
+	// classification is the gateway's (isProjectLevelObjective), never
+	// re-derived here.
+	ev.BroadObjective = d.isProjectLevelObjective()
 	return ev
 }
 

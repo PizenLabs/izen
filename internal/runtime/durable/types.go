@@ -203,6 +203,13 @@ const (
 	EventStructuralAmbiguity    EventType = "STRUCTURAL_AMBIGUITY"
 	EventProposalAuthorized     EventType = "PROPOSAL_AUTHORIZED"
 	EventWorkspaceSwitched      EventType = "WORKSPACE_SWITCHED"
+	// EventHumanDecision records a HUMAN decision at a parked boundary:
+	// approve / reject / clarify / proposal selection, with the candidate
+	// identity and digest the decision was bound to when one exists. It is
+	// audit lineage only — it does not mutate task identity or cursor state —
+	// but it is durable, so a resumed run can read what the human actually
+	// decided instead of only inferring it from the absence of a mutation.
+	EventHumanDecision EventType = "HUMAN_DECISION"
 	// EventPhaseTransition records a logical orchestration phase hop
 	// (domain/orchestration.Phase) against a durable task. It is audit
 	// lineage only: task identity, cursor, checkpoint, evidence and

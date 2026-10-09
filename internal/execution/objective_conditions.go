@@ -126,6 +126,7 @@ type conditionFacts struct {
 	VerifierSatisfied  bool
 	VerificationPassed bool
 	VerifierSkipped    bool
+	BroadObjective     bool
 	ResponseSatisfied  bool
 	Discharged         map[string]bool
 	ClaimedOnly        map[string]bool
@@ -143,6 +144,7 @@ func conditionFactsFrom(ev ObjectiveEvidence) conditionFacts {
 		VerifierSatisfied:  ev.verifierSatisfied(true),
 		VerificationPassed: ev.VerificationPassed,
 		VerifierSkipped:    ev.VerificationSkipped,
+		BroadObjective:     ev.BroadObjective,
 		ResponseSatisfied:  responseSatisfied(ev),
 		Discharged:         toSet(ev.DischargedRequirements),
 		ClaimedOnly:        toSet(ev.ClaimedRequirements),
@@ -267,6 +269,18 @@ func reduceCondition(c CompletionCondition, f conditionFacts) CompletionConditio
 
 	case ObligationIntegrityHeld:
 		if f.VerifierSkipped && !f.VerificationPassed {
+			// A skipped verifier is a provably-not-applicable gate ONLY when the
+			// objective's acceptance is determined by the artifact itself (an
+			// explicit creation, a declared delta). For a BROAD project-level
+			// transformation the acceptance criteria are semantic, so the fact
+			// that no gate applies is exactly the fact that the objective is
+			// UNVERIFIED: the mutation may have landed, but the runtime has not
+			// established the objective and must not report PROVEN.
+			if f.BroadObjective {
+				return unsatisfied(c, VerifyGateUnverified,
+					"no verification contract applies to the target(s) and the objective is a broad "+
+						"transformation, so its acceptance criteria remain unverified")
+			}
 			c.Status = ConditionSatisfied
 			c.VerificationState = VerifyGateNotApplicable
 			c.EvidenceRefs = []string{"evidence:verifier=NOT_APPLICABLE"}

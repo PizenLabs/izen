@@ -139,6 +139,11 @@ func Select(raw string, deps Deps) ExecutionStrategyProfile {
 	if op != OperationCreate && declaredCreation {
 		op = OperationCreate
 	}
+	// The operation family is recorded on the profile so a downstream authority
+	// that needs to reason about the objective's SCOPE WIDTH reads it here
+	// rather than re-classifying the prompt. It is the same `op` every branch
+	// below already steers by; this is a projection, not a second decision.
+	profile.Operation = op
 
 	// The canonical semantic verdict, read once. It answers "what act does this
 	// request perform?" and is what stops a review that named a file from

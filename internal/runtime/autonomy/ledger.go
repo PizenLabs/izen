@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/core/domain"
@@ -305,6 +306,37 @@ func (d *Driver) ledgerObserved(obs autonomy.Observation) {
 	ok := !obs.Outcome.Failed() && obs.Verification.Passed
 	if err := d.ledger.RecordVerification(d.ledgerTask, d.ledgerOperationID(), ok, detail); err != nil {
 		ledgerFail("VERIFICATION_RESULT refused for %s: %v", d.ledgerTask, err)
+	}
+}
+
+// ledgerHumanDecision durably records one human decision at a parked boundary.
+//
+// The decision is NOT inferable from the mutation record: an approval that
+// produced no bytes and a rejection that produced no bytes leave identical
+// workspaces. Recording the action, the candidate identity and the content
+// digest it was bound to is what lets a resumed run distinguish "the human said
+// yes to this exact candidate" from "the human said no" — and stops a stale
+// approval from being replayed against a candidate that has since changed.
+//
+// It is audit lineage (RecordCustomEvent), never a task-state transition: the
+// human decision does not itself mutate the loop's terminal truth.
+func (d *Driver) ledgerHumanDecision(action, reason, candidateID, candidateDigest string) {
+	if !d.ledgerReady() {
+		return
+	}
+	payload := map[string]any{
+		"action":     action,
+		"objective":  d.prompt,
+		"targets":    append([]string(nil), d.objectiveTargets()...),
+		"candidate":  candidateID,
+		"digest":     candidateDigest,
+		"decided_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if strings.TrimSpace(reason) != "" {
+		payload["reason"] = boundedLedgerDetail(reason)
+	}
+	if err := d.ledger.RecordCustomEvent(d.ledgerTask, durable.EventHumanDecision, payload); err != nil {
+		ledgerFail("HUMAN_DECISION refused for %s: %v", d.ledgerTask, err)
 	}
 }
 

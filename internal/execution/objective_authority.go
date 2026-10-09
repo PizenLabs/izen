@@ -343,6 +343,15 @@ type ObjectiveEvidence struct {
 	// target (semantically NOT APPLICABLE — distinct from a gate that ran and
 	// failed). It never claims a pass.
 	VerificationSkipped bool
+	// BroadObjective reports that the objective is a broad project-level
+	// transformation (the strategy gateway classified it architect/refactor)
+	// whose acceptance criteria are semantic rather than determined by the
+	// artifact alone. For such an objective a skipped verifier is NOT a
+	// provably-not-applicable gate: the objective remains UNVERIFIED and must
+	// not be reported PROVEN. It is set by the control plane that owns the
+	// objective's classification; the zero value keeps the legacy behavior for
+	// content-determined objectives (an explicit creation, a declared delta).
+	BroadObjective bool
 	// WorkspaceObservations counts the workspace observation / AST parse events
 	// this execution produced. It is the READ/REVIEW evidence of observation.
 	WorkspaceObservations int
@@ -415,6 +424,11 @@ func (e ObjectiveEvidence) VerifierVerdict() string {
 	switch {
 	case e.VerificationRan && e.VerificationPassed:
 		return "PASS"
+	case e.VerificationSkipped && e.BroadObjective:
+		// A skipped verifier is NOT APPLICABLE only when the objective's
+		// acceptance is determined by the artifact. A broad transformation's
+		// skipped verifier is UNVERIFIED: the criterion was never checked.
+		return "UNVERIFIED"
 	case e.VerificationSkipped:
 		return "NOT_APPLICABLE"
 	case e.VerificationRan:
@@ -428,9 +442,17 @@ func (e ObjectiveEvidence) VerifierVerdict() string {
 // provably not-applicable gate satisfies the requirement the same way an
 // untestable target's syntax is not a mutation failure — but the outcome
 // records WHICH, so no projection can render "verified" for a skipped gate.
+//
+// A BROAD project-level transformation is the exception: its acceptance
+// criteria are semantic, so a skipped gate leaves the objective UNVERIFIED and
+// must not satisfy the requirement. The mutation may have applied; the
+// objective is not proven.
 func (e ObjectiveEvidence) verifierSatisfied(required bool) bool {
 	if !required {
 		return true
+	}
+	if e.VerificationSkipped && !e.VerificationPassed && e.BroadObjective {
+		return false
 	}
 	return e.VerificationPassed || e.VerificationSkipped
 }

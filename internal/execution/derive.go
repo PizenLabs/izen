@@ -151,6 +151,15 @@ type DerivationRequest struct {
 	// StatedTargets is the caller's own proven target set. A non-empty set makes
 	// derivation a no-op: an explicit target outranks a derived one.
 	StatedTargets []string
+	// ProjectLevel records that the objective is a BROAD PROJECT-LEVEL
+	// transformation (the strategy gateway classified it as architect/refactor)
+	// rather than a targeted request. It only matters when the objective declares
+	// NO artifact kind: a project-level objective names a PROJECT, not a file, so
+	// an unresolved target is a DEFERRED target the runtime may resolve from
+	// observed implementation evidence, not an ambiguity the human must resolve
+	// by naming a filename. A non-project-level objective that declares no kind
+	// keeps the strict declared-kind-only semantics.
+	ProjectLevel bool
 }
 
 // DerivationStatus is the closed, three-valued verdict of one evidence-bound
@@ -285,6 +294,16 @@ func DeriveScope(req DerivationRequest) Derivation {
 	}
 	kinds := DeclareArtifactKinds(req.Prompt)
 	if len(kinds) == 0 {
+		// A PROJECT-LEVEL objective names a project, not a file. When it declares
+		// no artifact kind, the runtime resolves its deferred target from the
+		// workspace's own implementation surface rather than asking the human to
+		// nominate a filename. This is the counterpart of the declared-kind path:
+		// both read candidates from the OBSERVED workspace and neither invents a
+		// path. Every non-project-level objective keeps the strict semantics
+		// below.
+		if req.ProjectLevel {
+			return deriveProjectScope(req)
+		}
 		// The objective declares no kind, so no target can be DERIVED. The
 		// observed candidate set is still recorded: "which files exist" is
 		// evidence, and a run that can say it looked is different from one that
@@ -428,4 +447,108 @@ func nonBlank(items []string) []string {
 		}
 	}
 	return out
+}
+
+// ── PROJECT-LEVEL EVIDENCE-BOUND SCOPE DERIVATION ────────────────────────────
+//
+// The declared-kind derivation above answers "the objective named HTML, CSS and
+// JS — which observed files satisfy those kinds?". A project-level objective
+// such as "redesign this project" names no kind at all; it names the WHOLE
+// project. Requiring the human to nominate the entry document in that case is
+// the failure this function closes: the workspace is known, the target is
+// deferrable, and the runtime can determine an appropriate target set from the
+// project's own implementation surface.
+//
+// The rule is deliberately GENERIC. It names EXTENSIONS, never a project,
+// framework, or filename — no `index.html`, no "static web" case. Authored
+// implementation formats qualify; documentation, data, configuration and
+// binary assets do not, because a project-level objective changes how the
+// project is IMPLEMENTED, not its prose or its images. The result is bounded:
+// a workspace whose implementation surface is too large or too polyglot to be
+// a single redesign stays UNRESOLVED and the human narrows it.
+
+// projectSourceExtensions are the extension families that constitute authored
+// implementation source for the purpose of resolving a project-level objective.
+// The set is language-neutral by construction: it is a list of file EXTENSIONS,
+// and every entry says "this is implementation source", never "this is the
+// project". Documentation (.md/.rst), data/configuration (.json/.yaml/.toml/
+// .mod/.lock/.xml), and binary assets (.svg/.png/.woff/…) are absent.
+var projectSourceExtensions = map[string]bool{
+	".html": true, ".htm": true, ".css": true, ".scss": true, ".sass": true, ".less": true,
+	".js": true, ".mjs": true, ".cjs": true, ".jsx": true, ".ts": true, ".tsx": true,
+	".vue": true, ".svelte": true, ".astro": true,
+	".py": true, ".go": true, ".rs": true, ".java": true, ".kt": true, ".kts": true,
+	".rb": true, ".php": true, ".c": true, ".h": true, ".cc": true, ".cpp": true,
+	".hpp": true, ".cs": true, ".swift": true, ".scala": true, ".sh": true, ".bash": true,
+	".zsh": true, ".sql": true, ".lua": true, ".dart": true, ".ex": true, ".exs": true,
+	".erl": true, ".hrl": true, ".clj": true, ".cljs": true, ".fs": true, ".fsx": true,
+	".pl": true, ".pm": true, ".r": true, ".jl": true, ".zig": true, ".nim": true,
+	".hs": true, ".ml": true, ".mli": true, ".groovy": true, ".tf": true, ".hcl": true,
+}
+
+const (
+	// maxProjectScopeTargets bounds how many implementation artifacts one
+	// project-level derivation may bind. A project surface larger than this is
+	// not a bounded redesign: it is a question, and the human must narrow it.
+	maxProjectScopeTargets = 12
+	// maxProjectScopeFamilies bounds how many distinct extension families a
+	// project-level derivation may span, so "the project" cannot silently bind
+	// a polyglot monorepo the user only meant to touch in one place.
+	maxProjectScopeFamilies = 5
+)
+
+// deriveProjectScope resolves a project-level objective that names no file and
+// declares no artifact kind to the workspace's authored implementation
+// artifacts. It returns UNIQUE only when at least one bounded implementation
+// artifact exists; an empty or over-broad surface stays UNRESOLVED (with the
+// observed candidates carried as evidence), so the run remains read-only until
+// a human narrows it.
+func deriveProjectScope(req DerivationRequest) Derivation {
+	candidates := req.Profile.CandidatePaths()
+	var source []string
+	families := map[string]bool{}
+	for _, c := range candidates {
+		ext := strings.ToLower(path.Ext(c))
+		if ext == "" || !projectSourceExtensions[ext] {
+			continue
+		}
+		source = append(source, c)
+		families[ext] = true
+	}
+	sort.Strings(source)
+	if len(source) == 0 {
+		return Derivation{
+			Status:     DerivationUnresolved,
+			Candidates: append([]string(nil), candidates...),
+			Derivable:  true,
+			Reason: "the objective is project-level and bounded discovery observed no implementation " +
+				"artifact to derive a target from; the workspace holds no authored source",
+		}
+	}
+	famList := make([]string, 0, len(families))
+	for f := range families {
+		famList = append(famList, f)
+	}
+	sort.Strings(famList)
+	if len(source) > maxProjectScopeTargets || len(famList) > maxProjectScopeFamilies {
+		return Derivation{
+			Status:     DerivationUnresolved,
+			Candidates: append([]string(nil), source...),
+			Kinds:      famList,
+			Derivable:  true,
+			Reason: fmt.Sprintf(
+				"the objective is project-level and the workspace holds %d implementation artifact(s) across %d extension families; that surface is too broad to bind without a human narrowing it",
+				len(source), len(famList)),
+		}
+	}
+	return Derivation{
+		Status:     DerivationUnique,
+		Targets:    append([]string(nil), source...),
+		Candidates: append([]string(nil), source...),
+		Kinds:      famList,
+		Derivable:  true,
+		Reason: "project-level objective: bounded discovery observed the workspace's implementation artifact(s) " +
+			describePaths(source) + "; every path was read from disk and non-implementation files " +
+			"(documentation, data, configuration, assets) were excluded",
+	}
 }

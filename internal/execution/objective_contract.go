@@ -261,8 +261,18 @@ const (
 	VerifyGatePass VerificationState = "GATE_PASS"
 	// VerifyGateFail: a verification command gate ran and failed.
 	VerifyGateFail VerificationState = "GATE_FAIL"
-	// VerifyGateNotApplicable: no verification contract exists for the target.
+	// VerifyGateNotApplicable: no verification contract exists for the target
+	// AND the objective's acceptance is determined by the artifact itself (an
+	// explicit creation or a declared delta), so there is nothing more a gate
+	// could check. It is a provably not-applicable gate, not a pass.
 	VerifyGateNotApplicable VerificationState = "GATE_NOT_APPLICABLE"
+	// VerifyGateUnverified: no verification contract exists for the target AND
+	// the objective's acceptance is NOT determined by the artifact alone — a
+	// broad project-level transformation (redesign/refactor) whose criteria are
+	// semantic. The mutation may have landed, but the objective is UNVERIFIED:
+	// the runtime reports exactly what it observed and does not claim PROVEN.
+	// It is a distinct state from GATE_NOT_APPLICABLE and from GATE_FAIL.
+	VerifyGateUnverified VerificationState = "GATE_UNVERIFIED"
 	// VerifyClaimedOnly: only the model claimed it; no observed fact supports
 	// it. It is UNSATISFIED, and this state records exactly why.
 	VerifyClaimedOnly VerificationState = "CLAIMED_ONLY"
