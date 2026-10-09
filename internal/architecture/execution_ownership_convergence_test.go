@@ -84,3 +84,51 @@ func TestExecutionOwnership_DirectExecutorDispatchIsFencedToHarnessFallback(t *t
 		t.Error("architecture: /build ordinary prompt must pass the authoritative admission gate")
 	}
 }
+
+// TestExecutionOwnership_CLIOrchestrateDrivesAuthoritativeDriver pins that the
+// `izen prompt` / `izen orchestrate` command drives the SAME authoritative
+// runtime lifecycle as the TUI. Its historical private control-plane proposal
+// lifecycle (orchestrator.RunCycle + ProposalProviderCLI + ProposalValidator +
+// ApprovalGate + FileExecutor) must no longer be on the command path. The lock
+// is an AST call-edge assertion: it survives whitespace churn and fails if a
+// competing lifecycle is silently reintroduced.
+func TestExecutionOwnership_CLIOrchestrateDrivesAuthoritativeDriver(t *testing.T) {
+	root := repoRoot(t)
+	f, _ := parseFile(t, filepath.Join(root, "cmd", "izen", "orchestrate.go"))
+	fn := findFuncDecl(f, "runOrchestrateCommand")
+	if fn == nil {
+		t.Fatal("architecture: runOrchestrateCommand must exist")
+	}
+	callees := calleeNamesInNode(fn)
+	if callees["RunAuthoritative"] == 0 {
+		t.Error("architecture: izen orchestrate must drive the authoritative runtime lifecycle (cli.RunAuthoritative)")
+	}
+	if callees["Wire"] == 0 {
+		t.Error("architecture: izen orchestrate must wire the production composition root")
+	}
+	// The command must NOT construct or run its own proposal lifecycle.
+	for _, forbidden := range []string{"RunCycle", "NewOrchestrator", "NewProposalProvider", "NewTerminalBridge"} {
+		if callees[forbidden] != 0 {
+			t.Errorf("architecture: izen orchestrate still calls %s — a competing proposal lifecycle", forbidden)
+		}
+	}
+}
+
+// TestExecutionOwnership_AuthoritativeCLIPathInvokesNoProvider pins that the
+// migrated CLI lifecycle driver reaches execution ONLY through the structural
+// runtime port: it must never invoke a provider, parse an artifact, or mutate a
+// file. The loop owns all of that; the CLI owns the human boundary.
+func TestExecutionOwnership_AuthoritativeCLIPathInvokesNoProvider(t *testing.T) {
+	root := repoRoot(t)
+	f, _ := parseFile(t, filepath.Join(root, "internal", "cli", "authoritative.go"))
+	fn := findFuncDecl(f, "RunAuthoritative")
+	if fn == nil {
+		t.Fatal("architecture: cli.RunAuthoritative must exist")
+	}
+	callees := calleeNamesInNode(fn)
+	for _, forbidden := range []string{"Execute", "ExecuteStream", "Complete", "WriteFile", "Apply", "Commit"} {
+		if callees[forbidden] != 0 {
+			t.Errorf("architecture: cli.RunAuthoritative calls %s — it must not reach the provider or the filesystem", forbidden)
+		}
+	}
+}

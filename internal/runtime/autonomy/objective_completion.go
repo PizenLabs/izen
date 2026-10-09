@@ -324,6 +324,12 @@ func (d *Driver) scopeProvenance() domain.ScopeProvenance {
 	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$hot") {
 		return domain.ScopeDeclared
 	}
+	// `$orchestrate` is the headless CLI build surface (`izen prompt` /
+	// `izen orchestrate`). It is a runtime-resolved dynamic mutation scope,
+	// exactly like `$prompt` and `$build`; only the command surface differs.
+	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$orchestrate") {
+		return domain.ScopeDynamic
+	}
 	return domain.ScopeNone
 }
 

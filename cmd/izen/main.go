@@ -123,11 +123,12 @@ func main() {
 			}
 			os.Exit(0)
 		case "prompt":
-			// E2E verification path: `izen prompt "check this file @index.html and rewrite it"`
-			// Routes through the hard-gated orchestrator Stack to enforce:
-			// - DecisionSurface with (recommended)/[HIGH RISK]/[DISABLED] annotations
-			// - Budget hard-block before model invocation
-			// - Single snapshot read (zero repetitive disk I/O)
+			// `izen prompt "<objective>"` routes through the SAME authoritative
+			// runtime as `izen orchestrate`: the production composition root
+			// (compose.Wire) drives the bounded autonomy Driver over the
+			// RuntimeExecutor. The runtime owns admission, the provider seam,
+			// the proposal/approval boundary, mutation, verification and
+			// terminal truth; the command plays the human at [y/N].
 			promptStr := strings.Join(os.Args[2:], " ")
 			if strings.TrimSpace(promptStr) == "" && len(os.Args) > 2 {
 				promptStr = os.Args[2]

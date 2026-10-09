@@ -391,6 +391,9 @@ func TestScopeProvenanceMapping(t *testing.T) {
 	}{
 		{"$prompt", domain.ScopeDynamic},
 		{"$PROMPT", domain.ScopeDynamic},
+		{"$build", domain.ScopeDynamic},
+		{"$orchestrate", domain.ScopeDynamic},
+		{"$ORCHESTRATE", domain.ScopeDynamic},
 		{"$hot", domain.ScopeDeclared},
 		{"", domain.ScopeNone},
 		{"bare text", domain.ScopeNone},

@@ -5,46 +5,47 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
+	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/PizenLabs/izen/internal/ai"
-	legacyaudit "github.com/PizenLabs/izen/internal/audit"
+	"github.com/PizenLabs/izen/internal/autonomy"
 	"github.com/PizenLabs/izen/internal/cli"
 	"github.com/PizenLabs/izen/internal/config"
-	"github.com/PizenLabs/izen/internal/contextcompiler"
-	"github.com/PizenLabs/izen/internal/runtime/orchestrator"
+	"github.com/PizenLabs/izen/internal/core/workflow"
+	appruntime "github.com/PizenLabs/izen/internal/runtime"
+	"github.com/PizenLabs/izen/internal/runtime/compose"
+	domainorch "github.com/PizenLabs/izen/internal/runtime/orchestrator"
 )
 
 // orchestrateUsage describes the `izen orchestrate` subcommand.
-const orchestrateUsage = `Usage: izen orchestrate [flags] "<target>"
+const orchestrateUsage = `Usage: izen orchestrate [flags] "<objective>"
 
-Run one prompt through the Izen control-plane orchestrator. The prompt is
-treated as the target file reference (for example "README.md"). The full
-deterministic control loop runs: preflight -> LLM proposal -> validation ->
-approval gate -> atomic commit.
-
-Flags:
-  -dir <path>   Workspace root (default ".")
+Run one objective through the AUTHORITATIVE Izen runtime — the same bounded
+autonomy Driver the TUI drives over the RuntimeExecutor execution plane. The
+runtime owns the loop, continuation, recovery, cancellation, mutation and
+terminal truth; this command only plays the human at the approval boundary.
 
 The proposal diff is rendered to stdout and an interactive [y/N] approval
 prompt blocks until you decide. "y" applies the proposal atomically, "i"
 inspects without applying, and anything else (including Enter) rejects it.
+
+Flags:
+  -dir <path>   Workspace root (default ".")
 `
 
-// runOrchestrateCommand implements `izen orchestrate`: it wires the control
-// plane (preflight, proposal provider, terminal UI projection bridge, and
-// orchestrator) and executes one prompt through the deterministic control
-// loop.
+// runOrchestrateCommand implements `izen orchestrate`: it wires the production
+// composition root and drives one objective through the authoritative autonomy
+// Driver. It does not build a private proposal lifecycle: the CLI's historical
+// control-plane stack (orchestrator.RunCycle + ProposalProviderCLI +
+// ProposalValidator + ApprovalGate + FileExecutor) is no longer on the command
+// path. The command owns exactly the human surface — rendering the runtime's
+// own candidate review, collecting the decision, and issuing the mutation
+// authorization on approve — and projects the runtime's terminal truth.
 //
-// PHASE 8 M5 — SINGLE-CYCLE CONTRACT (intentional, canonical): one
-// invocation performs one cli.Stack cycle (Stack.Run) and returns.
-// Continuation requires the caller to re-invoke; the command never enters
-// autonomy.Driver and never loops internally. Authorization converges with
-// every other entry point (same guards, same approval [y/N]/i semantics);
-// only the loop cardinality differs, by explicit contract.
+// A session-start checkpoint is a production precondition: the mutation
+// authorization is checkpoint-gated, so a workspace that cannot produce one is
+// refused before any approval is offered.
 func runOrchestrateCommand(args []string) error {
 	dir := "."
 	var prompt string
@@ -64,13 +65,13 @@ func runOrchestrateCommand(args []string) error {
 				return fmt.Errorf("izen orchestrate: unknown flag %q", args[i])
 			}
 			if prompt != "" {
-				return errors.New("izen orchestrate: exactly one target argument is required")
+				return errors.New("izen orchestrate: exactly one objective argument is required")
 			}
 			prompt = args[i]
 		}
 	}
-	if prompt == "" {
-		return errors.New("izen orchestrate: a target argument is required")
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("izen orchestrate: an objective argument is required")
 	}
 
 	cfg, err := config.Load()
@@ -79,117 +80,112 @@ func runOrchestrateCommand(args []string) error {
 	}
 	provider, model, err := buildActiveProvider(cfg)
 	if err != nil {
-		// For E2E without provider config, still exercise hard-gated DecisionSurface
-		// via a no-op provider so the binary reflects invariants without needing API keys.
-		fmt.Fprintf(os.Stderr, "izen v%s (rmah-wired) provider=none model=none root=%s\n", Version, dir)
-		fmt.Fprintf(os.Stderr, "izen v%s: running hard-gated preflight for prompt %q\n", Version, prompt)
-		ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel2()
-		stub := &stubNoopProvider{}
-		stack2 := cli.Wire(stub, dir, os.Stdin, os.Stdout)
-		// Force small budget to guarantee BudgetExceeded for large index.html in E2E
-		// (DefaultTokenBudget 12000 would not exceed for moderate files).
-		// Override to 1024 to ensure FULL_REWRITE disabled is visible.
-		stack2.TokenBudget = 1024
-		res2, _ := stack2.Run(ctx2, dir, prompt)
-		if res2 != nil {
-			fmt.Printf("proposal: %s target: %s action: %s committed: %t\n", res2.ProposalID, res2.Target, cli.ActionLabel(res2.Action), res2.Committed)
-		}
-		return nil
+		// No stub fallback: an execution command without a provider must fail
+		// closed rather than run a no-op model and report a fake proposal.
+		return fmt.Errorf("izen orchestrate: %w", err)
 	}
-	provider = contextcompiler.New().WrapProvider(provider)
-	fmt.Fprintf(os.Stderr, "izen v%s: orchestrator provider=%s model=%s root=%s\n", Version, provider.Name(), model, dir)
+	fmt.Fprintf(os.Stderr, "izen: authoritative runtime provider=%s model=%s root=%s\n", provider.Name(), model, dir)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	app, err := compose.Wire(
+		compose.WithRoot(dir),
+		compose.WithConfig(cfg),
+		compose.WithProvider(provider),
+		compose.WithAuditDir(filepath.Join(dir, ".izen", "audit")),
+	)
+	if err != nil {
+		return fmt.Errorf("izen orchestrate: wire authoritative runtime: %w", err)
+	}
+	defer app.Close()
+
+	if app.Autonomous == nil {
+		return errors.New("izen orchestrate: authoritative runtime driver is not wired")
+	}
+
+	// ADMISSION GRANT: invoking a build objective is the human's authorization
+	// to attempt it. The runtime's session capability ledger must carry the
+	// workspace vector (read + analyze + propose + mutate + verify) before the
+	// loop lowers its preflight barrier, exactly as the TUI's build admission
+	// does. The per-candidate `[y/N]` approval remains a SEPARATE, explicit
+	// human gate on the mutation itself.
+	if app.Autonomy != nil {
+		app.Autonomy.GrantDefault(
+			autonomy.CapRead, autonomy.CapAnalyze, autonomy.CapPropose,
+			autonomy.CapMutate, autonomy.CapVerify,
+		)
+	}
+
+	// The mutation authorization the runtime requires is checkpoint-gated. A
+	// session-start checkpoint is a production precondition for any approval, so
+	// it is created BEFORE the run is admitted.
+	if app.Execution != nil && app.Execution.ShadowCP != nil {
+		if _, err := app.Execution.ShadowCP.CreateSessionStartSnapshot(); err != nil {
+			return fmt.Errorf("izen orchestrate: session-start checkpoint: %w", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	stack := cli.Wire(&orchestrateAdapter{provider: provider, model: model}, dir, os.Stdin, os.Stdout)
-
-	// ── AUDIT DURABILITY (Truthful State Transition binding) ──────────
-	// The synchronous audit seam is wired into the orchestrator BEFORE the
-	// cycle runs: session finalization performs a blocking Flush whose error
-	// structurally invalidates success (ErrAuditPersistenceFailed) without
-	// rolling back the disk mutation. The same blocking flush is tied to
-	// SIGINT/SIGTERM and the defer chain so termination can never bypass it.
-	auditFlusher := legacyaudit.NewLogger(dir)
-	if stack.Orchestrator != nil {
-		stack.Orchestrator.WithAuditFlusher(auditFlusher)
+	// Production preflight dispatch: the objective enters the runtime through the
+	// same admission front-end every other surface uses.
+	if app.Runtime != nil {
+		app.Runtime.Start()
+		if err := app.Runtime.Execute(ctx, appruntime.SubmitPromptCmd{Prompt: prompt, Mode: "build"}); err != nil {
+			return fmt.Errorf("izen orchestrate: preflight dispatch: %w", err)
+		}
 	}
-	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	sigDone := make(chan struct{})
-	defer close(sigDone)
-	go func() {
-		select {
-		case sig := <-sigCh:
-			fmt.Fprintf(os.Stderr, "izen orchestrate: caught %v — flushing audit log synchronously…\n", sig)
-			if ferr := auditFlusher.Flush(); ferr != nil {
-				fmt.Fprintf(os.Stderr, "izen orchestrate: audit flush on signal failed: %v\n", ferr)
+
+	// The mutation authorization is issued ONLY after the operator approves, and
+	// it is bound to the reviewed candidate identity and digest. An authorization
+	// failure refuses the apply — it never falls through to a mutation.
+	authorize := func(targets []string, candidateID, candidateDigest string) error {
+		if app.Orchestrator != nil {
+			if err := app.Orchestrator.Transition(domainorch.PhaseBuild,
+				workflow.TransitionContext{HasPlan: true, HasCapabilities: true}); err != nil {
+				return fmt.Errorf("orchestrator transition to build: %w", err)
 			}
-		case <-sigDone:
 		}
-	}()
-	defer func() {
-		signal.Stop(sigCh)
-		// Belt-and-braces final flush: RunCycle already flushed at terminal
-		// finalization and propagated its error; this defer guarantees the
-		// blocking flush sequence runs even if the cycle panics or returns
-		// early. Errors are reported, never swallowed.
-		if ferr := auditFlusher.Flush(); ferr != nil {
-			fmt.Fprintf(os.Stderr, "izen orchestrate: final audit flush failed: %v\n", ferr)
+		if app.Auth == nil || app.Executor == nil {
+			return errors.New("authorization engine is not wired")
 		}
-	}()
+		auth, err := app.Auth.AuthorizeBuildCandidateContent(
+			targets, app.Caps, app.Budget, app.MicroBudget, false, true, candidateID, candidateDigest)
+		if err != nil {
+			return err
+		}
+		app.Executor.SetAuthorization(auth)
+		return nil
+	}
 
-	res, runErr := stack.Run(ctx, dir, prompt)
+	bridge := cli.NewDriverTerminalBridge(os.Stdin, os.Stdout)
+	res, runErr := cli.RunAuthoritative(ctx, app.Autonomous, bridge, authorize, "$orchestrate", prompt)
 
-	if res != nil {
-		fmt.Printf("proposal: %s target: %s action: %s committed: %t\n",
-			res.ProposalID, res.Target, cli.ActionLabel(res.Action), res.Committed)
-		if res.AuditError != nil {
-			fmt.Fprintf(os.Stderr, "izen orchestrate: audit persistence failed — evidence integrity compromised (mutations stand, success invalidated): %v\n", res.AuditError)
-		}
+	// Audit durability: a flush failure structurally invalidates success without
+	// rolling back a committed mutation — the same terminal rule as every other
+	// authoritative surface.
+	if flushErr := app.FlushAudit(); flushErr != nil {
+		return fmt.Errorf("izen orchestrate: audit persistence failed — evidence integrity compromised: %w", flushErr)
+	}
+
+	if res.Parked != nil {
+		fmt.Printf("orchestrate: parked action=%s reason=%q\n", res.Parked.Action, res.Parked.Reason)
+		return nil
 	}
 	if runErr != nil {
-		if errors.Is(runErr, orchestrator.ErrAuditPersistenceFailed) {
-			return fmt.Errorf("izen orchestrate: %w", runErr)
-		}
-		if errors.Is(runErr, orchestrator.ErrExecutionRejected) {
-			fmt.Println("execution rejected: the proposal was not applied")
-			return nil
-		}
 		return fmt.Errorf("izen orchestrate: %w", runErr)
 	}
-	return nil
-}
-
-// orchestrateAdapter adapts the configured ai.Provider to the cli.LLMProvider
-// contract so the CLI control plane stays free of a concrete AI dependency.
-type orchestrateAdapter struct {
-	provider ai.Provider
-	model    string
-}
-
-// stubNoopProvider is a no-op LLM provider for E2E hard-gate verification without API keys.
-type stubNoopProvider struct{}
-
-func (s *stubNoopProvider) Complete(_ context.Context, _, _ string) (string, error) {
-	return "noop", nil
-}
-
-// Complete implements cli.LLMProvider.
-func (a *orchestrateAdapter) Complete(ctx context.Context, system, prompt string) (string, error) {
-	resp, err := a.provider.Execute(ctx, ai.Request{
-		Model:        a.model,
-		System:       system,
-		Messages:     []ai.Message{{Role: "user", Content: prompt}},
-		Stream:       false,
-		ContextPhase: "execute",
-	})
-	if err != nil {
-		return "", err
+	term := res.Termination
+	if term == nil {
+		return errors.New("izen orchestrate: runtime returned no terminal state")
 	}
-	if resp == nil {
-		return "", errors.New("provider returned an empty response")
+	switch term.State {
+	case autonomy.RuntimeCompleted:
+		fmt.Printf("orchestrate: run=%s completed approved=%t reason=%q\n", res.RunID, res.Approved, term.Reason)
+		return nil
+	case autonomy.RuntimeUnsubstantiated:
+		fmt.Printf("orchestrate: run=%s unsubstantiated approved=%t reason=%q\n", res.RunID, res.Approved, term.Reason)
+		return nil
+	default:
+		return fmt.Errorf("izen orchestrate: terminal %s — %s", term.State, term.Reason)
 	}
-	return resp.Content, nil
 }
