@@ -2152,8 +2152,15 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// of the target it was decomposed from. The guard runs even under a
 	// patch-only artifact contract so each approved unit stays provably
 	// budget-feasible.
+	//
+	// CONTRACT MATCH: the guard judges the contract the dispatch will actually
+	// use (willDispatchBoundedPatch). A constrained model is forced onto the
+	// bounded SEARCH/REPLACE contract for existing targets, which fits any
+	// budget; refusing it as an infeasible full rewrite was a contract mismatch
+	// that parked a feasible multi-target objective before any provider call.
+	boundedDispatch := x.willDispatchBoundedPatch(req, profile)
 	if profile.Strategy == strategy.TargetedMutation &&
-		(!patchOnlyArtifact(profile) || len(req.StagedSubTasks) > 0) {
+		(!boundedDispatch || len(req.StagedSubTasks) > 0) {
 		for _, target := range targets {
 			verdict := EvaluatePreflight(PreflightRequest{
 				ArtifactBounded: false,
@@ -5874,6 +5881,49 @@ unrelated line byte-for-byte.`
 // structurally cannot accept a complete-file artifact.
 func patchOnlyArtifact(p strategy.ExecutionStrategyProfile) bool {
 	return p.Artifact.Bounded && p.Artifact.Kind == "search_replace"
+}
+
+// willDispatchBoundedPatch reports whether invokeMutation will dispatch this
+// request under a bounded (patch-anchored) artifact contract. It mirrors the
+// contract selection invokeMutation performs so Boundary 2 never judges a
+// full-file rewrite the executor was never going to attempt.
+//
+// WHY THIS EXISTS. A constrained (free-tier / low-ceiling) model is forced onto
+// the bounded SEARCH/REPLACE contract for every existing target — a contract
+// that fits ANY output budget by construction. Boundary 2 previously ran before
+// that classification and refused the request as an infeasible full rewrite, so
+// a multi-target objective whose per-target bounded patches fit easily was
+// parked at PREFLIGHT_INFEASIBLE before a single provider request. Judging the
+// dispatch contract here keeps the guard honest: it still refuses a full
+// rewrite that genuinely cannot fit, and it no longer refuses one the runtime
+// will not attempt.
+//
+// The capability resolution (llmstep.ResolveMaxTokens) and the strategy-derived
+// ModelProfile are the two existing authorities for "constrained"; neither is
+// re-derived, and this helper only combines them exactly as invokeMutation does.
+func (x *RuntimeExecutor) willDispatchBoundedPatch(req ExecuteRequest, profile strategy.ExecutionStrategyProfile) bool {
+	if patchOnlyArtifact(profile) {
+		return true
+	}
+	// A creation has no existing content to anchor a bounded patch against; the
+	// constrained contract deliberately keeps the full-artifact create.
+	if profile.Artifact.Kind == "create_file" {
+		return false
+	}
+	model, err := x.resolveModel(req)
+	if err != nil {
+		// An unresolvable model fails later at the invocation boundary; do not
+		// suppress the preflight guard on its behalf.
+		return false
+	}
+	requested := effectiveMaxOutput(req.MaxOutputTokens, &profile)
+	if requested == 0 {
+		requested = llmstep.DefaultMutationRequestedTokens
+	}
+	if _, constrained := llmstep.ResolveMaxTokens(model, requested); constrained {
+		return true
+	}
+	return ModelProfile{OutputTokenCap: profile.MaxOutputTokens, ModelID: model}.IsConstrained()
 }
 
 func buildMutationBaseUserPrompt(request, evidence string) string {

@@ -611,6 +611,34 @@ func authorRuntimeConditions(kind TaskKind, scope []string, intent string) []Com
 }
 
 // ── The admissibility gate ──────────────────────────────────────────────────
+//
+// OBJECTIVE ADEQUACY POLICY (all-rejected requirements).
+//
+// A proposal is ADMITTED only when it is traceable to the user's request AND
+// grounded in a concrete target inside the objective's evidence-bound scope.
+// The gate is never weakened to admit an untraceable or ungrounded proposal,
+// and the runtime never requires every model-proposed requirement to be
+// accepted.
+//
+// Source and authority:
+//   - Explicit user acceptance criteria (the request text, its clauses, the
+//     resolved scope, the task kind) remain authoritative via the runtime's
+//     own completion conditions. They never depend on a model proposal.
+//   - Repository-derived facts (scope, existence, deltas) require attributable
+//     runtime evidence (resolution verdict, pre-execution provenance,
+//     observed deltas, post-mutation re-reads).
+//   - Model-proposed criteria remain proposals until validated by this gate;
+//     a rejected proposal authors no completion condition.
+//   - Rejected criteria retain their rejection reasons in the ledger.
+//   - The absence of admitted criteria never becomes proof of success: the
+//     runtime's own obligations still gate completion, and an unproven
+//     objective terminates UNSUBSTANTIATED, never PROVEN.
+//
+// A broad objective with no admitted requirements therefore executes under an
+// explicitly visible best-effort policy (evidence-bound scope, runtime
+// obligations, truthful UNVERIFIED/UNSUBSTANTIATED semantics), not under an
+// invented requirement. A consequential unresolved choice is routed through
+// the adaptive proposal mechanism (a human decision), never synthesized.
 
 // groundingFloor is the minimum share of a proposal's significant words that
 // must be ANCHORED for the proposal to count as a traceable restatement of the

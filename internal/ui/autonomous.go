@@ -860,6 +860,50 @@ func (m *model) stopAutonomousDriver(reason string) tea.Cmd {
 	}
 }
 
+// autonomousUsageDeltaCmd returns the command that folds this boundary's NEW
+// provider usage into the session baseline.
+//
+// The driver's AggregatedUsage is CUMULATIVE across a run's parks and resumes
+// (it is reset only when a fresh Run starts). The UI commits usage into the
+// session baseline, so committing the raw cumulative total at every boundary —
+// the park AND the terminal — adds the same provider calls to the baseline more
+// than once. That is the ~2× discrepancy between the footer and the provider's
+// real billing.
+//
+// This commits only the delta since the last commit for the SAME run and
+// advances the per-run baseline. A boundary that reports nothing new returns
+// nil; a run whose aggregate is UNKNOWN commits nothing (a missing measurement
+// must never become a zero). The baseline advances only for the usage actually
+// dispatched, so a command that is never executed cannot consume the delta.
+func (m *model) autonomousUsageDeltaCmd(aggIn, aggOut int, known bool) tea.Cmd {
+	if m == nil || !known {
+		return nil
+	}
+	runID := ""
+	if m.autonomousDriver != nil {
+		runID = m.autonomousDriver.RunID()
+	}
+	if runID != m.usageAggRun {
+		// A new run's aggregate starts from zero, so the previous run's
+		// committed baseline must not be subtracted from it.
+		m.usageAggRun = runID
+		m.usageAggIn, m.usageAggOut = 0, 0
+	}
+	deltaIn := aggIn - m.usageAggIn
+	deltaOut := aggOut - m.usageAggOut
+	if deltaIn < 0 {
+		deltaIn = 0
+	}
+	if deltaOut < 0 {
+		deltaOut = 0
+	}
+	if deltaIn == 0 && deltaOut == 0 {
+		return nil
+	}
+	m.usageAggIn, m.usageAggOut = aggIn, aggOut
+	return m.tokenUsageCmdKnown(deltaIn, deltaOut, true)
+}
+
 // handleAutonomousRun processes the terminal/parked outcome of a driver
 // Run/Resume/Abort. It releases the operation, renders the boundary card or the
 // terminal outcome, and keeps the driver's loop state as the single truth.
@@ -882,10 +926,7 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 		aggIn, aggOut, aggKnown = m.autonomousDriver.AggregatedUsage()
 	}
 	usageCmd := func() tea.Cmd {
-		if aggKnown {
-			return m.tokenUsageCmdKnown(aggIn, aggOut, true)
-		}
-		return nil
+		return m.autonomousUsageDeltaCmd(aggIn, aggOut, aggKnown)
 	}
 
 	if msg.err != nil {

@@ -1,0 +1,41 @@
+diff --git a/index.html b/index.html
+index d284fbb..98ad1da 100644
+--- a/index.html
++++ b/index.html
+@@ -26,7 +26,7 @@
+   <header class="site-header" id="top">
+     <div class="container header-inner">
+       <a class="brand" href="#top" aria-label="Tom Hunter, back to top">
+-        <img class="brand-mark" src="assets/logo.svg" width="40" height="40" alt="" aria-hidden="true" />
++        <img class="brand-mark" src="assets/logo.svg" width="40" height="40" alt="Tom Hunter logo" />
+         <span class="brand-text">Tom Hunter</span>
+       </a>
+ 
+diff --git a/script.js b/script.js
+index e9d12b4..9785588 100644
+--- a/script.js
++++ b/script.js
+@@ -31,7 +31,8 @@
+     }
+ 
+     function effectiveTheme() {
+-      return root.getAttribute("data-theme") || (systemPrefersDark() ? "dark" : "light");
++      var current = root.getAttribute("data-theme");
++      return current !== null ? current : (systemPrefersDark() ? "dark" : "light");
+     }
+ 
+     function refreshToggle(theme) {
+diff --git a/styles.css b/styles.css
+index bae46da..4612dcb 100644
+--- a/styles.css
++++ b/styles.css
+@@ -41,7 +41,8 @@
+   --radius: 14px;
+   --radius-lg: 22px;
+   --header-h: 4.5rem;
+-}
++  --radius-full: 50%;
++  --shadow-xl: 0 20px 25px -5px rgba(16, 24, 40, 0.10), 0 10px 10px -5px rgba(16, 24, 40, 0.04);
+ 
+ /* Explicit dark theme (set by the theme toggle). */
+ :root[data-theme="dark"] {

@@ -1289,6 +1289,21 @@ type model struct {
 	// reported zero). "0 tok" must mean an actual zero, not an unknown.
 	usageKnown bool
 
+	// ── Autonomous per-run usage accounting ─────────────────────────────
+	// The autonomous driver exposes a CUMULATIVE per-run aggregate
+	// (AggregatedUsage) that it does not reset when the run parks and resumes.
+	// The UI commits provider usage into the session baseline, so committing
+	// the cumulative total at every boundary (park AND terminal) would add the
+	// same provider calls to the baseline more than once — the observed
+	// ~2× discrepancy between the footer and the provider's real billing.
+	// usageAggRun is the run identity the baseline below belongs to;
+	// usageAggIn/usageAggOut are the aggregate already committed for that run.
+	// Each boundary commits only the DELTA since the last commit, so every
+	// provider call is folded into the session exactly once.
+	usageAggRun string
+	usageAggIn  int
+	usageAggOut int
+
 	streamParser     *IncrementalStreamParser
 	streamBuffer     string // buffered tokens for smooth tick emission
 	streamTickActive bool   // whether smooth-stream tick is active
@@ -2928,6 +2943,8 @@ func (m *model) resetTokenMetrics() {
 	m.streamLiveTokens = 0
 	m.AccumulatedCost = 0
 	m.usageKnown = false
+	m.usageAggRun = ""
+	m.usageAggIn, m.usageAggOut = 0, 0
 	m.ContextLimit = 0
 	status.Default.Reset()
 	m.clearRetryState()

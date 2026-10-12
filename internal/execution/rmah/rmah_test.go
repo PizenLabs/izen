@@ -160,6 +160,45 @@ func TestTier2_RejectsDestructiveTruncation(t *testing.T) {
 	}
 }
 
+// TestTier2_RetentionBoundary pins the retention floor at, below and above the
+// configured ratio. The floor is a strict inequality (ratio < 0.60 rejects), so
+// exactly 60% is ADMITTED — the boundary must not silently drift by a byte in
+// either direction.
+func TestTier2_RetentionBoundary(t *testing.T) {
+	const baselineBytes = 1000
+	baseline := strings.Repeat("x", baselineBytes)
+	if ratio := float64(baselineBytes) * retentionFloorRatio; ratio != 600 {
+		t.Fatalf("fixture assumes a 600-byte floor at %v, got %v", retentionFloorRatio, ratio)
+	}
+	cases := []struct {
+		name     string
+		candLen  int
+		wantPass bool
+	}{
+		{"above_threshold", 700, true},
+		{"at_threshold", 600, true},
+		{"below_threshold", 599, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := strings.Repeat("y", tc.candLen)
+			p := NewPipeline().
+				WithStrictExtractor(func(raw, orig string) (string, bool) { return "", false }).
+				WithCodeExtractor(func(string) (string, bool) { return candidate, true }).
+				WithBaselineVerifier(func(content, target string) bool { return true })
+
+			result := p.Process("raw unstructured output", "index.html", baseline)
+			if result.Passed != tc.wantPass {
+				t.Fatalf("retention %d/%d: passed=%v want=%v (reason=%q)",
+					tc.candLen, baselineBytes, result.Passed, tc.wantPass, result.RejectReason)
+			}
+			if !tc.wantPass && !strings.Contains(result.RejectReason, "destructive truncation") {
+				t.Fatalf("below-floor rejection must cite destructive truncation, got %q", result.RejectReason)
+			}
+		})
+	}
+}
+
 func TestTier2_RejectsNoExtractableContent(t *testing.T) {
 	p := NewPipeline().
 		WithStrictExtractor(func(raw, orig string) (string, bool) {

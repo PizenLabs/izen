@@ -209,7 +209,13 @@ func (d *Driver) objectiveEvaluation() execution.ObjectiveEvaluation {
 // so the recorded transition names both the execution outcome the matrix saw
 // and the obligation the evidence failed.
 func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
-	if d == nil || decision == nil || decision.Action != autonomy.LoopComplete {
+	if d == nil || decision == nil {
+		return
+	}
+	// Every decision point re-stages its own grant. A grant left over from a
+	// previous decision point must never be committed against a later one.
+	d.pendingProven = nil
+	if decision.Action != autonomy.LoopComplete {
 		return
 	}
 	contract := d.taskContract()
@@ -223,12 +229,17 @@ func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
 	d.lastContract = contract
 
 	if evaluation.Outcome.Proves() {
-		// The authority proved the objective: the workspace work it
-		// authorized is committed, and that is a truth boundary the journal
-		// must hold before the loop is allowed to move on.
-		d.ledgerExecutionCommitted()
+		// The authority proved the objective. The terminal objective state is
+		// NOT committed or published here. The behavioral proof gate and the
+		// loop's own transition still run after this authority and can
+		// downgrade the completion, so a commit written now would be a
+		// terminal objective state recorded while authorized work that can
+		// still change the outcome is in flight. Stage the grant and let
+		// commitObjectiveCompletion emit the terminal event and the durable
+		// commit only once every downgrade gate has run.
+		proven := evaluation
+		d.pendingProven = &proven
 		decision.Reason = strings.TrimSpace(decision.Reason + "; objective PROVEN by evidence")
-		d.emitObjectiveEvaluated(evaluation, string(autonomy.LoopComplete), true)
 		return
 	}
 
@@ -254,6 +265,55 @@ func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
 		decision.Action = autonomy.LoopUnsubstantiate
 		decision.Reason = reason
 	}
+}
+
+// discardPendingProven drops a staged PROVEN grant without publishing or
+// committing anything. It is the single cleanup path for every transition that
+// abandons or replaces a staged completion decision: cancellation, abort,
+// retry, resume, a new run, and a later downgrade (which commit handles by
+// discarding). A stale grant must never leak into another decision or run.
+func (d *Driver) discardPendingProven() {
+	if d == nil {
+		return
+	}
+	d.pendingProven = nil
+}
+
+// commitObjectiveCompletion publishes and durably commits a PROVEN objective
+// verdict. It is the ONE place the terminal objective state is committed, and it
+// runs only after every gate that can downgrade a proposed completion has run
+// (the behavioral proof gate and the contract-recovery breaker). This is what
+// makes the emitted terminal objective event and the durable commit agree with
+// the state the run actually reaches:
+//
+//   - a gate that removed the completion (the decision is no longer
+//     LoopComplete) discards the staged grant — no objective.evaluated with
+//     granted=true is published and no EXECUTION_COMMITTED marker is written
+//     for a run that did not complete;
+//   - a run that is still completing commits exactly once, at the end, with
+//     the final reason and the post-gate evidence.
+//
+// It is a no-op when no grant is staged, so a refused or downgraded decision
+// costs nothing.
+func (d *Driver) commitObjectiveCompletion(decision *autonomy.LoopDecision) {
+	if d == nil || decision == nil {
+		return
+	}
+	staged := d.pendingProven
+	d.pendingProven = nil
+	if staged == nil || !staged.Outcome.Proves() {
+		return
+	}
+	if decision.Action != autonomy.LoopComplete {
+		// A later gate revoked the completion. The staged grant must not be
+		// committed: the run did not reach the objective terminal state the
+		// authority proposed.
+		return
+	}
+	// The workspace work the authority proved is committed; that is a truth
+	// boundary the journal must hold before the loop is allowed to move on.
+	d.ledgerExecutionCommitted()
+	d.emitObjectiveEvaluated(*staged, string(autonomy.LoopComplete), true)
 }
 
 // authorizeBehavioralCompletion gates a proposed completion on REAL behavioral

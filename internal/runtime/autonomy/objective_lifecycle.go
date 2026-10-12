@@ -205,19 +205,24 @@ func (d *Driver) deriveObjectiveRequirements(ctx context.Context) {
 		d.objective.requirementNote = "requirement derivation unavailable: " + err.Error()
 		diagnosticf("[objective] requirement derivation unavailable: %v — "+
 			"the runtime's own completion obligations still gate this objective", err)
+		// Absence must be visible, not silent: publish the empty tally so a
+		// reader can tell "no requirements were derived" from "the tally was
+		// never emitted". The runtime's own obligations still gate completion;
+		// a failed derivation never loosens the contract and never proves
+		// anything.
+		d.publishObjectiveRequirements(0, 0)
 		return
 	}
 	d.objective.proposals = proposals
-	admitted, rejected := 0, 0
-	for _, p := range proposals {
-		// The gate itself runs inside DeriveObjectiveContract; this loop only
-		// reports the outcome it produced so the trace carries the tally.
-		_ = p
-	}
+	// The gate itself runs inside DeriveObjectiveContract, which is invoked by
+	// the tally below. There is deliberately no per-proposal loop here: the
+	// admissibility verdict (and its reason) is produced once, by the gate, and
+	// read back — a second loop that merely iterated the proposals would be
+	// dead code that looked like it decided something.
 	diagnosticf("[objective] requirement derivation proposed %d requirement(s) for scope %v",
 		len(proposals), d.objectiveTargets())
 	d.objective.requirementNote = fmt.Sprintf("%d requirement(s) proposed", len(proposals))
-	admitted, rejected = d.objectiveTally()
+	admitted, rejected := d.objectiveTally()
 	d.publishObjectiveRequirements(admitted, rejected)
 }
 
@@ -823,7 +828,15 @@ func (d *Driver) publishObjectiveRequirements(admitted, rejected int) {
 	for _, r := range contract.Requirements {
 		switch {
 		case !r.Admitted():
-			parts = append(parts, fmt.Sprintf("%s=REJECTED", r.ID))
+			// A rejected requirement is published WITH its attributable reason.
+			// Reporting only "REJECTED" makes an all-rejected derivation look
+			// like a silent drop; the reason is what turns it into an auditable
+			// decision an operator can act on.
+			reason := strings.TrimSpace(r.RejectReason)
+			if reason == "" {
+				reason = "unspecified"
+			}
+			parts = append(parts, fmt.Sprintf("%s=REJECTED(%s)", r.ID, reason))
 		default:
 			parts = append(parts, fmt.Sprintf("%s=ADMITTED", r.ID))
 		}

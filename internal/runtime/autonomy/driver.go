@@ -192,6 +192,16 @@ type Driver struct {
 	// lastContract is the canonical TaskContract the last verdict was judged
 	// against. Keeping it adjacent to the verdict makes the pairing auditable.
 	lastContract execution.TaskContract
+	// pendingProven is the objective authority's PROVEN verdict for the CURRENT
+	// decision point, staged but not yet committed. The terminal objective
+	// event and the durable EXECUTION_COMMITTED marker are emitted only by
+	// commitObjectiveCompletion, after every gate that can downgrade a
+	// proposed completion has run. Committing the grant at the authority (as
+	// the code once did) published a terminal objective state before the
+	// behavioral gate could still revoke it, so the emitted event could
+	// disagree with the durable final state. A nil value means no grant is
+	// staged. See objective_completion.go.
+	pendingProven *execution.ObjectiveEvaluation
 	// ── Objective lifecycle (the OUTCOME half of the contract) ──────────
 	// objective is the per-run objective state: the derived completion contract,
 	// the requirement ledger, the runtime-attributed discharge set and the
@@ -374,6 +384,9 @@ type Driver struct {
 	renderedEntry    string
 	renderedChecks   []RenderedCheck
 	renderedChecked  bool
+	// renderedPolicyNoted latches the one-time opt-in policy line so a broad
+	// objective's skipped rendered verification is stated exactly once.
+	renderedPolicyNoted bool
 	// renderedPolicy decides whether an objective requires a rendered
 	// verification. Nil disables it by default.
 	renderedPolicy func(objective string) bool
@@ -681,6 +694,7 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.syntheticSubGoal = ""
 	d.lastObjective = execution.ObjectiveEvaluation{}
 	d.lastContract = execution.TaskContract{}
+	d.pendingProven = nil
 	d.preTargets = nil
 	d.contractRecoveries = 0
 	d.contractRecoveryExhausted = false
@@ -690,6 +704,7 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.renderedCriteria = nil
 	d.renderedRequired = false
 	d.renderedChecked = false
+	d.renderedPolicyNoted = false
 	d.renderedEvidence = RenderedVerification{}
 	// R5: a new run is a new progress lifecycle. Carrying the previous run's
 	// satisfied-condition snapshot forward would render one objective's
@@ -970,6 +985,9 @@ func (d *Driver) Abort(reason string) (*autonomy.LoopTermination, error) {
 	if d.runCancel != nil {
 		d.runCancel()
 	}
+	// A staged PROVEN grant belongs to a decision point this abort replaces.
+	// It must not survive into another decision or run.
+	d.discardPendingProven()
 	// Use the run context (now cancelled) for termination so the termination
 	// event carries the correct cancellation context.
 	abortReason := "aborted by operator: " + reason
@@ -2431,6 +2449,9 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 		select {
 		case <-ctx.Done():
 			// Cancellation is a clean permanent abort, not a propagated error.
+			// It replaces any staged completion decision: discard the grant
+			// so a cancelled run writes no terminal objective state.
+			d.discardPendingProven()
 			return d.terminateAbort(ctx, "context cancelled", autonomy.FailurePermanent), nil //nolint:nilerr // termination, not a failure
 		default:
 		}
@@ -2500,6 +2521,17 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			pre = decision
 			d.authorizeContractRecovery(&decision)
 			d.forensics.noteAuthority(AuthorityContractRecovery, pre, decision)
+			// ── TERMINAL OBJECTIVE COMMIT (deferred) ─────────────────────
+			// The completion authority stages a PROVEN grant instead of
+			// committing it, precisely so this point — after the behavioral
+			// proof gate and the contract-recovery breaker have both had the
+			// chance to downgrade — is the ONLY place the terminal objective
+			// state is emitted and durably committed. A completion any gate
+			// removed is discarded here, so the terminal objective event and
+			// the durable state can never disagree, and no terminal objective
+			// state is written while authorized work that can still change
+			// the outcome is in flight.
+			d.commitObjectiveCompletion(&decision)
 			// ── PHASE 12: CANONICAL CONTINUATION CONSULTATION ────────────
 			// An exhausted invocation is an INVOCATION outcome, not a task
 			// failure. Before the matrix acts on it, the pure continuation

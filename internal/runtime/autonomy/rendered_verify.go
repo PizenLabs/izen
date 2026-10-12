@@ -338,11 +338,26 @@ func (d *Driver) ensureRenderedVerification(ctx context.Context) {
 		return
 	}
 	if !d.renderedRequired {
+		// OPT-IN POLICY VISIBILITY. Rendered verification is enabled by policy
+		// (in production, the IZEN_RENDERED_VERIFY environment variable). When a
+		// broad, project-level objective runs WITHOUT it, the objective's
+		// acceptance criteria stay UNVERIFIED — a fact the trace must state, not
+		// leave to inference. Emitted once per run.
+		if !d.renderedPolicyNoted && d.isProjectLevelObjective() {
+			d.renderedPolicyNoted = true
+			if d.bus != nil {
+				d.bus.Publish(eventsActivity(
+					"[render] SKIPPED: rendered verification is opt-in and not enabled for this run " +
+						"(IZEN_RENDERED_VERIFY=1 plus IZEN_RENDERED_ENTRY/IZEN_RENDERED_CONTAINS); " +
+						"the broad objective's acceptance criteria remain UNVERIFIED"))
+			}
+		}
 		return
 	}
 	d.renderedChecked = true
 	if d.renderedVerifier == nil {
 		d.renderedEvidence = RenderedVerification{Blocked: "rendered verification is required but no verifier is bound"}
+		d.publishRenderedSummary()
 		return
 	}
 	// $hot is a strict local target boundary; it never gains a browser/network
@@ -350,6 +365,7 @@ func (d *Driver) ensureRenderedVerification(ctx context.Context) {
 	// silently skipped as a pass.
 	if IsHot(d.scope) {
 		d.renderedEvidence = RenderedVerification{Blocked: "rendered verification is not authorized under the strict local $hot boundary"}
+		d.publishRenderedSummary()
 		return
 	}
 	root := ""
@@ -363,9 +379,19 @@ func (d *Driver) ensureRenderedVerification(ctx context.Context) {
 		Targets: d.objectiveTargets(),
 		Timeout: 45 * time.Second,
 	})
-	if d.bus != nil {
-		d.bus.Publish(eventsActivity("[render] " + d.renderedEvidence.summary()))
+	d.publishRenderedSummary()
+}
+
+// publishRenderedSummary emits the rendered verification outcome on the trace.
+// It is called on EVERY terminal path of ensureRenderedVerification — including
+// the blocked ones — so a required-but-unrun check is visible rather than
+// silent. A skipped check that leaves no line is indistinguishable from a check
+// that was never requested.
+func (d *Driver) publishRenderedSummary() {
+	if d == nil || d.bus == nil {
+		return
 	}
+	d.bus.Publish(eventsActivity("[render] " + d.renderedEvidence.summary()))
 }
 
 // summary renders a bounded one-line result for telemetry.
