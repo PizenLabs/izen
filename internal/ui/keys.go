@@ -881,6 +881,81 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.refreshViewportContent()
 				m.followTail()
 				return m, m.resumeAutonomousProposal("cancel")
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal && m.adaptiveEditing != "" &&
+				msg.Type == tea.KeyEscape && bare:
+				// Discard the draft. A half-typed answer that was never committed
+				// must never reach the runtime.
+				m.cancelAdaptiveFreeForm()
+				m.push(roleSystem, infoStyle.Render("  Free-form answer discarded."))
+				m.refreshViewportContent()
+				m.followTail()
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal && m.adaptiveEditing != "" &&
+				msg.Type == tea.KeyEnter && bare:
+				// Adopt the typed text as the human's answer for that question and
+				// return to selection mode. The runtime still validates it against
+				// the parked question on submit.
+				if m.commitAdaptiveFreeForm() {
+					m.push(roleSystem, infoStyle.Render("  Free-form answer accepted — Enter submits it to the runtime."))
+				}
+				m.refreshViewportContent()
+				m.followTail()
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal && m.adaptiveEditing != "" &&
+				msg.Type == tea.KeyBackspace:
+				if n := len([]rune(m.adaptiveDraft)); n > 0 {
+					m.adaptiveDraft = string([]rune(m.adaptiveDraft)[:n-1])
+				}
+				m.refreshViewportContent()
+				m.followTail()
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal && m.adaptiveEditing != "" &&
+				appendAdaptiveDraft(m, msg):
+				m.refreshViewportContent()
+				m.followTail()
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal &&
+				msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == 'i' && bare:
+				// Open the free-form editor for the focused question. A question
+				// that does not accept free-form input is refused here rather than
+				// collecting text the runtime will reject on submit.
+				if q := m.adaptiveQuestionAt(); q != nil && m.startAdaptiveFreeForm() {
+					m.push(roleSystem, infoStyle.Render("  Free-form answer for: "+q.Prompt))
+				} else {
+					m.push(roleError, "[autonomous] this question accepts only its listed options")
+				}
+				m.refreshViewportContent()
+				m.followTail()
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal &&
+				msg.Type == tea.KeyUp && bare:
+				m.adaptiveFocusQuestion(-1)
+				m.refreshViewportContent()
+				m.followTail()
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal &&
+				msg.Type == tea.KeyDown && bare:
+				m.adaptiveFocusQuestion(1)
+				m.refreshViewportContent()
+				m.followTail()
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal &&
+				msg.Type == tea.KeyRunes && len(msg.Runes) == 1 &&
+				msg.Runes[0] >= '1' && msg.Runes[0] <= '9' && bare:
+				m.selectAdaptiveOption(int(msg.Runes[0]-'0') - 1)
+				m.refreshViewportContent()
+				m.followTail()
+				return m, nil
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal && msg.Type == tea.KeyEnter && bare:
+				m.push(roleSystem, infoStyle.Render("  Decisions submitted — the runtime will validate and record them."))
+				m.refreshViewportContent()
+				m.followTail()
+				return m, m.resumeAutonomousAdaptiveProposal()
+			case b.Action == autonomy.HumanBoundaryAdaptiveProposal && msg.Type == tea.KeyEscape && bare:
+				m.push(roleSystem, infoStyle.Render("  "+Icon.Error+" Cancelled — autonomous run aborted."))
+				m.refreshViewportContent()
+				m.followTail()
+				return m, m.abortAutonomousRun("adaptive proposal dismissed by operator")
 			case b.Action == autonomy.HumanBoundaryApproval &&
 				(msg.String() == "alt+a" || (msg.Type == tea.KeyEnter && bare)):
 				// STATE-ACCURATE TRANSITION LANGUAGE.

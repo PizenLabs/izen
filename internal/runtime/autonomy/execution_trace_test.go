@@ -91,16 +91,6 @@ func renderPayload(ev events.DomainEvent) string {
 	}
 }
 
-func (r *traceRecorder) kinds() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]string, 0, len(r.steps))
-	for _, s := range r.steps {
-		out = append(out, s.Kind)
-	}
-	return out
-}
-
 func (r *traceRecorder) all() []traceStep {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -120,18 +110,14 @@ func (r *traceRecorder) waitFor(pred func([]traceStep) bool, d time.Duration) bo
 	return pred(r.all())
 }
 
-func (r *traceRecorder) hasKind(kind string) bool {
-	for _, k := range r.kinds() {
-		if k == kind {
-			return true
-		}
-	}
-	return false
-}
-
-// waitForKind waits until any of the given kinds has been delivered. The bus
-// delivers on per-subscription goroutines, so reading hasKind immediately after
-// a run can observe scheduling latency rather than a missing event.
+// waitForKind waits until any of the given kinds has been delivered.
+//
+// EVERY caller must use this rather than reading the recorded kinds directly.
+// The bus delivers on per-subscription goroutines and services bounded control
+// batches before telemetry, so a telemetry event published during a run can
+// still be undelivered when the run returns. Reading hasKind directly asserts
+// delivery latency as if it were an absence — the exact intermittent failure
+// this test used to produce under package-parallel CPU contention.
 func (r *traceRecorder) waitForKind(d time.Duration, kinds ...string) bool {
 	want := make(map[string]bool, len(kinds))
 	for _, k := range kinds {
@@ -261,7 +247,17 @@ func TestExecutionTrace_CanonicalObjectiveSequence(t *testing.T) {
 
 	// ── objective.accepted + context.acquired ───────────────────────────
 	// A real run resolves a real target and prepares real workspace context.
-	if !rec.hasKind(events.EventTargetResolved) {
+	//
+	// Every assertion below WAITS for its event rather than reading the
+	// recorder the instant Run returns. The bus delivers on its own
+	// per-subscription goroutine and services control events in bounded
+	// batches before telemetry, so the delivery of a TELEMETRY event such as
+	// target.resolved can legitimately lag the end of the run by an unbounded
+	// (scheduling-dependent) amount. Reading it un-waited asserts delivery
+	// LATENCY as if it were an absence — which is exactly the intermittent
+	// failure this used to produce under package-parallel CPU contention.
+	// Waiting for the same event with a deadline asserts the same fact.
+	if !rec.waitForKind(5*time.Second, events.EventTargetResolved) {
 		t.Errorf("objective.accepted: no target resolution evidence\n%s", traceAllText(rec))
 	}
 	if !rec.waitForKind(5*time.Second, events.EventContextPrepared, events.EventContextCompilation) {
@@ -269,12 +265,12 @@ func TestExecutionTrace_CanonicalObjectiveSequence(t *testing.T) {
 	}
 
 	// ── proposal.authorized ─────────────────────────────────────────────
-	if !rec.hasKind(events.EventAdmissionDecision) && !rec.hasKind(events.EventStrategySelected) {
+	if !rec.waitForKind(5*time.Second, events.EventAdmissionDecision, events.EventStrategySelected) {
 		t.Errorf("proposal.authorized: no admission/authorization evidence\n%s", traceAllText(rec))
 	}
 
 	// ── model.computation.completed ─────────────────────────────────────
-	if !rec.hasKind(events.EventExecutionStarted) {
+	if !rec.waitForKind(5*time.Second, events.EventExecutionStarted) {
 		t.Errorf("model.computation: no execution evidence\n%s", traceAllText(rec))
 	}
 
@@ -362,7 +358,12 @@ func TestExecutionTrace_UnprovenObjectiveContinues(t *testing.T) {
 	// ── next computation happened (this is the boundary the audit found missing) ──
 	// The run must NOT have terminated after the first insufficient computation; it
 	// must have produced a second, informed attempt.
-	if collector.loopTransitions() == 0 {
+	//
+	// loop.transition is a control event, so it is always delivered — by the
+	// bus's OWN dispatch goroutine, which can still be draining when Run
+	// returns. Waiting for the transition asserts the same requirement without
+	// asserting delivery latency.
+	if !collector.waitTransitions(1, 5*time.Second) {
 		t.Fatal("the run terminated before a second computation was possible")
 	}
 

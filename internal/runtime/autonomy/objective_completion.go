@@ -129,6 +129,21 @@ func (d *Driver) allTargetsExistedBefore(targets []string) bool {
 	return true
 }
 
+// lifecycleIntent is the canonical intent label of the current lifecycle: the
+// executor-observed intent when one was recorded, else the deterministic
+// classification of the prompt. It is the SAME value taskContract() consumes,
+// so the execution-shape contract and the objective completion contract can
+// never classify the request differently.
+func (d *Driver) lifecycleIntent() string {
+	if d == nil {
+		return ""
+	}
+	if s := string(d.obs.Intent); s != "" {
+		return s
+	}
+	return string(autonomy.Classify(d.prompt, nil).Intent)
+}
+
 // taskContract derives the ONE canonical TaskContract of the current lifecycle.
 //
 // The intent that decides the contract is the CANONICAL resolved intent, not the
@@ -140,10 +155,7 @@ func (d *Driver) taskContract() execution.TaskContract {
 	}
 	targets := d.objectiveTargets()
 	ev := d.obs.Objective
-	intent := string(d.obs.Intent)
-	if intent == "" {
-		intent = string(autonomy.Classify(d.prompt, nil).Intent)
-	}
+	intent := d.lifecycleIntent()
 	requiresMutation := autonomy.Classify(d.prompt, nil).RequiresMutation()
 	// An explicit human read-only constraint ("do not modify anything") removes
 	// mutation authority even when the objective contains a mutation verb. The
@@ -197,7 +209,13 @@ func (d *Driver) objectiveEvaluation() execution.ObjectiveEvaluation {
 // so the recorded transition names both the execution outcome the matrix saw
 // and the obligation the evidence failed.
 func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
-	if d == nil || decision == nil || decision.Action != autonomy.LoopComplete {
+	if d == nil || decision == nil {
+		return
+	}
+	// Every decision point re-stages its own grant. A grant left over from a
+	// previous decision point must never be committed against a later one.
+	d.pendingProven = nil
+	if decision.Action != autonomy.LoopComplete {
 		return
 	}
 	contract := d.taskContract()
@@ -211,12 +229,17 @@ func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
 	d.lastContract = contract
 
 	if evaluation.Outcome.Proves() {
-		// The authority proved the objective: the workspace work it
-		// authorized is committed, and that is a truth boundary the journal
-		// must hold before the loop is allowed to move on.
-		d.ledgerExecutionCommitted()
+		// The authority proved the objective. The terminal objective state is
+		// NOT committed or published here. The behavioral proof gate and the
+		// loop's own transition still run after this authority and can
+		// downgrade the completion, so a commit written now would be a
+		// terminal objective state recorded while authorized work that can
+		// still change the outcome is in flight. Stage the grant and let
+		// commitObjectiveCompletion emit the terminal event and the durable
+		// commit only once every downgrade gate has run.
+		proven := evaluation
+		d.pendingProven = &proven
 		decision.Reason = strings.TrimSpace(decision.Reason + "; objective PROVEN by evidence")
-		d.emitObjectiveEvaluated(evaluation, string(autonomy.LoopComplete), true)
 		return
 	}
 
@@ -242,6 +265,55 @@ func (d *Driver) authorizeObjectiveCompletion(decision *autonomy.LoopDecision) {
 		decision.Action = autonomy.LoopUnsubstantiate
 		decision.Reason = reason
 	}
+}
+
+// discardPendingProven drops a staged PROVEN grant without publishing or
+// committing anything. It is the single cleanup path for every transition that
+// abandons or replaces a staged completion decision: cancellation, abort,
+// retry, resume, a new run, and a later downgrade (which commit handles by
+// discarding). A stale grant must never leak into another decision or run.
+func (d *Driver) discardPendingProven() {
+	if d == nil {
+		return
+	}
+	d.pendingProven = nil
+}
+
+// commitObjectiveCompletion publishes and durably commits a PROVEN objective
+// verdict. It is the ONE place the terminal objective state is committed, and it
+// runs only after every gate that can downgrade a proposed completion has run
+// (the behavioral proof gate and the contract-recovery breaker). This is what
+// makes the emitted terminal objective event and the durable commit agree with
+// the state the run actually reaches:
+//
+//   - a gate that removed the completion (the decision is no longer
+//     LoopComplete) discards the staged grant — no objective.evaluated with
+//     granted=true is published and no EXECUTION_COMMITTED marker is written
+//     for a run that did not complete;
+//   - a run that is still completing commits exactly once, at the end, with
+//     the final reason and the post-gate evidence.
+//
+// It is a no-op when no grant is staged, so a refused or downgraded decision
+// costs nothing.
+func (d *Driver) commitObjectiveCompletion(decision *autonomy.LoopDecision) {
+	if d == nil || decision == nil {
+		return
+	}
+	staged := d.pendingProven
+	d.pendingProven = nil
+	if staged == nil || !staged.Outcome.Proves() {
+		return
+	}
+	if decision.Action != autonomy.LoopComplete {
+		// A later gate revoked the completion. The staged grant must not be
+		// committed: the run did not reach the objective terminal state the
+		// authority proposed.
+		return
+	}
+	// The workspace work the authority proved is committed; that is a truth
+	// boundary the journal must hold before the loop is allowed to move on.
+	d.ledgerExecutionCommitted()
+	d.emitObjectiveEvaluated(*staged, string(autonomy.LoopComplete), true)
 }
 
 // authorizeBehavioralCompletion gates a proposed completion on REAL behavioral
@@ -310,11 +382,33 @@ func (d *Driver) scopeProvenance() domain.ScopeProvenance {
 	if d == nil || d.req.Scope == "" {
 		return domain.ScopeNone
 	}
+	// `$prompt` and `/build` share the SAME execution authority — both are
+	// runtime-resolved dynamic mutation scopes. They remain DISTINCT command
+	// surfaces (recorded verbatim on d.req.Scope and rendered on the command
+	// axis); only their authority vector coincides. `$hot` stays a bounded,
+	// human-declared scope.
 	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$prompt") {
+		return domain.ScopeDynamic
+	}
+	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$build") {
 		return domain.ScopeDynamic
 	}
 	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$hot") {
 		return domain.ScopeDeclared
+	}
+	// `$orchestrate` is the headless CLI build surface (`izen prompt` /
+	// `izen orchestrate`). It is a runtime-resolved dynamic mutation scope,
+	// exactly like `$prompt` and `$build`; only the command surface differs.
+	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$orchestrate") {
+		return domain.ScopeDynamic
+	}
+	// `$run` is the headless `izen run` build surface. It carries the SAME
+	// runtime-resolved dynamic mutation authority as `$prompt`, `$build` and
+	// `$orchestrate`; only the command surface differs. Migrating `izen run`
+	// onto the authoritative runtime must not silently downgrade every run to
+	// read-only authority, which is exactly what an unmapped scope would do.
+	if strings.EqualFold(strings.TrimSpace(d.req.Scope), "$run") {
+		return domain.ScopeDynamic
 	}
 	return domain.ScopeNone
 }
@@ -389,6 +483,15 @@ func (d *Driver) objectiveEvidence() execution.ObjectiveEvidence {
 			ev.TargetAbsent[t] = false
 		}
 	}
+	// A broad project-level objective's acceptance criteria are semantic, so a
+	// skipped verifier is UNVERIFIED rather than provably-not-applicable. The
+	// classification is the gateway's (isProjectLevelObjective), never
+	// re-derived here.
+	ev.BroadObjective = d.isProjectLevelObjective()
+	// The rendered verification is the runtime's own browser observation when
+	// one was required and performed. Its zero value means it did not run, so a
+	// broad objective stays UNVERIFIED rather than claiming a pass it lacks.
+	ev.RenderedVerification = d.renderedEvidence.Evidence()
 	return ev
 }
 

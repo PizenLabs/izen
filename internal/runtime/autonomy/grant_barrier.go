@@ -344,6 +344,10 @@ func (d *Driver) releaseRunResources() {
 	if d == nil {
 		return
 	}
+	// Terminal cleanup: a staged grant is per-decision state. Releasing the
+	// run without discarding it would let one run's staged completion leak
+	// into the next run's first decision point.
+	d.discardPendingProven()
 	d.runCtx, d.runCancel = nil, nil
 }
 

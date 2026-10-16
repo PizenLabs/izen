@@ -126,6 +126,9 @@ type conditionFacts struct {
 	VerifierSatisfied  bool
 	VerificationPassed bool
 	VerifierSkipped    bool
+	BroadObjective     bool
+	RenderedRan        bool
+	RenderedPassed     bool
 	ResponseSatisfied  bool
 	Discharged         map[string]bool
 	ClaimedOnly        map[string]bool
@@ -143,6 +146,9 @@ func conditionFactsFrom(ev ObjectiveEvidence) conditionFacts {
 		VerifierSatisfied:  ev.verifierSatisfied(true),
 		VerificationPassed: ev.VerificationPassed,
 		VerifierSkipped:    ev.VerificationSkipped,
+		BroadObjective:     ev.BroadObjective,
+		RenderedRan:        ev.RenderedVerification.Ran,
+		RenderedPassed:     ev.RenderedVerification.Passed,
 		ResponseSatisfied:  responseSatisfied(ev),
 		Discharged:         toSet(ev.DischargedRequirements),
 		ClaimedOnly:        toSet(ev.ClaimedRequirements),
@@ -267,6 +273,27 @@ func reduceCondition(c CompletionCondition, f conditionFacts) CompletionConditio
 
 	case ObligationIntegrityHeld:
 		if f.VerifierSkipped && !f.VerificationPassed {
+			// A skipped verifier is a provably-not-applicable gate ONLY when the
+			// objective's acceptance is determined by the artifact itself (an
+			// explicit creation, a declared delta). For a BROAD project-level
+			// transformation the acceptance criteria are semantic, so the fact
+			// that no gate applies is exactly the fact that the objective is
+			// UNVERIFIED — unless a REAL rendered verification established it.
+			if f.BroadObjective {
+				if f.RenderedRan && f.RenderedPassed {
+					c.Status = ConditionSatisfied
+					c.VerificationState = VerifyObserved
+					c.EvidenceRefs = []string{"evidence:rendered=RENDERED_PASS"}
+					return c
+				}
+				if f.RenderedRan {
+					return unsatisfied(c, VerifyGateFail,
+						"the rendered verification ran and did not satisfy every acceptance check")
+				}
+				return unsatisfied(c, VerifyGateUnverified,
+					"no verification contract applies to the target(s) and the objective is a broad "+
+						"transformation, so its acceptance criteria remain unverified")
+			}
 			c.Status = ConditionSatisfied
 			c.VerificationState = VerifyGateNotApplicable
 			c.EvidenceRefs = []string{"evidence:verifier=NOT_APPLICABLE"}

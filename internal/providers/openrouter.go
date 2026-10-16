@@ -759,7 +759,20 @@ func (p *OpenRouterProvider) buildRequest(model string, msgs []openrouterMessage
 		body.StreamOptions = &streamOptions{IncludeUsage: true}
 	}
 	if !openRouterModelSupportsReasoning(model) {
-		body.Reasoning = nil
+		// A model outside the reasoning whitelist must not receive an
+		// ENABLE/budget reasoning control it may reject with HTTP 400.
+		//
+		// An explicit DISABLE is different and is preserved. It asks the
+		// provider to suppress hidden chain-of-thought, which also holds for
+		// models that reason BY DEFAULT but are not in the effort whitelist
+		// (the live repro: cohere/north-mini-code emits reasoning unless
+		// reasoning.enabled=false, and it otherwise spends a constrained
+		// shared output budget on CoT before emitting any artifact). The
+		// gateway accepts the field for every model, and the existing
+		// HTTP-400 strip-and-retry below covers the rare model that does not.
+		if body.Reasoning == nil || body.Reasoning.Enabled == nil || *body.Reasoning.Enabled {
+			body.Reasoning = nil
+		}
 	} else if body.Reasoning != nil {
 		// Enforce token contracts via TokenManager
 		tm := llm.NewTokenManager()

@@ -377,7 +377,17 @@ func Classify(input string, semantic ClassifyFunc) IntentResult {
 
 // extractTargets pulls explicit @file references and bare file paths from the
 // input. Deduplicated, preserving first-appearance order.
+//
+// QUOTED / CODE-QUOTED NAMES. A human routinely names a target inside quotes or
+// backticks ("`zuru.md`", "\"zuru.md\""). The patterns anchor the path at a
+// token boundary (start, whitespace or comma), so the opening delimiter hides
+// the target and an explicitly named file is never extracted — the CREATE then
+// compiles as a targetless modification and discovery is asked to guess a scope
+// the user already stated. Normalizing the delimiters to spaces restores the
+// real token boundaries; it changes nothing else, because a delimiter is never
+// part of a filesystem path.
 func extractTargets(input string) []string {
+	input = normalizeTargetDelimiters(input)
 	seen := make(map[string]bool)
 	var out []string
 	for _, m := range targetRefPattern.FindAllStringSubmatch(input, -1) {
@@ -399,6 +409,21 @@ func extractTargets(input string) []string {
 		}
 	}
 	return out
+}
+
+// normalizeTargetDelimiters replaces quote and code-span delimiters with spaces
+// so a quoted filename ("`zuru.md`", "\"zuru.md\"") presents the same token
+// boundaries as a bare one. It touches only delimiters, never path characters.
+func normalizeTargetDelimiters(input string) string {
+	return strings.NewReplacer(
+		"`", " ",
+		`"`, " ",
+		"'", " ",
+		"\u2018", " ",
+		"\u2019", " ",
+		"\u201c", " ",
+		"\u201d", " ",
+	).Replace(input)
 }
 
 func clampConfidence(c float64) float64 {

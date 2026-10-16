@@ -52,30 +52,35 @@ func printMinimalistHelp() {
 	fmt.Println("izen — human-centered coding intelligence")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  izen                    Start the interactive TUI")
-	fmt.Println("  izen version            Show version information")
-	fmt.Println("  izen help               Show this help message")
-	fmt.Println("  izen debug [path]       Inspect engine diagnostics (Lea, governance, output)")
-	fmt.Println("  izen auth login         Authenticate with a provider")
-	fmt.Println("  izen stats              Show usage statistics")
-	fmt.Println("  izen config style       Set response style policy (verbose|balanced|terse|ultra)")
-	fmt.Println("  izen compact            Compress prompt overhead in context/memory files")
-	fmt.Println("  izen memory optimize    Alias for izen compact")
-	fmt.Println("  izen rollback           Review recent file mutations")
-	fmt.Println("  izen run \"<prompt>\"      Execute a prompt through the v3 agent runtime")
-	fmt.Println("  izen orchestrate \"<target>\"  Run the control-plane orchestrator on a target")
-	fmt.Println("  izen [path]             Start TUI at the given project path")
+	fmt.Println("  izen                       Start the interactive TUI")
+	fmt.Println("  izen [path]                Start TUI at the given project path")
+	fmt.Println()
+	fmt.Println("Execution (one authoritative runtime):")
+	fmt.Println("  izen run [flags] \"<objective>\"   Execute an objective (see `izen run -h`)")
+	fmt.Println("  izen prompt [flags] \"<objective>\"  Alias of run (surface $prompt)")
+	fmt.Println("  izen orchestrate [flags] \"<objective>\"  Alias of run (surface $orchestrate)")
+	fmt.Println("  izen resume [flags]        Continue the recorded interrupted objective")
+	fmt.Println("  izen runs                  List durable execution tasks")
+	fmt.Println()
+	fmt.Println("Inspect and configure:")
+	fmt.Println("  izen models [use <p> <m>]  List or set the active provider/model binding")
+	fmt.Println("  izen auth status           Show credential availability (never the secret)")
+	fmt.Println("  izen config show|get|style Inspect or set configuration")
+	fmt.Println("  izen stats [-json]         Token usage from the durable ledger")
+	fmt.Println("  izen debug [path]          Inspect engine diagnostics (Lea, governance, output)")
+	fmt.Println("  izen compact               Compress prompt overhead in context/memory files")
+	fmt.Println("  izen memory optimize       Alias for izen compact")
+	fmt.Println("  izen rollback              Review recent file mutations")
+	fmt.Println("  izen version               Show version information")
+	fmt.Println("  izen help                  Show this help message")
+	fmt.Println()
+	fmt.Println("Non-interactive execution flags (izen run/resume):")
+	fmt.Println("  -dir -target -provider -model -base-url -mode -approve -timeout -json -quiet")
+	fmt.Println()
+	fmt.Println("Exit codes: 0 success 1 failed 2 usage 3 provider 4 human-required 5 unsubstantiated 6 timeout 7 denied")
 	fmt.Println()
 	fmt.Println("Interactive Commands (inside TUI):")
-	fmt.Println("  /ask          Explain, inspect, understand (read-only)")
-	fmt.Println("  /plan         Architecture, migrations, refactors (no exec)")
-	fmt.Println("  /build        Implement, refactor, write tests (controlled exec)")
-	fmt.Println("  /investigate  Debug bugs, failures, regressions")
-	fmt.Println("  /review       Audit changes, detect risks")
-	fmt.Println("  /help         Show interactive help")
-	fmt.Println("  /status       Inspect workspace, VCS, index, session, and authority state")
-	fmt.Println("  /mode <name>  Switch mode")
-	fmt.Println("  /q            Exit Izen")
+	fmt.Println("  /ask /plan /build /investigate /review /help /status /mode /q")
 	fmt.Println("  !<cmd>        Run a shell command")
 	fmt.Println("  Ctrl+C / Esc  Exit Izen")
 }
@@ -92,18 +97,13 @@ func main() {
 			printMinimalistHelp()
 			os.Exit(0)
 		case "auth":
-			if len(os.Args) > 2 && os.Args[2] == "login" {
-				fmt.Println("Auth login is not yet implemented.")
-				os.Exit(0)
-			}
-			fmt.Println("Usage: izen auth login")
-			os.Exit(1)
+			os.Exit(runAuthCommand(os.Args[2:]))
+		case "models", "model":
+			os.Exit(runModelsCommand(os.Args[2:]))
 		case "stats":
-			fmt.Println("Stats are not yet implemented.")
-			os.Exit(0)
+			os.Exit(runStatsCommand(os.Args[2:]))
 		case "config":
-			runConfigCommand(os.Args[2:])
-			os.Exit(0)
+			os.Exit(runConfigCommand(os.Args[2:]))
 		case "compact":
 			runCompactCommand(os.Args[2:])
 			os.Exit(0)
@@ -116,34 +116,19 @@ func main() {
 				os.Exit(1)
 			}
 			os.Exit(0)
-		case "run":
-			if err := runRuntimeCommand(os.Args[2:]); err != nil {
-				fmt.Fprintf(os.Stderr, "%v\n", err)
-				os.Exit(1)
-			}
-			os.Exit(0)
+		case "run", "exec":
+			os.Exit(runRuntimeCommand(os.Args[2:]))
 		case "prompt":
-			// E2E verification path: `izen prompt "check this file @index.html and rewrite it"`
-			// Routes through the hard-gated orchestrator Stack to enforce:
-			// - DecisionSurface with (recommended)/[HIGH RISK]/[DISABLED] annotations
-			// - Budget hard-block before model invocation
-			// - Single snapshot read (zero repetitive disk I/O)
-			promptStr := strings.Join(os.Args[2:], " ")
-			if strings.TrimSpace(promptStr) == "" && len(os.Args) > 2 {
-				promptStr = os.Args[2]
-			}
-			// Ensure we have a target file for E2E; default to index.html if none extracted.
-			if err := runOrchestrateCommand([]string{promptStr}); err != nil {
-				fmt.Fprintf(os.Stderr, "%v\n", err)
-				os.Exit(1)
-			}
-			os.Exit(0)
+			// `izen prompt "<objective>"` is an alias of `izen run` recorded
+			// under the "$prompt" surface. It drives the SAME authoritative
+			// runtime: compose.Wire → autonomy Driver → RuntimeExecutor.
+			os.Exit(runPromptCommand(os.Args[2:]))
 		case "orchestrate":
-			if err := runOrchestrateCommand(os.Args[2:]); err != nil {
-				fmt.Fprintf(os.Stderr, "%v\n", err)
-				os.Exit(1)
-			}
-			os.Exit(0)
+			os.Exit(runOrchestrateCommand(os.Args[2:]))
+		case "resume":
+			os.Exit(runResumeCommand(os.Args[2:]))
+		case "runs":
+			os.Exit(runRunsCommand(os.Args[2:]))
 		}
 	}
 
@@ -377,40 +362,77 @@ func updateLocalConfig(root string, localCfg *config.LocalConfig, det project.De
 	_ = config.SaveLocalConfig(root, localCfg)
 }
 
-// runConfigCommand implements `izen config style <policy>`: it parses the
-// policy, persists it to the global config, and activates it for the current
-// process.
-func runConfigCommand(args []string) {
+// runConfigCommand implements the `izen config` command group:
+//
+//	izen config show              print the effective non-secret configuration
+//	izen config get <key>         print one effective value
+//	izen config style <policy>    set the response style policy
+func runConfigCommand(args []string) int {
 	usage := func() {
-		fmt.Fprintln(os.Stderr, "Usage: izen config style <verbose|balanced|terse|ultra>")
-		os.Exit(1)
+		fmt.Fprintln(os.Stderr, "Usage:")
+		fmt.Fprintln(os.Stderr, "  izen config show")
+		fmt.Fprintln(os.Stderr, "  izen config get <provider|model|style|username>")
+		fmt.Fprintln(os.Stderr, "  izen config style <verbose|balanced|terse|ultra>")
 	}
-	if len(args) < 2 || args[0] != "style" {
+	if len(args) == 0 {
 		usage()
+		return exitUsage
 	}
-
-	policy, err := prompt.ParseStylePolicy(args[1])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "izen config style: %v\n", err)
-		os.Exit(2)
-	}
-
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "izen config style: load config: %v\n", err)
-		os.Exit(1)
+		cfg = config.Default()
 	}
-	cfg.Style = string(policy)
-	if err := config.Save(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "izen config style: save config: %v\n", err)
-		os.Exit(1)
+	switch args[0] {
+	case "-h", "--help", "help":
+		usage()
+		return exitOK
+	case "show":
+		fmt.Printf("provider: %s\n", cfg.ActiveProviderName())
+		fmt.Printf("model:    %s\n", cfg.ActiveModelName())
+		fmt.Printf("style:    %s\n", cfg.Style)
+		fmt.Printf("username: %s\n", cfg.Username)
+		return exitOK
+	case "get":
+		if len(args) < 2 {
+			usage()
+			return exitUsage
+		}
+		switch args[1] {
+		case "provider":
+			fmt.Println(cfg.ActiveProviderName())
+		case "model":
+			fmt.Println(cfg.ActiveModelName())
+		case "style":
+			fmt.Println(cfg.Style)
+		case "username":
+			fmt.Println(cfg.Username)
+		default:
+			fmt.Fprintf(os.Stderr, "izen config get: unknown key %q\n", args[1])
+			return exitUsage
+		}
+		return exitOK
+	case "style":
+		if len(args) < 2 {
+			usage()
+			return exitUsage
+		}
+		policy, perr := prompt.ParseStylePolicy(args[1])
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "izen config style: %v\n", perr)
+			return exitUsage
+		}
+		cfg.Style = string(policy)
+		if serr := config.Save(cfg); serr != nil {
+			fmt.Fprintf(os.Stderr, "izen config style: save config: %v\n", serr)
+			return exitFailed
+		}
+		prompt.SetActiveStyle(policy)
+		fmt.Printf("izen: output style set to %q\n", policy)
+		return exitOK
+	default:
+		usage()
+		return exitUsage
 	}
-	prompt.SetActiveStyle(policy)
-
-	home, _ := os.UserHomeDir()
-	path := filepath.Join(home, ".izen", "config.yml")
-	fmt.Printf("izen: output style set to %q (saved to %s)\n", policy, path)
-	fmt.Printf("izen: injected OUTPUT STYLE directive into system prompts:\n%s\n", prompt.StyleDirective(policy))
 }
 
 // runCompactCommand implements `izen compact` / `izen memory optimize`: it

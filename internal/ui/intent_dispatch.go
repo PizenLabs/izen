@@ -299,6 +299,7 @@ func (m *model) routePromptDirective(rawInput string) tea.Cmd {
 		return nil
 	}
 	m.bindScopeProvenance(intentdomain.ScopeDynamic)
+	m.executionSurface = "$prompt"
 	m.cancelStaleAgentOps()
 	rawInput = strings.TrimSpace(rawInput)
 	if rawInput == "" {

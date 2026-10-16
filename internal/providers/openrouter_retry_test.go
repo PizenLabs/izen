@@ -41,6 +41,34 @@ func TestOpenRouterReasoningOmittedForNonReasoningModel(t *testing.T) {
 	}
 }
 
+// TestOpenRouterReasoningDisablePreservedForNonWhitelistedModel pins the
+// counterpart of the sanitization rule: an explicit DISABLE must survive even
+// for a model outside the effort whitelist. Models such as
+// cohere/north-mini-code reason by default, are not in the whitelist, and spend
+// a constrained free-tier output budget on hidden CoT before emitting any
+// artifact. reasoning.enabled=false is accepted by the gateway for every model,
+// so the runtime's explicit disable must reach the wire.
+func TestOpenRouterReasoningDisablePreservedForNonWhitelistedModel(t *testing.T) {
+	for _, model := range []string{"cohere/north-mini-code:free", "google/gemma-4-26b-a4b"} {
+		client, body := captureClient(t)
+		p := NewOpenRouterProvider("key", model, "https://openrouter.example.com/api/v1")
+		p.client = client
+		if _, err := p.Execute(context.Background(), ai.Request{
+			Model:     model,
+			Reasoning: &ai.ReasoningConfig{Disabled: true},
+		}); err != nil {
+			t.Fatalf("%s: Execute: %v", model, err)
+		}
+		reasoning, ok := decodeBody(t, body())["reasoning"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s: explicit reasoning disable was dropped from the wire (payload %s)", model, body())
+		}
+		if enabled, has := reasoning["enabled"]; !has || enabled != false {
+			t.Fatalf("%s: reasoning = %v, want enabled=false (payload %s)", model, reasoning, body())
+		}
+	}
+}
+
 // TestOpenRouterModelSupportsReasoning asserts the strict whitelist gating:
 // only verified reasoning families (openai/o1*, openai/o3*, anthropic/claude-3-7-sonnet*,
 // deepseek/deepseek-r1*) are reasoning-capable; all others are false.

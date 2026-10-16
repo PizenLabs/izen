@@ -154,6 +154,7 @@ func (d *Driver) objectiveContract() execution.ObjectiveContract {
 		ObjectiveID: d.runRequestID,
 		Request:     d.prompt,
 		Kind:        d.taskContract().Kind,
+		Intent:      d.lifecycleIntent(),
 		Scope:       d.objectiveTargets(),
 		Proposals:   d.objective.proposals,
 	})
@@ -204,19 +205,24 @@ func (d *Driver) deriveObjectiveRequirements(ctx context.Context) {
 		d.objective.requirementNote = "requirement derivation unavailable: " + err.Error()
 		diagnosticf("[objective] requirement derivation unavailable: %v — "+
 			"the runtime's own completion obligations still gate this objective", err)
+		// Absence must be visible, not silent: publish the empty tally so a
+		// reader can tell "no requirements were derived" from "the tally was
+		// never emitted". The runtime's own obligations still gate completion;
+		// a failed derivation never loosens the contract and never proves
+		// anything.
+		d.publishObjectiveRequirements(0, 0)
 		return
 	}
 	d.objective.proposals = proposals
-	admitted, rejected := 0, 0
-	for _, p := range proposals {
-		// The gate itself runs inside DeriveObjectiveContract; this loop only
-		// reports the outcome it produced so the trace carries the tally.
-		_ = p
-	}
+	// The gate itself runs inside DeriveObjectiveContract, which is invoked by
+	// the tally below. There is deliberately no per-proposal loop here: the
+	// admissibility verdict (and its reason) is produced once, by the gate, and
+	// read back — a second loop that merely iterated the proposals would be
+	// dead code that looked like it decided something.
 	diagnosticf("[objective] requirement derivation proposed %d requirement(s) for scope %v",
 		len(proposals), d.objectiveTargets())
 	d.objective.requirementNote = fmt.Sprintf("%d requirement(s) proposed", len(proposals))
-	admitted, rejected = d.objectiveTally()
+	admitted, rejected := d.objectiveTally()
 	d.publishObjectiveRequirements(admitted, rejected)
 }
 
@@ -822,7 +828,15 @@ func (d *Driver) publishObjectiveRequirements(admitted, rejected int) {
 	for _, r := range contract.Requirements {
 		switch {
 		case !r.Admitted():
-			parts = append(parts, fmt.Sprintf("%s=REJECTED", r.ID))
+			// A rejected requirement is published WITH its attributable reason.
+			// Reporting only "REJECTED" makes an all-rejected derivation look
+			// like a silent drop; the reason is what turns it into an auditable
+			// decision an operator can act on.
+			reason := strings.TrimSpace(r.RejectReason)
+			if reason == "" {
+				reason = "unspecified"
+			}
+			parts = append(parts, fmt.Sprintf("%s=REJECTED(%s)", r.ID, reason))
 		default:
 			parts = append(parts, fmt.Sprintf("%s=ADMITTED", r.ID))
 		}
@@ -1021,12 +1035,10 @@ func (d *Driver) observedDeltaTargets() []string {
 //
 //	Intent ≠ Authorization ≠ Grant ≠ Execution ≠ Evidence ≠ Verification
 //
-// Where the driver cannot see an axis (the command mode is chosen by the UI
-// composition root and is not carried into the loop), it reports
-// (not-carried) rather than substituting a neighbouring axis. A missing value is
-// visible; a plausible wrong one is not.
-// NotCarried is the explicit representation for an axis the runtime genuinely
-// does not have.
+// Where the driver cannot see an axis it reports (not-carried) rather than
+// substituting a neighbouring axis. The command mode is carried by the per-run
+// `SetScope` binding, so it is visible for every run that received a directive;
+// the marker remains for a run the composition never bound one for.
 //
 // It exists because "unknown" is ambiguous: it reads as "the runtime looked and
 // could not determine this", when the truth in several cases is "this concept is
@@ -1070,11 +1082,18 @@ func (d *Driver) intentAxes() (userIntent, commandMode, interaction, executionIn
 		userIntent = NotCarried
 	}
 
-	// The command SURFACE is chosen by the UI composition root and is not
-	// carried into the loop. It is reported as not-carried rather than guessed
-	// from a neighbouring axis.
-	commandMode = d.subcommand
-	if strings.TrimSpace(commandMode) == "" {
+	// The command SURFACE is the human directive that authorized this run. It is
+	// carried into the loop by SetScope (the per-input push form), so reading the
+	// authoritative per-run value is what makes the axis truthful. The
+	// composition-time `subcommand` policy field is only a fallback for callers
+	// that bound a policy without a per-run directive; it is never preferred,
+	// because a composition default would mislabel every run with the one value
+	// chosen at wiring time.
+	commandMode = strings.TrimSpace(d.req.Scope)
+	if commandMode == "" {
+		commandMode = strings.TrimSpace(d.subcommand)
+	}
+	if commandMode == "" {
 		commandMode = NotCarried
 	}
 

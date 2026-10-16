@@ -303,6 +303,33 @@ func (c TaskContract) targetsAbsent(absent map[string]bool) bool {
 // keeps `ExecutionEvidence`. The authority consumes BOTH: the sealed record
 // when the runtime has one (see SealedRecord) and the boundary facts otherwise.
 
+// RenderedVerificationEvidence is the completion authority's view of one
+// rendered-layout verification. It is EVIDENCE, never authority: a passing
+// value can satisfy the broad objective's integrity condition only because a
+// real browser rendered a concrete artifact revision and every deterministic
+// acceptance check held.
+type RenderedVerificationEvidence struct {
+	// Ran reports that a real browser rendered the workspace.
+	Ran bool
+	// Passed reports that every deterministic acceptance check held.
+	Passed bool
+	// Revision is the digest of the served artifact set at inspection time.
+	Revision string
+	// Browser identifies the browser that performed the rendering.
+	Browser string
+	// Observations are the deterministic facts observed in the rendered output.
+	Observations []string
+	// Defects are the checks that failed.
+	Defects []string
+	// BlockedReason explains why rendering could not run.
+	BlockedReason string
+}
+
+// RenderedProven reports whether a real, passing rendering was recorded.
+func (r RenderedVerificationEvidence) RenderedProven() bool {
+	return r.Ran && r.Passed
+}
+
 type ObjectiveEvidence struct {
 	// ── Boundary 1: PROVIDER (transport) ──────────────────────────────
 	Provider ProviderState
@@ -343,6 +370,21 @@ type ObjectiveEvidence struct {
 	// target (semantically NOT APPLICABLE — distinct from a gate that ran and
 	// failed). It never claims a pass.
 	VerificationSkipped bool
+	// RenderedVerification is the attributable result of a REAL browser
+	// rendering of the composed output, when one was required and performed.
+	// Its zero value means rendered verification did not run; a broad objective
+	// whose source-level gate is not applicable stays UNVERIFIED unless this
+	// evidence shows a real, passing rendering.
+	RenderedVerification RenderedVerificationEvidence
+	// BroadObjective reports that the objective is a broad project-level
+	// transformation (the strategy gateway classified it architect/refactor)
+	// whose acceptance criteria are semantic rather than determined by the
+	// artifact alone. For such an objective a skipped verifier is NOT a
+	// provably-not-applicable gate: the objective remains UNVERIFIED and must
+	// not be reported PROVEN. It is set by the control plane that owns the
+	// objective's classification; the zero value keeps the legacy behavior for
+	// content-determined objectives (an explicit creation, a declared delta).
+	BroadObjective bool
 	// WorkspaceObservations counts the workspace observation / AST parse events
 	// this execution produced. It is the READ/REVIEW evidence of observation.
 	WorkspaceObservations int
@@ -415,6 +457,15 @@ func (e ObjectiveEvidence) VerifierVerdict() string {
 	switch {
 	case e.VerificationRan && e.VerificationPassed:
 		return "PASS"
+	case e.RenderedVerification.Ran && e.RenderedVerification.Passed:
+		return "RENDERED_PASS"
+	case e.RenderedVerification.Ran && !e.RenderedVerification.Passed:
+		return "RENDERED_FAIL"
+	case e.VerificationSkipped && e.BroadObjective:
+		// A skipped verifier is NOT APPLICABLE only when the objective's
+		// acceptance is determined by the artifact. A broad transformation's
+		// skipped verifier is UNVERIFIED: the criterion was never checked.
+		return "UNVERIFIED"
 	case e.VerificationSkipped:
 		return "NOT_APPLICABLE"
 	case e.VerificationRan:
@@ -428,9 +479,19 @@ func (e ObjectiveEvidence) VerifierVerdict() string {
 // provably not-applicable gate satisfies the requirement the same way an
 // untestable target's syntax is not a mutation failure — but the outcome
 // records WHICH, so no projection can render "verified" for a skipped gate.
+//
+// A BROAD project-level transformation is the exception: its acceptance
+// criteria are semantic, so a skipped gate leaves the objective UNVERIFIED and
+// must not satisfy the requirement. The mutation may have applied; the
+// objective is not proven.
 func (e ObjectiveEvidence) verifierSatisfied(required bool) bool {
 	if !required {
 		return true
+	}
+	if e.VerificationSkipped && !e.VerificationPassed && e.BroadObjective {
+		// A broad objective's skipped source-level gate is satisfied ONLY by a
+		// real, passing rendered verification. Nothing else may stand in.
+		return e.RenderedVerification.RenderedProven()
 	}
 	return e.VerificationPassed || e.VerificationSkipped
 }
@@ -562,8 +623,10 @@ var reviewIntents = map[string]bool{
 //     (pre-execution determination or the executor's NO-OP structural verdict)
 //     → IDEMPOTENT
 //  4. any other mutation objective        → PATCH
-//  5. a review-classified read-only intent → REVIEW
-//  6. any other read-only intent           → READ
+//  5. a conversational objective           → READ (response only; no workspace
+//     observation, because a conversation has no workspace)
+//  6. a review-classified read-only intent → REVIEW
+//  7. any other read-only intent           → READ
 //
 // A mutation objective that names NO target (target DEFERRED) takes rule 4, not
 // rule 2: an unresolved target is not evidence of a new artifact. Discovery
@@ -653,7 +716,27 @@ func DeriveTaskContract(in TaskClassification) TaskContract {
 		return contract
 	}
 
-	// 5/6 — read-only contracts: the deliverable is the delivered response, and
+	// 5 — CONVERSATION: a pure conversational exchange has NO workspace to
+	// observe. Its objective is delivered the moment the runtime produced a
+	// response, so it is judged by the RESPONSE obligation alone. Requiring a
+	// workspace observation would make every greeting unprovable by
+	// construction — the runtime would refuse completion for a request that
+	// never had a workspace.
+	//
+	// This is NOT "assume success". The contract stays evidence-bound: the
+	// observation obligation is dropped, but the response obligation is kept,
+	// and ResponseProduced is a runtime-observed fact (non-empty delivered
+	// bytes), never the model's self-report. Conversation is the ONLY intent
+	// with no workspace (autonomy.Intent.RequiresWorkspace), so this clause can
+	// never leak to a read/investigation/review objective that must look.
+	if strings.EqualFold(strings.TrimSpace(in.Intent), "conversation") {
+		contract.Kind = TaskRead
+		contract.RequiresResponse = true
+		contract.RequiresObservation = false
+		return contract
+	}
+
+	// 6/7 — read-only contracts: the deliverable is the delivered response, and
 	// the evidence that the model actually looked at the workspace.
 	contract.RequiresResponse = true
 	contract.RequiresObservation = true

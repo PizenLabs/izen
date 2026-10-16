@@ -176,6 +176,7 @@ func (x *RuntimeExecutor) invokeArtifactBoundedStep(
 	baseReq ai.Request,
 	recompile func(userTurn string, stepMaxTokens int) (ai.Request, error),
 	streamCb StreamCallback,
+	allowMarkupRepair bool,
 	maxTokens int,
 	constrained bool,
 	disableReasoning bool,
@@ -222,7 +223,7 @@ func (x *RuntimeExecutor) invokeArtifactBoundedStep(
 		g.BeginModel(model)
 
 		var providerMetadata ai.ResponseMetadata
-		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, streamCb, &providerMetadata)
+		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, streamCb, allowMarkupRepair, &providerMetadata)
 		if itrace != nil {
 			*trace = itrace
 		}

@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	"github.com/PizenLabs/izen/internal/autonomy"
@@ -289,11 +290,17 @@ func TestPhase12_ContextSufficiencyIsNotTradedForTokens(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(prepared) == 0 {
+	// The compiler telemetry is published on the bus and dispatched by its own
+	// per-subscription goroutine, so it can still be in flight when Execute
+	// returns. Waiting for the delivery asserts the same sufficiency claim
+	// without asserting delivery latency as if it were an absence. The wait
+	// takes the mutex itself, so it must run BEFORE the block below holds it.
+	if !waitContextPrepared(&mu, &prepared, 5*time.Second) {
 		t.Fatal("no context telemetry was emitted — the sufficiency claim would be vacuous")
 	}
+
+	mu.Lock()
+	defer mu.Unlock()
 	// The compiler was NOT asked to prune: nothing was truncated and nothing
 	// was dropped to save tokens.
 	for i, p := range prepared {
@@ -396,4 +403,27 @@ func truncateForPhase12(s string) string {
 		return s[:300] + "…"
 	}
 	return s
+}
+
+// waitContextPrepared polls until the context compiler's telemetry has actually
+// been DELIVERED to the collector, up to a bounded deadline.
+//
+// The bus dispatches on its own per-subscription goroutine, so telemetry
+// published during a run can still be in flight when the run returns. Polling a
+// slice the executor filled synchronously would assert delivery latency as if it
+// were an absence — the intermittent failure shape this removes.
+func waitContextPrepared(mu *sync.Mutex, prepared *[]events.ContextPreparedPayload, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		mu.Lock()
+		ready := len(*prepared) > 0
+		mu.Unlock()
+		if ready {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }

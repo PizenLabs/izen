@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/user"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1013,6 +1014,25 @@ func Wire(opts ...Option) (*Application, error) {
 		// The session identity makes the task key stable across the run and
 		// keeps one session's objectives out of another's ledger.
 		runtimeAutonomy.WithLedger(a.ledger, sess.SessionID),
+		// ADAPTIVE PROPOSAL ORCHESTRATION: the runtime selects its interaction
+		// from the objective, the observed evidence and the applicable policy.
+		// The domain-neutral advisor recommends an evidence-bound strategy and
+		// asks no question by default; a policy/domain advisor may supply the
+		// consequential decisions. The proposal never authorizes anything — its
+		// accepted decisions compile into the SAME request the existing
+		// authorization, approval and verification path consumes.
+		runtimeAutonomy.WithProposalAdvisor(runtimeAutonomy.DefaultProposalAdvisor),
+		// RENDERED-LAYOUT VERIFICATION: enabled by policy. When an accepted
+		// strategy requires it, the local headless browser renders the composed
+		// output and evaluates the deterministic acceptance checks. With no
+		// browser or entry configured, the objective stays UNVERIFIED.
+		runtimeAutonomy.WithRenderedVerificationPolicy(func(string) bool {
+			return strings.TrimSpace(os.Getenv("IZEN_RENDERED_VERIFY")) == "1"
+		}),
+		runtimeAutonomy.WithRenderedVerifier(&runtimeAutonomy.HeadlessBrowserVerifier{
+			BrowserPath: runtimeAutonomy.DetectBrowser(),
+		}),
+		runtimeAutonomy.WithRenderedChecks(renderedEntry(), renderedChecks()),
 	)
 
 	// ── AUTONOMY BOUNDARY-TELEMETRY SINK ─────────────────────────────────
@@ -1317,4 +1337,36 @@ func (g composedCapabilityGraph) CanMutateFile(path string) bool {
 // scope covers the command.
 func (g composedCapabilityGraph) CanExecuteCommand(cmd string) bool {
 	return g.caps != nil && g.caps.CanExecuteCommand(cmd)
+}
+
+// renderedEntry is the workspace-relative entry document the optional rendered
+// verification renders. It is configured by policy (IZEN_RENDERED_ENTRY) so the
+// runtime never hard-codes a filename.
+func renderedEntry() string {
+	return strings.TrimSpace(os.Getenv("IZEN_RENDERED_ENTRY"))
+}
+
+// renderedChecks builds the deterministic rendered acceptance checks from policy
+// (IZEN_RENDERED_CONTAINS, a comma-separated list of required rendered-DOM
+// substrings). An empty list means nothing was established about the output, so
+// the verifier reports UNVERIFIED rather than a pass.
+func renderedChecks() []runtimeAutonomy.RenderedCheck {
+	raw := strings.TrimSpace(os.Getenv("IZEN_RENDERED_CONTAINS"))
+	if raw == "" {
+		return nil
+	}
+	var out []runtimeAutonomy.RenderedCheck
+	for i, v := range strings.Split(raw, ",") {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		out = append(out, runtimeAutonomy.RenderedCheck{
+			ID:          "policy-contains-" + strconv.Itoa(i+1),
+			Kind:        runtimeAutonomy.RenderedDOMContains,
+			Value:       v,
+			Description: "policy requires the rendered output to contain " + strconv.Quote(v),
+		})
+	}
+	return out
 }

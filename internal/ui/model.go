@@ -1289,6 +1289,21 @@ type model struct {
 	// reported zero). "0 tok" must mean an actual zero, not an unknown.
 	usageKnown bool
 
+	// ── Autonomous per-run usage accounting ─────────────────────────────
+	// The autonomous driver exposes a CUMULATIVE per-run aggregate
+	// (AggregatedUsage) that it does not reset when the run parks and resumes.
+	// The UI commits provider usage into the session baseline, so committing
+	// the cumulative total at every boundary (park AND terminal) would add the
+	// same provider calls to the baseline more than once — the observed
+	// ~2× discrepancy between the footer and the provider's real billing.
+	// usageAggRun is the run identity the baseline below belongs to;
+	// usageAggIn/usageAggOut are the aggregate already committed for that run.
+	// Each boundary commits only the DELTA since the last commit, so every
+	// provider call is folded into the session exactly once.
+	usageAggRun string
+	usageAggIn  int
+	usageAggOut int
+
 	streamParser     *IncrementalStreamParser
 	streamBuffer     string // buffered tokens for smooth tick emission
 	streamTickActive bool   // whether smooth-stream tick is active
@@ -1424,6 +1439,28 @@ type model struct {
 	// autonomousSelect is the highlighted candidate index of a parked
 	// clarify boundary.
 	autonomousSelect int
+	// adaptiveAnswers holds the human's selected option id(s) per adaptive
+	// proposal question while the driver parks at HumanBoundaryAdaptiveProposal.
+	// It is presentation state only: the runtime validates and records every
+	// decision on submit.
+	adaptiveAnswers map[string][]string
+	// adaptiveFreeform holds the human's free-form text per adaptive proposal
+	// question. It is the answer for a question that declares AllowFreeForm (or
+	// is a free_form question), and it travels to the runtime through the SAME
+	// ResumeAdaptiveProposal submission as an option selection — never by
+	// mutating proposal state in the UI.
+	adaptiveFreeform map[string]string
+	// adaptiveFocus is the index of the adaptive proposal question the keyboard
+	// cursor is on. It is presentation only: it decides which question the
+	// free-form editor writes to, never what the runtime will accept.
+	adaptiveFocus int
+	// adaptiveEditing names the question whose free-form answer is being typed,
+	// or "" when the keyboard is in selection mode. It is deliberately distinct
+	// from adaptiveFreeform: a draft is not an answer until the human commits
+	// it, and a cancelled draft must never reach the runtime.
+	adaptiveEditing string
+	// adaptiveDraft is the uncommitted free-form text.
+	adaptiveDraft string
 	// autonomousObjective is the objective of the active/parked driver run.
 	autonomousObjective string
 	// proposalTUI is the interactive Zero-Token DecisionSurface selection model
@@ -2198,6 +2235,13 @@ type model struct {
 	// authorization proposal is outstanding, so Execute can resume the hotfix
 	// pipeline on the SAME objective without re-parsing a command.
 	pendingHotfixObjective string
+	// executionSurface records the COMMAND SURFACE that authorized the run
+	// ("$prompt", "/build" → "$build", "$hot"). It is carried to the
+	// authoritative runtime as the run's scope so the command axis is truthful
+	// and `$hot` stays a bounded, human-declared authority. `/build` and
+	// `$prompt` share the SAME dynamic execution authority but remain distinct
+	// surfaces. Empty falls back to the session scope provenance.
+	executionSurface string
 
 	// Patch engine: 4-tier pipeline (Tier 1 structured diff -> Tier 2
 	// SEARCH/REPLACE -> Tier 3 whole-file -> Tier 4 human approval) replacing
@@ -2899,6 +2943,8 @@ func (m *model) resetTokenMetrics() {
 	m.streamLiveTokens = 0
 	m.AccumulatedCost = 0
 	m.usageKnown = false
+	m.usageAggRun = ""
+	m.usageAggIn, m.usageAggOut = 0, 0
 	m.ContextLimit = 0
 	status.Default.Reset()
 	m.clearRetryState()

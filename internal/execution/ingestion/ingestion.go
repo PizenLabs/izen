@@ -27,6 +27,20 @@ var ErrSyntaxInvalid = errors.New("ingestion: normalized payload failed envelope
 // The executor decides whether to accept the candidate after AST validation
 // and safety-threshold checks.
 func Process(rawOutput string) (*IngestionTrace, error) {
+	return process(rawOutput, true)
+}
+
+// ProcessWithPolicy is Process under an explicit repair policy. When
+// allowMarkupRepair is false the HTML tag-balance heuristic is never proposed:
+// the artifact's contract (its target type) does not call for markup repair, so
+// a structural-looking payload must be rejected to the contract retry loop
+// rather than silently rewritten. This keeps MIME/contract knowledge at the
+// runtime that owns the target, not in a content-only classifier.
+func ProcessWithPolicy(rawOutput string, allowMarkupRepair bool) (*IngestionTrace, error) {
+	return process(rawOutput, allowMarkupRepair)
+}
+
+func process(rawOutput string, allowMarkupRepair bool) (*IngestionTrace, error) {
 	normalized, steps := NormalizeTransport(rawOutput)
 	cls := Classify(normalized, steps)
 	trace := &IngestionTrace{
@@ -37,9 +51,11 @@ func Process(rawOutput string) (*IngestionTrace, error) {
 		Timestamp:         time.Now(),
 	}
 	if cls == ClassSyntaxInvalid {
-		if candidate := ProposeRepair(normalized); candidate != nil {
-			trace.RepairCandidate = candidate
-			RecordRepairGenerated()
+		if allowMarkupRepair {
+			if candidate := ProposeRepair(normalized); candidate != nil {
+				trace.RepairCandidate = candidate
+				RecordRepairGenerated()
+			}
 		}
 		// TRANSPORT FALLBACK (last resort): if the envelope failure is caused by
 		// RESIDUAL TRANSPORT ARTIFACTS — an unterminated fence or stray closer

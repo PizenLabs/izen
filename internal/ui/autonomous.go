@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -76,6 +77,11 @@ type autonomousDriver interface {
 	// / inspect / cancel) back to the runtime. The intent is a plain string so
 	// this projection never imports the runtime autonomy package.
 	ResumeWithProposal(ctx context.Context, intent string) (*autonomy.LoopTermination, error)
+	// ResumeAdaptiveProposal routes the human's accepted decisions for an
+	// adaptive proposal back to the runtime. The decisions are the transport
+	// type owned by the loop contract package, so this projection never imports
+	// the runtime autonomy package.
+	ResumeAdaptiveProposal(ctx context.Context, fingerprint string, decisions []autonomy.ProposalDecision) (*autonomy.LoopTermination, error)
 	Abort(reason string) (*autonomy.LoopTermination, error)
 	State() autonomy.RuntimeState
 	Boundary() *autonomy.HumanBoundary
@@ -149,7 +155,13 @@ func (m *model) runAutonomousDriver(objective string) tea.Cmd {
 	// presentation layer. The driver derives the behavioral completion gate's
 	// capability vector from it, so a run that received an empty scope would
 	// silently execute under read-only authority and could never prove a result.
-	m.autonomousDriver.SetScope(m.scopeProvenanceDirective())
+	// The recorded command SURFACE wins ("$prompt" / "$build" / "$hot") so the
+	// run's command axis is truthful and `/build` is not relabelled as `$prompt`.
+	surface := m.executionSurface
+	if surface == "" {
+		surface = m.scopeProvenanceDirective()
+	}
+	m.autonomousDriver.SetScope(surface)
 	m.beginOperation(OpAutonomous)
 	m.agentLabel = ""
 	m.startShimmer("", "autonomy")
@@ -351,6 +363,388 @@ func (m *model) resumeAutonomousProposal(intent string) tea.Cmd {
 	})
 }
 
+// renderAutonomousAdaptiveProposalBoundary announces the parked adaptive
+// proposal and initializes the answer state. The interactive card is rendered
+// by renderAutonomousBoundaryBlock; this records the status lines.
+func (m *model) renderAutonomousAdaptiveProposalBoundary(b *autonomy.HumanBoundary) {
+	if b == nil {
+		return
+	}
+	if m.adaptiveAnswers == nil {
+		m.adaptiveAnswers = map[string][]string{}
+	}
+	m.adaptiveEditing = ""
+	m.adaptiveDraft = ""
+	m.adaptiveFocus = 0
+	m.push(roleStatus, fmt.Sprintf(
+		"%s ADAPTIVE PROPOSAL — revision %d",
+		boldSapphireStyle.Render(Icon.Blueprint), b.ProposalRevision))
+	if strings.TrimSpace(b.ProposalSummary) != "" {
+		m.push(roleSystem, infoStyle.Render("  Recommended: "+b.ProposalSummary))
+	}
+	m.push(roleSystem, mutedStyle.Render("  "+b.Reason))
+	if adaptiveFreeFormAvailable(b) {
+		m.push(roleSystem, infoStyle.Render("  Select options with 1–9 · i free-form answer · Enter submit · Esc cancel"))
+	} else {
+		m.push(roleSystem, infoStyle.Render("  Select options with 1–9 · Enter submit · Esc cancel"))
+	}
+}
+
+// resumeAutonomousAdaptiveProposal submits the human's accepted decisions to
+// the runtime. The UI owns no proposal state: it collects the selected option
+// ids and the free-form text and routes them through
+// Driver.ResumeAdaptiveProposal, which validates them against the parked
+// revision, records them durably, and compiles them into the existing execution
+// contract.
+func (m *model) resumeAutonomousAdaptiveProposal() tea.Cmd {
+	b := m.autonomousBoundary
+	if b == nil || b.Action != autonomy.HumanBoundaryAdaptiveProposal {
+		return nil
+	}
+	var decisions []autonomy.ProposalDecision
+	for _, q := range b.ProposalQuestions {
+		// A free-form answer is submitted through the SAME authoritative
+		// surface as an option answer. A question that carries both sends the
+		// free-form text, which is what the human actually typed.
+		if free := strings.TrimSpace(m.adaptiveFreeFormFor(q.ID)); free != "" {
+			decisions = append(decisions, autonomy.ProposalDecision{
+				QuestionID: q.ID,
+				FreeForm:   free,
+			})
+			continue
+		}
+		sel := m.adaptiveAnswers[q.ID]
+		if len(sel) == 0 {
+			continue
+		}
+		if q.Kind == autonomy.HumanProposalQuestionMulti {
+			decisions = append(decisions, autonomy.ProposalDecision{
+				QuestionID: q.ID,
+				OptionIDs:  append([]string(nil), sel...),
+			})
+			continue
+		}
+		decisions = append(decisions, autonomy.ProposalDecision{
+			QuestionID: q.ID,
+			OptionID:   sel[0],
+		})
+	}
+	// Input validation happens HERE, before the runtime is invoked: a
+	// submission that answers nothing is not a decision, and routing it would
+	// ask the authoritative path to reject a message the UI already knows is
+	// empty while telling the human nothing.
+	if len(decisions) == 0 {
+		m.push(roleError, "[autonomous] no decision was made — answer at least one question before submitting")
+		m.refreshViewportContent()
+		m.followTail()
+		return nil
+	}
+	m.autonomousBoundary = nil
+	m.adaptiveAnswers = nil
+	m.adaptiveFreeform = nil
+	m.adaptiveEditing = ""
+	m.adaptiveDraft = ""
+	m.adaptiveFocus = 0
+	m.beginAutonomousResume("autonomy proposal")
+	ctx := m.operationContext()
+	return m.autonomousResumeCmds(func() tea.Msg {
+		return m.driveAutonomy(func() (*autonomy.LoopTermination, error) {
+			return m.autonomousDriver.ResumeAdaptiveProposal(ctx, b.ProposalFingerprint, decisions)
+		})
+	})
+}
+
+// ── free-form answer entry ──────────────────────────────────────────────────
+
+// adaptiveQuestionAt resolves the focused question of a parked adaptive proposal
+// boundary, or nil when there is nothing to focus.
+func (m *model) adaptiveQuestionAt() *autonomy.HumanProposalQuestion {
+	b := m.autonomousBoundary
+	if b == nil || len(b.ProposalQuestions) == 0 {
+		return nil
+	}
+	idx := m.adaptiveFocus
+	if idx < 0 || idx >= len(b.ProposalQuestions) {
+		idx = 0
+	}
+	return &b.ProposalQuestions[idx]
+}
+
+// adaptiveFocusQuestion moves the keyboard cursor between the questions that
+// accept an answer, so the free-form editor always targets a question the human
+// can see.
+func (m *model) adaptiveFocusQuestion(delta int) {
+	b := m.autonomousBoundary
+	if b == nil || len(b.ProposalQuestions) == 0 {
+		return
+	}
+	m.adaptiveFocus += delta
+	if m.adaptiveFocus < 0 {
+		m.adaptiveFocus = 0
+	}
+	if max := len(b.ProposalQuestions) - 1; m.adaptiveFocus > max {
+		m.adaptiveFocus = max
+	}
+}
+
+// startAdaptiveFreeForm opens the free-form editor for the focused question.
+// A question that neither declares free-form nor allows it is REFUSED rather
+// than silently accepting text the runtime would reject on submit.
+func (m *model) startAdaptiveFreeForm() bool {
+	q := m.adaptiveQuestionAt()
+	if q == nil || (!q.AllowFreeForm && q.Kind != autonomy.HumanProposalQuestionFreeForm) {
+		return false
+	}
+	m.adaptiveEditing = q.ID
+	m.adaptiveDraft = m.adaptiveFreeFormFor(q.ID)
+	return true
+}
+
+// commitAdaptiveFreeForm adopts the draft as the human's answer for the focused
+// question and leaves edit mode. It is still only presentation state: the
+// runtime re-validates it against the parked question on submit.
+func (m *model) commitAdaptiveFreeForm() bool {
+	if m.adaptiveEditing == "" {
+		return false
+	}
+	id := m.adaptiveEditing
+	if text := strings.TrimSpace(m.adaptiveDraft); text != "" {
+		if m.adaptiveFreeform == nil {
+			m.adaptiveFreeform = map[string]string{}
+		}
+		m.adaptiveFreeform[id] = text
+		// A free-form answer replaces any option selection for the same
+		// question: they are two spellings of one decision.
+		delete(m.adaptiveAnswers, id)
+	}
+	m.adaptiveEditing = ""
+	m.adaptiveDraft = ""
+	return true
+}
+
+// cancelAdaptiveFreeForm discards the draft. A half-typed answer that was never
+// committed must not reach the runtime.
+func (m *model) cancelAdaptiveFreeForm() {
+	m.adaptiveEditing = ""
+	m.adaptiveDraft = ""
+}
+
+// adaptiveFreeFormFor returns the committed free-form answer for a question.
+func (m *model) adaptiveFreeFormFor(questionID string) string {
+	if m.adaptiveFreeform == nil {
+		return ""
+	}
+	return m.adaptiveFreeform[questionID]
+}
+
+// adaptiveFreeFormAvailable reports whether the parked proposal has a question
+// that accepts free-form input, so the rendered hint only promises a key that
+// actually does something.
+func adaptiveFreeFormAvailable(b *autonomy.HumanBoundary) bool {
+	if b == nil {
+		return false
+	}
+	for _, q := range b.ProposalQuestions {
+		if q.AllowFreeForm || q.Kind == autonomy.HumanProposalQuestionFreeForm {
+			return true
+		}
+	}
+	return false
+}
+
+// appendAdaptiveDraft appends printable text to the free-form draft and reports
+// whether the key was consumed. Explicit typed characters are appended one at a
+// time; a pasted multi-rune block is appended in order. Control sequences and
+// mouse fragments are rejected so they can never reach a draft that becomes a
+// human decision.
+func appendAdaptiveDraft(m *model, msg tea.KeyMsg) bool {
+	switch msg.Type {
+	case tea.KeyRunes, tea.KeySpace:
+		if len(msg.Runes) == 0 {
+			return false
+		}
+	case tea.KeyTab:
+		if len(msg.Runes) == 0 {
+			msg.Runes = []rune{'\t'}
+		}
+	default:
+		if msg.Type != tea.KeyRunes || len(msg.Runes) == 0 {
+			return false
+		}
+	}
+	for _, r := range msg.Runes {
+		if r < 32 && r != '\t' {
+			return false
+		}
+	}
+	if isControlSequence(msg.Runes) || IsSGRMouseFragmentRunes(msg.Runes) {
+		return false
+	}
+	// Bound the draft: it travels to the model as part of a decision, and an
+	// unbounded paste is not a human decision, it is an injection vector.
+	const maxDraft = 4000
+	if len([]rune(m.adaptiveDraft))+len(msg.Runes) > maxDraft {
+		m.push(roleError, "[autonomous] free-form answer is too long (4000 characters)")
+		return true
+	}
+	m.adaptiveDraft += string(msg.Runes)
+	return true
+}
+
+// adaptiveOptionRef maps one flattened option index to its question and option.
+type adaptiveOptionRef struct {
+	QuestionID string
+	OptionID   string
+	Multi      bool
+}
+
+// adaptiveOptions flattens the proposal's selectable options into a stable
+// index order shared by the renderer and the key handler.
+func adaptiveOptions(b *autonomy.HumanBoundary) []adaptiveOptionRef {
+	if b == nil {
+		return nil
+	}
+	var out []adaptiveOptionRef
+	for _, q := range b.ProposalQuestions {
+		for _, o := range q.Options {
+			out = append(out, adaptiveOptionRef{
+				QuestionID: q.ID,
+				OptionID:   o.ID,
+				Multi:      q.Kind == autonomy.HumanProposalQuestionMulti,
+			})
+		}
+	}
+	return out
+}
+
+// selectAdaptiveOption applies a flattened option index to the answer state.
+// Single-choice replaces; multi-select toggles.
+func (m *model) selectAdaptiveOption(index int) {
+	refs := adaptiveOptions(m.autonomousBoundary)
+	if index < 0 || index >= len(refs) {
+		return
+	}
+	if m.adaptiveAnswers == nil {
+		m.adaptiveAnswers = map[string][]string{}
+	}
+	ref := refs[index]
+	cur := m.adaptiveAnswers[ref.QuestionID]
+	if !ref.Multi {
+		m.adaptiveAnswers[ref.QuestionID] = []string{ref.OptionID}
+		return
+	}
+	// Toggle.
+	for i, id := range cur {
+		if id == ref.OptionID {
+			m.adaptiveAnswers[ref.QuestionID] = append(cur[:i], cur[i+1:]...)
+			return
+		}
+	}
+	m.adaptiveAnswers[ref.QuestionID] = append(cur, ref.OptionID)
+}
+
+// adaptiveCard is the presentation-only view of the adaptive proposal the human
+// is answering: the selected options, the committed free-form answers, which
+// question the keyboard cursor is on, and the uncommitted draft being typed.
+type adaptiveCard struct {
+	answers  map[string][]string
+	freeform map[string]string
+	focus    int
+	editing  string
+	draft    string
+}
+
+// renderAdaptiveProposalCard renders the adaptive proposal card: objective,
+// recommended strategy, material trade-offs/risks, and the questions with their
+// selectable options and any free-form answer the human has typed. It is a pure
+// function of the boundary and the view, and it draws nothing the runtime
+// consults.
+func renderAdaptiveProposalCard(b *autonomy.HumanBoundary, view adaptiveCard, width int) string {
+	var sb strings.Builder
+	sb.WriteString(permissionTitleStyle.Render(Icon.Blueprint + " ADAPTIVE PROPOSAL"))
+	sb.WriteString("\n\n")
+	if strings.TrimSpace(b.ProposalObjective) != "" {
+		sb.WriteString(permissionDescStyle.Render("Objective:"))
+		sb.WriteString(" " + infoStyle.Render(b.ProposalObjective) + "\n")
+	}
+	sb.WriteString(permissionDescStyle.Render("Revision:"))
+	fmt.Fprintf(&sb, " %d\n", b.ProposalRevision)
+
+	for _, s := range b.ProposalStrategies {
+		if !s.Recommended {
+			continue
+		}
+		sb.WriteString("\n")
+		sb.WriteString(permissionDescStyle.Render("Recommended:"))
+		sb.WriteString(" " + boldTextStyle.Render(s.Title) + "\n")
+		if strings.TrimSpace(s.Summary) != "" {
+			sb.WriteString("  " + mutedStyle.Render(s.Summary) + "\n")
+		}
+		for _, tr := range s.Tradeoffs {
+			sb.WriteString("  " + mutedStyle.Render("trade-off: "+tr.Description+" (+"+tr.Benefit+" / -"+tr.Cost+")") + "\n")
+		}
+		for _, r := range s.Risks {
+			sb.WriteString("  " + mutedStyle.Render("risk ["+r.Severity+"]: "+r.Description) + "\n")
+		}
+	}
+
+	index := 0
+	for qi, q := range b.ProposalQuestions {
+		sb.WriteString("\n")
+		marker := ""
+		if q.Required {
+			marker = " *"
+		}
+		focus := ""
+		if qi == view.focus && len(b.ProposalQuestions) > 1 {
+			focus = " " + mutedStyle.Render("◀")
+		}
+		sb.WriteString(permissionDescStyle.Render(q.Prompt) + marker + focus + "\n")
+		for _, o := range q.Options {
+			index++
+			selected := false
+			for _, id := range view.answers[q.ID] {
+				if id == o.ID {
+					selected = true
+				}
+			}
+			var prefix string
+			label := mutedStyle.Render(o.Label)
+			if selected {
+				prefix = "  " + permissionKeyStyle.Render("[x]") + " "
+				label = boldTextStyle.Render(o.Label)
+			} else {
+				prefix = fmt.Sprintf("  %s ", mutedStyle.Render("["+strconv.Itoa(index)+"]"))
+			}
+			rec := ""
+			if o.ID == q.Recommended {
+				rec = " " + mutedStyle.Render("(recommended)")
+			}
+			sb.WriteString(prefix + label + rec + "\n")
+		}
+		if free := strings.TrimSpace(view.freeform[q.ID]); free != "" {
+			sb.WriteString("  " + permissionKeyStyle.Render("[free-form]") + " " + boldTextStyle.Render(free) + "\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(" " + boundRule(width, permissionBoxStyle, 2) + "\n")
+	hint := "1–9 select/toggle · Enter submit · Esc cancel"
+	if len(b.ProposalQuestions) > 1 {
+		hint = "↑/↓ question · " + hint
+	}
+	if adaptiveFreeFormAvailable(b) {
+		hint += " · i free-form answer"
+	}
+	sb.WriteString(" " + mutedStyle.Render(hint) + "\n")
+	if view.editing != "" {
+		sb.WriteString(" " + infoStyle.Render("free-form answer for "+view.editing+":") + "\n")
+		sb.WriteString("  " + boldTextStyle.Render(view.draft) + "\n")
+		sb.WriteString(" " + mutedStyle.Render("Enter accept this text · Esc discard the draft") + "\n")
+	}
+	return boundBox(permissionBoxStyle, width).Render(sb.String())
+}
+
 // resumeAutonomousProposalApprove resolves a parked DECOMPOSITION_PROPOSAL
 // boundary by authorizing the WHOLE plan: the driver runs every approved
 // sub-task as one atomic transaction. The authorization issued here covers
@@ -466,6 +860,50 @@ func (m *model) stopAutonomousDriver(reason string) tea.Cmd {
 	}
 }
 
+// autonomousUsageDeltaCmd returns the command that folds this boundary's NEW
+// provider usage into the session baseline.
+//
+// The driver's AggregatedUsage is CUMULATIVE across a run's parks and resumes
+// (it is reset only when a fresh Run starts). The UI commits usage into the
+// session baseline, so committing the raw cumulative total at every boundary —
+// the park AND the terminal — adds the same provider calls to the baseline more
+// than once. That is the ~2× discrepancy between the footer and the provider's
+// real billing.
+//
+// This commits only the delta since the last commit for the SAME run and
+// advances the per-run baseline. A boundary that reports nothing new returns
+// nil; a run whose aggregate is UNKNOWN commits nothing (a missing measurement
+// must never become a zero). The baseline advances only for the usage actually
+// dispatched, so a command that is never executed cannot consume the delta.
+func (m *model) autonomousUsageDeltaCmd(aggIn, aggOut int, known bool) tea.Cmd {
+	if m == nil || !known {
+		return nil
+	}
+	runID := ""
+	if m.autonomousDriver != nil {
+		runID = m.autonomousDriver.RunID()
+	}
+	if runID != m.usageAggRun {
+		// A new run's aggregate starts from zero, so the previous run's
+		// committed baseline must not be subtracted from it.
+		m.usageAggRun = runID
+		m.usageAggIn, m.usageAggOut = 0, 0
+	}
+	deltaIn := aggIn - m.usageAggIn
+	deltaOut := aggOut - m.usageAggOut
+	if deltaIn < 0 {
+		deltaIn = 0
+	}
+	if deltaOut < 0 {
+		deltaOut = 0
+	}
+	if deltaIn == 0 && deltaOut == 0 {
+		return nil
+	}
+	m.usageAggIn, m.usageAggOut = aggIn, aggOut
+	return m.tokenUsageCmdKnown(deltaIn, deltaOut, true)
+}
+
 // handleAutonomousRun processes the terminal/parked outcome of a driver
 // Run/Resume/Abort. It releases the operation, renders the boundary card or the
 // terminal outcome, and keeps the driver's loop state as the single truth.
@@ -488,10 +926,7 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 		aggIn, aggOut, aggKnown = m.autonomousDriver.AggregatedUsage()
 	}
 	usageCmd := func() tea.Cmd {
-		if aggKnown {
-			return m.tokenUsageCmdKnown(aggIn, aggOut, true)
-		}
-		return nil
+		return m.autonomousUsageDeltaCmd(aggIn, aggOut, aggKnown)
 	}
 
 	if msg.err != nil {
@@ -575,6 +1010,12 @@ func (m *model) handleAutonomousRun(msg autonomousRunMsg) tea.Cmd {
 				// never relies on log strings for a human decision.
 				m.finalizeOperation(OpOutcomeAmbiguous, nil)
 				m.renderAutonomousProposalBoundary(b)
+			case autonomy.HumanBoundaryAdaptiveProposal:
+				// An adaptive proposal park is a LIVE human decision: render the
+				// interpreted objective, the recommended strategy, its material
+				// trade-offs, and the questions that affect execution.
+				m.finalizeOperation(OpOutcomeAmbiguous, nil)
+				m.renderAutonomousAdaptiveProposalBoundary(b)
 			default:
 				m.finalizeOperation(OpOutcomeFailure, nil)
 				m.renderAutonomousInformBoundary(b)
@@ -1147,6 +1588,18 @@ func (m *model) renderAutonomousBoundaryBlock(width int) string {
 		sb.WriteString(" " + boundRule(width, permissionBoxStyle, 2) + "\n")
 		sb.WriteString(" " + mutedStyle.Render("↑/↓ navigate · Enter select · Esc cancel") + "\n")
 		return boundBox(permissionBoxStyle, width).Render(sb.String())
+	case autonomy.HumanBoundaryAdaptiveProposal:
+		// The adaptive proposal: the interpreted objective, the recommended
+		// strategy, its material trade-offs, and only the questions that
+		// materially affect execution. Decisions route to the runtime; the UI
+		// owns no proposal state.
+		return renderAdaptiveProposalCard(b, adaptiveCard{
+			answers:  m.adaptiveAnswers,
+			freeform: m.adaptiveFreeform,
+			focus:    m.adaptiveFocus,
+			editing:  m.adaptiveEditing,
+			draft:    m.adaptiveDraft,
+		}, width)
 	default:
 		return ""
 	}

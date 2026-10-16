@@ -91,6 +91,32 @@ type Patch struct {
 	Applied       bool      `json:"applied"`
 	TaskID        int       `json:"task_id,omitempty"`
 	IsFullRewrite bool      `json:"is_full_rewrite,omitempty"`
+	// Canonical reports that Modified ALREADY holds the mutation artifact's
+	// canonical, apply-ready bytes, resolved by the artifact boundary BEFORE
+	// approval (a FILE_CREATE envelope's terminated body). Apply writes them
+	// verbatim through the kernel instead of re-deriving them from protocol text,
+	// so the bytes a human approved and the digest bound to the authorization are
+	// the exact bytes committed. It is never set on an unresolved payload: a
+	// non-canonical patch still goes through the full envelope/diff resolution.
+	Canonical bool `json:"canonical,omitempty"`
+	// Resolved reports that Modified ALREADY holds the runtime's final,
+	// apply-ready content for an EXISTING target: the executor resolved the
+	// payload (SEARCH/REPLACE, unified diff, bounded patch, full artifact) to
+	// the exact bytes the mutation will write, and the human reviewed and the
+	// authorization digested those same bytes. Apply must therefore write them
+	// verbatim, never re-run the protocol cascade. Re-resolving a resolved
+	// patch is not a harmless idempotence step: SanitizeLLMResponse can strip a
+	// legitimate reviewed line (one beginning "FILE:", a stray "```", ...), so
+	// the bytes committed would differ from the bytes approved and digested —
+	// the exact approved-content/applied-content divergence the canonical bit
+	// removes for envelope creations, here removed for every resolved mutation.
+	//
+	// It is distinct from Canonical: a Canonical patch is an addressed
+	// creation/contract envelope whose own header names the file, while a
+	// Resolved patch has already been resolved to content by the executor
+	// against a known target. A raw protocol payload staged by a legacy
+	// PatchManager caller leaves both unset and resolves through the cascade.
+	Resolved bool `json:"resolved,omitempty"`
 }
 
 type PatchManager struct {
@@ -234,6 +260,11 @@ type applyFacts struct {
 	changed      bool
 	verifyRun    bool
 	verifyPassed bool
+	// artifactPresent overrides the default "content is non-empty" artifact
+	// proxy. A terminated creation envelope is a produced artifact even when
+	// its body is empty (an empty-file creation): the presence of the artifact,
+	// not the byte length of its body, is what the artifact boundary reports.
+	artifactPresent *bool
 }
 
 // recordMutationEvidence appends the semantic outcome of an apply attempt into
@@ -252,6 +283,9 @@ func (pm *PatchManager) recordMutationEvidence(patch *Patch, outcome MutationOut
 		Reason:  reason,
 	}
 	ev.ArtifactPresent = patch.Modified != ""
+	if facts.artifactPresent != nil {
+		ev.ArtifactPresent = *facts.artifactPresent
+	}
 	ev.ApplyExecuted = facts.executed
 	ev.FilesystemChanged = facts.changed
 	ev.VerificationRun = facts.verifyRun
@@ -635,7 +669,7 @@ func (pm *PatchManager) apply(ctx context.Context, patch *Patch) error {
 	if patch.File == "" {
 		return fmt.Errorf("patch has empty file path")
 	}
-	if patch.Modified == "" {
+	if patch.Modified == "" && !patch.Canonical {
 		return fmt.Errorf("patch for %s has empty content", patch.File)
 	}
 	cleaned := filepath.Clean(patch.File)
@@ -696,41 +730,59 @@ func (pm *PatchManager) apply(ctx context.Context, patch *Patch) error {
 		return fmt.Errorf("shadow backup %s: %w", patch.File, err)
 	}
 
-	// SanitizeLLMResponse: strip hallucinated metadata (FILE: lines, [target]
-	// markers, stray code fences) that local models inject inside code blocks
-	// before the content enters the diff parser or file write path.
-	patch.Modified = SanitizeLLMResponse(patch.Modified)
-
-	// ── FILE_CREATE PROTOCOL: extract file path and pure content from
-	// <<<<<<< FILE_CREATE: path ... >>>>>>> END_FILE blocks. This MUST run
-	// before SplitAndFilterPatches and the main diff/SEARCH/REPLACE flow so
-	// new files are written directly without hunk matching against nonexistent
-	// originals. When a FILE_CREATE block is detected, patch.File is updated
-	// to the canonical path from the block header and patch.Modified is
-	// replaced with the content only (markers stripped).
-	if fileCreateBlocks := parseFileCreateBlocks(patch.Modified); len(fileCreateBlocks) > 0 {
-		block := fileCreateBlocks[0]
-		patch.File = block.FilePath
-		patch.Modified = block.Content
-		// Recompute fullPath with the updated file path so the shadow backup,
-		// write, and verification all target the correct location.
-		cleaned = filepath.Clean(patch.File)
-		if cleaned == "." || cleaned == "/" || strings.Contains(cleaned, "..") {
-			return fmt.Errorf("invalid FILE_CREATE path: %s", patch.File)
+	// ── FILE_CREATE PROTOCOL (extract from the RAW payload) ─────────────
+	// The envelope is extracted BEFORE SanitizeLLMResponse. SanitizeLLMResponse
+	// strips the canonical envelope markers; running it first silently demotes a
+	// typed creation to an untyped raw body, which is how a recognized creation
+	// ends up with its protocol written into the file. Extraction from the raw
+	// payload keeps the creation typed (CREATED evidence) and tolerant of the
+	// marker-length variants a small model emits. New files are written directly
+	// without hunk matching against nonexistent originals.
+	//
+	// A patch whose Canonical bit is set (the runtime executor resolved the
+	// envelope body at the artifact boundary, before approval) is written
+	// VERBATIM: its Modified bytes are already the reviewed, digested artifact.
+	// Re-extracting or re-sanitizing them here would let apply substitute
+	// different content after the human approved.
+	fileCreateBlocks := []fileCreateBlock(nil)
+	envelopeCreate := false
+	if !patch.Canonical {
+		fileCreateBlocks = parseFileCreateBlocks(patch.Modified)
+		envelopeCreate = len(fileCreateBlocks) > 0
+	}
+	if patch.Canonical || envelopeCreate {
+		if envelopeCreate {
+			block := fileCreateBlocks[0]
+			// A header that names no path keeps the dispatched target; a header that
+			// names one updates it so the write targets the artifact the model
+			// addressed.
+			if block.FilePath != "" {
+				patch.File = block.FilePath
+			}
+			patch.Modified = sanitizeCreationBody(block.Content)
+			// Recompute fullPath with the updated file path so the shadow backup,
+			// write, and verification all target the correct location.
+			cleaned = filepath.Clean(patch.File)
+			if cleaned == "." || cleaned == "/" || strings.Contains(cleaned, "..") {
+				return fmt.Errorf("invalid FILE_CREATE path: %s", patch.File)
+			}
+			fullPath = filepath.Join(pm.root, cleaned)
+			// As above: the kernel creates the parent directories under the grant.
+			patch.Original = ""
+			if err := pm.recordTransaction(fullPath); err != nil {
+				return fmt.Errorf("transaction record %s: %w", patch.File, err)
+			}
+			if err := pm.createShadowBackup(fullPath); err != nil {
+				return fmt.Errorf("shadow backup %s: %w", patch.File, err)
+			}
 		}
-		fullPath = filepath.Join(pm.root, cleaned)
-		// As above: the kernel creates the parent directories under the grant.
-		patch.Original = ""
-		if err := pm.recordTransaction(fullPath); err != nil {
-			return fmt.Errorf("transaction record %s: %w", patch.File, err)
-		}
-		if err := pm.createShadowBackup(fullPath); err != nil {
-			return fmt.Errorf("shadow backup %s: %w", patch.File, err)
-		}
-		// Truncation guardrail: reject truncated LLM output before writing.
-		if reason := IsTruncatedOutput(patch.Modified); reason != "" {
-			return fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
-		}
+		// The envelope is terminated by an explicit END_FILE, so the artifact is
+		// complete by construction: the fragmentary-content heuristic (which
+		// rejects any body under three lines) does not apply, and an EMPTY body
+		// is a legitimate empty-file creation. Truncation is signalled
+		// authoritatively by finish_reason=length at the transport boundary, not
+		// by body emptiness, so an empty terminated envelope is written as an
+		// empty file rather than refused.
 		// Write the new file directly — skip diff/SEARCH/REPLACE flow.
 		writeBytes := []byte(patch.Modified)
 		if applied, err := pm.commitThroughKernel(ctx, patch.File, writeBytes); err != nil {
@@ -756,62 +808,138 @@ func (pm *PatchManager) apply(ctx context.Context, patch *Patch) error {
 			return fmt.Errorf("patch applied but audit log failed: %w", err)
 		}
 		pm.recordLedgerAndSummarize(patch)
-		// The FILE_CREATE boundary executed a write that created the file; the
-		// verification gate does not run on this path, so the evidence never
-		// claims a verification that did not happen.
-		pm.recordMutationEvidence(patch, OutcomeCreated, "", applyFacts{executed: true, changed: true})
-		return pm.store(patch)
-	}
-
-	// SplitAndFilterPatches: strip hunks targeting other files from the raw
-	// LLM diff output before passing it to the patching engine. This handles
-	// multi-file context bleeding where the model hallucinates hunks for
-	// unrelated files within a single code block.
-	diffInput := SplitAndFilterPatches(patch.Modified, patch.File)
-
-	// Resolve the final file content through the strategy cascade (unified
-	// diff → SEARCH/REPLACE blocks → legacy content block → full content).
-	// `patch.Original` holds the exact bytes freshly read from disk, so every
-	// SEARCH/hunk context is matched against the true current file content.
-	final, patchErr := pm.resolvePatchContent(patch.Original, diffInput, patch)
-
-	// ── FRESH CONTEXT RETRY (ONCE) ──────────────────────────────────────
-	// When a patch fails to match its SEARCH/hunk context, the file may have
-	// changed between when the caller captured `patch.Original` and now (e.g.
-	// a sibling mutation in the same batch, or an external editor save).
-	// Re-read the exact bytes from disk and re-attempt the resolution ONCE
-	// before reporting a failure.
-	if patchErr != nil {
-		if data, err := os.ReadFile(fullPath); err == nil && string(data) != patch.Original {
-			patch.Original = string(data)
-			if retried, rerr := pm.resolvePatchContent(patch.Original, diffInput, patch); rerr == nil {
-				final = retried
-				patchErr = nil
+		// ── Deterministic Verification Gate ──────────────────────────────
+		// A creation is verified with the SAME per-target gate as any other
+		// mutation. The gate report is captured on the mutation boundary
+		// UNCONDITIONALLY, including the not-applicable (Skipped) case: without
+		// it a CREATE records no verification at all, the integrity completion
+		// condition cannot distinguish "checked, no contract" from "never
+		// checked", and a correctly created artifact is refused completion.
+		gateRun := false
+		gatePassed := false
+		if pm.verifier != nil {
+			report := pm.verifier.RunAllFor(ctx, patch.File)
+			pm.recordVerification(&report)
+			if report.Skipped {
 				if globalActivityLog != nil {
-					globalActivityLog("[patch] Context refresh on %s: re-read file and re-resolved patch successfully", patch.File)
+					globalActivityLog("[VERIFY] verification skipped for %s: %s", patch.File, report.Reason)
+				}
+			} else {
+				gateRun = true
+				gatePassed = report.Passed
+				if !report.Passed {
+					// A created artifact that fails its own gate is not a durable
+					// creation. Restore is a no-op for a fresh file (no shadow
+					// backup), but the truthful outcome is recorded and the
+					// objective is never claimed.
+					if err := pm.restoreFromShadowBackup(fullPath); err != nil && globalActivityLog != nil {
+						globalActivityLog("[FAIL] create write-back failed on %s: %v", patch.File, err)
+					}
+					errMsg := fmt.Sprintf("verification gate blocked created file %s", patch.File)
+					diskChanged := true
+					if data, rerr := os.ReadFile(fullPath); rerr == nil {
+						diskChanged = string(data) != patch.Original
+					}
+					pm.recordMutationEvidence(patch, OutcomeVerifyFailed, errMsg,
+						applyFacts{executed: true, changed: diskChanged, verifyRun: true, verifyPassed: false})
+					return fmt.Errorf("%s", errMsg)
+				}
+				if globalActivityLog != nil {
+					globalActivityLog("[VERIFY] verification gate passed for %s", patch.File)
 				}
 			}
 		}
+		// The FILE_CREATE boundary executed a write that created the file. The
+		// verification facts are the ones that ACTUALLY ran — never fabricated.
+		// The envelope is a produced artifact even when its body is empty.
+		artifactPresent := true
+		pm.recordMutationEvidence(patch, OutcomeCreated, "",
+			applyFacts{executed: true, changed: true, verifyRun: gateRun, verifyPassed: gatePassed, artifactPresent: &artifactPresent})
+		return pm.store(patch)
 	}
 
-	// ── FORCED FULL-CONTENT FALLBACK (≤50KB) ──────────────────────────
-	// If both attempts still failed to match and the target file is small
-	// (≤ MaxFullContentRewriteBytes, e.g. index.html), a ≤50KB file edit
-	// NEVER aborts with a hunk-mismatch error when the patch payload carries
-	// a valid full replacement text. Write that replacement payload as the
-	// full file content unconditionally. Only an ambiguous-snippet rejection
-	// (ErrInvalidPatchFormat) still short-circuits here so the build agent
-	// can retry with properly formatted SEARCH/REPLACE markers.
-	if patchErr != nil &&
-		!errors.Is(patchErr, ErrInvalidPatchFormat) &&
-		patch.Original != "" &&
-		len(patch.Original) <= MaxFullContentRewriteBytes {
-		if resolved, ok := forcedFullContentFallback(patch.Original, diffInput); ok {
-			if globalActivityLog != nil {
-				globalActivityLog("[patch] SEARCH mismatch — forced full-content fallback applied on %s (%d bytes)", patch.File, len(resolved))
+	// ── APPLY-READY CONTENT ─────────────────────────────────────────────
+	// A patch the runtime executor already RESOLVED at staging carries its final
+	// apply-ready bytes in Modified — the same bytes the human reviewed and the
+	// authorization's digest bound. Writing them verbatim is what makes
+	// "approved" and "applied" one object; re-running the protocol cascade here
+	// would let SanitizeLLMResponse strip a legitimate reviewed line and commit
+	// bytes nobody saw.
+	//
+	// A patch with no Resolved marker is a raw protocol payload staged by a
+	// legacy PatchManager caller: it resolves through the full cascade below.
+	var final string
+	var patchErr error
+	if patch.Resolved {
+		// Run the apply boundary's SAFETY predicates (ambiguous snippet, raw
+		// protocol residue, truncation) by resolving a COPY, then DISCARD the
+		// resolved output. The approved bytes are written verbatim: the
+		// resolver is used here purely as a validator, never as a rewriter, so
+		// applying a reviewed patch can never substitute different content.
+		probe := *patch
+		if _, probeErr := pm.resolvePatchContent(patch.Original, patch.Modified, &probe); probeErr != nil {
+			patchErr = probeErr
+		} else {
+			final = patch.Modified
+		}
+	} else {
+		// SanitizeLLMResponse: strip hallucinated metadata (FILE: lines, [target]
+		// markers, stray code fences) that local models inject inside code blocks
+		// before the content enters the diff parser or file write path. This runs
+		// only on the non-envelope path: a creation envelope was already extracted
+		// from the raw payload above.
+		patch.Modified = SanitizeLLMResponse(patch.Modified)
+
+		// SplitAndFilterPatches: strip hunks targeting other files from the raw
+		// LLM diff output before passing it to the patching engine. This handles
+		// multi-file context bleeding where the model hallucinates hunks for
+		// unrelated files within a single code block.
+		diffInput := SplitAndFilterPatches(patch.Modified, patch.File)
+
+		// Resolve the final file content through the strategy cascade (unified
+		// diff → SEARCH/REPLACE blocks → legacy content block → full content).
+		// `patch.Original` holds the exact bytes freshly read from disk, so every
+		// SEARCH/hunk context is matched against the true current file content.
+		final, patchErr = pm.resolvePatchContent(patch.Original, diffInput, patch)
+
+		// ── FRESH CONTEXT RETRY (ONCE) ──────────────────────────────────────
+		// When a patch fails to match its SEARCH/hunk context, the file may have
+		// changed between when the caller captured `patch.Original` and now (e.g.
+		// a sibling mutation in the same batch, or an external editor save).
+		// Re-read the exact bytes from disk and re-attempt the resolution ONCE
+		// before reporting a failure.
+		if patchErr != nil {
+			if data, err := os.ReadFile(fullPath); err == nil && string(data) != patch.Original {
+				patch.Original = string(data)
+				if retried, rerr := pm.resolvePatchContent(patch.Original, diffInput, patch); rerr == nil {
+					final = retried
+					patchErr = nil
+					if globalActivityLog != nil {
+						globalActivityLog("[patch] Context refresh on %s: re-read file and re-resolved patch successfully", patch.File)
+					}
+				}
 			}
-			final = resolved
-			patchErr = nil
+		}
+
+		// ── FORCED FULL-CONTENT FALLBACK (≤50KB) ──────────────────────────
+		// If both attempts still failed to match and the target file is small
+		// (≤ MaxFullContentRewriteBytes, e.g. index.html), a ≤50KB file edit
+		// NEVER aborts with a hunk-mismatch error when the patch payload carries
+		// a valid full replacement text. Write that replacement payload as the
+		// full file content unconditionally. Only an ambiguous-snippet rejection
+		// (ErrInvalidPatchFormat) still short-circuits here so the build agent
+		// can retry with properly formatted SEARCH/REPLACE markers.
+		if patchErr != nil &&
+			!errors.Is(patchErr, ErrInvalidPatchFormat) &&
+			patch.Original != "" &&
+			len(patch.Original) <= MaxFullContentRewriteBytes {
+			if resolved, ok := forcedFullContentFallback(patch.Original, diffInput); ok {
+				if globalActivityLog != nil {
+					globalActivityLog("[patch] SEARCH mismatch — forced full-content fallback applied on %s (%d bytes)", patch.File, len(resolved))
+				}
+				final = resolved
+				patchErr = nil
+			}
 		}
 	}
 
@@ -1046,7 +1174,17 @@ func (pm *PatchManager) apply(ctx context.Context, patch *Patch) error {
 			applyFacts{executed: true, verifyRun: gateRun, verifyPassed: gatePassed})
 		return pm.store(patch)
 	}
-	pm.recordMutationEvidence(patch, OutcomeChanged, "",
+	// A target with no on-disk original before the apply did not exist: the
+	// mutation BROUGHT IT INTO EXISTENCE. That is CREATED, not CHANGED; the two
+	// are different facts and a CREATE contract must be able to read its own
+	// semantics from the evidence. `patch.Original` is the exact bytes read from
+	// disk at the top of apply, so an empty value here is positive evidence of
+	// absence.
+	outcome := OutcomeChanged
+	if patch.Original == "" {
+		outcome = OutcomeCreated
+	}
+	pm.recordMutationEvidence(patch, outcome, "",
 		applyFacts{executed: true, changed: true, verifyRun: gateRun, verifyPassed: gatePassed})
 
 	return pm.store(patch)
@@ -1167,6 +1305,25 @@ func (pm *PatchManager) resolvePatchContent(original, diffInput string, patch *P
 				}
 				return content, nil
 			}
+			// ── CREATE FROM A SEARCH/REPLACE PAYLOAD ────────────────────
+			// A creation has no existing file to anchor a SEARCH context
+			// against. A model that answered a create with a SEARCH/REPLACE
+			// envelope names no applicable SEARCH, but its REPLACE payload IS
+			// the new file's body. Forcing that creation through the
+			// existing-file patch contract is the exact confusion this branch
+			// removes: the artifact is a creation, so its REPLACE side is the
+			// artifact.
+			if original == "" {
+				if body := creationBodyFromSearchReplace(blocks); body != "" {
+					if reason := IsTruncatedNewFile(body); reason != "" {
+						return "", fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
+					}
+					if globalActivityLog != nil {
+						globalActivityLog("[patch] creation body resolved from SEARCH/REPLACE payload for %s (%d bytes)", patch.File, len(body))
+					}
+					return body, nil
+				}
+			}
 		}
 		// SEARCH markers present but no usable replacement payload — refuse
 		// to write raw markers into the file.
@@ -1246,11 +1403,25 @@ func (pm *PatchManager) resolvePatchContent(original, diffInput string, patch *P
 		}
 		return clean, nil
 	default:
-		final := SanitizeDiffContent(diffInput)
-		// Truncation guardrail: reject truncated LLM output before writing
-		// a new file. Only fires for new file creation (original is empty)
-		// where the LLM produced the full file content directly.
-		if reason := IsTruncatedOutput(final); reason != "" {
+		// A new-file payload that still carries raw creation-envelope tokens
+		// was RECOGNIZED as a creation artifact but its body could not be
+		// extracted (no terminator). Writing the protocol as content is a
+		// corrupted artifact reported as a completed objective: refuse instead,
+		// so the contract recovery path can re-ask for a well-formed artifact.
+		if containsCreationEnvelopeResidue(diffInput) {
+			return "", fmt.Errorf("%w: raw creation-envelope markers in a new-file payload for %s — no extractable creation body", ErrInvalidPatchFormat, patch.File)
+		}
+		// New-file content is cleaned with the creation sanitizer: a model that
+		// conflates the SEARCH/REPLACE and FILE_CREATE formats can leave a bare
+		// '=======' separator inside the body, which must never become file
+		// content. The identity of a brand-new file is the artifact, not the
+		// protocol that delivered it.
+		final := sanitizeCreationBody(SanitizeDiffContent(diffInput))
+		// Truncation guardrail: reject a new file whose artifact is EMPTY. The
+		// fragmentary line-count heuristic is not applied to a creation: a new
+		// file has no baseline and a short complete artifact is a legitimate
+		// creation, not a truncation.
+		if reason := IsTruncatedNewFile(final); reason != "" {
 			return "", fmt.Errorf("%w: %s (%s)", ErrTruncatedOutput, patch.File, reason)
 		}
 		return final, nil
@@ -1899,10 +2070,130 @@ type fileCreateBlock struct {
 	Content  string
 }
 
-// parseFileCreateBlocks scans content for <<<<<<< FILE_CREATE: path ... >>>>>>> END_FILE
-// blocks and returns the parsed blocks. Each block contains the file path from the
-// header line and the content between the header and END_FILE terminator.
-// Returns nil if no valid blocks are found.
+// fileCreateHeaderRe matches a creation-envelope header. The marker run is
+// deliberately tolerant of length: small models routinely emit one to several
+// '<' characters, and the artifact recognizer (RecognizeArtifactForm) already
+// accepts any run. Recognition and extraction MUST agree, or a recognized
+// creation is not extracted and its envelope is written verbatim as file
+// content while the objective is declared PROVEN.
+var fileCreateHeaderRe = regexp.MustCompile(`^<+\s*FILE_CREATE:?\s*(.*)$`)
+
+// fileCreateTerminatorRe matches a creation-envelope terminator: the canonical
+// '>' run and the '=' run some models emit, at any length >= 2. It requires the
+// END_FILE token, so a bare separator line is NOT a terminator.
+var fileCreateTerminatorRe = regexp.MustCompile(`^[>=]{2,}\s*END_FILE\b.*$`)
+
+// creationResidualMarkerRe matches a line that is PURE artifact scaffolding
+// left inside a creation body: an envelope header/terminator, a SEARCH/REPLACE
+// delimiter, or a contract fence marker. These are protocol, never file
+// content, and must not be committed into a newly created artifact.
+var creationResidualMarkerRe = regexp.MustCompile(`(?i)^(<+\s*FILE_CREATE.*|[<>=]{2,}\s*(REPLACE|END_FILE|SEARCH)?\s*|:artifact.*|:::.*)$`)
+
+// fileCreateHeaderPath reports the path named by a creation-envelope header,
+// tolerating any leading '<' run and the optional ':' separator.
+func fileCreateHeaderPath(trimmed string) (string, bool) {
+	m := fileCreateHeaderRe.FindStringSubmatch(trimmed)
+	if m == nil {
+		return "", false
+	}
+	p := strings.TrimSpace(m[1])
+	p = strings.TrimRight(p, ">")
+	return strings.TrimSpace(p), true
+}
+
+// isFileCreateTerminator reports whether a line terminates a creation envelope.
+func isFileCreateTerminator(trimmed string) bool {
+	return fileCreateTerminatorRe.MatchString(trimmed)
+}
+
+// sanitizeCreationBody cleans the body extracted from a creation envelope: it
+// strips hallucinated metadata and any residual protocol delimiter lines that
+// the model conflated into the body (for example a SEARCH/REPLACE '======='
+// separator emitted inside a FILE_CREATE block). A newly created file must
+// contain the artifact, never the protocol that delivered it.
+//
+// The body's own leading/trailing whitespace is preserved: a trailing newline
+// is content, and trimming it would silently alter the artifact the model
+// produced.
+func sanitizeCreationBody(body string) string {
+	body = SanitizeLLMResponse(body)
+	lines := strings.Split(body, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if creationResidualMarkerRe.MatchString(strings.TrimSpace(line)) {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// creationBodyFromSearchReplace extracts the new-file body from a
+// SEARCH/REPLACE payload that a model emitted for a creation. A creation has no
+// SEARCH context to anchor against, so the REPLACE side is the artifact; when
+// every block's REPLACE is empty there is nothing to create and "" is returned.
+func creationBodyFromSearchReplace(blocks []searchReplaceBlock) string {
+	var parts []string
+	for _, b := range blocks {
+		if strings.TrimSpace(b.replace) == "" {
+			continue
+		}
+		parts = append(parts, b.replace)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return sanitizeCreationBody(strings.Join(parts, "\n"))
+}
+
+// containsCreationEnvelopeResidue reports whether a payload still carries raw
+// creation-envelope protocol tokens. A payload that was RECOGNIZED as a
+// creation artifact but whose body could not be extracted must be refused, not
+// written: committing the protocol as content is a corrupted artifact reported
+// as a completed objective. The test is deliberately narrow: the distinctive
+// FILE_CREATE token, or a real END_FILE terminator line — not the bare word
+// "end_file" that legitimate content may contain.
+func containsCreationEnvelopeResidue(content string) bool {
+	if strings.Contains(strings.ToUpper(content), "FILE_CREATE") {
+		return true
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if isFileCreateTerminator(strings.TrimSpace(line)) {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalFileCreateBody resolves a recognized FILE_CREATE envelope into the
+// EXACT bytes the mutation boundary will apply: the terminated body between the
+// header and the END_FILE marker, cleaned with the SAME sanitizer the apply
+// boundary uses.
+//
+// It is the single normalization step that lets the parser's artifact
+// recognition and the candidate's identity agree. Resolving the body at
+// STAGING — before the candidate is held, digested and previewed — is what
+// guarantees the human approves the bytes that will be written; deferring the
+// extraction to apply time let a rendered diff show the envelope while the
+// applied file held only the parsed body.
+//
+// ok=false is a FAIL-CLOSED result: the payload was recognized as an addressed
+// FILE_CREATE envelope but carried no END_FILE terminator, so no body can be
+// determined. A truncated or malformed envelope must never be applied and must
+// never be presented for approval.
+func canonicalFileCreateBody(payload string) (string, bool) {
+	blocks := parseFileCreateBlocks(payload)
+	if len(blocks) == 0 {
+		return "", false
+	}
+	return sanitizeCreationBody(blocks[0].Content), true
+}
+
+// parseFileCreateBlocks scans content for a FILE_CREATE envelope
+// (header ... END_FILE) and returns the parsed blocks. Each block carries the
+// file path from the header and the content between the header and terminator.
+// Marker length is tolerated (see fileCreateHeaderRe / fileCreateTerminatorRe).
+// Returns nil when no TERMINATED block is found.
 func parseFileCreateBlocks(content string) []fileCreateBlock {
 	var blocks []fileCreateBlock
 	lines := strings.Split(content, "\n")
@@ -1913,19 +2204,13 @@ func parseFileCreateBlocks(content string) []fileCreateBlock {
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "<<<<<<< FILE_CREATE:") || strings.HasPrefix(trimmed, "<<<<<<< FILE_CREATE ") {
+		if p, ok := fileCreateHeaderPath(trimmed); ok {
 			inBlock = true
+			filePath = p
 			contentLines = nil
-			// Extract file path after "FILE_CREATE:" or "FILE_CREATE "
-			pathPart := strings.TrimPrefix(trimmed, "<<<<<<< FILE_CREATE:")
-			if pathPart == trimmed {
-				pathPart = strings.TrimPrefix(trimmed, "<<<<<<< FILE_CREATE ")
-			}
-			filePath = strings.TrimSpace(pathPart)
 			continue
 		}
-		if inBlock && (trimmed == ">>>>>>> END_FILE" || strings.HasPrefix(trimmed, ">>>>>>> END_FILE") ||
-			trimmed == "======= END_FILE" || strings.HasPrefix(trimmed, "======= END_FILE")) {
+		if inBlock && isFileCreateTerminator(trimmed) {
 			blocks = append(blocks, fileCreateBlock{
 				FilePath: filePath,
 				Content:  strings.Join(contentLines, "\n"),
@@ -2575,6 +2860,22 @@ func IsTruncatedOutput(content string) string {
 		return "fragmentary content (less than 3 lines)"
 	}
 
+	return ""
+}
+
+// IsTruncatedNewFile reports truncation evidence for a brand-new file. A
+// creation has no baseline to compare against, so "few lines" is not evidence
+// of truncation: a short but complete artifact (for example a file whose
+// requested content is a single line) is a legitimate creation, and rejecting
+// it forces the model to emit filler merely to satisfy a heuristic. Only an
+// EMPTY body — the artifact never existed — is truncation for a creation.
+func IsTruncatedNewFile(content string) string {
+	if content == "" {
+		return "empty content"
+	}
+	if strings.TrimSpace(content) == "" {
+		return "whitespace-only content"
+	}
 	return ""
 }
 

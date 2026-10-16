@@ -304,6 +304,15 @@ type ExecutionStrategyProfile struct {
 	Intent string
 	// Strategy is the selected execution strategy.
 	Strategy ExecutionStrategy
+	// Operation is the coarse operation family the request was classified
+	// under (content / create / fix / refactor / diagnose / architect /
+	// explain / undetermined). It is exposed so a caller that must reason about
+	// the OBJECTIVE's SCOPE WIDTH — for example whether an unresolved target is
+	// a broad project-level transformation that bounded discovery may resolve,
+	// rather than a targeted request whose target the human must name — reads
+	// the gateway's own classification instead of re-deriving it from the
+	// prompt and drifting.
+	Operation OperationKind
 	// StrategyReason explains the deterministic selection.
 	StrategyReason string
 	// ModelRequired reports whether this strategy requires any model reasoning.

@@ -33,6 +33,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/PizenLabs/izen/internal/ai"
 	coreautonomy "github.com/PizenLabs/izen/internal/autonomy"
@@ -118,6 +119,28 @@ func (l *r3EventLog) authorization() (events.ExecutionAuthorizedPayload, bool) {
 		}
 	}
 	return out, found
+}
+
+// waitForAuthorization returns the authorization record once the control-plane
+// stream has actually DELIVERED it, within a bounded deadline.
+//
+// The bus dispatches on its own per-subscription goroutine, so a record
+// published during a run can still be in flight when the run returns. Reading
+// authorization() directly therefore asserts delivery latency as if it were an
+// absence — "the gate was never reached" — which is precisely the intermittent
+// failure this test produced under CPU contention. Waiting for the same record
+// with a deadline asserts the same fact.
+func (l *r3EventLog) waitForAuthorization(d time.Duration) (events.ExecutionAuthorizedPayload, bool) {
+	deadline := time.Now().Add(d)
+	for {
+		if auth, ok := l.authorization(); ok {
+			return auth, true
+		}
+		if !time.Now().Before(deadline) {
+			return l.authorization()
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 func (l *r3EventLog) sawMutationCompleted() bool {
@@ -338,7 +361,7 @@ func TestR3_UniqueCandidateIsProposedNotAuthorized(t *testing.T) {
 	// The refusal is published as explicitly as a grant would be: a run that
 	// records DISCOVERED+PROPOSED and a DISAMBIGUATE verdict is not an
 	// accidental zero-scope fallback.
-	auth, ok := r.Events.authorization()
+	auth, ok := r.Events.waitForAuthorization(5 * time.Second)
 	if !ok {
 		t.Fatal("no authorization record; the gate's refusal is indistinguishable from never reaching it")
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/PizenLabs/izen/internal/loop"
 	"github.com/PizenLabs/izen/internal/protocol"
 	"github.com/PizenLabs/izen/internal/runtime/durable"
+	"github.com/PizenLabs/izen/internal/runtime/proposal"
 	"github.com/PizenLabs/izen/internal/runtime/substrate"
 )
 
@@ -191,6 +192,16 @@ type Driver struct {
 	// lastContract is the canonical TaskContract the last verdict was judged
 	// against. Keeping it adjacent to the verdict makes the pairing auditable.
 	lastContract execution.TaskContract
+	// pendingProven is the objective authority's PROVEN verdict for the CURRENT
+	// decision point, staged but not yet committed. The terminal objective
+	// event and the durable EXECUTION_COMMITTED marker are emitted only by
+	// commitObjectiveCompletion, after every gate that can downgrade a
+	// proposed completion has run. Committing the grant at the authority (as
+	// the code once did) published a terminal objective state before the
+	// behavioral gate could still revoke it, so the emitted event could
+	// disagree with the durable final state. A nil value means no grant is
+	// staged. See objective_completion.go.
+	pendingProven *execution.ObjectiveEvaluation
 	// ── Objective lifecycle (the OUTCOME half of the contract) ──────────
 	// objective is the per-run objective state: the derived completion contract,
 	// the requirement ledger, the runtime-attributed discharge set and the
@@ -336,6 +347,49 @@ type Driver struct {
 	// behavioral completion gate derives a read-only capability vector and can
 	// never observe the workspace it is being asked to prove. See WithScope.
 	scope string
+
+	// statedTargets is the explicit target set a caller bound for the NEXT Run
+	// through SetTargets. It is a STATEMENT (the same authority as a target the
+	// human names at a clarification boundary), not a resolution: the run still
+	// binds it through the canonical gateway. It is consumed once — cleared when
+	// the run binds its scope — so a later Run without an explicit binding
+	// resolves its own scope rather than silently reusing this one.
+	statedTargets []string
+
+	// ── Adaptive proposal orchestration ─────────────────────────────────
+	// proposalAdvisor derives the proposal (strategies, questions, evidence)
+	// from facts the driver already owns. It is nil by default: an unwired
+	// driver behaves exactly as before, so simple tasks and every existing test
+	// keep their path. The production composition root wires it.
+	proposalAdvisor ProposalAdvisor
+	// proposalState is the revision-safe mutable holder of the current
+	// proposal. It owns the revision and the decisions; the Driver never edits a
+	// contract by hand.
+	proposalState *proposal.State
+	// compiledProposal is the authoritative execution contract the accepted
+	// decisions compiled into. It is the bridge to the existing execution path,
+	// never a second executor.
+	compiledProposal *proposal.ExecutionContract
+	// renderedCriteria / renderedRequired carry the accepted rendered-check
+	// requirement into the completion path.
+	renderedCriteria []proposal.AcceptanceCriterion
+	renderedRequired bool
+	// renderedEvidence is the attributable rendered-verification observation,
+	// populated only by a real browser run.
+	renderedEvidence RenderedVerification
+	// renderedVerifier is the local-browser verifier (nil disables it);
+	// renderedEntry/renderedChecks are the entry document and deterministic
+	// checks an accepted rendered strategy requires.
+	renderedVerifier RenderedVerifier
+	renderedEntry    string
+	renderedChecks   []RenderedCheck
+	renderedChecked  bool
+	// renderedPolicyNoted latches the one-time opt-in policy line so a broad
+	// objective's skipped rendered verification is stated exactly once.
+	renderedPolicyNoted bool
+	// renderedPolicy decides whether an objective requires a rendered
+	// verification. Nil disables it by default.
+	renderedPolicy func(objective string) bool
 }
 
 // MaxContractRecoveryAttempts bounds how many times one execution lifecycle
@@ -497,6 +551,21 @@ func (d *Driver) SetScope(s string) {
 	d.req.Scope = s
 }
 
+// SetTargets records the explicit target set for the NEXT Run. It is the push
+// form of an explicit scope statement, bound before the run begins and applied
+// through the SAME authoritative seam a human-named target uses (see
+// bindAuthoritativeTargets): the run still resolves, derives and admission-gates
+// the statement through the canonical gateway. An explicit target that does not
+// resolve stays unresolved and fails closed exactly like one stated in the
+// prompt; SetTargets never fabricates a binding. The set is consumed once, so a
+// subsequent Run without a new binding resolves its own scope.
+func (d *Driver) SetTargets(targets []string) {
+	if d == nil {
+		return
+	}
+	d.statedTargets = uniqueNonEmpty(targets)
+}
+
 // WithInteractionContract binds the semantic interaction contract used by the
 // driver and all of its dispatch/recovery requests.  The descriptor is
 // optional; when omitted the contract's conservative default is used.  The
@@ -625,10 +694,18 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	d.syntheticSubGoal = ""
 	d.lastObjective = execution.ObjectiveEvaluation{}
 	d.lastContract = execution.TaskContract{}
+	d.pendingProven = nil
 	d.preTargets = nil
 	d.contractRecoveries = 0
 	d.contractRecoveryExhausted = false
 	d.derivationNote = ""
+	d.proposalState = nil
+	d.compiledProposal = nil
+	d.renderedCriteria = nil
+	d.renderedRequired = false
+	d.renderedChecked = false
+	d.renderedPolicyNoted = false
+	d.renderedEvidence = RenderedVerification{}
 	// R5: a new run is a new progress lifecycle. Carrying the previous run's
 	// satisfied-condition snapshot forward would render one objective's
 	// first decision as an advance over another objective.
@@ -695,8 +772,16 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	//
 	// bindAuthoritativeTargets is that resolution and that derivation, in the one
 	// place either can happen for this lifecycle. Nothing stated yet, so the
-	// objective resolves alone.
-	d.bindAuthoritativeTargets(nil, "a new run resolves and derives its own scope")
+	// objective resolves alone — unless a caller bound an explicit target set
+	// before the run, which is a statement the run must honour through the SAME
+	// seam rather than re-guess.
+	stated := d.statedTargets
+	d.statedTargets = nil
+	bindReason := "a new run resolves and derives its own scope"
+	if len(stated) > 0 {
+		bindReason = "the caller stated an explicit target set before the run"
+	}
+	d.bindAuthoritativeTargets(stated, bindReason)
 	interaction, interactionDescriptor, contractErr := d.selectInteractionContract(objective)
 	if contractErr != nil {
 		d.emitAuthorization("deny", "interaction contract binding failed: "+contractErr.Error(),
@@ -742,6 +827,34 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 	// resolved targets are known, and before anything can be dispatched, so
 	// an interruption from here on is reconstructable.
 	d.ledgerBeginRun(objective)
+	// ── DURABLE CROSS-PROCESS PROPOSAL RECOVERY ─────────────────────────
+	// A new process re-running an objective whose durable task is still open
+	// continues that task rather than minting a second one (see
+	// ledgerBeginRun). The proposal parked inside it is recovered the same way:
+	// from the ledger, not from memory or from the prompt. When a proposal is
+	// restored, maybeAdaptiveProposal below continues THAT revision instead of
+	// forming a competing one — otherwise the fresh record would overwrite the
+	// revision the human actually left decisions on.
+	//
+	// Nothing here is an authorization. The restored value is state only; the
+	// existing approval gate and the canonical gateway still decide what may
+	// execute, exactly as they did in the process that recorded it.
+	if d.proposalAdvisor != nil && d.ledger != nil {
+		if restored, err := d.RestoreProposalFromLedger(objective); err != nil {
+			// A recorded-but-untrustworthy proposal is a refusal, not a
+			// fallback: proceeding as though nothing had been recorded would
+			// discard the human's decisions without ever saying so.
+			d.emitAuthorization("deny", "durable proposal could not be restored: "+err.Error(),
+				"PROPOSAL_RESTORE_REFUSED", false, true)
+			_, _ = d.loop.Abort("durable proposal could not be restored: "+err.Error(), autonomy.FailurePermanent)
+			d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
+			d.releaseRunResources()
+			return nil, err
+		} else if restored {
+			diagnosticf("[proposal] run %s continues a durable proposal (revision %d)",
+				d.runRequestID, d.proposalState.Revision())
+		}
+	}
 	// ── PHASE 12: DERIVE THE RUN-LEVEL TOKEN BOUND ──────────────────────
 	// The run-level budget is derived from the per-invocation budget this run
 	// is actually bound to, so a legitimate multi-invocation task is not
@@ -788,6 +901,20 @@ func (d *Driver) Run(ctx context.Context, objective string) (*autonomy.LoopTermi
 		d.enrichBoundary()
 		d.publish(d.runCtx) //nolint:contextcheck // runCtx is the run's own cancellation context
 		return d.term(), nil
+	}
+	// ── ADAPTIVE PROPOSAL ORCHESTRATION ────────────────────────────────
+	// With an advisor wired, the runtime selects its interaction from the
+	// objective, the observed evidence and the applicable policy. A clear,
+	// bounded objective returns here and keeps its direct path; a broad or
+	// consequential objective forms an evidence-bound proposal and either parks
+	// for the decisions that matter or proceeds with the recommended strategy.
+	// The proposal never authorizes anything: acceptance compiles into THIS
+	// request and the existing authorization/approval/verification path runs
+	// unchanged.
+	if d.proposalAdvisor != nil {
+		if term, parked := d.maybeAdaptiveProposal(ctx, runID); parked {
+			return term, nil
+		}
 	}
 	if err := ValidateObjectiveContract(objective, interaction, interactionDescriptor); err != nil {
 		d.emitAuthorization("deny", "interaction contract authority ceiling: "+err.Error(),
@@ -858,6 +985,9 @@ func (d *Driver) Abort(reason string) (*autonomy.LoopTermination, error) {
 	if d.runCancel != nil {
 		d.runCancel()
 	}
+	// A staged PROVEN grant belongs to a decision point this abort replaces.
+	// It must not survive into another decision or run.
+	d.discardPendingProven()
 	// Use the run context (now cancelled) for termination so the termination
 	// event carries the correct cancellation context.
 	abortReason := "aborted by operator: " + reason
@@ -902,6 +1032,16 @@ func (d *Driver) ResumeApprove(ctx context.Context) (*autonomy.LoopTermination, 
 	pid, err := d.approvalPatchID()
 	if err != nil {
 		return d.term(), err
+	}
+	// DURABLE HUMAN DECISION: record what the human authorized, bound to the
+	// reviewed candidate identity and digest, BEFORE the apply. A resumed run
+	// must be able to read the decision itself, not merely infer it from bytes.
+	{
+		cid, digest := "", ""
+		if b := d.loop.Boundary(); b != nil {
+			cid, digest = b.CandidateID, b.CandidateDigest
+		}
+		d.ledgerHumanDecision("approve", "", cid, digest)
 	}
 	obs, err := d.adapter.Approve(ctx, pid)
 	if obs.RequestID == "" {
@@ -972,6 +1112,13 @@ func (d *Driver) ResumeReject(ctx context.Context, reason string) (*autonomy.Loo
 	if err != nil {
 		return d.term(), err
 	}
+	{
+		cid, digest := "", ""
+		if b := d.loop.Boundary(); b != nil {
+			cid, digest = b.CandidateID, b.CandidateDigest
+		}
+		d.ledgerHumanDecision("reject", reason, cid, digest)
+	}
 	obs, err := d.adapter.Reject(ctx, pid, reason)
 	if obs.RequestID == "" {
 		// Hard reject error: no terminal result exists. Release the human and
@@ -1032,6 +1179,7 @@ func (d *Driver) ResumeClarify(ctx context.Context, target string) (*autonomy.Lo
 	// invalidation an authorization bypass: a target the gateway refuses (a file
 	// the workspace does not contain) must fail closed through the same gate as
 	// any other unbound destination.
+	d.ledgerHumanDecision("clarify", "human named the clarification target", "", "")
 	targets := d.bindAuthoritativeTargets([]string{target},
 		"a human named the target at the clarification boundary: "+target)
 	// Preserve the active contract and request identity across clarification;
@@ -1118,6 +1266,8 @@ func (d *Driver) resumeWithProposal(ctx context.Context, intent ProposalIntent) 
 	if string(intent) == "rescope_textual_patch" {
 		intent = ProposalRescopeBoundedPatch
 	}
+	// DURABLE HUMAN DECISION: the proposal strategy the human selected.
+	d.ledgerHumanDecision("proposal:"+string(intent), d.surfaceReason(), "", "")
 	// Resolve the DecisionSurface lifecycle on every human choice.
 	d.resolveSurfaceLifecycle(ctx, "human choice: "+string(intent))
 	// ProposalCancel: ABORTED with $0 spent.
@@ -1766,6 +1916,35 @@ func (d *Driver) invalidateDerivedScope(reason string) {
 	}
 }
 
+// isProjectLevelObjective reports whether the strategy gateway classified the
+// objective as a broad project-level transformation (architect or refactor).
+//
+// A project-level objective names a PROJECT, not a file: "redesign this
+// project" is about the workspace's implementation surface, so an unresolved
+// target is a DEFERRED target the runtime may resolve from observed evidence —
+// not an ambiguity the human must resolve by nominating a filename. The
+// classification is read from the gateway's own profile (Profile.Operation),
+// never re-derived from the prompt here, so there is one authority for it.
+func (d *Driver) isProjectLevelObjective() bool {
+	if d == nil {
+		return false
+	}
+	// $hot is a STRICT LOCAL TARGET BOUNDARY: it may never widen a run to the
+	// project's implementation surface, so a project-level objective under
+	// $hot keeps the pre-existing conservative behavior (a human names the
+	// local target). Every other surface may resolve a deferred project target
+	// from evidence.
+	if IsHot(d.scope) {
+		return false
+	}
+	switch d.resolved.Profile.Operation {
+	case strategy.OperationArchitect, strategy.OperationRefactor:
+		return true
+	default:
+		return false
+	}
+}
+
 // deriveEvidenceScope observes the workspace and binds an evidence-backed target
 // set for an objective that names no file but DOES declare artifact kinds.
 //
@@ -1834,7 +2013,7 @@ func (d *Driver) deriveEvidenceScope() {
 	// proven target outranks anything discovery could derive, and the precedence
 	// must be legible HERE, at the one place a run acquires a target it was not
 	// given. (The early return above guarantees it is empty on this path.)
-	derivation := d.adapter.DeriveScope(d.prompt, d.resolved.Targets)
+	derivation := d.adapter.DeriveScopeWith(d.prompt, d.resolved.Targets, d.isProjectLevelObjective())
 	d.scopeDerivation = derivation
 
 	// ── DISCOVERED ─────────────────────────────────────────────────────
@@ -2270,6 +2449,9 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 		select {
 		case <-ctx.Done():
 			// Cancellation is a clean permanent abort, not a propagated error.
+			// It replaces any staged completion decision: discard the grant
+			// so a cancelled run writes no terminal objective state.
+			d.discardPendingProven()
 			return d.terminateAbort(ctx, "context cancelled", autonomy.FailurePermanent), nil //nolint:nilerr // termination, not a failure
 		default:
 		}
@@ -2296,6 +2478,11 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			// that returned, a step that came back nil and a verifier that
 			// merely ran are structurally incapable of producing it.
 			pre := decision
+			// Rendered verification, when an accepted proposal demanded it, runs
+			// BEFORE the authority judges the evidence so a real, passing
+			// rendering can satisfy a broad objective's integrity condition. It
+			// is idempotent (at most once per run) and mutates nothing.
+			d.ensureRenderedVerification(ctx)
 			d.authorizeObjectiveCompletion(&decision)
 			d.forensics.noteAuthority(AuthorityCompletionGate, pre, decision)
 			// ── OBJECTIVE EVIDENCE-CARRY-OVER ──────────────────────
@@ -2334,6 +2521,17 @@ func (d *Driver) observeAndRun(ctx context.Context, runID uint64) (*autonomy.Loo
 			pre = decision
 			d.authorizeContractRecovery(&decision)
 			d.forensics.noteAuthority(AuthorityContractRecovery, pre, decision)
+			// ── TERMINAL OBJECTIVE COMMIT (deferred) ─────────────────────
+			// The completion authority stages a PROVEN grant instead of
+			// committing it, precisely so this point — after the behavioral
+			// proof gate and the contract-recovery breaker have both had the
+			// chance to downgrade — is the ONLY place the terminal objective
+			// state is emitted and durably committed. A completion any gate
+			// removed is discarded here, so the terminal objective event and
+			// the durable state can never disagree, and no terminal objective
+			// state is written while authorized work that can still change
+			// the outcome is in flight.
+			d.commitObjectiveCompletion(&decision)
 			// ── PHASE 12: CANONICAL CONTINUATION CONSULTATION ────────────
 			// An exhausted invocation is an INVOCATION outcome, not a task
 			// failure. Before the matrix acts on it, the pure continuation

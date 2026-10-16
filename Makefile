@@ -20,6 +20,13 @@ test:
 	@echo "Running test suite (race, count=1)..."
 	go test -race -count=1 ./...
 
+# bench-cli runs the subprocess CLI benchmark: it builds the real izen binary
+# and drives it against a scripted local provider, asserting exact artifact
+# bytes, the JSON report, exit codes and durable evidence.
+bench-cli:
+	@echo "Running subprocess CLI benchmark suite..."
+	go test -run 'TestCLIBench' -v -count=1 -timeout 15m ./test/benchmark
+
 lint:
 	@echo "Running golangci-lint (timeout 5m)..."
 	golangci-lint run --timeout=5m ./...

@@ -255,6 +255,16 @@ func (a *ExecutorAdapter) PreflightTarget(ctx context.Context, prompt string, ex
 // strategy.Select a pure text classifier and keeps the executor free of
 // objective-language parsing.
 func (a *ExecutorAdapter) DeriveScope(prompt string, stated []string) execution.Derivation {
+	return a.DeriveScopeWith(prompt, stated, false)
+}
+
+// DeriveScopeWith is DeriveScope with the objective's PROJECT-LEVEL fact made
+// explicit. A project-level objective (the gateway classified it architect or
+// refactor) that declares no artifact kind may derive the workspace's authored
+// implementation artifacts, because it named a PROJECT rather than a file. Every
+// other objective keeps the strict declared-kind-only semantics, so a targeted
+// request can never acquire targets merely because it was broad.
+func (a *ExecutorAdapter) DeriveScopeWith(prompt string, stated []string, projectLevel bool) execution.Derivation {
 	if a == nil || a.executor == nil {
 		return execution.Derivation{Reason: "no executor is bound to the adapter; scope derivation is impossible"}
 	}
@@ -263,6 +273,7 @@ func (a *ExecutorAdapter) DeriveScope(prompt string, stated []string) execution.
 		Prompt:        prompt,
 		Profile:       resolver.DiscoverProfile(),
 		StatedTargets: stated,
+		ProjectLevel:  projectLevel,
 	})
 }
 

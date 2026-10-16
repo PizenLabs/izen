@@ -288,8 +288,16 @@ func approvalEventForInput(epoch authorization.InteractionEpoch, line string) au
 	}
 }
 
-// Stack is the wired composition root for the CLI control-plane path. It is
-// assembled by Wire and consumed by Run.
+// Stack is the historical wired composition root for the CLI control-plane
+// path. It is assembled by Wire and consumed by Run.
+//
+// SUBORDINATED (Phase 2 execution-topology convergence): the production
+// `izen prompt` / `izen orchestrate` command no longer builds this Stack. It
+// drives the authoritative autonomy Driver through cli.RunAuthoritative
+// (authoritative.go). The Stack + RunCycle + FileExecutor lifecycle is retained
+// only as the parity/rollback boundary and for the internal/verification
+// harness; it is not reachable from any production command. Do not add new
+// callers.
 type Stack struct {
 	Preflight    *preflight.PreflightEngine
 	Validator    *executor.ProposalValidator

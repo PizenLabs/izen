@@ -261,8 +261,18 @@ const (
 	VerifyGatePass VerificationState = "GATE_PASS"
 	// VerifyGateFail: a verification command gate ran and failed.
 	VerifyGateFail VerificationState = "GATE_FAIL"
-	// VerifyGateNotApplicable: no verification contract exists for the target.
+	// VerifyGateNotApplicable: no verification contract exists for the target
+	// AND the objective's acceptance is determined by the artifact itself (an
+	// explicit creation or a declared delta), so there is nothing more a gate
+	// could check. It is a provably not-applicable gate, not a pass.
 	VerifyGateNotApplicable VerificationState = "GATE_NOT_APPLICABLE"
+	// VerifyGateUnverified: no verification contract exists for the target AND
+	// the objective's acceptance is NOT determined by the artifact alone — a
+	// broad project-level transformation (redesign/refactor) whose criteria are
+	// semantic. The mutation may have landed, but the objective is UNVERIFIED:
+	// the runtime reports exactly what it observed and does not claim PROVEN.
+	// It is a distinct state from GATE_NOT_APPLICABLE and from GATE_FAIL.
+	VerifyGateUnverified VerificationState = "GATE_UNVERIFIED"
 	// VerifyClaimedOnly: only the model claimed it; no observed fact supports
 	// it. It is UNSATISFIED, and this state records exactly why.
 	VerifyClaimedOnly VerificationState = "CLAIMED_ONLY"
@@ -404,6 +414,12 @@ type ObjectiveDerivation struct {
 	Request string
 	// Kind is the canonical task contract kind.
 	Kind TaskKind
+	// Intent is the canonical user-intent label the lifecycle classified the
+	// request under (e.g. "conversation"). It selects the runtime-authored
+	// obligation set for a read-only objective: a pure conversation has no
+	// workspace to observe, so its contract drops the observation obligation.
+	// Empty preserves the observation obligation (fail-closed).
+	Intent string
 	// Operation is the semantic operation the objective intends. When empty it
 	// is derived from Kind. It is an explicit input so a caller that already
 	// classified the operation does not have to round-trip it through the
@@ -483,7 +499,7 @@ func DeriveObjectiveContract(in ObjectiveDerivation) ObjectiveContract {
 	contract.Requirements = admitRequirements(in.Proposals, in.Request, scope, clauses)
 
 	// ── 3 — the runtime's own obligations ────────────────────────────
-	contract.Conditions = authorRuntimeConditions(in.Kind, scope)
+	contract.Conditions = authorRuntimeConditions(in.Kind, scope, in.Intent)
 
 	// …then the obligations the admitted model requirements add.
 	for _, r := range contract.Requirements {
@@ -505,9 +521,12 @@ func DeriveObjectiveContract(in ObjectiveDerivation) ObjectiveContract {
 }
 
 // authorRuntimeConditions builds the obligations the runtime owns. They are a
-// function of the task contract KIND and the resolved SCOPE only — never of the
-// size, shape or domain of the change.
-func authorRuntimeConditions(kind TaskKind, scope []string) []CompletionCondition {
+// function of the task contract KIND, the resolved SCOPE and the classified
+// INTENT only — never of the size, shape or domain of the change. Intent is
+// consulted for exactly one case: a pure conversational objective has no
+// workspace to observe, so its read-only contract omits the observation
+// obligation and is judged by the delivered response alone.
+func authorRuntimeConditions(kind TaskKind, scope []string, intent string) []CompletionCondition {
 	cond := func(id, desc string, ob Obligation, targets []string) CompletionCondition {
 		return CompletionCondition{
 			ID:                id,
@@ -561,13 +580,20 @@ func authorRuntimeConditions(kind TaskKind, scope []string) []CompletionConditio
 				ObligationIntegrityHeld, scopeCopy),
 		}
 	case TaskRead, TaskReview:
-		return []CompletionCondition{
-			cond("cond-observed",
-				"the declared scope was observed, not answered from priors", ObligationObserved, scopeCopy),
-			cond("cond-response-delivered",
-				"a response (or a deterministic structural verdict) was delivered",
-				ObligationResponseDelivered, nil),
+		observed := cond("cond-observed",
+			"the declared scope was observed, not answered from priors", ObligationObserved, scopeCopy)
+		response := cond("cond-response-delivered",
+			"a response (or a deterministic structural verdict) was delivered",
+			ObligationResponseDelivered, nil)
+		// A pure conversation has no workspace to observe. Requiring an
+		// observation would make every greeting unprovable by construction, so
+		// the conversation contract is judged by the delivered response alone.
+		// Every other read-only objective (explanation, investigation, review)
+		// keeps the observation obligation and still fails closed without one.
+		if strings.EqualFold(strings.TrimSpace(intent), "conversation") {
+			return []CompletionCondition{response}
 		}
+		return []CompletionCondition{observed, response}
 	case TaskIdempotent:
 		return []CompletionCondition{
 			cond("cond-post-mutation-reinspected",
@@ -585,6 +611,34 @@ func authorRuntimeConditions(kind TaskKind, scope []string) []CompletionConditio
 }
 
 // ── The admissibility gate ──────────────────────────────────────────────────
+//
+// OBJECTIVE ADEQUACY POLICY (all-rejected requirements).
+//
+// A proposal is ADMITTED only when it is traceable to the user's request AND
+// grounded in a concrete target inside the objective's evidence-bound scope.
+// The gate is never weakened to admit an untraceable or ungrounded proposal,
+// and the runtime never requires every model-proposed requirement to be
+// accepted.
+//
+// Source and authority:
+//   - Explicit user acceptance criteria (the request text, its clauses, the
+//     resolved scope, the task kind) remain authoritative via the runtime's
+//     own completion conditions. They never depend on a model proposal.
+//   - Repository-derived facts (scope, existence, deltas) require attributable
+//     runtime evidence (resolution verdict, pre-execution provenance,
+//     observed deltas, post-mutation re-reads).
+//   - Model-proposed criteria remain proposals until validated by this gate;
+//     a rejected proposal authors no completion condition.
+//   - Rejected criteria retain their rejection reasons in the ledger.
+//   - The absence of admitted criteria never becomes proof of success: the
+//     runtime's own obligations still gate completion, and an unproven
+//     objective terminates UNSUBSTANTIATED, never PROVEN.
+//
+// A broad objective with no admitted requirements therefore executes under an
+// explicitly visible best-effort policy (evidence-bound scope, runtime
+// obligations, truthful UNVERIFIED/UNSUBSTANTIATED semantics), not under an
+// invented requirement. A consequential unresolved choice is routed through
+// the adaptive proposal mechanism (a human decision), never synthesized.
 
 // groundingFloor is the minimum share of a proposal's significant words that
 // must be ANCHORED for the proposal to count as a traceable restatement of the

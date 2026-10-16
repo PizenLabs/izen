@@ -186,6 +186,17 @@ func (d *Driver) attachCandidateReview(b *autonomy.HumanBoundary) {
 		b.Targets = append([]string(nil), preview.Targets...)
 	}
 	b.CandidateEvidence = MutationReviewEvidence(preview)
+	// When the target set was DERIVED from workspace evidence (a targetless or
+	// project-level objective), the review carries the runtime's own rationale
+	// for WHY these files are the proposal. The human is authorizing a scope,
+	// not a bare filename, so the scope's provenance is part of the review.
+	if note := strings.TrimSpace(d.derivationNote); note != "" {
+		b.CandidateEvidence = append(b.CandidateEvidence, autonomy.BoundaryEvidence{
+			Label:     "scope derived from evidence",
+			Satisfied: true,
+			Detail:    note,
+		})
+	}
 }
 
 // MutationReviewEvidence is the runtime's own checklist for a mutation review.

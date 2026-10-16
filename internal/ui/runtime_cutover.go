@@ -334,7 +334,24 @@ func (m *model) runRuntimeTaskRequest(task *plan.Task) tea.Cmd {
 // the RuntimeExecutor. It is the cutover equivalent of the legacy build-mode
 // handleMessageContent path (legacy reclassification inside an
 // autonomy-decided workspace).
+//
+// ── /build IS AN EXECUTION CONTRACT ────────────────────────────────────────
+// A normal prompt typed INSIDE /build is already an execution request: the
+// workspace interaction contract itself is the authorization, so it must not
+// require the `$prompt` token. When this input carried no explicit directive
+// (that path is dispatched through dispatchDirectives before reaching here), the
+// /build contract binds the runtime-resolved mutation scope (ScopeDynamic).
+//
+// This does NOT collapse /build into $prompt. An explicit `$hot` already bound a
+// bounded, human-declared scope (ScopeDeclared) and is left untouched; an
+// explicit `$prompt` inside /build already bound ScopeDynamic through its own
+// directive path. The three surfaces stay distinct at the command layer and
+// converge on the same mutation authority at admission.
 func (m *model) runRuntimePrompt(content string) tea.Cmd {
+	if m.resolver != nil && m.resolver.Current() == modes.ModeBuild &&
+		(m.sess == nil || !m.sess.ScopeProvenance.AllowsMutation()) {
+		m.bindScopeProvenance(intentdomain.ScopeDynamic)
+	}
 	if m.sess == nil || !m.sess.ScopeProvenance.AllowsMutation() {
 		return m.runGatedLine(content)
 	}
@@ -346,6 +363,26 @@ func (m *model) runRuntimePrompt(content string) tea.Cmd {
 		m.Viewport.GotoBottom()
 		return nil
 	}
+	// ── ONE REQUEST → ONE AUTHORITATIVE RUNTIME ────────────────────────
+	// A /build ordinary prompt is an execution request like `$prompt`. When the
+	// decision runtime is wired, it enters the SAME authoritative runtime
+	// lifecycle (the bounded autonomy Driver) instead of the UI dispatching the
+	// executor directly and thereby owning a second lifecycle. The Driver owns
+	// provider scheduling, budget, continuation and terminal truth; the executor
+	// is its mutation/verification capability. The command surface "$build" is
+	// carried so /build stays distinct from $prompt while sharing their dynamic
+	// execution authority.
+	if m.autonomy != nil && m.autonomousDriver != nil {
+		if !m.admitNewExecutionRun() {
+			return nil
+		}
+		m.executionSurface = "$build"
+		return m.runAutonomyRoutedCmdExplicit(content)
+	}
+	// ── EXPLICIT HARNESS FALLBACK (no decision runtime wired) ──────────
+	// A headless/test harness without the Driver still routes through the single
+	// executor authority; it does NOT start a second loop. This path is fenced
+	// by TestBuildModeWithoutDriverUsesExplicitExecutorBoundary.
 	profile := m.gateway.SelectStrategy(content)
 	m.lastExecutionStrategy = profile
 	if profile.Strategy == strategy.HumanClarification {

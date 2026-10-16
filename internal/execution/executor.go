@@ -1314,7 +1314,21 @@ var ErrProviderModelMismatch = errors.New("executor: provider/model mismatch")
 // existed but was rejected, distinct from a missing artifact.
 var ErrArtifactRejected = errors.New("executor: mutation artifact rejected")
 
+// ErrArtifactPlaceholderEcho is returned when a mutation artifact still carries
+// the artifact-contract placeholder verbatim: the model republished the
+// instruction rather than the requested content. It is an EXPLICIT rejection —
+// never a silent repair — so a Markdown/plain artifact can never be corrupted
+// by markup tag balancing applied to instruction text.
+var ErrArtifactPlaceholderEcho = errors.New("executor: artifact echoed the contract placeholder instead of content")
+
 var ErrArtifactRetryableRejected = errors.New("executor: mutation artifact rejected with retry directive")
+
+// ErrEmptyProposalPayload is returned when a valid artifact cannot be rendered
+// as any approval payload. Entering OutcomePendingApproval with no diff would
+// open an approval surface whose consumer waits for a producer that never runs
+// (the orphaned "Waiting for proposal payload..." state). A proposal must reach
+// an explicit terminal outcome, never an unfulfillable wait.
+var ErrEmptyProposalPayload = errors.New("executor: proposal produced no renderable payload")
 
 // ErrNonRetryableArtifactError is the circuit-breaker sentinel for
 // ambiguous-anchor failures that cannot be resolved without explicit
@@ -2138,8 +2152,15 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	// of the target it was decomposed from. The guard runs even under a
 	// patch-only artifact contract so each approved unit stays provably
 	// budget-feasible.
+	//
+	// CONTRACT MATCH: the guard judges the contract the dispatch will actually
+	// use (willDispatchBoundedPatch). A constrained model is forced onto the
+	// bounded SEARCH/REPLACE contract for existing targets, which fits any
+	// budget; refusing it as an infeasible full rewrite was a contract mismatch
+	// that parked a feasible multi-target objective before any provider call.
+	boundedDispatch := x.willDispatchBoundedPatch(req, profile)
 	if profile.Strategy == strategy.TargetedMutation &&
-		(!patchOnlyArtifact(profile) || len(req.StagedSubTasks) > 0) {
+		(!boundedDispatch || len(req.StagedSubTasks) > 0) {
 		for _, target := range targets {
 			verdict := EvaluatePreflight(PreflightRequest{
 				ArtifactBounded: false,
@@ -2436,6 +2457,34 @@ func (x *RuntimeExecutor) Execute(ctx context.Context, req ExecuteRequest) (*Exe
 	res.Original = patches[0].Original
 	res.Content = patches[0].Modified
 	res.Diff = diffs[0]
+	// ── PROPOSAL PRODUCER/CONSUMER AGREEMENT ───────────────────────────
+	// A CREATE has no unified-diff baseline, so the changeset pipeline can
+	// legitimately compile nothing even though the artifact is a concrete body
+	// of bytes. Derive the whole-file-addition diff from the SAME artifact bytes
+	// the apply will write — the same projection the candidate preview already
+	// uses — so the approval payload can never disagree with the held patch.
+	// The consumer then never waits for a payload no producer will fill.
+	if strings.TrimSpace(res.Diff) == "" {
+		if fallback, _ := wholeFileAdditionDiff(patches[0].Modified); fallback != "" {
+			res.Diff = fallback
+			if len(diffs) > 0 {
+				diffs[0] = fallback
+			}
+		}
+	}
+	if strings.TrimSpace(res.Diff) == "" && !patches[0].Canonical {
+		// Truly no renderable payload: fail EXPLICITLY here rather than open an
+		// approval surface that can never be fulfilled. A CANONICAL create is
+		// exempt: a terminated, empty FILE_CREATE envelope is a legitimate
+		// empty-file creation whose artifact is the empty body itself, not a
+		// missing payload.
+		g.FailExecution(events.FailurePermanent, ErrEmptyProposalPayload, "executor.proposal")
+		res.Err = ErrEmptyProposalPayload
+		res.Proof.Outcome = OutcomeFailed
+		res.Proof.FinishedAt = time.Now()
+		setProofGraph(res, g)
+		return x.finalizeResult(res), ErrEmptyProposalPayload
+	}
 	for _, p := range patches {
 		g.CompleteArtifact("patch", p.File)
 	}
@@ -2501,6 +2550,16 @@ func (x *RuntimeExecutor) Approve(ctx context.Context, patchID string) (*Executi
 		if x.auth.CandidateDigest != "" && held && preview.CandidateID != patchID {
 			return nil, fmt.Errorf("executor: %w: authorization %s names candidate %q, refusing %q",
 				authorization.ErrAuthorizationCandidateMismatch, x.auth.ID, x.auth.CandidateID, patchID)
+		}
+		// ── AUTHORIZATION CONSUMPTION BOUNDARY ─────────────────────────
+		// A mutation-operation grant authorizes the WHOLE apply+verify
+		// operation. It is consumed exactly once — when this operation reaches
+		// its terminal state — never by each verification shell command. This
+		// keeps a multi-step verifier from starving itself on the first command
+		// while preserving single-use semantics for the mutation operation.
+		if x.auth.Scope == authorization.ScopeMutationOperation {
+			grant := x.auth
+			defer markAuthConsumed(grant)
 		}
 	}
 
@@ -3167,6 +3226,34 @@ func wholeFileAdditionDiff(body string) (string, int) {
 	return sb.String(), len(lines)
 }
 
+// markupTargetExts are the extensions whose artifact CONTRACT is markup, i.e.
+// for which an HTML tag-balance repair is semantically applicable. Markup
+// knowledge is derived from the resolved target, not from the payload's
+// incidental characters — a Markdown or plain-text target is never markup.
+var markupTargetExts = map[string]bool{
+	".html": true, ".htm": true, ".xhtml": true, ".xml": true,
+	".svg": true, ".vue": true,
+}
+
+// isMarkupTarget reports whether the resolved target's artifact contract is
+// markup, so document-level tag balancing may legitimately apply.
+func isMarkupTarget(target string) bool {
+	if strings.TrimSpace(target) == "" {
+		return false
+	}
+	return markupTargetExts[strings.ToLower(filepath.Ext(target))]
+}
+
+// anyMarkupTarget reports whether any resolved target is a markup artifact.
+func anyMarkupTarget(targets []string) bool {
+	for _, t := range targets {
+		if isMarkupTarget(t) {
+			return true
+		}
+	}
+	return false
+}
+
 // countDiffLines measures the compiled diff for the preview when the patch record
 // carries no own metrics (a bounded SEARCH/REPLACE artifact has no hunk header).
 func countDiffLines(diffs []string) (added, removed int) {
@@ -3403,16 +3490,26 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 	maxOut, llmConstrained = llmstep.ResolveMaxTokens(model, requested)
 	// Constrained Output Budget Invariant: models capped at max_output <= 1024
 	// (or ":free" free-tier IDs) force max_tokens = min(requested, 980) and
-	// DISABLE FULL_REWRITE entirely, forcing SEARCH_REPLACE output.
-	// Both the capability-derived classification (llmstep) and the
+	// DISABLE FULL_REWRITE for PATCH-SHAPED artifacts, forcing SEARCH_REPLACE
+	// output. Both the capability-derived classification (llmstep) and the
 	// strategy-derived classification (ModelProfile against the profile budget)
 	// gate the artifact shape.
+	//
+	// ── A CREATION IS NOT A PATCH ──────────────────────────────────────
+	// The bounded-patch contract is only sound when there is existing content
+	// to anchor a SEARCH block against. A `create_file` target does not exist
+	// yet, so forcing it into search_replace asks the model for an anchored
+	// patch against nothing — an impossible artifact that guarantees failure
+	// and burns the constrained budget proving it. The creation keeps its
+	// full-artifact contract; the constrained ceiling still bounds it, and
+	// hidden reasoning is disabled below so CoT cannot consume the shared
+	// budget before the content is emitted.
 	profileConstrained := ModelProfile{OutputTokenCap: profile.MaxOutputTokens, ModelID: model}.IsConstrained()
 	if llmConstrained || profileConstrained {
 		if maxOut <= 0 || maxOut > ConstrainedMaxTokens {
 			maxOut = ConstrainedMaxTokens
 		}
-		if !patchOnly {
+		if !patchOnly && profile.Artifact.Kind != "create_file" {
 			patchOnly = true
 		}
 	}
@@ -3580,6 +3677,13 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			// artifact; the hidden reasoning pass is disabled for it.
 			disableReasoning = true
 		}
+		// A constrained model shares its small output ceiling between hidden
+		// reasoning and the artifact. Disable the hidden channel for it as
+		// well, including a constrained CREATION: the model reasons by default
+		// and would otherwise spend the ceiling before writing the file.
+		if llmConstrained || profileConstrained {
+			disableReasoning = true
+		}
 		reasoningMode := "provider_default"
 		if disableReasoning {
 			reasoningMode = "disabled"
@@ -3622,7 +3726,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					}
 					return stepReq, nil
 				},
-				req.StreamCallback, maxOut, llmConstrained, disableReasoning, &invs, &trace,
+				req.StreamCallback, isMarkupTarget(target), maxOut, llmConstrained, disableReasoning, &invs, &trace,
 			)
 			candidates = append(candidates, outcome.Candidate)
 			if stepErr != nil {
@@ -3637,7 +3741,7 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			var callErr error
 			var itrace *ingestion.IngestionTrace
 			var usage ai.ProviderUsage
-			raw, usage, itrace, callErr = x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, &providerMetadata)
+			raw, usage, itrace, callErr = x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, isMarkupTarget(target), &providerMetadata)
 			trace = itrace
 			// The invocation evidence is built from the stream outcome REGARDLESS
 			// of the artifact result: the provider billed these tokens whether the
@@ -3716,6 +3820,15 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			}
 		}
 		var modified string
+		// canonicalEnvelope records that the full-artifact path resolved the
+		// artifact's canonical, apply-ready bytes at STAGING (a terminated
+		// FILE_CREATE / contract-fence body), so the staged candidate, its
+		// digest, the approval preview and the applied bytes are one object.
+		// It covers an envelope aimed at a NEW target and at an EXISTING one:
+		// the apply boundary has always extracted the body in both cases, so
+		// staging the envelope instead made the review describe bytes the
+		// mutation would not write.
+		canonicalEnvelope := false
 		if patchOnly {
 			// Bounded-patch artifact boundary: extract ONLY structured patch
 			// representations. A full-file (or otherwise unstructured)
@@ -3807,28 +3920,71 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 					target, parseErr)
 			}
 			modified = ResolveModifiedContent(original, raw)
+			// ── CREATE FROM A SEARCH/REPLACE PAYLOAD ────────────────────
+			// A model that answered a creation with a SEARCH/REPLACE envelope
+			// has no existing file to anchor against. Its REPLACE side is the
+			// new file's body; the envelope is the model's transport choice, not
+			// the artifact contract. Extract the body here so the staged
+			// candidate is clean and no anchor is invented for an absent target.
+			if original == "" && strings.Contains(verbatim, "<<<<<<< SEARCH") {
+				if body := creationBodyFromSearchReplace(ParseSearchReplaceBlocks(verbatim)); body != "" {
+					modified = body
+				}
+			}
+			// ── TRANSPORT ENVELOPE → CANONICAL BODY (Phase 2.1) ─────────
+			//
+			// A FILE_CREATE envelope or a formal ":::artifact <path>" contract
+			// fence is TRANSPORT, not the artifact: the bytes to apply are the
+			// terminated body inside it. Resolve that body HERE, before binding,
+			// before the candidate is held, digested and previewed. Deferring the
+			// extraction to apply time is what let a rendered CandidateDiff show
+			// the envelope while the applied file held only the parsed body — a
+			// human approving one artifact and the runtime writing another.
+			//
+			// A recognized envelope is resolved to its canonical body whether it
+			// is aimed at a NEW target or an EXISTING one: the apply boundary
+			// has always extracted the body in both cases, so staging the
+			// envelope left the approval review describing bytes the mutation
+			// would not write. An envelope that is NOT terminated is malformed:
+			// fail closed, stage no candidate, open no approval surface.
+			if artifact.Structural {
+				switch artifact.Form {
+				case ArtifactFormFileCreate:
+					body, ok := canonicalFileCreateBody(verbatim)
+					if !ok {
+						return nil, invs, diffs, candidates, trace, fmt.Errorf(
+							"%w: %w: %s: FILE_CREATE envelope is not terminated by END_FILE",
+							ErrInvalidPatchFormat, ErrArtifactRejected, target)
+					}
+					modified = body
+					canonicalEnvelope = true
+				case ArtifactFormContractFence:
+					body, ok := canonicalContractFenceBody(ctx, verbatim)
+					if !ok {
+						return nil, invs, diffs, candidates, trace, fmt.Errorf(
+							"%w: %w: %s: artifact contract fence is not closed",
+							ErrInvalidPatchFormat, ErrArtifactRejected, target)
+					}
+					modified = body
+					canonicalEnvelope = true
+				}
+			}
 			// ANCHOR HONESTY UNDER A FULL-ARTIFACT CONTRACT. A provider that
 			// answered a "replace the file" contract with a SEARCH/REPLACE
 			// envelope did NOT produce a whole document; it produced a patch
 			// that names a destination region. If that region does not exist in
 			// the target, the model hallucinated the anchor.
 			//
-			// ResolveModifiedContent deliberately returns the ORIGINAL bytes when
-			// an unresolvable envelope is present (so raw markers can never be
-			// written into a user's file). That safety choice is correct, but on
-			// its own it converts "I could not anchor this" into "there is
-			// nothing to change" — a fabricated no-op that then opens an approval
-			// surface and asks a human to authorize a mutation of nothing.
-			//
-			// A no-op is a CLAIM and may only come from the NO_CHANGES_REQUIRED
-			// sentinel, which is structurally classified. An unanchorable patch is
-			// a FAILURE and is classified here, at the artifact boundary, before
-			// any candidate exists.
-			if _, anchorErr := classifyAnchors(original, verbatim); anchorErr != nil {
-				log.Printf("[execution] request=%s target=%s artifact_anchor=REJECTED reason=%q — no patch staged, no approval surface opened",
-					requestID, target, anchorErr)
-				return nil, invs, diffs, candidates, trace,
-					fmt.Errorf("%w: %w: %s: %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, anchorErr)
+			// It applies ONLY when there are existing bytes to anchor to: a
+			// creation has no region to hallucinate, and its REPLACE payload was
+			// already resolved above.
+			if original != "" {
+				if _, anchorErr := classifyAnchors(original, verbatim); anchorErr != nil {
+					log.Printf("[execution] request=%s target=%s artifact_anchor=REJECTED reason=%q — no patch staged, no approval surface opened",
+						requestID, target, anchorErr)
+					return nil, invs, diffs, candidates, trace,
+						fmt.Errorf("%w: %w: %s: %w", ErrHallucinatedAnchorError, ErrArtifactRejected, target, anchorErr)
+				}
 			}
 			if modified == "" {
 				// The payload carried a recognizable artifact but the content
@@ -3882,11 +4038,24 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			}
 			modified = bound.Content
 		}
-		if strings.TrimSpace(modified) == "" {
+		if isArtifactPlaceholderEcho(modified) {
+			// The model republished the instruction placeholder as if it were
+			// file content. That is NOT an artifact: reject it explicitly before
+			// validation or any approval surface, so no repair heuristic can
+			// "balance" the placeholder's brackets into a corrupted file.
+			return nil, invs, diffs, candidates, trace, fmt.Errorf(
+				"%w: %w: %s", ErrArtifactPlaceholderEcho, ErrArtifactRejected, target)
+		}
+		if strings.TrimSpace(modified) == "" && !canonicalEnvelope {
 			// Phase 1 safety rule: an artifact extraction failure is a FAILURE,
 			// never a proposal staged for approval. The model produced no
 			// usable mutation artifact — abort before any approval surface.
 			// The billed invocation is still returned so usage is preserved.
+			//
+			// A canonical envelope is exempt: an explicitly TERMINATED
+			// FILE_CREATE envelope with an empty body is a legitimate
+			// empty-file / empty-overwrite (truncation is signalled by
+			// finish_reason=length, not by body emptiness).
 			return nil, invs, diffs, candidates, trace, fmt.Errorf("executor: model produced no mutation artifact for %s", target)
 		}
 		// ── ARTIFACT BOUNDARY (Phase 2) ─────────────────────────────
@@ -3938,12 +4107,53 @@ func (x *RuntimeExecutor) invokeMutation(ctx context.Context, req ExecuteRequest
 			return nil, invs, diffs, candidates, trace, fmt.Errorf("%w: %w", ErrArtifactRetryableRejected, redundant)
 		}
 		patches = append(patches, &Patch{
-			ID:       fmt.Sprintf("%s-patch-%d", requestID, len(patches)+1),
-			File:     target,
-			Original: original,
-			Modified: modified,
+			ID:        fmt.Sprintf("%s-patch-%d", requestID, len(patches)+1),
+			File:      target,
+			Original:  original,
+			Modified:  modified,
+			Canonical: canonicalEnvelope,
+			// The executor has resolved Modified to the exact bytes the
+			// mutation will write — for every staged patch, not only an
+			// addressed envelope. The mutation boundary must therefore write
+			// those bytes verbatim: re-running its protocol cascade would let
+			// SanitizeLLMResponse strip a reviewed line and commit bytes
+			// nobody approved / the authorization did not digest.
+			Resolved: true,
 		})
-		diffs = append(diffs, x.compileDiff(raw, target, original))
+		if original == "" {
+			// A creation has no baseline: derive the entire diff from the SAME
+			// canonical bytes the apply will write (never from the raw
+			// envelope), so the review the human approves and the mutation that
+			// lands are one object. The mutation boundary records its diff from
+			// this same compiled diff (SetCompiledDiffs). This covers both a
+			// recognized FILE_CREATE/contract-fence envelope and a plain-body
+			// creation.
+			d, _ := wholeFileAdditionDiff(modified)
+			diffs = append(diffs, d)
+		} else {
+			// ── PREVIEW/EVIDENCE DIFF FROM THE APPLIED BYTES ────────────────
+			//
+			// `modified` is the canonical content the apply will write
+			// (Patch.Modified). The review and the mutation-boundary evidence
+			// MUST describe those bytes — never a re-parse of the transport
+			// envelope that produced them. The bounded-patch extractor and the
+			// changeset pipeline are two parsers of the same model output, and
+			// on a malformed envelope (stray blank lines around the markers,
+			// say) they can disagree: the extractor resolves the applied body
+			// while the changeset pipeline reads the whole envelope as a
+			// full-file replacement. The human was then shown an
+			// envelope-shaped diff while the mutation wrote the resolved body
+			// — an approved-content/applied-content divergence.
+			//
+			// Compiling from the canonical bytes makes the review and the
+			// mutation the same object by construction. The raw-envelope
+			// re-parse remains only as a fallback for a no-diff edge case.
+			if d, derr := changeset.UnifiedDiffBetween(target, original, modified); derr == nil {
+				diffs = append(diffs, d)
+			} else {
+				diffs = append(diffs, x.compileDiff(raw, target, original))
+			}
+		}
 	}
 	return patches, invs, diffs, candidates, trace, nil
 }
@@ -4525,7 +4735,7 @@ func (x *RuntimeExecutor) invokeReadOnly(ctx context.Context, req ExecuteRequest
 		g.BeginModel(model)
 
 		var providerMetadata ai.ResponseMetadata
-		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, &providerMetadata)
+		raw, usage, itrace, callErr := x.invokeStream(ctx, aiReq, requestID, model, g, req.StreamCallback, anyMarkupTarget(targets), &providerMetadata)
 		if itrace != nil {
 			trace = itrace
 		}
@@ -4627,7 +4837,7 @@ func isOutputExhausted(err error) bool {
 // reasoning.telemetry event on completion. The accumulated visible content and
 // the authoritative provider usage are returned; the authoritative artifact
 // always travels on the ExecutionResult afterwards.
-func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback, metadataOut ...*ai.ResponseMetadata) (raw string, usage ai.ProviderUsage, trace *ingestion.IngestionTrace, err error) {
+func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requestID, model string, g *runtimegraph.Graph, streamCb StreamCallback, allowMarkupRepair bool, metadataOut ...*ai.ResponseMetadata) (raw string, usage ai.ProviderUsage, trace *ingestion.IngestionTrace, err error) {
 	// Provider adapters are untrusted callers. Keep their descriptor mutation
 	// confined to a private request copy so the executor's active ceiling and
 	// the pending approval proof cannot be changed after admission.
@@ -4773,12 +4983,13 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 		// Transport normalization: preserve the raw response and record every
 		// transformation in an IngestionTrace before the payload reaches the
 		// L1 Execution Gate / artifact parser.
-		trace, procErr := ingestion.Process(resp.Content)
+		trace, procErr := ingestion.ProcessWithPolicy(resp.Content, allowMarkupRepair)
 		visible := ai.VisibleCompletion(trace.NormalizedPayload)
 		if procErr != nil {
 			if errors.Is(procErr, ingestion.ErrSyntaxInvalid) && trace != nil && trace.RepairCandidate != nil {
 				candidate := trace.RepairCandidate
-				if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) {
+				if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) &&
+					!isArtifactPlaceholderEcho(trace.NormalizedPayload) && !isArtifactPlaceholderEcho(candidate.ProposedPayload) {
 					ingestion.RecordRepairAccepted()
 					log.Printf("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
 					if globalActivityLog != nil {
@@ -5158,14 +5369,14 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	// every transformation in an IngestionTrace before the payload reaches the
 	// L1 Execution Gate / artifact parser.
 	rawVisible := content.String()
-	ingTrace, procErr := ingestion.Process(rawVisible)
+	ingTrace, procErr := ingestion.ProcessWithPolicy(rawVisible, allowMarkupRepair)
 	trace = ingTrace
 	visible := ai.VisibleCompletion(trace.NormalizedPayload)
 	if strings.TrimSpace(visible) == "" && reasoningBuf.Len() > 0 {
 		// The entire visible completion was reasoning: ingest the reasoning
 		// text as the raw artifact so forensic traceability survives.
 		reasoningRaw := reasoningBuf.String()
-		ingTrace2, procErr2 := ingestion.Process(reasoningRaw)
+		ingTrace2, procErr2 := ingestion.ProcessWithPolicy(reasoningRaw, allowMarkupRepair)
 		trace, procErr = ingTrace2, procErr2
 		visible = ai.VisibleCompletion(trace.NormalizedPayload)
 	}
@@ -5175,7 +5386,8 @@ func (x *RuntimeExecutor) invokeStream(ctx context.Context, req ai.Request, requ
 	if procErr != nil {
 		if errors.Is(procErr, ingestion.ErrSyntaxInvalid) && trace != nil && trace.RepairCandidate != nil {
 			candidate := trace.RepairCandidate
-			if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) {
+			if ingestion.IsASTValid(candidate.ProposedPayload) && ingestion.WithinSafetyThreshold(trace.NormalizedPayload, candidate) &&
+				!isArtifactPlaceholderEcho(trace.NormalizedPayload) && !isArtifactPlaceholderEcho(candidate.ProposedPayload) {
 				ingestion.RecordRepairAccepted()
 				log.Printf("[ingestion] repair candidate accepted rule=%s", candidate.RuleID)
 				if globalActivityLog != nil {
@@ -5669,6 +5881,49 @@ unrelated line byte-for-byte.`
 // structurally cannot accept a complete-file artifact.
 func patchOnlyArtifact(p strategy.ExecutionStrategyProfile) bool {
 	return p.Artifact.Bounded && p.Artifact.Kind == "search_replace"
+}
+
+// willDispatchBoundedPatch reports whether invokeMutation will dispatch this
+// request under a bounded (patch-anchored) artifact contract. It mirrors the
+// contract selection invokeMutation performs so Boundary 2 never judges a
+// full-file rewrite the executor was never going to attempt.
+//
+// WHY THIS EXISTS. A constrained (free-tier / low-ceiling) model is forced onto
+// the bounded SEARCH/REPLACE contract for every existing target — a contract
+// that fits ANY output budget by construction. Boundary 2 previously ran before
+// that classification and refused the request as an infeasible full rewrite, so
+// a multi-target objective whose per-target bounded patches fit easily was
+// parked at PREFLIGHT_INFEASIBLE before a single provider request. Judging the
+// dispatch contract here keeps the guard honest: it still refuses a full
+// rewrite that genuinely cannot fit, and it no longer refuses one the runtime
+// will not attempt.
+//
+// The capability resolution (llmstep.ResolveMaxTokens) and the strategy-derived
+// ModelProfile are the two existing authorities for "constrained"; neither is
+// re-derived, and this helper only combines them exactly as invokeMutation does.
+func (x *RuntimeExecutor) willDispatchBoundedPatch(req ExecuteRequest, profile strategy.ExecutionStrategyProfile) bool {
+	if patchOnlyArtifact(profile) {
+		return true
+	}
+	// A creation has no existing content to anchor a bounded patch against; the
+	// constrained contract deliberately keeps the full-artifact create.
+	if profile.Artifact.Kind == "create_file" {
+		return false
+	}
+	model, err := x.resolveModel(req)
+	if err != nil {
+		// An unresolvable model fails later at the invocation boundary; do not
+		// suppress the preflight guard on its behalf.
+		return false
+	}
+	requested := effectiveMaxOutput(req.MaxOutputTokens, &profile)
+	if requested == 0 {
+		requested = llmstep.DefaultMutationRequestedTokens
+	}
+	if _, constrained := llmstep.ResolveMaxTokens(model, requested); constrained {
+		return true
+	}
+	return ModelProfile{OutputTokenCap: profile.MaxOutputTokens, ModelID: model}.IsConstrained()
 }
 
 func buildMutationBaseUserPrompt(request, evidence string) string {

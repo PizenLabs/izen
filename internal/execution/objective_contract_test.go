@@ -675,3 +675,66 @@ func TestCaseO_EmptyConditionSetIsBackwardsCompatible(t *testing.T) {
 		t.Fatalf("with no conditions the authority changed behaviour: %s (%s)", got.Outcome, got.Reason)
 	}
 }
+
+// TestConversationContractNeedsNoWorkspaceObservation pins the explicit
+// workspace-independent completion contract for a pure conversational request.
+//
+// A greeting has no workspace to observe, so an observation requirement would
+// make it unprovable BY CONSTRUCTION. The conversation contract therefore keeps
+// the RESPONSE obligation (a runtime-observed non-empty delivery) and drops
+// only the observation obligation. The guard clause below proves the drop is
+// scoped to conversation: a read-only investigation still requires an
+// observation and is UNSUBSTANTIATED on a response alone.
+func TestConversationContractNeedsNoWorkspaceObservation(t *testing.T) {
+	c := DeriveTaskContract(TaskClassification{Intent: "conversation", Objective: "say hello in one short sentence"})
+	if c.Kind != TaskRead {
+		t.Fatalf("conversation contract kind = %s, want READ", c.Kind)
+	}
+	if !c.RequiresResponse {
+		t.Fatal("conversation contract must require a delivered response")
+	}
+	if c.RequiresObservation {
+		t.Fatal("conversation contract must not require a workspace observation")
+	}
+	if c.RequiresMutation() {
+		t.Fatal("conversation contract must never require a mutation")
+	}
+
+	delivered := ObjectiveEvidence{Provider: ProviderDone, FinishReason: "stop", Artifact: ArtifactNone, ResponseProduced: true, ResponseBytes: 17}
+	if got := AuthorizeObjective(c, delivered); got.Outcome != ObjectiveProven {
+		t.Fatalf("delivered conversation outcome = %s (%s), want PROVEN", got.Outcome, got.Reason)
+	}
+	silent := ObjectiveEvidence{Provider: ProviderDone, FinishReason: "stop", Artifact: ArtifactNone}
+	if got := AuthorizeObjective(c, silent); got.Outcome == ObjectiveProven {
+		t.Fatalf("a silent conversation was PROVEN: %+v", got)
+	}
+
+	// Scoping guard: a read-only investigation is NOT conversation and must
+	// still fail closed without an observation, even with a response.
+	investigation := DeriveTaskContract(TaskClassification{Intent: "investigation", Objective: "inspect @main.go"})
+	if !investigation.RequiresObservation {
+		t.Fatal("an investigation contract must require a workspace observation")
+	}
+	if got := AuthorizeObjective(investigation, delivered); got.Outcome == ObjectiveProven {
+		t.Fatalf("an investigation was PROVEN by a response with no observation: %+v", got)
+	}
+
+	// The runtime-authored CONDITION set must agree with the contract: a
+	// conversation authors no observation obligation, an investigation keeps it.
+	convo := DeriveObjectiveContract(ObjectiveDerivation{Request: "hello", Kind: TaskRead, Intent: "conversation"})
+	for _, c := range convo.Conditions {
+		if c.Obligation == ObligationObserved {
+			t.Fatal("the conversation objective contract authored an observation obligation")
+		}
+	}
+	inv := DeriveObjectiveContract(ObjectiveDerivation{Request: "inspect @main.go", Kind: TaskReview, Intent: "investigation"})
+	hasObserved := false
+	for _, c := range inv.Conditions {
+		if c.Obligation == ObligationObserved {
+			hasObserved = true
+		}
+	}
+	if !hasObserved {
+		t.Fatal("the investigation objective contract dropped the observation obligation")
+	}
+}

@@ -1,0 +1,142 @@
+{
+  "schema": "izen.run.v1",
+  "run_id": "run-1",
+  "surface": "$prompt",
+  "provider": "openrouter",
+  "model": "cohere/north-mini-code:free",
+  "workspace": ".",
+  "objective": "check this project and redesign it",
+  "mode": "build",
+  "outcome": "unsubstantiated",
+  "reason": "objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-integrity-held\" is unmet: the verification gate reported GATE_UNVERIFIED — refused completion claim over outcome \"changed\"",
+  "approved": true,
+  "inspected": false,
+  "rejected": false,
+  "clarify_required": false,
+  "objective_contract": {
+    "objective_id": "run-1",
+    "task_kind": "PATCH",
+    "progress": "PARTIALLY_SATISFIED",
+    "outcome": "UNSUBSTANTIATED",
+    "continuation": "CONTINUE",
+    "scope": [
+      "index.html",
+      "script.js",
+      "styles.css"
+    ],
+    "pending": [
+      "cond-integrity-held"
+    ],
+    "conditions": [
+      {
+        "id": "cond-scope-mutated",
+        "description": "every declared target was durably transformed",
+        "obligation": "SCOPE_MUTATED",
+        "status": "SATISFIED",
+        "verification_state": "OBSERVED",
+        "evidence_refs": [
+          "evidence:delta=index.html",
+          "evidence:delta=script.js",
+          "evidence:delta=styles.css"
+        ]
+      },
+      {
+        "id": "cond-observed",
+        "description": "the declared scope was observed, not answered from priors",
+        "obligation": "OBSERVED",
+        "status": "SATISFIED",
+        "verification_state": "OBSERVED",
+        "evidence_refs": [
+          "evidence:observed=index.html",
+          "evidence:observed=script.js",
+          "evidence:observed=styles.css"
+        ]
+      },
+      {
+        "id": "cond-post-mutation-reinspected",
+        "description": "every declared target was re-read after the mutation",
+        "obligation": "POST_MUTATION_REINSPECTED",
+        "status": "SATISFIED",
+        "verification_state": "OBSERVED",
+        "evidence_refs": [
+          "evidence:reinspected=index.html",
+          "evidence:reinspected=script.js",
+          "evidence:reinspected=styles.css"
+        ]
+      },
+      {
+        "id": "cond-integrity-held",
+        "description": "the verification gate for the declared scope passed or is provably not applicable",
+        "obligation": "INTEGRITY_HELD",
+        "status": "UNSATISFIED",
+        "verification_state": "GATE_UNVERIFIED"
+      },
+      {
+        "id": "cond-r4",
+        "description": "identify issues in index.html and propose redesign",
+        "obligation": "REQUIREMENT_DISCHARGED",
+        "status": "SATISFIED",
+        "verification_state": "OBSERVED",
+        "evidence_refs": [
+          "evidence:requirement_discharged=r4"
+        ]
+      },
+      {
+        "id": "cond-r5",
+        "description": "identify issues in script.js and propose redesign",
+        "obligation": "REQUIREMENT_DISCHARGED",
+        "status": "SATISFIED",
+        "verification_state": "OBSERVED",
+        "evidence_refs": [
+          "evidence:requirement_discharged=r5"
+        ]
+      },
+      {
+        "id": "cond-r6",
+        "description": "identify issues in styles.css and propose redesign",
+        "obligation": "REQUIREMENT_DISCHARGED",
+        "status": "SATISFIED",
+        "verification_state": "OBSERVED",
+        "evidence_refs": [
+          "evidence:requirement_discharged=r6"
+        ]
+      },
+      {
+        "id": "cond-r9",
+        "description": "update styles.css with new styles and improved layout",
+        "obligation": "REQUIREMENT_DISCHARGED",
+        "status": "SATISFIED",
+        "verification_state": "OBSERVED",
+        "evidence_refs": [
+          "evidence:requirement_discharged=r9"
+        ]
+      }
+    ],
+    "requirement_count": 9,
+    "discharged_count": 4
+  },
+  "artifacts": {
+    "candidate_targets": [
+      "index.html",
+      "script.js",
+      "styles.css"
+    ],
+    "candidate_id": "run-1-patch-1",
+    "candidate_digest": "9852d16a1d37943bf5d27627f8fef0aa50e3c83e26c44133cd68e915ed7514a7",
+    "operation": "UPDATE",
+    "added_lines": 8,
+    "removed_lines": 6,
+    "applied": [
+      "index.html",
+      "script.js",
+      "styles.css"
+    ]
+  },
+  "usage": {
+    "input_tokens": 6895,
+    "output_tokens": 512,
+    "known": true
+  },
+  "elapsed_ms": 8037,
+  "exit_code": 5
+}

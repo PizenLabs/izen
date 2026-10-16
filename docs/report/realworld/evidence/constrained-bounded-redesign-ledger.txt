@@ -1,0 +1,18 @@
+durable ledger: .izen/runtime/ledger.ndjson
+records: 16
+  CHECKPOINT_CREATED: 6
+  PROPOSAL_SNAPSHOT: 2
+  VERIFICATION_RESULT: 2
+  TASK_CREATED: 1
+  CURSOR_DISPATCHED: 1
+  TASK_PAUSED: 1
+  HUMAN_DECISION: 1
+  EXECUTION_COMMITTED: 1
+  FAILURE_CLASSIFIED: 1
+
+TASK_CREATED {"intent": "check this project and redesign it", "provenance": 0, "scope": ["index.html", "script.js", "styles.css"]}
+TASK_PAUSED {"reason": "mutation awaiting approval"}
+HUMAN_DECISION {"action": "approve", "candidate": "run-1-patch-1", "decided_at": "2026-10-10T03:46:19.751856Z", "digest": "9852d16a1d37943bf5d27627f8fef0aa50e3c83e26c44133cd68e915ed7514a7", "objective": "check this project and redesign it", "targets": ["index.html", "script.js", "styles.css"]}
+EXECUTION_COMMITTED {"operationId": "run-1-attempt-0", "phase": "COMMITTED", "postconditionDigest": "eaa15a51f6842400cefc29e6a2fdd0a804caa3bf6e9b4ca08b7b528816e0f7ed", "status": "COMMITTED"}
+FAILURE_CLASSIFIED {"detail": "objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-integrity-held\" is unmet: the verification gate reported GATE_UNVERIFIED \u2014 refused completion claim over outcome \"changed\"", "operationId": "run-1-attempt-1", "reason": "unsubstantiated"}
+VERIFICATION_RESULT(terminal) {"detail": "objective UNPROVEN (UNSUBSTANTIATED): completion condition \"cond-integrity-held\" is unmet: the verification gate reported GATE_UNVERIFIED \u2014 refused completion claim over outcome \"changed\"", "failed": true, "ok": false, "operationId": "run-1-attempt-1", "terminal": true}

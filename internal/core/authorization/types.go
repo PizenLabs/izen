@@ -20,6 +20,25 @@ func NewAuthorizationID() AuthorizationID {
 	return AuthorizationID("authz_" + generateULID())
 }
 
+// AuthorizationScope names the capability family a grant authorizes. It exists
+// because ONE single-use token shared by two capability families (a file write
+// and a shell-command verification step) is consumed by whichever guard runs
+// first, starving the other. The scope makes the CONSUMPTION BOUNDARY explicit:
+// the token is consumed where its documented meaning says it is.
+type AuthorizationScope string
+
+const (
+	// ScopeMutationOperation: one grant authorizes ONE whole mutation operation
+	// — the file write AND every verification step its apply gate runs. It is
+	// consumed exactly once, when the operation reaches a terminal state, so a
+	// multi-step verifier cannot starve itself on the first command.
+	ScopeMutationOperation AuthorizationScope = "mutation_operation"
+	// ScopeCapabilityInvocation (the zero value, and the historical behaviour)
+	// authorizes ONE guarded capability invocation and is consumed by that
+	// invocation's own guard.
+	ScopeCapabilityInvocation AuthorizationScope = "capability_invocation"
+)
+
 type MutationProposal struct {
 	IntentID           artifact.ArtifactID
 	PlanID             artifact.ArtifactID
@@ -49,6 +68,13 @@ type MutationAuthorization struct {
 	ExpiresAt     time.Time
 	SingleUse     bool
 	IssuedAt      time.Time
+	// Scope names the capability family this grant authorizes and therefore
+	// WHERE its single-use consumption occurs. The zero value is
+	// ScopeCapabilityInvocation — the historical per-invocation boundary — so
+	// existing callers are unchanged. A grant minted for a whole mutation
+	// operation sets ScopeMutationOperation and is consumed once, at the end of
+	// that operation.
+	Scope AuthorizationScope
 	// CandidateID is the MutationCandidate identity this token was issued FOR,
 	// when the caller knows it. It is the lineage binding that closes the last
 	// gap in
@@ -123,6 +149,18 @@ func shortDigest(d string) string {
 
 func (a *MutationAuthorization) IsExpired() bool {
 	return !a.ExpiresAt.IsZero() && time.Now().After(a.ExpiresAt)
+}
+
+// ConsumesPerInvocation reports whether a single-use grant is consumed by EACH
+// guarded capability invocation. A mutation-operation grant (the whole
+// apply+verify operation) is deliberately NOT consumed by an individual shell
+// command: its consumption boundary is the operation, not the command. A
+// non-single-use grant is never consumed at all.
+func (a *MutationAuthorization) ConsumesPerInvocation() bool {
+	if a == nil || !a.SingleUse {
+		return false
+	}
+	return a.Scope != ScopeMutationOperation
 }
 
 type DeniedStep int
